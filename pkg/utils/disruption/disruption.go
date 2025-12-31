@@ -75,3 +75,13 @@ func ReschedulingCost(ctx context.Context, pods []*corev1.Pod) float64 {
 	}
 	return cost
 }
+
+func IsUnderConsolidateAfter(nodePool *v1.NodePool, nodeClaim *v1.NodeClaim, c clock.Clock) bool {
+	initialized := nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized)
+
+	// If the lastPodEvent is zero, use the time that the nodeclaim was initialized, as that's when Karpenter recognizes that pods could have started scheduling
+	timeToCheck := lo.Ternary(!nodeClaim.Status.LastPodEventTime.IsZero(), nodeClaim.Status.LastPodEventTime.Time, initialized.LastTransitionTime.Time)
+
+	// Consider a node under the effect of consolidateAfter by looking at the lastPodEvent status field on the nodeclaim.
+	return lo.Ternary(nodePool.Spec.Disruption.ConsolidateAfter.Duration == nil, false, c.Since(timeToCheck) < lo.FromPtr(nodePool.Spec.Disruption.ConsolidateAfter.Duration))
+}
