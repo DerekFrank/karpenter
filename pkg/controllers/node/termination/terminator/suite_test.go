@@ -247,5 +247,30 @@ var _ = Describe("Eviction/Queue", func() {
 			ExpectNotFound(ctx, env.Client, pod)
 			Expect(recorder.Calls(events.Disrupted)).To(Equal(1))
 		})
+		It("should not pass a negative grace period when nodeTerminationTime is in the past", func() {
+			// This test reproduces the bug from issue #3032:
+			// When the health controller sets NodeClaimTerminationTimestampAnnotationKey = now(),
+			// by the time the termination controller reconciles, the timestamp is already in the past.
+			// This causes gracePeriodSeconds = time.Until(pastTime) to be negative, which the API server
+			// interprets as a force-delete (grace=0), violating at-most-one pod semantics.
+			//
+			// We add a finalizer so we can observe the difference: with grace >= 1 the pod enters
+			// Terminating state (DeletionTimestamp set, pod still in etcd). With grace == 0 the pod
+			// would be force-removed from etcd immediately, even with a finalizer.
+			pod.ObjectMeta.Finalizers = []string{"karpenter.sh/test-finalizer"}
+			pod.Spec.TerminationGracePeriodSeconds = lo.ToPtr[int64](30)
+			ExpectApplied(ctx, env.Client, pod)
+
+			// Simulate the health controller setting the termination timestamp to "now"
+			// and then the termination controller reconciling 5 seconds later
+			nodeTerminationTime := fakeClock.Now()
+			fakeClock.Step(5 * time.Second)
+
+			Expect(terminatorInstance.DeleteExpiringPods(ctx, []*corev1.Pod{pod}, &nodeTerminationTime)).To(Succeed())
+
+			// The pod must still exist in etcd (Terminating, not force-removed).
+			pod = ExpectExists(ctx, env.Client, pod)
+			Expect(pod.DeletionTimestamp.IsZero()).To(BeFalse())
+		})
 	})
 })

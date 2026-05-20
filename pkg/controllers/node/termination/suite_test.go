@@ -811,10 +811,49 @@ var _ = Describe("Termination", func() {
 			Expect(pod.DeletionTimestamp.IsZero()).To(BeFalse())
 
 		})
+		It("should not use a negative grace period when nodeTerminationTime is already past (node repair scenario)", func() {
+			// This test reproduces the bug from issue #3032:
+			// The health controller sets NodeClaimTerminationTimestampAnnotationKey = now().
+			// By the time the termination controller reconciles, the timestamp is already in the past,
+			// causing gracePeriodSeconds to go negative. A negative grace period causes force-deletion
+			// of pods from etcd without waiting for containers to stop, violating at-most-one semantics.
+			nodeClaim.Spec.TerminationGracePeriod = &metav1.Duration{Duration: time.Second * 300}
+			// Simulate what the health controller does: set the annotation to "now" (already past)
+			nodeClaim.Annotations = map[string]string{
+				v1.NodeClaimTerminationTimestampAnnotationKey: fakeClock.Now().Format(time.RFC3339),
+			}
+			pod := test.Pod(test.PodOptions{
+				NodeName: node.Name,
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						v1.DoNotDisruptAnnotationKey: "true",
+					},
+					OwnerReferences: defaultOwnerRefs,
+					Finalizers:      []string{"karpenter.sh/test-finalizer"},
+				},
+				TerminationGracePeriodSeconds: lo.ToPtr(int64(30)),
+			})
+			ExpectApplied(ctx, env.Client, node, nodeClaim, nodePool, pod)
+			Expect(env.Client.Delete(ctx, node)).To(Succeed())
+
+			// Step the clock forward to simulate the delay between health controller setting
+			// the annotation and the termination controller reconciling
+			fakeClock.Step(5 * time.Second)
+
+			// Past minDrainTime so drain proceeds
+			fakeClock.Step(2 * termination.MinDrainTime)
+			ExpectRequeued(ExpectObjectReconciled(ctx, env.Client, terminationController, node)) // DrainInitiation
+
+			// The pod must still exist in etcd (Terminating, not force-removed).
+			// With grace >= 1, the API server sets DeletionTimestamp but keeps the pod.
+			// With grace == 0 (the bug), the pod would be immediately removed from etcd.
+			pod = ExpectExists(ctx, env.Client, pod)
+			Expect(pod.DeletionTimestamp.IsZero()).To(BeFalse())
+		})
 		It("should update deletion timestamp for terminating pods when it is after node deletion timestamp", func() {
 			nodeClaim.Spec.TerminationGracePeriod = &metav1.Duration{Duration: time.Second * 300}
 			fakeClock.SetTime(time.Now())
-			nodeTerminationTimestamp := time.Now().Add(nodeClaim.Spec.TerminationGracePeriod.Duration)
+			nodeTerminationTimestamp := fakeClock.Now().Add(nodeClaim.Spec.TerminationGracePeriod.Duration)
 			nodeClaim.Annotations = map[string]string{
 				v1.NodeClaimTerminationTimestampAnnotationKey: nodeTerminationTimestamp.Format(time.RFC3339),
 			}
@@ -838,7 +877,12 @@ var _ = Describe("Termination", func() {
 			ExpectNodeWithNodeClaimDraining(env.Client, node.Name)
 			ExpectNodeExists(ctx, env.Client, node.Name)
 			pod = ExpectExists(ctx, env.Client, pod)
-			Expect(pod.DeletionTimestamp.Time).To((BeTemporally("~", nodeTerminationTimestamp, 10*time.Second)))
+			// The pod's DeletionTimestamp should be updated to reflect the remaining grace period
+			// until the node termination time (300s - 90s = 210s from the fake clock's perspective).
+			// The API server uses real time for DeletionTimestamp, so we assert that the grace period
+			// is approximately correct rather than matching an exact timestamp.
+			Expect(pod.DeletionGracePeriodSeconds).ToNot(BeNil())
+			Expect(*pod.DeletionGracePeriodSeconds).To(BeNumerically("~", 210, 15))
 		})
 		It("should not finish draining until minDrainTime has passed", func() {
 			ExpectApplied(ctx, env.Client, node, nodeClaim)
