@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/awslabs/operatorpkg/object"
 	"github.com/awslabs/operatorpkg/status"
@@ -231,6 +232,27 @@ func AllNodesForNodeClaim(ctx context.Context, c client.Client, nodeClaim *v1.No
 		return nil, fmt.Errorf("listing nodes, %w", err)
 	}
 	return lo.ToSlicePtr(nodeList.Items), nil
+}
+
+// AnnotateTerminationTimestamp sets the NodeClaimTerminationTimestampAnnotationKey to the given
+// time. The termination controller uses this to enforce a deadline on graceful drain. If the
+// annotation already exists with a time at or before the requested time, this is a no-op —
+// the termination deadline can only be moved earlier, never extended.
+func AnnotateTerminationTimestamp(ctx context.Context, kubeClient client.Client, nodeClaim *v1.NodeClaim, terminationTime time.Time) error {
+	if existing, exists := nodeClaim.Annotations[v1.NodeClaimTerminationTimestampAnnotationKey]; exists {
+		existingTime, err := time.Parse(time.RFC3339, existing)
+		if err == nil && !existingTime.After(terminationTime) {
+			return nil
+		}
+	}
+	stored := nodeClaim.DeepCopy()
+	nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
+		v1.NodeClaimTerminationTimestampAnnotationKey: terminationTime.Format(time.RFC3339),
+	})
+	if err := kubeClient.Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	return nil
 }
 
 func UpdateNodeOwnerReferences(nodeClaim *v1.NodeClaim, node *corev1.Node) *corev1.Node {

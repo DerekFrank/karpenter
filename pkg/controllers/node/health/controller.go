@@ -24,7 +24,6 @@ import (
 	"github.com/awslabs/operatorpkg/reasonable"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
@@ -47,6 +46,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
+	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
 
@@ -155,7 +155,7 @@ func (c *Controller) Reconcile(ctx context.Context, node *corev1.Node) (reconcil
 		}
 	}
 	// For unhealthy past the tolerationDisruption window we can forcefully terminate the node
-	if err := c.annotateTerminationGracePeriod(ctx, nodeClaim); err != nil {
+	if err := nodeclaimutils.AnnotateTerminationTimestamp(ctx, c.kubeClient, nodeClaim, c.clock.Now()); err != nil {
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 	return c.deleteNodeClaim(ctx, nodeClaim, node, unhealthyNodeCondition)
@@ -203,26 +203,6 @@ func (c *Controller) findUnhealthyConditions(node *corev1.Node) (nc *corev1.Node
 		}
 	}
 	return nc, cpTerminationDuration
-}
-
-func (c *Controller) annotateTerminationGracePeriod(ctx context.Context, nodeClaim *v1.NodeClaim) error {
-	if expirationTimeString, exists := nodeClaim.Annotations[v1.NodeClaimTerminationTimestampAnnotationKey]; exists {
-		expirationTime, err := time.Parse(time.RFC3339, expirationTimeString)
-		if err == nil && expirationTime.Before(c.clock.Now()) {
-			return nil
-		}
-	}
-	stored := nodeClaim.DeepCopy()
-	terminationTime := c.clock.Now().Format(time.RFC3339)
-	nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{v1.NodeClaimTerminationTimestampAnnotationKey: terminationTime})
-
-	if !equality.Semantic.DeepEqual(stored, nodeClaim) {
-		if err := c.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
-			return err
-		}
-		log.FromContext(ctx).WithValues(v1.NodeClaimTerminationTimestampAnnotationKey, terminationTime).Info("annotated nodeclaim")
-	}
-	return nil
 }
 
 // isNodePoolHealthy checks if the number of unhealthy nodes managed by the given NodePool exceeds the health threshold.
