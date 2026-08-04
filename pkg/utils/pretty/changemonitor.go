@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"github.com/mitchellh/hashstructure/v2"
-	"github.com/patrickmn/go-cache"
+	"github.com/awslabs/operatorpkg/cache"
 )
 
 // ChangeMonitor is used to reduce logging when discovering information that may change. The values recorded expire after
@@ -32,7 +32,7 @@ type ChangeMonitor struct {
 
 func NewChangeMonitor() *ChangeMonitor {
 	return &ChangeMonitor{
-		lastSeen: cache.New(24*time.Hour, 12*time.Hour),
+		lastSeen: cache.New("pretty.changemonitor", 24*time.Hour, 12*time.Hour),
 	}
 }
 

@@ -21,7 +21,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/patrickmn/go-cache"
+	"github.com/awslabs/operatorpkg/cache"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/flowcontrol"
@@ -58,7 +58,7 @@ const defaultDedupeTimeout = 2 * time.Minute
 func NewRecorder(r record.EventRecorder) Recorder {
 	return &recorder{
 		rec:   r,
-		cache: cache.New(defaultDedupeTimeout, 10*time.Second),
+		cache: cache.New("events.dedupe", defaultDedupeTimeout, 10*time.Second),
 	}
 }
 

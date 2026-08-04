@@ -20,7 +20,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/patrickmn/go-cache"
+	"github.com/awslabs/operatorpkg/cache"
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -64,7 +64,7 @@ func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider clou
 	return &Controller{
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
-		drift:         &Drift{clock: clk, cloudProvider: cloudProvider, instanceTypeNotFoundCheckCache: cache.New(time.Minute*30, time.Minute)},
+		drift:         &Drift{clock: clk, cloudProvider: cloudProvider, instanceTypeNotFoundCheckCache: cache.New("nodeclaim.disruption.instancetypenotfound", time.Minute*30, time.Minute)},
 		consolidation: &Consolidation{kubeClient: kubeClient, clock: clk},
 	}
 }

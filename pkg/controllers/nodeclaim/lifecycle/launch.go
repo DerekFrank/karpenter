@@ -22,7 +22,7 @@ import (
 	"fmt"
 
 	"github.com/awslabs/operatorpkg/status"
-	"github.com/patrickmn/go-cache"
+	"github.com/awslabs/operatorpkg/cache"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/clock"

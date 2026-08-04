@@ -22,7 +22,7 @@ import (
 	"time"
 
 	"github.com/awslabs/operatorpkg/status"
-	"github.com/patrickmn/go-cache"
+	"github.com/awslabs/operatorpkg/cache"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -70,7 +70,7 @@ func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider clou
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
 		recorder:      recorder,
-		lastScanned:   cache.New(scanPeriod, 1*time.Minute),
+		lastScanned:   cache.New("nodeclaim.consistency.lastscanned", scanPeriod, 1*time.Minute),
 		checks: []Check{
 			NewNodeShape(),
 		},
