@@ -42,7 +42,6 @@ import (
 	metricsnode "sigs.k8s.io/karpenter/pkg/controllers/metrics/node"
 	metricsnodepool "sigs.k8s.io/karpenter/pkg/controllers/metrics/nodepool"
 	metricspod "sigs.k8s.io/karpenter/pkg/controllers/metrics/pod"
-	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 	nodehydration "sigs.k8s.io/karpenter/pkg/controllers/node/hydration"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
@@ -163,10 +162,9 @@ func NewControllers(
 		)
 	}
 
-	// The cloud provider must define status conditions for the node repair controller to use to detect unhealthy nodes
-	if len(cloudProvider.RepairPolicies()) != 0 && options.FromContext(ctx).FeatureGates.NodeRepair {
-		controllers = append(controllers, health.NewController(kubeClient, cloudProvider, clock, recorder))
-	}
+	// Node repair is no longer a standalone force-deleting controller with a hardcoded 20% breaker. It now runs as a
+	// voluntary disruption method (reason "Repair") inside the disruption controller: budgeted, ordered, pre-spinning,
+	// and vetoable via do-not-repair. Registration lives in disruption.NewMethods, gated on RepairPolicies + the gate.
 
 	if options.FromContext(ctx).FeatureGates.StaticCapacity {
 		controllers = append(controllers, staticprovisioning.NewController(kubeClient, cluster, recorder, cloudProvider, p, clock, deviceAllocationController, virtualPodCache))

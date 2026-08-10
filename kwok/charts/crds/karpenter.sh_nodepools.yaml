@@ -114,13 +114,14 @@ spec:
                             description: |-
                               reasons is a list of disruption methods that this budget applies to. If Reasons is not set, this budget applies to all methods.
                               Otherwise, this will apply to each reason defined.
-                              allowed reasons are Underutilized, Empty, and Drifted.
+                              allowed reasons are Underutilized, Empty, Drifted, and Repair.
                             items:
                               description: DisruptionReason defines valid reasons for disruption budgets.
                               enum:
                                 - Underutilized
                                 - Empty
                                 - Drifted
+                                - Repair
                               type: string
                             maxItems: 50
                             type: array
@@ -293,8 +294,6 @@ spec:
                                     rule: self != "karpenter.sh/nodepool"
                                   - message: label "kubernetes.io/hostname" is restricted
                                     rule: self != "kubernetes.io/hostname"
-                                  - message: label domain "karpenter.kwok.sh" is restricted
-                                    rule: self in ["karpenter.kwok.sh/kwoknodeclass", "karpenter.kwok.sh/instance-cpu", "karpenter.kwok.sh/instance-memory", "karpenter.kwok.sh/instance-family", "karpenter.kwok.sh/instance-size"] || !self.find("^([^/]+)").endsWith("karpenter.kwok.sh")
                               minValues:
                                 description: |-
                                   This field is ALPHA and can be dropped or replaced at any time

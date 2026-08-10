@@ -48,7 +48,11 @@ import (
 
 const (
 	GracefulDisruptionClass = metrics.TerminationModeGraceful // graceful disruption always respects blocking pod PDBs and the do-not-disrupt annotation
-	EventualDisruptionClass = metrics.TerminationModeEventual // eventual disruption is bounded by a NodePool's TerminationGracePeriod, regardless of blocking pod PDBs and the do-not-disrupt annotation
+	EventualDisruptionClass = metrics.TerminationModeEventual  // eventual disruption is bounded by a NodePool's TerminationGracePeriod, regardless of blocking pod PDBs and the do-not-disrupt annotation
+	// RepairDisruptionClass is voluntary node repair. Like graceful, it drains and honors PDBs; unlike graceful, it
+	// ignores do-not-disrupt (repair is not discretionary — it honors the separate do-not-repair veto) and its drain
+	// is bounded by the per-condition RepairPolicy TerminationGracePeriod (0 = forceful), like eventual.
+	RepairDisruptionClass = "repair"
 )
 
 type MethodOptions struct {
@@ -168,11 +172,19 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 		return nil, fmt.Errorf("candidate is already being disrupted")
 	}
 	if err = node.ValidateNodeDisruptable(clk); err != nil {
-		// Only emit an event if the NodeClaim is not nil, ensuring that we only emit events for Karpenter-managed nodes
-		if node.NodeClaim != nil {
-			recorder.Publish(disruptionevents.Blocked(node.Node, node.NodeClaim, pretty.Sentence(err.Error()))...)
+		// Repair is voluntary but is NOT discretionary: a node carrying do-not-disrupt must still be repairable,
+		// since do-not-disrupt was never meant to strand a broken node (repair honors do-not-repair instead).
+		// So for the repair class we ignore the do-not-disrupt block here; all other block reasons still apply.
+		if disruptionClass == RepairDisruptionClass {
+			err = state.IgnoreNodeDoNotDisruptError(err)
 		}
-		return nil, err
+		if err != nil {
+			// Only emit an event if the NodeClaim is not nil, ensuring that we only emit events for Karpenter-managed nodes
+			if node.NodeClaim != nil {
+				recorder.Publish(disruptionevents.Blocked(node.Node, node.NodeClaim, pretty.Sentence(err.Error()))...)
+			}
+			return nil, err
+		}
 	}
 	// We know that the node will have the label key because of the node.IsDisruptable check above
 	nodePoolName := node.Labels()[v1.NodePoolLabelKey]
@@ -189,9 +201,11 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 	if pods, err = node.ValidatePodsDisruptable(ctx, kubeClient, pdbs, clk, recorder); err != nil {
 		// If the NodeClaim has a TerminationGracePeriod set and the disruption class is eventual, the node should be
 		// considered a candidate even if there's a pod that will block eviction. Other error types should still cause
-		// failure creating the candidate.
-		eventualDisruptionCandidate := node.NodeClaim.Spec.TerminationGracePeriod != nil && disruptionClass == EventualDisruptionClass
-		if lo.Ternary(eventualDisruptionCandidate, state.IgnorePodBlockEvictionError(err), err) != nil {
+		// failure creating the candidate. Repair behaves the same when its per-condition drain bound is set (that bound
+		// is stamped onto the NodeClaim TGP before repair runs), so a broken node is never stranded by a blocking pod.
+		drainBoundedCandidate := node.NodeClaim.Spec.TerminationGracePeriod != nil &&
+			(disruptionClass == EventualDisruptionClass || disruptionClass == RepairDisruptionClass)
+		if lo.Ternary(drainBoundedCandidate, state.IgnorePodBlockEvictionError(err), err) != nil {
 			recorder.Publish(disruptionevents.Blocked(node.Node, node.NodeClaim, pretty.Sentence(err.Error()))...)
 			return nil, err
 		}
