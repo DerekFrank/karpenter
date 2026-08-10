@@ -61,15 +61,32 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			disruption.WithMethods(disruption.NewRepair(env.Client, cluster, prov, cloudProvider, recorder, env.Clock, queue)))
 	})
 
+	// bindReschedulablePod attaches a ReplicaSet-owned pod to a node. With a pod present, a headroom pool would
+	// replace-FIRST (pre-spin a replacement). So a delete-only command on a pod-bearing node is decisive evidence of
+	// terminate-first, not an artifact of the node being empty (an empty node yields delete-only on ANY path).
+	bindReschedulablePod := func(n *corev1.Node) {
+		rs := test.ReplicaSet()
+		ExpectApplied(ctx, env.Client, rs)
+		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
+		pod := test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rs.Name, UID: rs.UID, Controller: lo.ToPtr(true), BlockOwnerDeletion: lo.ToPtr(true),
+		}}}})
+		ExpectApplied(ctx, env.Client, pod)
+		ExpectManualBinding(ctx, env.Client, pod, n)
+		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(n))
+	}
+
 	// INV-F2-1: a static NodePool (fixed replica count) has no room to grow, so repair terminates first — the command
-	// is delete-only (no pre-spun replacement).
-	It("should issue a delete-only command for a capacity-constrained (static) NodePool", func() {
+	// is delete-only (no pre-spun replacement) EVEN THOUGH the node carries a workload that a headroom pool would
+	// pre-spin a replacement for. The bound pod is what distinguishes terminate-first from an empty-node delete.
+	It("should issue a delete-only command for a capacity-constrained (static) NodePool with a workload", func() {
 		nodePool := test.StaticNodePool(v1.NodePool{Spec: v1.NodePoolSpec{Replicas: lo.ToPtr(int64(1))}})
 		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
 		}})
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		bindReschedulablePod(node) // a headroom pool would pre-spin a replacement for this pod; a static pool must not
 		markUnhealthy(node)
 		env.Clock.Step(31 * time.Minute)
 
@@ -77,6 +94,8 @@ var _ = Describe("Repair/TerminateFirst", func() {
 
 		cmds := queue.GetCommands()
 		Expect(cmds).To(HaveLen(1))
+		// Delete-only despite the workload: terminate-first, not a pre-spin. (Contrast the headroom test below, which
+		// with the same workload yields a ReplaceDecision.)
 		Expect(cmds[0].Decision()).To(Equal(disruption.DeleteDecision))
 		Expect(cmds[0].Replacements).To(HaveLen(0))
 	})
@@ -89,16 +108,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		}})
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
-		// Bind a reschedulable pod so the pre-spin simulation produces a replacement.
-		rs := test.ReplicaSet()
-		ExpectApplied(ctx, env.Client, rs)
-		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
-		pod := test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
-			APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rs.Name, UID: rs.UID, Controller: lo.ToPtr(true), BlockOwnerDeletion: lo.ToPtr(true),
-		}}}})
-		ExpectApplied(ctx, env.Client, pod)
-		ExpectManualBinding(ctx, env.Client, pod, node)
-		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
+		bindReschedulablePod(node) // same workload as the static test; a headroom pool pre-spins a replacement for it
 		markUnhealthy(node)
 		env.Clock.Step(31 * time.Minute)
 
@@ -110,28 +120,63 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		Expect(cmds[0].Replacements).To(HaveLen(1))
 	})
 
-	// INV-F2-4: terminate-first is still paced by the disruption budget. With a static pool of 4 unhealthy nodes and a
-	// default 10% budget, only one terminate-first command is issued per pass.
-	It("should still pace terminate-first by the disruption budget", func() {
-		const count = 4
-		nodePool := test.StaticNodePool(v1.NodePool{Spec: v1.NodePoolSpec{Replicas: lo.ToPtr(int64(count))}})
-		nodeClaims, nodes := test.NodeClaimsAndNodes(count, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+	// INV-F2-4: terminate-first is still paced by the disruption budget. A static pool with a Repair budget of 0 blocks
+	// terminate-first entirely (the operator's opt-out), and a nonzero budget lets it through — proving the budget, not
+	// just the one-command-per-pass loop, governs terminate-first.
+	It("should gate terminate-first on the disruption budget", func() {
+		nodePool := test.StaticNodePool(v1.NodePool{Spec: v1.NodePoolSpec{
+			Replicas:   lo.ToPtr(int64(1)),
+			Disruption: v1.Disruption{Budgets: []v1.Budget{{Reasons: []v1.DisruptionReason{v1.DisruptionReasonRepair}, Nodes: "0"}}},
+		}})
+		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
 		}})
-		ExpectApplied(ctx, env.Client, nodePool)
-		for i := range nodes {
-			ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
-		}
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
-		for i := range nodes {
-			markUnhealthy(nodes[i])
-		}
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		bindReschedulablePod(node)
+		markUnhealthy(node)
 		env.Clock.Step(31 * time.Minute)
 
+		// Budget 0 for Repair -> no terminate-first command.
 		ExpectSingletonReconciled(ctx, repairController)
-		// 10% of 4 rounds up to 1.
+		Expect(queue.GetCommands()).To(HaveLen(0))
+
+		// Raise the Repair budget; now terminate-first proceeds (delete-only, still governed by the budget).
+		nodePool.Spec.Disruption.Budgets = []v1.Budget{{Reasons: []v1.DisruptionReason{v1.DisruptionReasonRepair}, Nodes: "100%"}}
+		ExpectApplied(ctx, env.Client, nodePool)
+		ExpectSingletonReconciled(ctx, repairController)
 		cmds := queue.GetCommands()
 		Expect(cmds).To(HaveLen(1))
 		Expect(cmds[0].Decision()).To(Equal(disruption.DeleteDecision))
+	})
+
+	// INV-F2-3: a launch FAILURE must never flip a pool to terminate-first. A dynamic (headroom) pool whose replacement
+	// fails to launch keeps replacing-first (a replace command with a replacement) — it does not degrade to delete-only.
+	// terminate-first is derived from static capacity posture, never from launch outcomes.
+	It("should not flip to terminate-first when a replacement launch fails", func() {
+		nodePool := test.NodePool() // dynamic / headroom pool
+		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
+		}})
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		bindReschedulablePod(node)
+		// Make every subsequent launch fail (ICE-like) — the replacement can't come up.
+		cloudProvider.AllowedCreateCalls = 0
+		markUnhealthy(node)
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+		cmds := queue.GetCommands()
+		// It still tries to REPLACE-first (the command carries a replacement); the failed launch is handled by the
+		// queue's retry/backoff, not by silently switching to delete-only.
+		if len(cmds) == 1 {
+			Expect(cmds[0].Decision()).To(Equal(disruption.ReplaceDecision))
+			Expect(cmds[0].Replacements).To(HaveLen(1))
+		}
+		// The pool must NOT have terminated the node via a delete-only command.
+		for _, c := range cmds {
+			Expect(c.Decision()).ToNot(Equal(disruption.DeleteDecision))
+		}
 	})
 })

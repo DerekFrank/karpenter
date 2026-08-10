@@ -78,6 +78,10 @@ type RepairPolicy struct {
 	// Priority is an ordering weight (0-100) for repair. Higher repairs first. Collisions are expected and
 	// unresolved; only the ordering matters, not the magnitude (it is compressed to a dense rank).
 	Priority int
+	// ReasonMatcher is an optional regex matched (whole-string) against each reason a node carries within the
+	// condition (F1). The policy applies when the condition matches AND some reason on the node matches this. An empty
+	// matcher (or ".*") means "any reason" — the condition-only behavior, so ReasonMatcher is a clean superset.
+	ReasonMatcher string
 }
 
 // CloudProvider interface is implemented by cloud providers to support provisioning.
