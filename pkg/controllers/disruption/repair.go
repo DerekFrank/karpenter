@@ -53,9 +53,11 @@ type Repair struct {
 	cloudProvider cloudprovider.CloudProvider
 	recorder      events.Recorder
 	clock         clock.Clock
+	queue         *Queue
+	restraint     *restraint
 }
 
-func NewRepair(kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, clk clock.Clock) *Repair {
+func NewRepair(kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, clk clock.Clock, queue *Queue) *Repair {
 	return &Repair{
 		kubeClient:    kubeClient,
 		cluster:       cluster,
@@ -63,6 +65,8 @@ func NewRepair(kubeClient client.Client, cluster *state.Cluster, provisioner *pr
 		cloudProvider: cp,
 		recorder:      recorder,
 		clock:         clk,
+		queue:         queue,
+		restraint:     newRestraint(),
 	}
 }
 
@@ -91,6 +95,10 @@ func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 // ComputeCommands orders eligible candidates by the repair score and returns one replace-then-terminate command for the
 // highest-scoring candidate whose NodePool has budget. Only one command per pass, mirroring drift.
 func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
+	// Feed the outcomes of prior probes back into the per-domain restraint dials before deciding this pass: proven
+	// successes widen, failures cut and cool. Correlated-failure restraint (F3) layers strictly beneath the budget.
+	r.restraint.observe(ctx, r.kubeClient, r.queue, r.clock.Now())
+
 	ranks := r.denseRanks()
 	sort.SliceStable(candidates, func(i, j int) bool {
 		si, sj := r.score(candidates[i], ranks), r.score(candidates[j], ranks)
@@ -108,6 +116,16 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			continue
 		}
+		// Correlated-failure restraint (F3): even within budget, only admit this candidate if its failure domains
+		// (NodePool ∧ Zone ∧ Policy) have width headroom and are out of cooldown. A correlated burst collapses into
+		// shared domains that cold-start at width 1 → one probe first; widen only as probes prove out.
+		policy, _ := r.matchingPolicy(candidate.Node)
+		if policy == nil {
+			continue
+		}
+		if !r.restraint.admit(candidate, string(policy.ConditionType), r.clock.Now()) {
+			continue
+		}
 		// Terminate-first (F2): a capacity-constrained pool has no room to pre-spin a replacement, so repair issues a
 		// delete-only command and reactive provisioning refills the freed slot. The budget still paces it and the drain
 		// still honors PDBs/TGP.
@@ -115,6 +133,7 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 			if err := r.stampDrainBound(ctx, candidate); err != nil {
 				return []Command{}, err
 			}
+			r.restraint.recordProbe(candidate, string(policy.ConditionType))
 			return []Command{{
 				Candidates:          []*Candidate{candidate},
 				PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
@@ -139,6 +158,7 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 		if err := r.stampDrainBound(ctx, candidate); err != nil {
 			return []Command{}, err
 		}
+		r.restraint.recordProbe(candidate, string(policy.ConditionType))
 		return []Command{{
 			Candidates:          []*Candidate{candidate},
 			Replacements:        replacementsFromNodeClaims(results.NewNodeClaims...),
