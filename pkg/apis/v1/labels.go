@@ -48,6 +48,12 @@ const (
 // Karpenter specific annotations
 const (
 	DoNotDisruptAnnotationKey                  = apis.Group + "/do-not-disrupt"
+	// DoNotRepairAnnotationKey blocks voluntary node repair on a node (or, on a pod, the node it runs on).
+	// It is deliberately distinct from do-not-disrupt: do-not-disrupt protects a node from *discretionary*
+	// disruption (consolidation, drift) but was never meant to strand a *broken* node, and repair has always
+	// ignored it. do-not-repair carries the narrower "don't remediate this, even if it looks broken" intent
+	// and is the operator's mid-incident escape hatch (SIM-3291). It does not touch involuntary commitments.
+	DoNotRepairAnnotationKey                   = apis.Group + "/do-not-repair"
 	ProviderCompatibilityAnnotationKey         = apis.CompatibilityGroup + "/provider"
 	NodePoolHashAnnotationKey                  = apis.Group + "/nodepool-hash"
 	NodePoolHashVersionAnnotationKey           = apis.Group + "/nodepool-hash-version"
