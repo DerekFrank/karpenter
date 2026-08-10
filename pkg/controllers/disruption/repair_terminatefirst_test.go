@@ -58,7 +58,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute},
 		}
 		repairController = disruption.NewController(env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
-			disruption.WithMethods(disruption.NewRepair(env.Client, cluster, prov, cloudProvider, recorder, env.Clock)))
+			disruption.WithMethods(disruption.NewRepair(env.Client, cluster, prov, cloudProvider, recorder, env.Clock, queue)))
 	})
 
 	// INV-F2-1: a static NodePool (fixed replica count) has no room to grow, so repair terminates first — the command

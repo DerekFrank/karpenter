@@ -104,7 +104,7 @@ func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Clien
 	// Repair runs first: fixing a fault outranks any discretionary rebalance. Only registered when a cloud provider
 	// defines repair policies and the NodeRepair feature gate is on, matching the old node.health controller's gating.
 	if len(cp.RepairPolicies()) != 0 {
-		methods = append(methods, NewRepair(kubeClient, cluster, provisioner, cp, recorder, clk))
+		methods = append(methods, NewRepair(kubeClient, cluster, provisioner, cp, recorder, clk, queue))
 	}
 	return append(methods, []Method{
 		// Delete empty nodes across all consolidation policies (WhenEmpty, WhenEmptyOrUnderutilized, Balanced).
