@@ -108,6 +108,18 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			continue
 		}
+		// Terminate-first (F2): a capacity-constrained pool has no room to pre-spin a replacement, so repair issues a
+		// delete-only command and reactive provisioning refills the freed slot. The budget still paces it and the drain
+		// still honors PDBs/TGP.
+		if r.terminateFirst(candidate) {
+			if err := r.stampDrainBound(ctx, candidate); err != nil {
+				return []Command{}, err
+			}
+			return []Command{{
+				Candidates:          []*Candidate{candidate},
+				PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+			}}, nil
+		}
 		// Pre-spin: simulate scheduling to build the replacement(s). The queue launches them first and only
 		// terminates the original once they are healthy — so a replacement that boots unhealthy (bad AMI, partitioned
 		// zone) is never followed by terminating the original. Replace-then-terminate is the loop's circuit breaker.
@@ -135,6 +147,16 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 		}}, nil
 	}
 	return []Command{}, nil
+}
+
+// terminateFirst reports whether repair must delete this candidate before it can replace, because the candidate's
+// NodePool has no room to grow a replacement first (Terminate-First Disruption, RFC #3203). It is derived from the
+// operator's existing capacity posture — no new API: a static NodePool (Spec.Replicas set) runs a fixed node count, so
+// a pre-spun replacement would be an (N+1)th node the operator capped out; free the slot first and let reactive
+// provisioning refill it. A launch *failure* must never flip a pool to terminate-first — that holds by construction
+// here, since this reads static configuration, never launch outcomes.
+func (r *Repair) terminateFirst(c *Candidate) bool {
+	return c.OwnedByStaticNodePool()
 }
 
 // score computes E = rank + age/τ − backoff. Age is time past toleration (post-eligibility), so a flakier signal's
