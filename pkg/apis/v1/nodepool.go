@@ -177,16 +177,18 @@ func (p ConsolidationPolicy) IsBalanced() bool {
 }
 
 // DisruptionReason defines valid reasons for disruption budgets.
-// +kubebuilder:validation:Enum={Underutilized,Empty,Drifted,Repair}
+// +kubebuilder:validation:Enum={Underutilized,Empty,Drifted,Unhealthy}
 type DisruptionReason string
 
 const (
 	DisruptionReasonUnderutilized DisruptionReason = "Underutilized"
 	DisruptionReasonEmpty         DisruptionReason = "Empty"
 	DisruptionReasonDrifted       DisruptionReason = "Drifted"
-	// DisruptionReasonRepair paces node repair through the shared disruption budget, replacing the standalone
-	// node.health controller's hardcoded 20% breaker. Repair is voluntary: budgeted, ordered, and pre-spinning.
-	DisruptionReasonRepair DisruptionReason = "Repair"
+	// DisruptionReasonUnhealthy paces node repair through the shared disruption budget, replacing the standalone
+	// node.health controller's hardcoded 20% breaker. The reason names the node's *state* (like Underutilized/Empty/
+	// Drifted); "Repair" is the *method* that acts on it (RepairPolicy, repair ordering). Repair is voluntary:
+	// budgeted, ordered, and pre-spinning.
+	DisruptionReasonUnhealthy DisruptionReason = "Unhealthy"
 )
 
 type Limits v1.ResourceList

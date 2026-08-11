@@ -194,12 +194,12 @@ var _ = Describe("Repair", func() {
 		// The budget is legible: the reason-labeled allowed-disruptions gauge reads 1 (= 10% of 10) for Repair.
 		ExpectMetricGaugeValue(disruption.NodePoolAllowedDisruptions, 1, map[string]string{
 			metrics.NodePoolLabel: nodePool.Name,
-			metrics.ReasonLabel:   string(v1.DisruptionReasonRepair),
+			metrics.ReasonLabel:   string(v1.DisruptionReasonUnhealthy),
 		})
 	})
 
 	It("should block repair entirely when the Repair budget is zero", func() {
-		nodePool.Spec.Disruption.Budgets = []v1.Budget{{Reasons: []v1.DisruptionReason{v1.DisruptionReasonRepair}, Nodes: "0"}}
+		nodePool.Spec.Disruption.Budgets = []v1.Budget{{Reasons: []v1.DisruptionReason{v1.DisruptionReasonUnhealthy}, Nodes: "0"}}
 		ExpectApplied(ctx, env.Client, nodePool)
 		initNode(nodeClaim, node)
 		markUnhealthy(node, "BadNode")

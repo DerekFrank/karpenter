@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
+	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
@@ -44,7 +45,7 @@ import (
 const agingConstant = 30 * time.Minute
 
 // Repair is a voluntary disruption method that remediates unhealthy nodes. It replaces the standalone node.health
-// controller: repair rides the shared disruption budget (reason "Repair"), pre-spins a replacement before terminating
+// controller: repair rides the shared disruption budget (reason "Unhealthy"), pre-spins a replacement before terminating
 // (replace-then-terminate), orders candidates by rank + age/τ − backoff, and is vetoed by the do-not-repair annotation.
 type Repair struct {
 	kubeClient    client.Client
@@ -74,13 +75,12 @@ func NewRepair(kubeClient client.Client, cluster *state.Cluster, provisioner *pr
 // RepairPolicy, have waited past that policy's toleration, and are not vetoed by the do-not-repair annotation.
 func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 	// Repair is behind the NodeRepair feature gate, matching the old node.health controller's gating.
-	if !options.FromContext(ctx).FeatureGates.NodeRepair {
-		return false
-	}
-	if c.Node == nil {
+	if !options.FromContext(ctx).FeatureGates.NodeRepair || c.Node == nil {
 		return false
 	}
 	// do-not-repair is the operator's escape hatch: it blocks all repair on this node, whatever the drain bound.
+	// TODO: the veto shape is deliberately unsettled by the RFC (node vs. NodePool scope; whether do-not-disrupt should
+	// imply don't-repair). Revisit per kubernetes-sigs/karpenter#2424.
 	if c.Annotations()[v1.DoNotRepairAnnotationKey] == "true" {
 		return false
 	}
@@ -165,18 +165,11 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 		if !r.restraint.admit(candidate, rr.conditionType, r.clock.Now()) {
 			continue
 		}
-		// Terminate-first (F2): a capacity-constrained pool has no room to pre-spin a replacement, so repair issues a
-		// delete-only command and reactive provisioning refills the freed slot. The budget still paces it and the drain
-		// still honors PDBs/TGP.
-		if r.terminateFirst(candidate) {
-			if err := r.stampDrainBound(ctx, candidate, rr.merged); err != nil {
-				return []Command{}, err
-			}
-			r.restraint.recordProbe(candidate, rr.conditionType)
-			return []Command{{
-				Candidates:          []*Candidate{candidate},
-				PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
-			}}, nil
+		// Terminate-first (F2), static case: a static NodePool (fixed Spec.Replicas) structurally has no room to grow, so
+		// repair issues a delete-only command and reactive provisioning refills the freed slot. This is known before any
+		// simulation, so short-circuit. The budget still paces it and the drain still honors PDBs/TGP.
+		if candidate.OwnedByStaticNodePool() {
+			return r.terminateFirstCommand(ctx, candidate, rr)
 		}
 		// Pre-spin: simulate scheduling to build the replacement(s). The queue launches them first and only
 		// terminates the original once they are healthy — so a replacement that boots unhealthy (bad AMI, partitioned
@@ -191,6 +184,12 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 		if !results.AllNonPendingPodsScheduled() {
 			r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
 			continue
+		}
+		// Terminate-first (F2), dynamic/reserved case: the simulation ran as if the candidate were already gone. If it
+		// can only place the replacement back into the same reservation (every new NodeClaim is reserved capacity), the
+		// pool can't grow, so terminate-first; any other option (incl. on-demand) means replace-first as usual.
+		if candidate.capacityType == v1.CapacityTypeReserved && onlyReservedReplacements(results.NewNodeClaims) {
+			return r.terminateFirstCommand(ctx, candidate, rr)
 		}
 		// Bound the drain per the matched policy before the queue terminates the candidate, so repair is never an
 		// unbounded hang and a forceful (0) policy skips the drain for conditions the kubelet can't evict through.
@@ -208,14 +207,34 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 	return []Command{}, nil
 }
 
-// terminateFirst reports whether repair must delete this candidate before it can replace, because the candidate's
-// NodePool has no room to grow a replacement first (Terminate-First Disruption, RFC #3203). It is derived from the
-// operator's existing capacity posture — no new API: a static NodePool (Spec.Replicas set) runs a fixed node count, so
-// a pre-spun replacement would be an (N+1)th node the operator capped out; free the slot first and let reactive
-// provisioning refill it. A launch *failure* must never flip a pool to terminate-first — that holds by construction
-// here, since this reads static configuration, never launch outcomes.
-func (r *Repair) terminateFirst(c *Candidate) bool {
-	return c.OwnedByStaticNodePool()
+// terminateFirstCommand builds the delete-only repair command (no pre-spun replacement) for a capacity-constrained
+// candidate: the drain is bounded/stamped and the candidate is recorded as an in-flight probe, exactly as the
+// replace-first path does, but reactive provisioning fills the freed slot afterward (Terminate-First Disruption,
+// RFC #3203). The budget still paces it; PDBs and TGP still bound the drain.
+func (r *Repair) terminateFirstCommand(ctx context.Context, candidate *Candidate, rr resolution) ([]Command, error) {
+	if err := r.stampDrainBound(ctx, candidate, rr.merged); err != nil {
+		return []Command{}, err
+	}
+	r.restraint.recordProbe(candidate, rr.conditionType)
+	return []Command{{
+		Candidates:          []*Candidate{candidate},
+		PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+	}}, nil
+}
+
+// onlyReservedReplacements reports whether every simulated replacement resolved to reserved capacity — i.e. the pool
+// can only grow back into the same reservation, so there is no headroom and repair must terminate-first. An empty set
+// (no replacement needed) is not "reserved-only": that is an ordinary empty-node delete, handled on the normal path.
+func onlyReservedReplacements(newNodeClaims []*pscheduling.NodeClaim) bool {
+	if len(newNodeClaims) == 0 {
+		return false
+	}
+	for _, nc := range newNodeClaims {
+		if !nc.Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeReserved) {
+			return false
+		}
+	}
+	return true
 }
 
 // score computes E = rank + age/τ − backoff for an already-resolved candidate. Age is time past toleration
@@ -286,10 +305,12 @@ func (r *Repair) stampDrainBound(ctx context.Context, c *Candidate, merged merge
 	if equality.Semantic.DeepEqual(stored, c.NodeClaim) {
 		return nil
 	}
-	return r.kubeClient.Patch(ctx, c.NodeClaim, client.MergeFrom(stored))
+	// Optimistic lock: the nodeclaim lifecycle controller also stamps this annotation, so a plain MergeFrom could race
+	// and clobber. Matches lifecycle's MergeFromWithOptimisticLock. (Follow-up: extract a shared stamping helper.)
+	return r.kubeClient.Patch(ctx, c.NodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
 }
 
-func (r *Repair) Reason() v1.DisruptionReason { return v1.DisruptionReasonRepair }
+func (r *Repair) Reason() v1.DisruptionReason { return v1.DisruptionReasonUnhealthy }
 
 func (r *Repair) Class() string { return RepairDisruptionClass }
 

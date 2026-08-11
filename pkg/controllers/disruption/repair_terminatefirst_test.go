@@ -17,6 +17,7 @@ limitations under the License.
 package disruption_test
 
 import (
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -30,8 +31,10 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
+	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
 )
 
 // These tests exercise Terminate-First Disruption for repair (F2 / RFC #3203): a capacity-constrained NodePool has no
@@ -126,7 +129,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 	It("should gate terminate-first on the disruption budget", func() {
 		nodePool := test.StaticNodePool(v1.NodePool{Spec: v1.NodePoolSpec{
 			Replicas:   lo.ToPtr(int64(1)),
-			Disruption: v1.Disruption{Budgets: []v1.Budget{{Reasons: []v1.DisruptionReason{v1.DisruptionReasonRepair}, Nodes: "0"}}},
+			Disruption: v1.Disruption{Budgets: []v1.Budget{{Reasons: []v1.DisruptionReason{v1.DisruptionReasonUnhealthy}, Nodes: "0"}}},
 		}})
 		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
@@ -142,7 +145,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		Expect(queue.GetCommands()).To(HaveLen(0))
 
 		// Raise the Repair budget; now terminate-first proceeds (delete-only, still governed by the budget).
-		nodePool.Spec.Disruption.Budgets = []v1.Budget{{Reasons: []v1.DisruptionReason{v1.DisruptionReasonRepair}, Nodes: "100%"}}
+		nodePool.Spec.Disruption.Budgets = []v1.Budget{{Reasons: []v1.DisruptionReason{v1.DisruptionReasonUnhealthy}, Nodes: "100%"}}
 		ExpectApplied(ctx, env.Client, nodePool)
 		ExpectSingletonReconciled(ctx, repairController)
 		cmds := queue.GetCommands()
@@ -178,5 +181,45 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		for _, c := range cmds {
 			Expect(c.Decision()).ToNot(Equal(disruption.DeleteDecision))
 		}
+	})
+
+	// INV-F2-1 (dynamic/reserved): a NON-static pool pinned to a full reservation has no room to grow — the scheduling
+	// simulation can only re-place the replacement into the same reservation. Repair must terminate-first (delete-only),
+	// NOT because Spec.Replicas is set (it isn't), but because the sim proves the only replacement is reserved capacity.
+	It("should issue a delete-only command for a reserved-capacity NodePool with no headroom", func() {
+		ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeRepair: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
+		reservationID := fmt.Sprintf("r-%s", mostExpensiveInstance.Name)
+		// Make the most-expensive instance ONLY offer reserved capacity in this reservation, so the sim's only option to
+		// replace is reserved (no on-demand fallback) — the reserved no-headroom case.
+		mostExpensiveInstance.Requirements.Add(scheduling.NewRequirement(cloudprovider.ReservationIDLabel, corev1.NodeSelectorOpIn, reservationID))
+		mostExpensiveInstance.Requirements.Get(v1.CapacityTypeLabelKey).Insert(v1.CapacityTypeReserved)
+		mostExpensiveInstance.Offerings = cloudprovider.Offerings{{
+			Price: mostExpensiveOffering.Price / 1_000_000.0, Available: true, ReservationCapacity: 1,
+			Requirements: scheduling.NewLabelRequirements(map[string]string{
+				v1.CapacityTypeLabelKey: v1.CapacityTypeReserved, corev1.LabelTopologyZone: mostExpensiveOffering.Zone(), v1alpha1.LabelReservationID: reservationID,
+			}),
+		}}
+		ExpectSingletonReconciled(ctx, pricingController)
+
+		nodePool := test.NodePool() // dynamic pool (no Spec.Replicas) — terminate-first must come from the sim, not config
+		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				v1.NodePoolLabelKey: nodePool.Name, corev1.LabelInstanceTypeStable: mostExpensiveInstance.Name,
+				v1.CapacityTypeLabelKey: v1.CapacityTypeReserved, corev1.LabelTopologyZone: mostExpensiveOffering.Zone(),
+				cloudprovider.ReservationIDLabel: reservationID,
+			},
+		}})
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		bindReschedulablePod(node)
+		markUnhealthy(node)
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+		cmds := queue.GetCommands()
+		Expect(cmds).To(HaveLen(1))
+		// Delete-only: the reservation is full, so the pool can't grow — terminate-first, derived from the sim.
+		Expect(cmds[0].Decision()).To(Equal(disruption.DeleteDecision))
+		Expect(cmds[0].Replacements).To(HaveLen(0))
 	})
 })
