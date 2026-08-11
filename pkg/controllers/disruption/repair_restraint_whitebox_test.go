@@ -21,7 +21,9 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clocktesting "k8s.io/utils/clock/testing"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -29,18 +31,21 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 )
 
-// White-box Ginkgo specs for the correlated-failure restraint dials (F3). These drive the restraint state machine
-// directly, covering the admission-side invariants whose end-to-end forms are awkward in the behavioral harness (the
-// per-condition toleration exceeds the cooldown cap, so a clock step taken to make a fresh fault eligible also expires
-// the cooldown under test). The dial mechanics are pure functions, so this is the right altitude to pin them.
+// White-box Ginkgo specs for the AIMD restraint dials (F3). They drive the restraint state machine directly through
+// its interface — CanDisrupt (admit + count in-flight) and Record (fold in an outcome) — covering the admission-side
+// invariants whose end-to-end forms are awkward in the behavioral harness. The dials are a pure function of the
+// candidate + reported outcomes, so this is the right altitude to pin them.
 
-// wbCandidate builds a minimal Candidate carrying the fields restraint reads: NodePool name, zone, providerID.
-func wbCandidate(providerID, nodePool, zone string) *Candidate {
+// wbCandidate builds a minimal Candidate carrying the fields restraint reads: NodePool name, zone, providerID, and a
+// node with the given unhealthy condition type (the "policy" failure domain).
+func wbCandidate(providerID, nodePool, zone, condType string) *Candidate {
 	return &Candidate{
-		StateNode: &state.StateNode{NodeClaim: &v1.NodeClaim{
-			ObjectMeta: metav1.ObjectMeta{Name: providerID},
-			Status:     v1.NodeClaimStatus{ProviderID: providerID},
-		}},
+		StateNode: &state.StateNode{
+			NodeClaim: &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: providerID}, Status: v1.NodeClaimStatus{ProviderID: providerID}},
+			Node: &corev1.Node{Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{
+				{Type: corev1.NodeConditionType(condType), Status: corev1.ConditionFalse},
+			}}},
+		},
 		NodePool: &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: nodePool}},
 		zone:     zone,
 	}
@@ -48,37 +53,32 @@ func wbCandidate(providerID, nodePool, zone string) *Candidate {
 
 var _ = Describe("Repair/Restraint (dials)", func() {
 	var r *restraint
-	// A fixed base time; the controller forbids time.Now, but white-box tests may construct times.
+	var fakeClock *clocktesting.FakeClock
 	t0 := metav1.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Time
 
 	BeforeEach(func() {
-		r = newRestraint()
+		fakeClock = clocktesting.NewFakeClock(t0)
+		r = newRestraint(fakeClock)
 	})
 
-	// INV-F3-1 / INV-F3-6: cold start at width 1 — the first probe in a domain is admitted, a second concurrent probe
-	// in the same domain is blocked. A fresh (stateless) restraint starts every domain here.
+	// INV-F3-1 / INV-F3-6: cold start at width 1 — the first probe in a domain is admitted, a second concurrent probe in
+	// the same domain is blocked. A fresh (stateless) restraint starts every domain here.
 	It("cold-starts each domain at width 1", func() {
-		c1, c2 := wbCandidate("n1", "np", "z1"), wbCandidate("n2", "np", "z1")
-		Expect(r.admit(c1, "BadNode", t0)).To(BeTrue())
-		r.recordProbe(c1, "BadNode")
-		Expect(r.admit(c2, "BadNode", t0)).To(BeFalse())
+		c1, c2 := wbCandidate("n1", "np", "z1", "BadNode"), wbCandidate("n2", "np", "z1", "BadNode")
+		Expect(r.CanDisrupt(c1)).To(BeTrue()) // CanDisrupt admits AND counts it in-flight
+		Expect(r.CanDisrupt(c2)).To(BeFalse())
 	})
 
 	// INV-F3-3: a proven success doubles the width, so two concurrent probes are then admitted and a third is blocked.
 	It("doubles concurrency on a proven success", func() {
-		c1 := wbCandidate("n1", "np", "z1")
-		r.recordProbe(c1, "BadNode")
-		for _, d := range domainsOf(c1, "BadNode") { // simulate what observe does on a proven, dwelled success
-			r.width[d] = r.widthFor(d) * 2
-		}
-		delete(r.probes, c1.ProviderID())
+		c1 := wbCandidate("n1", "np", "z1", "BadNode")
+		Expect(r.CanDisrupt(c1)).To(BeTrue())
+		r.Record(c1, RepairProven) // proven → width doubles to 2, in-flight back to 0
 
-		c2, c3, c4 := wbCandidate("n2", "np", "z1"), wbCandidate("n3", "np", "z1"), wbCandidate("n4", "np", "z1")
-		Expect(r.admit(c2, "BadNode", t0)).To(BeTrue())
-		r.recordProbe(c2, "BadNode")
-		Expect(r.admit(c3, "BadNode", t0)).To(BeTrue())
-		r.recordProbe(c3, "BadNode")
-		Expect(r.admit(c4, "BadNode", t0)).To(BeFalse()) // width 2 is the ceiling
+		c2, c3, c4 := wbCandidate("n2", "np", "z1", "BadNode"), wbCandidate("n3", "np", "z1", "BadNode"), wbCandidate("n4", "np", "z1", "BadNode")
+		Expect(r.CanDisrupt(c2)).To(BeTrue())
+		Expect(r.CanDisrupt(c3)).To(BeTrue())
+		Expect(r.CanDisrupt(c4)).To(BeFalse()) // width 2 is the ceiling
 	})
 
 	// INV-F3-2: the floor is 1, never 0 — even with an explicit 0 recorded, widthFor returns 1, so repair can never be
@@ -89,58 +89,59 @@ var _ = Describe("Repair/Restraint (dials)", func() {
 		Expect(r.widthFor(d)).To(Equal(1))
 	})
 
-	// INV-F3-2: a cooldown pauses admission, and once it elapses the candidate is admitted again (pause, not halt).
-	It("pauses under cooldown, then re-admits once it elapses", func() {
-		c := wbCandidate("n1", "np", "z1")
-		for _, d := range domainsOf(c, "BadNode") {
-			r.cooldownUntil[d] = t0.Add(5 * time.Minute)
-		}
-		Expect(r.admit(c, "BadNode", t0.Add(time.Minute))).To(BeFalse())
-		Expect(r.admit(c, "BadNode", t0.Add(6*time.Minute))).To(BeTrue())
+	// INV-F3-2 / INV-F3-3: a failed probe pins width at the floor and arms a cooldown; admission pauses, then resumes
+	// once the cooldown elapses (pause, not halt).
+	It("pauses after a failed probe, then re-admits once the cooldown elapses", func() {
+		c := wbCandidate("n1", "np", "z1", "BadNode")
+		Expect(r.CanDisrupt(c)).To(BeTrue())
+		r.Record(c, RepairFailed) // floor + cooldown armed (t0 + 1m)
+
+		Expect(r.CanDisrupt(wbCandidate("n2", "np", "z1", "BadNode"))).To(BeFalse()) // still in cooldown at t0
+		fakeClock.Step(2 * time.Minute)
+		Expect(r.CanDisrupt(wbCandidate("n3", "np", "z1", "BadNode"))).To(BeTrue()) // cooldown elapsed → re-admitted
 	})
 
-	// Domain-combine (any-domain-out-of-cooldown): a candidate sharing only a cooled NodePool domain, but with fresh
-	// zone/policy domains, is still admitted — a separate fault isn't frozen behind an unrelated flood.
+	// Domain-combine (any-domain-out-of-cooldown): a candidate sharing only a cooled NodePool domain, but with a fresh
+	// zone/policy, is still admitted — a separate fault isn't frozen behind an unrelated flood.
 	It("admits via any domain that is out of cooldown", func() {
 		r.cooldownUntil[failureDomain{kind: "nodepool", value: "np"}] = t0.Add(10 * time.Minute)
-		iso := wbCandidate("iso", "np", "z-fresh")
-		Expect(r.admit(iso, "IsolatedReason", t0)).To(BeTrue())
+		Expect(r.CanDisrupt(wbCandidate("iso", "np", "z-fresh", "IsolatedCondition"))).To(BeTrue())
 	})
 
 	// Domain-combine (min width): admitted concurrency is the MIN across a candidate's domains. With NodePool widened to
 	// 4 but the zone domain at the floor (1), a second concurrent probe is blocked by the zone domain.
 	It("gates concurrency by the min width across domains", func() {
 		r.width[failureDomain{kind: "nodepool", value: "np"}] = 4
-		c1, c2 := wbCandidate("n1", "np", "z1"), wbCandidate("n2", "np", "z1")
-		Expect(r.admit(c1, "BadNode", t0)).To(BeTrue())
-		r.recordProbe(c1, "BadNode")
-		Expect(r.admit(c2, "BadNode", t0)).To(BeFalse()) // zone width 1 binds even though nodepool width is 4
+		Expect(r.CanDisrupt(wbCandidate("n1", "np", "z1", "BadNode"))).To(BeTrue())
+		Expect(r.CanDisrupt(wbCandidate("n2", "np", "z1", "BadNode"))).To(BeFalse()) // zone width 1 binds
 	})
 
-	// INV-F3-5: a domain with no current fault (idle) has its widened dials reset to the floor, so a NEW correlated
-	// burst there starts slow again — past success doesn't mask a new correlated failure. An active domain is preserved.
-	It("resets idle domains but preserves active ones", func() {
-		active := failureDomain{kind: "zone", value: "z-active"}
-		idle := failureDomain{kind: "zone", value: "z-idle"}
-		r.width[active], r.width[idle] = 4, 4
-		r.cooldownUntil[idle] = t0.Add(time.Hour)
+	// INV-F3-5: RepairCleared forgets a domain's earned width, so a NEW correlated burst starts slow again — past
+	// success doesn't mask a new correlated failure.
+	It("forgets a domain's width when its fault clears", func() {
+		c := wbCandidate("n1", "np", "z1", "BadNode")
+		Expect(r.CanDisrupt(c)).To(BeTrue())
+		r.Record(c, RepairProven) // width 2 across c's domains, in-flight back to 0
+		c2 := wbCandidate("n2", "np", "z1", "BadNode")
+		Expect(r.CanDisrupt(c2)).To(BeTrue()) // width 2 lets a 2nd concurrent probe in
+		r.Record(c2, RepairProven)            // resolve it so nothing dangles in-flight
 
-		r.resetIdleDomains(map[failureDomain]struct{}{active: {}})
+		r.Record(c, RepairCleared) // episode over, no in-flight probes → forget earned width
 
-		Expect(r.widthFor(idle)).To(Equal(1))
-		Expect(r.cooldownUntil).ToNot(HaveKey(idle))
-		Expect(r.widthFor(active)).To(Equal(4))
+		// A fresh burst in the same domains starts at the floor again: one admitted, second blocked.
+		Expect(r.CanDisrupt(wbCandidate("m1", "np", "z1", "BadNode"))).To(BeTrue())
+		Expect(r.CanDisrupt(wbCandidate("m2", "np", "z1", "BadNode"))).To(BeFalse())
 	})
 
-	// resetIdleDomains must not reset a domain that still has an in-flight probe (the probe hasn't resolved yet).
-	It("does not reset a domain with an in-flight probe", func() {
-		c := wbCandidate("n1", "np", "z1")
-		r.recordProbe(c, "BadNode")
-		for _, d := range domainsOf(c, "BadNode") {
-			r.width[d] = 4
-		}
-		r.resetIdleDomains(map[failureDomain]struct{}{})
-		Expect(r.widthFor(failureDomain{kind: "zone", value: "z1"})).To(Equal(4))
+	// RepairCleared must NOT forget a domain that still has an in-flight probe.
+	It("does not forget a domain with an in-flight probe", func() {
+		c1 := wbCandidate("n1", "np", "z1", "BadNode")
+		Expect(r.CanDisrupt(c1)).To(BeTrue())
+		r.Record(c1, RepairProven) // width 2
+		c2 := wbCandidate("n2", "np", "z1", "BadNode")
+		Expect(r.CanDisrupt(c2)).To(BeTrue()) // in-flight in the domain
+		r.Record(c1, RepairCleared)           // c1's fault cleared, but c2 is still in flight → keep the width
+		Expect(r.width[failureDomain{kind: "zone", value: "z1"}]).To(Equal(2))
 	})
 
 	// INV-S3 (structural): repair registers first in NewMethods when repair policies exist, and not at all otherwise.

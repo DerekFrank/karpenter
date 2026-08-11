@@ -25,6 +25,8 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -55,8 +57,23 @@ type Repair struct {
 	recorder      events.Recorder
 	clock         clock.Clock
 	queue         *Queue
-	restraint     *restraint
+	restraint     RepairRestraint
+	probes        map[string]*repairProbe // providerID -> in-flight probe repair is tracking to an outcome
+	acted         map[string]*Candidate   // providerID -> candidate repair has acted on, watched for fault clearance
 }
+
+// repairProbe is a candidate repair admitted and is now watching to a terminal outcome, so it can report Proven/Failed
+// to the restraint policy. Repair (not the policy) owns this I/O: whether the replacement came up, and the success
+// dwell. The candidate snapshot is retained so the outcome can be attributed to the same failure domains that were
+// admitted, even after the original node is gone.
+type repairProbe struct {
+	candidate     *Candidate
+	nodeClaimName string
+	succeededAt   time.Time // when the original was observed terminated (replacement came up); zero until then
+}
+
+// repairDwell is how long a replacement must hold Ready+Healthy before a probe counts as a durable success.
+const repairDwell = 5 * time.Minute
 
 func NewRepair(kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, clk clock.Clock, queue *Queue) *Repair {
 	return &Repair{
@@ -67,7 +84,11 @@ func NewRepair(kubeClient client.Client, cluster *state.Cluster, provisioner *pr
 		recorder:      recorder,
 		clock:         clk,
 		queue:         queue,
-		restraint:     newRestraint(),
+		probes:        map[string]*repairProbe{},
+		acted:         map[string]*Candidate{},
+		// The correlated-failure AIMD policy is the default RepairRestraint; swap for another implementation (or
+		// noRestraint) without touching this method.
+		restraint: newRestraint(clk),
 	}
 }
 
@@ -96,24 +117,22 @@ func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 	return eligible
 }
 
-// resolution is a candidate's matched repair policy, resolved once per pass and reused for ordering, restraint, and the
-// drain bound (rather than recomputing the policy scan + reason merge at each step).
+// resolution is a candidate's matched repair policy, resolved once per pass and reused for ordering and the drain
+// bound (rather than recomputing the policy scan + reason merge at each step).
 type resolution struct {
-	conditionType string
-	cond          corev1.NodeCondition
-	merged        mergedRepairPolicy
-	score         float64
+	cond   corev1.NodeCondition
+	merged mergedRepairPolicy
+	score  float64
 }
 
 // ComputeCommands orders eligible candidates by the repair score and returns one replace-then-terminate command for the
 // highest-scoring candidate whose NodePool has budget. Only one command per pass, mirroring drift.
 func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
-	// Feed the outcomes of prior probes back into the per-domain restraint dials before deciding this pass: proven
-	// successes widen, failures cut and cool. Correlated-failure restraint (F3) layers strictly beneath the budget.
-	r.restraint.observe(ctx, r.kubeClient, r.queue, r.clock.Now())
+	// Detect the outcomes of prior probes (proven / failed) and report them to the restraint policy.
+	r.observeProbes(ctx)
 
 	// Resolve each candidate's matched policy ONCE (the policy scan + per-reason onset merge), then reuse it for
-	// ordering, restraint admission, and the drain bound below.
+	// ordering and the drain bound below.
 	policies := r.cloudProvider.RepairPolicies()
 	ranks := denseRanks(policies)
 	res := make(map[*Candidate]resolution, len(candidates))
@@ -124,23 +143,11 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 		}
 		merged, _ := resolveReasonPolicy(policies, *cond, r.clock.Now())
 		res[c] = resolution{
-			conditionType: string(policy.ConditionType),
-			cond:          *cond,
-			merged:        merged,
-			score:         r.score(*cond, policy.TolerationDuration, merged, ranks, c.NodePool),
+			cond:   *cond,
+			merged: merged,
+			score:  r.score(*cond, policy.TolerationDuration, merged, ranks, c.NodePool),
 		}
 	}
-
-	// Any width earned in a past fault episode must not carry into a new one: reset dials for domains with no current
-	// fault, so a fresh correlated burst starts slow even after a healthy stretch (past success ≠ predictor of new
-	// correlated failure). The active set is the domains of this pass's resolved candidates.
-	activeDomains := map[failureDomain]struct{}{}
-	for c, rr := range res {
-		for _, d := range domainsOf(c, rr.conditionType) {
-			activeDomains[d] = struct{}{}
-		}
-	}
-	r.restraint.resetIdleDomains(activeDomains)
 
 	// Order by the precomputed score (total order via the name tie-break, so a plain sort is deterministic).
 	sort.Slice(candidates, func(i, j int) bool {
@@ -159,10 +166,10 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 		if !ok || disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			continue
 		}
-		// Correlated-failure restraint (F3): even within budget, only admit this candidate if its failure domains
-		// (NodePool ∧ Zone ∧ Policy) have width headroom and are out of cooldown. A correlated burst collapses into
-		// shared domains that cold-start at width 1 → one probe first; widen only as probes prove out.
-		if !r.restraint.admit(candidate, rr.conditionType, r.clock.Now()) {
+		// Correlated-failure restraint (F3): even within budget, only admit this candidate if the restraint policy
+		// allows it. The default policy paces per failure domain (NodePool ∧ Zone ∧ Policy), cold-starting a correlated
+		// burst at one probe and widening only as probes prove out.
+		if !r.restraint.CanDisrupt(candidate) {
 			continue
 		}
 		// Terminate-first (F2), static case: a static NodePool (fixed Spec.Replicas) structurally has no room to grow, so
@@ -196,7 +203,7 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 		if err := r.stampDrainBound(ctx, candidate, rr.merged); err != nil {
 			return []Command{}, err
 		}
-		r.restraint.recordProbe(candidate, rr.conditionType)
+		r.trackProbe(candidate)
 		return []Command{{
 			Candidates:          []*Candidate{candidate},
 			Replacements:        replacementsFromNodeClaims(results.NewNodeClaims...),
@@ -215,11 +222,81 @@ func (r *Repair) terminateFirstCommand(ctx context.Context, candidate *Candidate
 	if err := r.stampDrainBound(ctx, candidate, rr.merged); err != nil {
 		return []Command{}, err
 	}
-	r.restraint.recordProbe(candidate, rr.conditionType)
+	r.trackProbe(candidate)
 	return []Command{{
 		Candidates:          []*Candidate{candidate},
 		PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
 	}}, nil
+}
+
+// trackProbe records a just-issued repair as an in-flight probe (CanDisrupt already counted it in-flight in the
+// restraint policy) so observeProbes can later attribute its outcome. It is also remembered in acted so, once its
+// fault later clears, repair can tell the policy the domain's episode is over (RepairCleared).
+func (r *Repair) trackProbe(c *Candidate) {
+	r.probes[c.ProviderID()] = &repairProbe{candidate: c, nodeClaimName: c.NodeClaim.Name}
+	r.acted[c.ProviderID()] = c
+}
+
+// observeProbes drives each in-flight probe to a terminal outcome and reports it to the restraint policy. Repair owns
+// this I/O so the policy stays pure:
+//   - still enqueued (queue holds it until the replacement initializes) → pending, no report.
+//   - dequeued and the original NodeClaim is gone → the replacement came up and the original was terminated; once it
+//     has held for the dwell, report RepairProven.
+//   - dequeued and the original NodeClaim still exists → the repair did not produce a healthy replacement (bad-AMI
+//     loop, partitioned zone, or command timeout) → report RepairFailed.
+func (r *Repair) observeProbes(ctx context.Context) {
+	now := r.clock.Now()
+	for providerID, p := range r.probes {
+		if r.queue.HasAny(providerID) {
+			continue // replacement still launching/waiting; outcome not yet known
+		}
+		nc := &v1.NodeClaim{}
+		err := r.kubeClient.Get(ctx, types.NamespacedName{Name: p.nodeClaimName}, nc)
+		switch {
+		case apierrors.IsNotFound(err):
+			// Original terminated → replacement proved healthy enough for the queue to proceed. Require the dwell to
+			// elapse before counting it as a durable success (invariant: success = healthy for a while).
+			if p.succeededAt.IsZero() {
+				p.succeededAt = now
+			}
+			if !now.Before(p.succeededAt.Add(repairDwell)) {
+				r.restraint.Record(p.candidate, RepairProven)
+				delete(r.probes, providerID)
+				delete(r.acted, providerID) // outcome settled; the original is gone, nothing left to watch for clearance
+			}
+		case err == nil:
+			r.restraint.Record(p.candidate, RepairFailed)
+			delete(r.probes, providerID)
+			// keep in acted: a failed repair leaves the original unhealthy; watch for it to clear on its own.
+		default:
+			// transient get error; leave the probe to be re-observed next pass
+		}
+	}
+
+	// Fault-episode clearance (invariant: past success doesn't mask a new correlated failure). A domain's width is only
+	// raised above the floor by a proven probe, and every probe is remembered in acted, so a domain that could have
+	// elevated width always has an acted candidate. When that candidate's node is still around but no longer unhealthy —
+	// the fault resolved on its own, WITHOUT a completed repair (a terminated original is instead handled above as
+	// proven/failed) — tell the policy the episode is over so it forgets the earned width. A fresh correlated burst then
+	// starts slow again.
+	policies := r.cloudProvider.RepairPolicies()
+	for providerID, c := range r.acted {
+		if _, stillProbing := r.probes[providerID]; stillProbing {
+			continue // an in-flight probe still owns the outcome; not cleared
+		}
+		freshNode := &corev1.Node{}
+		if err := r.kubeClient.Get(ctx, types.NamespacedName{Name: c.Node.Name}, freshNode); err != nil {
+			// The node is gone entirely — the repair already terminated it (handled as proven/failed above). Stop
+			// tracking it; its domains were already updated by the probe outcome.
+			delete(r.acted, providerID)
+			continue
+		}
+		if _, cond := matchingPolicy(policies, freshNode); cond == nil {
+			// Node exists and is healthy again: the episode cleared without a repair.
+			r.restraint.Record(c, RepairCleared)
+			delete(r.acted, providerID)
+		}
+	}
 }
 
 // onlyReservedReplacements reports whether every simulated replacement resolved to reserved capacity — i.e. the pool
