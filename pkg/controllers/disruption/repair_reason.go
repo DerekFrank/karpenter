@@ -104,10 +104,46 @@ type mergedRepairPolicy struct {
 	tgpSet                 bool
 }
 
-// resolveReasonPolicy matches the node's condition + per-reason onsets against the repair policies and returns the
+// resolveNodePolicy merges across EVERY unhealthy condition on the node (and every eligible reason within each), not
+// just one. A node can be unhealthy for several independent reasons at once — e.g. a false-positive flood on
+// AcceleratedHardwareReady alongside a genuine Ready=False — and repair must consider them together so the flood's
+// policy can't mask the real fault's (higher priority / tighter drain). The merge is the idempotent safety-monotone
+// join, so folding conditions together is order- and duplicate-independent. Returns the merged policy and whether any
+// (condition, reason) pair was eligible.
+func resolveNodePolicy(policies []cloudprovider.RepairPolicy, node *corev1.Node, now time.Time) (mergedRepairPolicy, bool) {
+	merged := mergedRepairPolicy{}
+	anyEligible := false
+	if node == nil {
+		return merged, false
+	}
+	for _, cond := range node.Status.Conditions {
+		m, eligible := resolveConditionPolicy(policies, cond, now)
+		if !eligible {
+			continue
+		}
+		anyEligible = true
+		merged = mergeRepairPolicies(merged, m)
+	}
+	return merged, anyEligible
+}
+
+// mergeRepairPolicies folds two merged results with the same lattice join used within a condition: priority = max,
+// TerminationGracePeriod = min.
+func mergeRepairPolicies(a, b mergedRepairPolicy) mergedRepairPolicy {
+	if b.priority > a.priority {
+		a.priority = b.priority
+	}
+	if b.tgpSet && (!a.tgpSet || *b.terminationGracePeriod < *a.terminationGracePeriod) {
+		a.terminationGracePeriod = b.terminationGracePeriod
+		a.tgpSet = true
+	}
+	return a
+}
+
+// resolveConditionPolicy matches one node condition + its per-reason onsets against the repair policies and returns the
 // merged policy over the reasons that are BOTH matched and past their own toleration ("eligible"), plus whether any
-// reason was eligible at all. When no policy carries a ReasonMatcher, this collapses to the condition-only behavior.
-func resolveReasonPolicy(policies []cloudprovider.RepairPolicy, cond corev1.NodeCondition, now time.Time) (mergedRepairPolicy, bool) {
+// reason was eligible. When no policy carries a ReasonMatcher, this collapses to the condition-only behavior.
+func resolveConditionPolicy(policies []cloudprovider.RepairPolicy, cond corev1.NodeCondition, now time.Time) (mergedRepairPolicy, bool) {
 	reasons := parseReasons(cond.Reason)
 	// A condition with no parseable reasons still behaves condition-only: treat it as a single empty reason whose onset
 	// is the condition's transition time.

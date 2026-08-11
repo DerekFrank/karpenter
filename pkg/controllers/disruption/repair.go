@@ -105,15 +105,11 @@ func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 	if c.Annotations()[v1.DoNotRepairAnnotationKey] == "true" {
 		return false
 	}
-	policies := r.cloudProvider.RepairPolicies()
-	_, cond := matchingPolicy(policies, c.Node)
-	if cond == nil {
-		return false
-	}
-	// Reason-level eligibility (F1): a policy applies only when the condition matches AND some reason on the node
-	// matches its ReasonMatcher, and eligibility is measured from that reason's own onset. When no policy carries a
-	// ReasonMatcher this collapses to condition-only — a clean superset of the pre-F1 behavior.
-	_, eligible := resolveReasonPolicy(policies, *cond, r.clock.Now())
+	// Reason-level eligibility (F1), across ALL of the node's unhealthy conditions: a policy applies when its condition
+	// matches AND some reason on the node matches its ReasonMatcher, measured from that reason's own onset. Considering
+	// every condition (not just the nearest-deadline one) ensures a false-positive flood on one condition can't mask a
+	// genuine fault on another. When no policy carries a ReasonMatcher this collapses to condition-only.
+	_, eligible := resolveNodePolicy(r.cloudProvider.RepairPolicies(), c.Node, r.clock.Now())
 	return eligible
 }
 
@@ -137,11 +133,17 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 	ranks := denseRanks(policies)
 	res := make(map[*Candidate]resolution, len(candidates))
 	for _, c := range candidates {
+		// merged folds priority + drain bound across ALL the node's unhealthy conditions/reasons (so a flood on one
+		// condition can't mask a real fault on another). The nearest-deadline condition is the representative aging
+		// basis for the score (time past its toleration).
+		merged, eligible := resolveNodePolicy(policies, c.Node, r.clock.Now())
+		if !eligible {
+			continue
+		}
 		policy, cond := matchingPolicy(policies, c.Node)
 		if policy == nil {
 			continue
 		}
-		merged, _ := resolveReasonPolicy(policies, *cond, r.clock.Now())
 		res[c] = resolution{
 			cond:   *cond,
 			merged: merged,

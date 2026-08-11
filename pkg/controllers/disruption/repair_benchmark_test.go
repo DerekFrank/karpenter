@@ -90,7 +90,7 @@ func resolveAndScore(r *Repair, policies []cloudprovider.RepairPolicy, ranks map
 		if policy == nil {
 			continue
 		}
-		merged, _ := resolveReasonPolicy(policies, *cond, r.clock.Now())
+		merged, _ := resolveConditionPolicy(policies, *cond, r.clock.Now())
 		_ = r.score(*cond, policy.TolerationDuration, merged, ranks, c.NodePool)
 	}
 }

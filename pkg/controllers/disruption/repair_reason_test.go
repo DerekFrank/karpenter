@@ -185,4 +185,33 @@ var _ = Describe("Repair/ReasonPolicy", func() {
 		Expect(err).ToNot(HaveOccurred())
 		Expect(deadline).To(BeTemporally("~", env.Clock.Now().Add(time.Hour), 2*time.Minute))
 	})
+
+	// Cross-condition merge: a node unhealthy on TWO different conditions must be considered for BOTH, so a
+	// false-positive flood on one condition can't mask a genuine fault on another. Here a graceful flood condition
+	// (AcceleratedHardwareReady, 1h drain) co-occurs with a forceful real-fault condition (KernelReady, 0 = forceful);
+	// the merged drain bound is the MIN across conditions → forceful. If repair only considered the nearest-deadline
+	// condition, the real fault's forceful bound could be dropped.
+	It("should merge across multiple unhealthy conditions, not just one", func() {
+		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+			{ConditionType: "AcceleratedHardwareReady", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, TerminationGracePeriod: lo.ToPtr(time.Hour)},
+			{ConditionType: "KernelReady", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, TerminationGracePeriod: lo.ToPtr(time.Duration(0))},
+		}
+		initNode()
+		n := ExpectExists(ctx, env.Client, node)
+		n.Status.Conditions = append(n.Status.Conditions,
+			corev1.NodeCondition{Type: "AcceleratedHardwareReady", Status: corev1.ConditionFalse, LastTransitionTime: metav1.Time{Time: env.Clock.Now()}},
+			corev1.NodeCondition{Type: "KernelReady", Status: corev1.ConditionFalse, LastTransitionTime: metav1.Time{Time: env.Clock.Now()}},
+		)
+		ExpectApplied(ctx, env.Client, n)
+		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(n))
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+		Expect(queue.GetCommands()).To(HaveLen(1))
+		// Merged min TGP across both conditions is 0 → forceful (deadline ≈ now). The graceful condition alone would be 1h.
+		updated := ExpectExists(ctx, env.Client, nodeClaim)
+		deadline, err := time.Parse(time.RFC3339, updated.Annotations[v1.NodeClaimTerminationTimestampAnnotationKey])
+		Expect(err).ToNot(HaveOccurred())
+		Expect(deadline).To(BeTemporally("~", env.Clock.Now(), time.Minute))
+	})
 })
