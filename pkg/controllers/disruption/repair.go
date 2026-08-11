@@ -172,10 +172,9 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 		if !r.restraint.CanDisrupt(candidate) {
 			continue
 		}
-		// Terminate-first (F2), static case: a static NodePool (fixed Spec.Replicas) structurally has no room to grow, so
-		// repair issues a delete-only command and reactive provisioning refills the freed slot. This is known before any
-		// simulation, so short-circuit. The budget still paces it and the drain still honors PDBs/TGP.
-		if candidate.OwnedByStaticNodePool() {
+		// A static NodePool has no room to grow, known without a simulation, so terminate-first directly (no replacement
+		// to stage). The budget still paces it and the drain still honors PDBs/TGP.
+		if terminateFirst(ctx, candidate, pscheduling.Results{}) {
 			return r.terminateFirstCommand(ctx, candidate, rr)
 		}
 		// Pre-spin: simulate scheduling to build the replacement(s). The queue launches them first and only
@@ -192,10 +191,9 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 			r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
 			continue
 		}
-		// Terminate-first (F2), dynamic/reserved case: the simulation ran as if the candidate were already gone. If it
-		// can only place the replacement back into the same reservation (every new NodeClaim is reserved capacity), the
-		// pool can't grow, so terminate-first; any other option (incl. on-demand) means replace-first as usual.
-		if candidate.capacityType == v1.CapacityTypeReserved && onlyReservedReplacements(results.NewNodeClaims) {
+		// With the candidate-gone simulation in hand, the shared terminate-first primitive decides replace-first vs
+		// delete-only from the fleet's capacity posture (reserved/ODCR with no headroom → terminate-first).
+		if terminateFirst(ctx, candidate, results) {
 			return r.terminateFirstCommand(ctx, candidate, rr)
 		}
 		// Bound the drain per the matched policy before the queue terminates the candidate, so repair is never an
@@ -297,21 +295,6 @@ func (r *Repair) observeProbes(ctx context.Context) {
 			delete(r.acted, providerID)
 		}
 	}
-}
-
-// onlyReservedReplacements reports whether every simulated replacement resolved to reserved capacity — i.e. the pool
-// can only grow back into the same reservation, so there is no headroom and repair must terminate-first. An empty set
-// (no replacement needed) is not "reserved-only": that is an ordinary empty-node delete, handled on the normal path.
-func onlyReservedReplacements(newNodeClaims []*pscheduling.NodeClaim) bool {
-	if len(newNodeClaims) == 0 {
-		return false
-	}
-	for _, nc := range newNodeClaims {
-		if !nc.Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeReserved) {
-			return false
-		}
-	}
-	return true
 }
 
 // score computes E = rank + age/τ − backoff for an already-resolved candidate. Age is time past toleration
