@@ -16,127 +16,257 @@ limitations under the License.
 
 package disruption_test
 
-// Rig for the node-repair simulation matrix: the end-to-end machinery each cell runs through, and the swappable
-// implementation OPTIONS. The rig deliberately steps a candidate all the way through drain + termination (not the
-// ExpectNodeClaimsCascadeDeletion shortcut the focused unit suites use) so PodDisruptionBudgets, the termination grace
-// period, and forceful-vs-graceful drain actually execute and are measurable — which is what makes Axis 3 real.
+// The simulation runner + fault models + implementation options.
+//
+// Each cell runs an ITERATED loop (decision → advance fault model on any fresh replacements → drain+terminate marked
+// nodes → step clock) to steady state, on a single stepped clock — so the differentiating behavior (multi-pass
+// pre-spin/dwell/terminate, re-flag loops, burst pacing) and decision latency are actually exercised, not just the
+// shared teardown. The teardown drives the REAL termination state machine so PDB/TGP/forceful drain execute and are
+// measurable.
+//
+// At this base (main), the only runnable option is the 20% breaker (node.health exists here; NewRepair does not). The
+// budget+restraint options (pinned/unpinned) plug into `simImpl` from the voluntary-repair POC layer stacked above.
 
 import (
 	"context"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2" //nolint:staticcheck
+	. "github.com/onsi/gomega"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	nodehealth "sigs.k8s.io/karpenter/pkg/controllers/node/health"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
+	"sigs.k8s.io/karpenter/pkg/test"
+	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
-	. "sigs.k8s.io/karpenter/pkg/test/expectations" //nolint:staticcheck
 )
 
-// maxDrainSteps bounds the drain/termination loop so a wedged (PDB-blocked, never-forceful) node can't spin forever;
-// hitting it is itself observable (the node never terminated).
-const maxDrainSteps = 40
+const (
+	simTick       = time.Minute      // clock advance per decision round
+	simMaxRounds  = 40               // bound on decision rounds (episode never converging shows as wedged/unmitigated)
+	simMaxDrain   = 40               // bound on the per-node drain loop
+	simBurst      = 5                // nodes in a correlated burst
+	simFiller     = 10               // healthy filler nodes per pool (so the unhealthy fraction is realistic)
+	simToleration = 30 * time.Minute // RepairPolicy toleration used across the matrix
+	repairCond    = corev1.NodeConditionType("BadNode")
+)
 
-// EventuallyExpectNodeDrainedAndTerminated drives a node marked for deletion all the way through the real termination
-// state machine — cordon, drain (evicting pods through the eviction API, which honors PodDisruptionBudgets), forceful
-// deletion once the node's termination-grace-period deadline passes, then finalize — until the node object is gone or
-// maxDrainSteps is exhausted. It reconciles the termination controller and the eviction queue together, stepping the
-// clock each round, exactly as a running cluster would. Returns whether the node actually terminated and how many
-// pod evictions were issued (the PDB-paced drain cost).
-func EventuallyExpectNodeDrainedAndTerminated(
-	ctx context.Context,
-	c client.Client,
-	terminationController *termination.Controller,
-	evictionQueue *terminator.Queue,
-	stepClock func(time.Duration),
-	node *corev1.Node,
-) (terminated bool, evictions int) {
-	GinkgoHelper()
-	// Marking the node for deletion is what the disruption queue (or the breaker) does when it decides to remove the
-	// candidate; the termination controller only acts on a node with a deletion timestamp + the termination finalizer.
-	if node.DeletionTimestamp.IsZero() {
-		if err := client.IgnoreNotFound(c.Delete(ctx, node)); err != nil {
-			return false, evictions
-		}
-	}
-	for i := 0; i < maxDrainSteps; i++ {
-		fresh := &corev1.Node{}
-		if err := c.Get(ctx, client.ObjectKeyFromObject(node), fresh); err != nil {
-			return true, evictions // node is gone → terminated
-		}
-		// One termination pass: taints + starts/continues the drain (enqueues evictable pods, or force-deletes past TGP).
-		ExpectObjectReconciled(ctx, c, terminationController, fresh)
-		// Process any pods the drain enqueued for eviction — this is where the PDB is honored (a blocking PDB fails the
-		// eviction and the pod stays, stalling the drain until the TGP deadline forces it).
-		if pods, err := nodeutils.GetPods(ctx, c, fresh.Name); err == nil {
-			for _, pod := range pods {
-				if evictionQueue.Has(pod) {
-					ExpectObjectReconciled(ctx, c, evictionQueue, pod)
-					evictions++
-				}
-			}
-		}
-		stepClock(2 * termination.MinDrainTime)
-	}
-	// Exhausted the budget without the node disappearing → not terminated (e.g. a fully-blocking PDB with no TGP).
-	if err := c.Get(ctx, client.ObjectKeyFromObject(node), &corev1.Node{}); err != nil {
-		return true, evictions
-	}
-	return false, evictions
-}
-
-// simImpl is one swappable implementation OPTION under test. The cases are identical across options; only impl varies.
-//   - name: report column.
-//   - reconcileDecision: run ONE "should I repair, and how" pass (a disruption-controller reconcile for the repair
-//     method options; a health-controller reconcile over the unhealthy nodes for the breaker).
-// Teardown (drain + terminate) is shared across options via EventuallyExpectNodeDrainedAndTerminated.
+// simImpl is one swappable implementation OPTION. reconcileDecision runs ONE decision pass; the runner iterates it.
 type simImpl struct {
 	name              string
 	reconcileDecision func()
 }
 
-// buildBreakerImpl restores the pre-repair behavior: the node.health controller with its hardcoded 20% breaker. It is
-// a Node-keyed reconciler that force-deletes unhealthy NodeClaims directly (no pre-spin, no budget), gated only by the
-// breaker. Comparison-only — not registered in production.
-func buildBreakerImpl(healthController *nodehealth.Controller, unhealthyNodes func() []*corev1.Node) simImpl {
+// fleet is the objects a cell's scenario created, retained so the runner can drive + observe them.
+type fleet struct {
+	nodePools []*v1.NodePool
+	nodes     []*corev1.Node    // the originally-faulted nodes
+	claims    []*v1.NodeClaim
+	podLabels map[string]string // workload selector (for PDB matching), or nil
+}
+
+// --- drain measurement -------------------------------------------------------------------------------------------
+
+// drainOutcome is what a single node teardown produced.
+type drainOutcome struct {
+	terminated bool
+	evictions  int
+}
+
+// drainAndTerminate drives a node marked for deletion through the REAL termination state machine — cordon, drain
+// (evicting pods through the eviction API, which honors PodDisruptionBudgets), forceful deletion once the node's
+// termination-grace-period deadline passes, then finalize — reconciling the termination controller + eviction queue
+// and stepping the clock until the node is gone or simMaxDrain is exhausted. It is a MEASUREMENT instrument (returns
+// data), deliberately not named Expect*/Eventually* and not an assert-or-fail helper: a node that never terminates
+// (e.g. a fully-blocking PDB) is a result we want to record (terminated=false), not a spec failure.
+func drainAndTerminate(ctx context.Context, tc *termination.Controller, eq *terminator.Queue, node *corev1.Node) drainOutcome {
+	out := drainOutcome{}
+	// The node-termination controller only drains a node that has the termination finalizer; without it a Delete would
+	// vanish the node instantly (no drain). Ensure it before deleting so the drain path actually runs.
+	if !lo.Contains(node.Finalizers, v1.TerminationFinalizer) {
+		stored := node.DeepCopy()
+		node.Finalizers = append(node.Finalizers, v1.TerminationFinalizer)
+		_ = env.Client.Patch(ctx, node, client.MergeFrom(stored))
+	}
+	// Count the workload pods on the node at teardown start — the observable disruption, whether they end up gracefully
+	// evicted or force-deleted past the TGP (the eviction-queue counter alone misses forceful deletions).
+	if pods, err := nodeutils.GetPods(ctx, env.Client, node.Name); err == nil {
+		out.evictions += len(pods)
+	}
+	if node.DeletionTimestamp.IsZero() {
+		if err := client.IgnoreNotFound(env.Client.Delete(ctx, node)); err != nil {
+			return out
+		}
+	}
+	for i := 0; i < simMaxDrain; i++ {
+		fresh := &corev1.Node{}
+		if err := env.Client.Get(ctx, client.ObjectKeyFromObject(node), fresh); err != nil {
+			out.terminated = true
+			return out
+		}
+		// Direct Reconcile (not ExpectObjectReconciled): this is a measurement instrument, so a transient reconcile
+		// error must not fail the spec — a node that can't finish terminating is a RESULT (recorded as not-terminated).
+		_, _ = tc.Reconcile(ctx, fresh)
+		if pods, err := nodeutils.GetPods(ctx, env.Client, fresh.Name); err == nil {
+			for _, pod := range pods {
+				if eq.Has(pod) {
+					_, _ = eq.Reconcile(ctx, pod)
+				}
+			}
+		}
+		env.Clock.Step(2 * termination.MinDrainTime)
+	}
+	if err := env.Client.Get(ctx, client.ObjectKeyFromObject(node), &corev1.Node{}); err != nil {
+		out.terminated = true
+	}
+	return out
+}
+
+// buildTerminationRig constructs the shared drain/termination machinery the runner uses to tear down every candidate.
+func buildTerminationRig() (*termination.Controller, *terminator.Queue) {
+	eq := terminator.NewQueue(env.Client, recorder)
+	tc := termination.NewController(env.Clock, env.Client, cloudProvider, terminator.NewTerminator(env.Clock, env.Client, eq, recorder), recorder)
+	return tc, eq
+}
+
+// --- breaker option (runnable at this base; node.health exists on main) ------------------------------------------
+
+func buildBreakerImpl(hc *nodehealth.Controller) simImpl {
 	return simImpl{
 		name: "breaker-20pct",
 		reconcileDecision: func() {
-			for _, n := range unhealthyNodes() {
-				ExpectObjectReconciled(ctx, env.Client, healthController, n)
+			// The health controller is Node-keyed; feed it every node still carrying the repair condition.
+			for _, n := range ExpectNodes(ctx, env.Client) {
+				if cond := nodeutils.GetCondition(n, repairCond); cond.Status == corev1.ConditionFalse || cond.Status == corev1.ConditionUnknown {
+	_, _ = hc.Reconcile(ctx, n)
+				}
 			}
 		},
 	}
 }
 
-// NOTE: the restraint-based options (budget+restraint, pinned/unpinned) plug into this seam from the voluntary-repair
-// POC layer that stacks ON TOP of this rig — they reference disruption.NewRepair, which does not exist at this base.
-// The base rig deliberately carries only the implementation-agnostic cases + the breaker baseline (node.health exists
-// here). See buildBreakerImpl above; each implementation branch adds its own simImpl builder.
+// --- fleet setup -------------------------------------------------------------------------------------------------
 
-// buildTerminationRig constructs the shared drain/termination machinery (eviction queue + termination controller) the
-// runner uses to tear down every candidate, for every option.
-func buildTerminationRig() (*termination.Controller, *terminator.Queue) {
-	evictionQueue := terminator.NewQueue(env.Client, recorder)
-	tc := termination.NewController(env.Clock, env.Client, cloudProvider, terminator.NewTerminator(env.Clock, env.Client, evictionQueue, recorder), recorder)
-	return tc, evictionQueue
+// zonesFor / amisFor spread a burst across the domains a correlation shares (or not).
+func poolCountFor(c simCell) int {
+	switch c.topo {
+	case topoPerAZ, topoPerAMI:
+		return 3
+	default:
+		return 1
+	}
 }
 
-// unhealthyNodesForBreaker lists nodes carrying a RepairPolicy-matching unhealthy condition (the breaker's input set).
-func unhealthyNodesForBreaker(policies func() []corev1.NodeConditionType) func() []*corev1.Node {
-	return func() []*corev1.Node {
-		var out []*corev1.Node
-		for _, n := range ExpectNodes(ctx, env.Client) {
-			for _, ct := range policies() {
-				if cond := nodeutils.GetCondition(n, ct); cond.Status == corev1.ConditionFalse || cond.Status == corev1.ConditionUnknown {
-					out = append(out, n)
-					break
-				}
+// setupFleet realizes a cell as cluster objects and returns them. It marks the fault (past toleration) so the decision
+// loop can act immediately.
+func setupFleet(c simCell) fleet {
+	f := fleet{}
+	nPools := poolCountFor(c)
+	for i := 0; i < nPools; i++ {
+		var np *v1.NodePool
+		if c.strat == stratTerminateFirst {
+			np = test.StaticNodePool(v1.NodePool{Spec: v1.NodePoolSpec{Replicas: lo.ToPtr(int64(simBurst))}})
+		} else {
+			np = test.NodePool()
+		}
+		ExpectApplied(ctx, env.Client, np)
+		f.nodePools = append(f.nodePools, np)
+	}
+
+	// Healthy filler so the unhealthy FRACTION is realistic — otherwise every pool is 100% unhealthy and the 20% breaker
+	// always freezes, collapsing the whole matrix. With filler, an isolated fault is a small fraction (breaker acts) and
+	// a correlated burst pushes the pool over the threshold (breaker freezes) — the behavior we want to measure.
+	for _, pool := range f.nodePools {
+		for i := 0; i < simFiller; i++ {
+			nc, n := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+				v1.NodePoolLabelKey: pool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a",
+			}}})
+			ExpectApplied(ctx, env.Client, nc, n)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{n}, []*v1.NodeClaim{nc})
+		}
+	}
+
+	count := 1
+	if !c.corr.isolated() {
+		count = simBurst
+	}
+	// A workload label so PDB cases can select the pods.
+	if c.drain.hasPDB() {
+		f.podLabels = map[string]string{"sim-workload": "app"}
+	}
+	for i := 0; i < count; i++ {
+		pool := f.nodePools[i%len(f.nodePools)]
+		zone := "test-zone-1a"
+		if c.corr == corrZone || c.topo == topoPerAZ {
+			zone = []string{"test-zone-1a", "test-zone-1b", "test-zone-1c"}[i%3]
+			if c.topo == topoPerAZ {
+				zone = []string{"test-zone-1a", "test-zone-1b", "test-zone-1c"}[(i % len(f.nodePools))]
 			}
 		}
-		return out
+		nc, n := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+			Finalizers: []string{v1.TerminationFinalizer}, // so a decision's Delete lingers (deletion timestamp) and flows through drain, as in prod
+			Labels: map[string]string{
+				v1.NodePoolLabelKey: pool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: zone,
+			}}})
+		ExpectApplied(ctx, env.Client, nc, n)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{n}, []*v1.NodeClaim{nc})
+		bindWorkload(n, f.podLabels)
+		f.nodes = append(f.nodes, n)
+		f.claims = append(f.claims, nc)
 	}
+	if c.drain.hasPDB() {
+		mu := intstr.FromString("100%")
+		if c.drain == drainNoPDBBlock {
+			mu = intstr.FromInt(0)
+		}
+		ExpectApplied(ctx, env.Client, test.PodDisruptionBudget(test.PDBOptions{Labels: f.podLabels, MaxUnavailable: &mu}))
+	}
+	// Inject the fault, then advance past toleration so it is immediately actionable.
+	for _, n := range f.nodes {
+		markFault(c, n)
+	}
+	env.Clock.Step(simToleration + time.Minute)
+	return f
+}
+
+// bindWorkload attaches a ReplicaSet-owned pod (so termination has something to drain and reactive provisioning has a
+// pod to replace). labels, if set, are stamped for PDB matching.
+func bindWorkload(n *corev1.Node, labels map[string]string) {
+	rs := test.ReplicaSet()
+	ExpectApplied(ctx, env.Client, rs)
+	Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
+	pod := test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{
+		Labels: labels,
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rs.Name, UID: rs.UID, Controller: lo.ToPtr(true), BlockOwnerDeletion: lo.ToPtr(true)}},
+	}})
+	ExpectApplied(ctx, env.Client, pod)
+	ExpectManualBinding(ctx, env.Client, pod, n)
+	ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(n))
+}
+
+// markFault stamps the repair-matching condition. kubelet-dead is represented as Ready=Unknown (drain can't proceed
+// gracefully); otherwise the node stays Ready with the BadNode condition False.
+func markFault(c simCell, n *corev1.Node) {
+	n = ExpectExists(ctx, env.Client, n)
+	ready := corev1.NodeCondition{Type: corev1.NodeReady, Status: corev1.ConditionTrue, Reason: "KubeletReady",
+		LastHeartbeatTime: metav1.NewTime(env.Clock.Now()), LastTransitionTime: metav1.NewTime(env.Clock.Now())}
+	if c.drain == drainNoKubeletDead {
+		// kubelet-dead: Ready=Unknown (node controller lost the heartbeat) → graceful drain can't proceed.
+		ready = corev1.NodeCondition{Type: corev1.NodeReady, Status: corev1.ConditionUnknown, Reason: "NodeStatusUnknown",
+			LastHeartbeatTime: metav1.NewTime(env.Clock.Now()), LastTransitionTime: metav1.NewTime(env.Clock.Now())}
+	}
+	n.Status.Phase = corev1.NodeRunning
+	n.Status.Conditions = []corev1.NodeCondition{
+		ready,
+		{Type: repairCond, Status: corev1.ConditionFalse, Reason: "SimFault",
+			LastHeartbeatTime: metav1.NewTime(env.Clock.Now()), LastTransitionTime: metav1.NewTime(env.Clock.Now())},
+	}
+	ExpectApplied(ctx, env.Client, n)
+	ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(n))
 }

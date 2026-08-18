@@ -125,28 +125,11 @@ func (c simCell) id() string {
 	return fmt.Sprintf("%s|%s|%s|%s|%s", c.help, c.corr, c.drain, c.strat, c.topo)
 }
 
-// skip encodes the degenerate cells (rules 1–3 from the design review): cells that are impossible or observationally
-// identical to another cell, so running them adds no signal.
-func (c simCell) skip() bool {
-	// Rule 1: topology is inert for an isolated fault (one node, one pool, one budget) — only `single` is meaningful.
-	if c.corr.isolated() && c.topo != topoSingle {
-		return true
-	}
-	// Rule 2: an ami-correlated burst is only observationally distinct under per-AMI topology; otherwise it collapses
-	// into a nodepool-wide (single) or zonal burst.
-	if c.corr == corrAMI && c.topo != topoPerAMI {
-		return true
-	}
-	// Rule 3: if nothing is ever drained, the PDB values collapse to the no-PDB baseline. The original is never
-	// terminated when we replace-first AND the replacement never becomes healthy (the pre-spin gate never clears).
-	replacementNeverHealthy := c.help == helpNoLaunchFail || c.help == helpNoUnhealthyInDwell
-	if c.strat == stratReplaceFirst && replacementNeverHealthy && c.drain != drainYesNoPDB {
-		return true
-	}
-	return false
-}
-
-// enumerateCells returns every non-degenerate cell in the cross product.
+// enumerateCells returns the FULL cross product — every cell is an explicit, authoritative entry. There is deliberately
+// no skip()/pruning predicate: which cells are degenerate is not a static property of a cell (a cell that collapses for
+// the breaker may not for restraint), so we do not *assert* degeneracy up front — we run every cell and let identical
+// metric rows reveal degeneracy *empirically* (see the collapse report in repair_simulation_test.go). This also avoids
+// leaking implementation mechanism into enumeration and can't silently drop a cell that's live for some implementation.
 func enumerateCells() []simCell {
 	var cells []simCell
 	for _, h := range []helpTruth{helpYes, helpNoLaunchFail, helpNoUnhealthyInDwell, helpNoUnhealthyAfterDwell, helpNoWorkloadBroken} {
@@ -154,10 +137,7 @@ func enumerateCells() []simCell {
 			for _, d := range []drainability{drainYesNoPDB, drainYesPDB, drainNoPDBBlock, drainNoKubeletDead} {
 				for _, s := range []strategy{stratReplaceFirst, stratTerminateFirst} {
 					for _, t := range []topology{topoSingle, topoPerAZ, topoPerAMI} {
-						cell := simCell{help: h, corr: corr, drain: d, strat: s, topo: t}
-						if !cell.skip() {
-							cells = append(cells, cell)
-						}
+						cells = append(cells, simCell{help: h, corr: corr, drain: d, strat: s, topo: t})
 					}
 				}
 			}
