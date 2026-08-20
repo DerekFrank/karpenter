@@ -25,10 +25,11 @@ package repair
 // as its regression suite.
 //
 // Metrics are deliberately observable (not Karpenter-internal): a repair implementation must not be graded on its own
-// objective function.
-//   - timeToRecovery: wall-clock from fault onset until the workload is healthy again on good capacity. nil when there
-//     is no genuine fault to resolve (help != helpYes) or it was never resolved — disambiguated by `outcome`, never by
-//     an overloaded nil.
+// objective function. They are RAW observables only — there is no interpreted verdict field. The old
+// mitigated/declined/churned/wedged/unmitigated taxonomy was derivable from these four numbers crossed with the
+// impairment/oracle, so interpretation is left to analysis and every cell is measured the same way.
+//   - timeToRecovery: wall-clock from fault onset until the workload is healthy again on good capacity. nil when the
+//     fault was never fully resolved by the deadline (a partial recovery reads as mitigatedFraction < 1 with a nil TTR).
 //   - disruptedPods: workload pods actually deleted/recreated during the run (the workload-facing disruption cost,
 //     observable — NOT Karpenter's internal DisruptionCost heuristic).
 //   - cpCalls: cloud-provider call count (Create+Delete) scraped from karpenter_cloudprovider_* metrics, counting
@@ -44,24 +45,12 @@ import (
 	. "github.com/onsi/ginkgo/v2" //nolint:staticcheck
 )
 
-// outcome names what actually happened, so a never-recovered (wedged) run is never confused with a correct decision
-// not to repair (declined) or with a genuine miss (unmitigated).
-type outcome string
-
-const (
-	outcomeMitigated   outcome = "mitigated"   // genuine fault resolved: healthy replacement carrying the workload
-	outcomeDeclined    outcome = "declined"    // repair took no disrupting action (correct when repair can't help)
-	outcomeChurned     outcome = "churned"     // repair disrupted node(s) but the fault was NOT resolved (waste)
-	outcomeWedged      outcome = "wedged"      // repair tried but could not complete (e.g. PDB-blocked, never drained)
-	outcomeUnmitigated outcome = "unmitigated" // genuine fault, repair acted, but replacement never came up healthy
-)
-
-// repairMetrics are the observable outcomes of running one cell under one option.
+// repairMetrics are the observable results of running one cell under one option. RAW observables only — no interpreted
+// verdict field (that taxonomy is derivable from these numbers + the impairment and is reconstructed in analysis).
 type repairMetrics struct {
 	timeToRecovery    *time.Duration
 	disruptedPods     int
 	cpCalls           int
-	outcome           outcome
 	mitigatedFraction float64 // fraction of the faulted nodes repair resolved by the deadline (0..1); 1.0 == fully mitigated
 }
 
@@ -101,11 +90,11 @@ func formatReport(results []repairResult) string {
 		return sorted[i].cell.id() < sorted[j].cell.id()
 	})
 	var b strings.Builder
-	b.WriteString("| option | cell | outcome | mitigated% | time-to-recovery | disrupted-pods | cp-calls |\n")
-	b.WriteString("|---|---|---|---|---|---|---|\n")
+	b.WriteString("| option | cell | mitigated% | time-to-recovery | disrupted-pods | cp-calls |\n")
+	b.WriteString("|---|---|---|---|---|---|\n")
 	for _, r := range sorted {
-		b.WriteString(fmt.Sprintf("| %s | %s | %s | %d%% | %s | %d | %d |\n",
-			r.option, r.cell.id(), r.m.outcome, int(r.m.mitigatedFraction*100+0.5), ttrString(r), r.m.disruptedPods, r.m.cpCalls))
+		b.WriteString(fmt.Sprintf("| %s | %s | %d%% | %s | %d | %d |\n",
+			r.option, r.cell.id(), int(r.m.mitigatedFraction*100+0.5), ttrString(r), r.m.disruptedPods, r.m.cpCalls))
 	}
 	return b.String()
 }
@@ -117,7 +106,7 @@ func formatReport(results []repairResult) string {
 func formatCollapseReport(results []repairResult) string {
 	byOption := map[string]map[string][]string{} // option -> metric-signature -> []cellID
 	for _, r := range results {
-		sig := fmt.Sprintf("%s|mit=%d%%|ttr=%s|pods=%d|cp=%d", r.m.outcome, int(r.m.mitigatedFraction*100+0.5), ttrString(r), r.m.disruptedPods, r.m.cpCalls)
+		sig := fmt.Sprintf("mit=%d%%|ttr=%s|pods=%d|cp=%d", int(r.m.mitigatedFraction*100+0.5), ttrString(r), r.m.disruptedPods, r.m.cpCalls)
 		if byOption[r.option] == nil {
 			byOption[r.option] = map[string][]string{}
 		}

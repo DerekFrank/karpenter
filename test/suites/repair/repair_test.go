@@ -16,27 +16,35 @@ limitations under the License.
 
 package repair
 
-// The e2e runner: each cell is realized as (Deployment sized per correlation + PDB per drain axis + NodePool topology),
-// provisioned against a DEPLOYED Karpenter/KWOK build; the fault is injected by patching KWOK node conditions; recovery
-// is MEASURED with Eventually (never a fake-clock step, because this is a real control plane on a real clock).
+// The e2e runner: each cell is realized as (Deployment sized per scale + PDB per drain axis + NodePool topology),
+// provisioned against a DEPLOYED Karpenter/KWOK build; the fault is injected by patching KWOK node/pod conditions;
+// recovery is MEASURED with Eventually (never a fake-clock step, because this is a real control plane on a real clock).
+//
+// The runner is UNIFIED: every cell is measured the same way — provision → armImpairment → injectFault → poll until the
+// workload is fully healthy on good capacity OR the deadline — and records only RAW observables. There is no
+// help/non-help branch and no interpreted verdict; whether repair "should" help is derived from the impairment in
+// analysis, not measured here.
 //
 // Cell → mechanism map:
-//   help      → the replacement fault model, applied post-injection (healthy / launch-fail / re-flag / workload-broken).
-//   scale     → fleet size (workload replicas, one pod per node) — makes the blast a meaningful FRACTION of the fleet.
-//   blast     → how many nodes are faulted (single / ~10% / ~35% of the fleet).
-//   structure → whether the faulted nodes share a failure domain (unrelated vs zone/ami/reason) — the correlation signal.
-//   drain     → PDB presence/strictness, and kubelet-dead (eviction won't succeed ⇒ forceful past the NodePool TGP).
-//   strat     → replace-first (elastic NodePool, headroom) vs terminate-first (static/reserved; currently un-runnable).
-//   topo      → single NodePool vs per-AZ vs per-AMI (arch) NodePools; sets the domains a repair's budget lines up with.
+//   impairment → the correlation domain and its fault: base SimUnhealthy on the faulted nodes, plus a domain-scoped
+//                replacement mechanism (node-broken re-flags in-domain replacement NODES unhealthy; workload-broken
+//                gates in-domain replacement PODS never-ready; benign/uncorrelated leave replacements healthy).
+//   scale      → fleet size (workload replicas, one pod per node) — makes the blast a meaningful FRACTION of the fleet.
+//   blast      → how many nodes are faulted (single / ~10% / ~35% of the fleet).
+//   drain      → PDB presence/strictness, and kubelet-dead (eviction won't succeed ⇒ forceful past the NodePool TGP).
+//   strat      → replace-first (elastic NodePool, headroom) vs terminate-first (static/reserved; currently un-runnable).
+//   topo       → single NodePool vs per-AZ vs per-AMI (arch) NodePools; sets the domains a repair's budget lines up with.
 //
-// Metrics recorded per (cell, option), scale-agnostic: time-to-recovery, disrupted-pods, cloud-provider calls (report.go).
+// Metrics recorded per (cell, option), scale-agnostic: mitigated%, time-to-recovery, disrupted-pods, cloud-provider
+// calls (report.go).
 
 import (
 	"bytes"
 	"fmt"
 	"os"
-	"sigs.k8s.io/karpenter/test/pkg/debug"
 	"time"
+
+	"sigs.k8s.io/karpenter/test/pkg/debug"
 
 	. "github.com/onsi/ginkgo/v2" //nolint:staticcheck
 	. "github.com/onsi/gomega"    //nolint:staticcheck
@@ -46,7 +54,6 @@ import (
 	"github.com/samber/lo"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -63,28 +70,15 @@ const (
 	provisionTimeout = 5 * time.Minute // fault-free provisioning of the workload onto fresh nodes
 	pollInterval     = 5 * time.Second
 
-	// reflagDwell approximates the "success dwell" boundary for the re-flag help models. In-dwell re-flags before it,
-	// after-dwell re-flags past it. This must be shorter than recoveryTimeout so the run still converges.
-	reflagDwell = 20 * time.Second
-
 	// nodePoolTGP is the NodePool's TerminationGracePeriod — the customer-facing drain bound. Setting it on the NodePool
 	// (NOT the RepairPolicy, which is an implementation detail) lets a correct implementation forcefully terminate a
 	// node whose drain cannot complete (kubelet-dead / blocking-PDB), so those cells resolve within the window instead
 	// of hanging forever. It must exceed the deployed toleration+dwell yet stay under recoveryTimeout.
 	nodePoolTGP = 90 * time.Second
 
-	// observeWindow bounds how long a NON-help cell waits to see whether repair takes a disrupting action before we
-	// classify it declined. Acting cells return as soon as the action is observed (plus a short settle); only genuinely
-	// declined cells wait the full window. Sized above the deployed toleration (~15s) with margin.
-	observeWindow = 60 * time.Second
-
-	// settleAfterAction is how long we let an observed disruption finish (terminate ⇒ churned, or stay stuck ⇒ wedged)
-	// once repair has acted on a non-help cell. Covers the NodePool TGP so a forceful termination can complete.
-	settleAfterAction = nodePoolTGP + 20*time.Second
-
 	// The deployed KWOK build's RepairPolicies (kwok/cloudprovider/cloudprovider.go RepairPolicies()) must include the
 	// custom {ConditionType: "SimUnhealthy", ConditionStatus: True} policy with a short (seconds) TolerationDuration, so
-	// the injected fault (see patchNodeReady) is actionable in test time. This is a deployment-side change; the suite
+	// the injected fault (see markNodeUnhealthy) is actionable in test time. This is a deployment-side change; the suite
 	// only observes.
 )
 
@@ -110,11 +104,11 @@ func envDuration(name string, def time.Duration) time.Duration {
 // include {ConditionType: "SimUnhealthy", ConditionStatus: True}.
 const simUnhealthyCondition corev1.NodeConditionType = "SimUnhealthy"
 
-// simWorkloadReadyGate is a pod readiness gate used only by the workload-broken help model. KWOK fakes container
+// simWorkloadReadyGate is a pod readiness gate used only by the workload-broken impairment. KWOK fakes container
 // readiness, so a normal probe can't make a pod unready; a readiness gate makes Ready = AND(containers, gate), and
-// nothing satisfies the gate unless we explicitly patch it. Provisioning patches it True to establish a healthy
-// baseline; the workload-broken fault flips it False so the workload is genuinely down while the NODES stay healthy
-// (the detection blind spot — repair must correctly decline).
+// nothing satisfies the gate unless we explicitly patch it. armImpairment patches it True on every workload pod to
+// establish a healthy baseline; the workload-broken fault then flips it False on pods in the impaired domain so those
+// pods are genuinely down while the NODES stay healthy (the detection blind spot — repair must correctly decline).
 const simWorkloadReadyGate corev1.PodConditionType = "SimWorkloadReady"
 
 // kwokZones / kwokArches mirror the domains the deployed KWOK provider generates (kwok/tools/gen_instance_types.go).
@@ -130,9 +124,14 @@ type fleet struct {
 	selector    labels.Selector
 	replicas    int
 	nodes       []*corev1.Node // workload nodes at fault-injection time
-	faultNodes  []*corev1.Node // the subset selected for the fault (count per blast, domain per structure)
+	faultNodes  []*corev1.Node // the subset selected for the fault (count per blast, confined to the impaired domain)
 	faultedPods sets.Set[string]
-	faultOnset  time.Time // when the fault was injected (anchors the re-flag dwell)
+	faultOnset  time.Time // when the fault was injected (pins the sustainFault transition time; anchors TTR)
+	// impairedKey/impairedValue record the impaired domain chosen at fault selection (e.g. topology.kubernetes.io/zone
+	// = test-zone-a, or kubernetes.io/arch = amd64). "" for uncorrelated (no shared domain). The domain-scoped
+	// mechanisms (re-flag / readiness gate) act ONLY on replacements whose zone/arch matches this.
+	impairedKey   string
+	impairedValue string
 }
 
 var _ = Describe("Repair/Performance", Label("repair-perf", debug.NoWatch), func() {
@@ -146,32 +145,28 @@ var _ = Describe("Repair/Performance", Label("repair-perf", debug.NoWatch), func
 	}
 })
 
-// runCell provisions the cell, injects its fault, measures the outcome, and returns the observable metrics.
+// runCell provisions the cell, injects its impairment, and measures recovery along the ONE unified path used for every
+// cell: provision → armImpairment → injectFault → poll (sustainFault + domain-scoped re-flag/gate each tick) until the
+// workload is fully healthy on good capacity OR the deadline. It records only raw observables — no help/non-help branch,
+// no per-cell classification. timeToRecovery is nil unless the cell fully recovered; a partial recovery shows up as
+// mitigatedFraction < 1.
 func runCell(c cell) repairMetrics {
 	m := repairMetrics{}
 
 	cpBefore := scrapeCloudProviderCalls()
 	f := provisionCell(c)
 
-	// Apply the replacement fault model that must be armed BEFORE the fault so it affects replacements as they appear.
-	armHelpModel(c, &f)
-
+	// Arm the replacement mechanism BEFORE injecting so it affects replacements as they appear.
+	armImpairment(c, &f)
 	injectFault(c, &f)
 
-	if c.help.helps() {
-		// A genuine fault: the oracle is time-to-recovery. Wait for the workload to be healthy again on good capacity.
-		recovered := measureRecovery(c, &f)
-		m.outcome, m.timeToRecovery = classifyHelp(&f, recovered, f.faultOnset)
-	} else {
-		// No genuine fault: the oracle is "did repair correctly decline?" Observe whether it took a disrupting action
-		// and whether that action completed (churned) or stuck mid-termination (wedged).
-		acted, stuck := observeRepairAction(c, &f)
-		m.outcome = classifyNonHelp(acted, stuck)
+	if measureRecovery(c, &f) {
+		d := time.Since(f.faultOnset)
+		m.timeToRecovery = &d
 	}
-
+	m.mitigatedFraction = fractionRepaired(&f)
 	m.disruptedPods = countDisrupted(&f)
 	m.cpCalls = maxZero(scrapeCloudProviderCalls() - cpBefore)
-	m.mitigatedFraction = fractionRepaired(&f)
 	return m
 }
 
@@ -192,58 +187,8 @@ func fractionRepaired(f *fleet) float64 {
 	return float64(n-remaining) / float64(n)
 }
 
-// classifyHelp scores a genuine-fault cell: recovered ⇒ mitigated (with time-to-recovery); otherwise wedged if a faulted
-// node is stuck mid-termination, else unmitigated (a genuine miss — frozen breaker, launch-fail, endless re-flag).
-func classifyHelp(f *fleet, recovered bool, onset time.Time) (outcome, *time.Duration) {
-	if recovered {
-		d := time.Since(onset)
-		return outcomeMitigated, &d
-	}
-	if anyStuck(f.faultNodes) {
-		return outcomeWedged, nil
-	}
-	return outcomeUnmitigated, nil
-}
-
-// classifyNonHelp scores a cell where repair cannot truly help: declining is correct; acting is waste (churned), and an
-// action that can't finish is wedged.
-func classifyNonHelp(acted, stuck bool) outcome {
-	switch {
-	case !acted:
-		return outcomeDeclined
-	case stuck:
-		return outcomeWedged
-	default:
-		return outcomeChurned
-	}
-}
-
-// observeRepairAction waits (bounded by observeWindow) for repair to take a disrupting action on the watched nodes —
-// the fault domain, or (workload-broken, no fault domain) the whole workload fleet, which a correct implementation must
-// leave alone. Once an action is seen, it lets it settle (up to settleAfterAction, covering the NodePool TGP) and
-// reports whether it finished (churned) or is stuck mid-termination (wedged).
-func observeRepairAction(c cell, f *fleet) (acted, stuck bool) {
-	watch := f.faultNodes
-	if len(watch) == 0 {
-		watch = f.nodes
-	}
-	_ = interruptibleEventually(observeWindow, func(g Gomega) {
-		sustainFault(c, f) // keep the fault alive against KWOK heartbeat clobber while waiting for repair to act
-		g.Expect(anyDisrupted(watch) || countDisrupted(f) > 0).To(BeTrue())
-	})
-	acted = anyDisrupted(watch) || countDisrupted(f) > 0
-	if !acted {
-		return false, false
-	}
-	finished := interruptibleEventually(settleAfterAction, func(g Gomega) {
-		g.Expect(allGone(watch)).To(BeTrue())
-	}) == nil
-	stuck = !finished && anyStuck(watch)
-	return acted, stuck
-}
-
 // provisionCell builds the topology NodePools + workload Deployment (+ PDB), waits for healthy provisioning, and
-// records the workload nodes and the fault-domain subset.
+// records the workload nodes and the fault-domain subset (recording the impaired domain in the fleet).
 func provisionCell(c cell) fleet {
 	f := fleet{}
 	f.nodePools = newNodePools(c)
@@ -264,7 +209,7 @@ func provisionCell(c cell) fleet {
 
 	env.EventuallyExpectHealthyPodCountWithTimeout(provisionTimeout, f.selector, f.replicas)
 	f.nodes = env.EventuallyExpectCreatedNodeCount(">=", 1)
-	f.faultNodes = selectFaultDomain(c, f)
+	f.selectFaultDomain(c)
 	f.faultedPods = podUIDsOnNodes(f.selector, f.faultNodes)
 	return f
 }
@@ -279,7 +224,7 @@ func newWorkload(c cell, replicas int) *appsv1.Deployment {
 	name := "repair-" + test.RandomName()
 	opts := test.CreateDeploymentOptions(name, int32(replicas), "1", "1Gi")
 	dep := test.Deployment(opts)
-	// Spread across ZONES (failure domains), not hostnames — this populates the zone/AMI domains the structure axis
+	// Spread across ZONES (failure domains), not hostnames — this populates the zone/AMI domains the impairment axis
 	// faults, so a correlated zonal blast actually lands on a zone's worth of pods. One-pod-per-node is still guaranteed
 	// by the CPU request (1000m) exceeding half a KWOK node's allocatable (c-2x ≈ 1900m). ScheduleAnyway (soft) so an
 	// uneven zone during provisioning never strands a pending pod — a pending pod keeps its target node "nominated",
@@ -290,11 +235,11 @@ func newWorkload(c cell, replicas int) *appsv1.Deployment {
 		WhenUnsatisfiable: corev1.ScheduleAnyway,
 		LabelSelector:     &metav1.LabelSelector{MatchLabels: dep.Spec.Selector.MatchLabels},
 	}}
-	if c.help == helpNoWorkloadBroken {
+	if c.impairment.workloadBroken() {
 		// workload-broken blind spot: nodes stay Ready+healthy to Karpenter, but the workload itself is down. A readiness
-		// gate makes each pod's readiness depend on a custom condition KWOK does not set; provisioning patches it True to
-		// reach a healthy baseline, and the fault flips it False. No node condition is injected — so a correct repair
-		// implementation sees only healthy nodes and declines.
+		// gate makes each pod's readiness depend on a custom condition KWOK does not set; armImpairment patches it True on
+		// every pod to reach a healthy baseline, and the fault flips it False on the impaired domain's pods. No node
+		// condition is injected — so a correct repair implementation sees only healthy nodes and declines.
 		dep.Spec.Template.Spec.ReadinessGates = append(dep.Spec.Template.Spec.ReadinessGates,
 			corev1.PodReadinessGate{ConditionType: simWorkloadReadyGate})
 	}
@@ -358,49 +303,54 @@ func newNodePools(c cell) []*v1.NodePool {
 	return pools
 }
 
-// selectFaultDomain picks the nodes to fault per the blast (how many) and structure (how they relate) axes:
-//   - workload-broken faults nothing (the fault is in the workload).
-//   - single: exactly one node.
-//   - zone / ami: `count` nodes confined to one shared domain (a correlated outage).
-//   - reason: `count` arbitrary nodes (the shared "domain" is the injected reason; see injectFault), spread across zones/AMIs.
-//   - unrelated: `count` nodes chosen to MAXIMIZE domain diversity (distinct zone+arch), so they share no domain.
-func selectFaultDomain(c cell, f fleet) []*corev1.Node {
-	if c.help == helpNoWorkloadBroken {
-		return nil
-	}
+// selectFaultDomain picks the nodes to fault per the blast (how many) and impairment (how they relate), and records the
+// impaired domain (impairedKey/impairedValue) on the fleet so the domain-scoped mechanisms can target replacements:
+//   - single (always uncorrelated): exactly one node; no shared domain.
+//   - uncorrelated multi-node: `count` nodes chosen to MAXIMIZE domain diversity (distinct zone+arch), so they share
+//     no domain.
+//   - zone-* / ami-*: `count` nodes confined to one shared zone/arch domain (a correlated outage); that zone/arch is
+//     recorded as the impaired domain.
+//
+// It selects the same node subset regardless of the domained impairment's mechanism (benign / node-broken /
+// workload-broken) — the mechanism differs only in what injectFault and the poll do to those nodes' replacements.
+func (f *fleet) selectFaultDomain(c cell) {
 	count := c.blast.count(c.scale)
 	if count > len(f.nodes) {
 		count = len(f.nodes)
 	}
-	if c.blast == blastSingle || count <= 1 {
-		return capNodes(f.nodes, 1)
+	// blast=single is always uncorrelated (the coupling) — one node, no recorded domain. Every other blast (including a
+	// minority/majority whose count rounds to 1) still runs the impairment switch so a domained cell RECORDS its impaired
+	// zone/arch (impairedKey/impairedValue) — the domain-scoped re-flag/gate need it even when count == 1.
+	if c.blast == blastSingle {
+		f.faultNodes = capNodes(f.nodes, 1)
+		return
 	}
-	switch c.structure {
-	case structZone:
-		return pickSharingDomain(f.nodes, corev1.LabelTopologyZone, count)
-	case structAMI:
-		return pickSharingDomain(f.nodes, corev1.LabelArchStable, count)
-	case structReason:
-		return capNodes(f.nodes, count) // shared reason is stamped in injectFault; domain spread is incidental
-	default: // structUnrelated
-		return pickDiverseDomains(f.nodes, count)
+	switch c.impairment.domainKey() {
+	case corev1.LabelTopologyZone:
+		f.faultNodes = f.pickImpairedDomain(corev1.LabelTopologyZone, count)
+	case corev1.LabelArchStable:
+		f.faultNodes = f.pickImpairedDomain(corev1.LabelArchStable, count)
+	default: // uncorrelated
+		f.faultNodes = pickDiverseDomains(f.nodes, count)
 	}
 }
 
-// pickSharingDomain returns up to `count` nodes that all share the most-populated value of `key` (a correlated outage
-// confined to one zone/arch). If the largest group is smaller than count, it returns that whole group.
-func pickSharingDomain(nodes []*corev1.Node, key string, count int) []*corev1.Node {
+// pickImpairedDomain returns up to `count` nodes that all share the most-populated value of `key` (a correlated outage
+// confined to one zone/arch) and records that domain on the fleet. If the largest group is smaller than count, it
+// returns that whole group.
+func (f *fleet) pickImpairedDomain(key string, count int) []*corev1.Node {
 	byVal := map[string][]*corev1.Node{}
-	for _, n := range nodes {
-		v := n.Labels[key]
-		byVal[v] = append(byVal[v], n)
+	for _, n := range f.nodes {
+		byVal[n.Labels[key]] = append(byVal[n.Labels[key]], n)
 	}
-	var best []*corev1.Node
-	for _, group := range byVal {
+	bestVal, best := "", []*corev1.Node(nil)
+	for v, group := range byVal {
 		if len(group) > len(best) {
-			best = group
+			bestVal, best = v, group
 		}
 	}
+	f.impairedKey = key
+	f.impairedValue = bestVal
 	return capNodes(best, count)
 }
 
@@ -432,26 +382,35 @@ func pickDiverseDomains(nodes []*corev1.Node, count int) []*corev1.Node {
 	return picked
 }
 
-// armHelpModel sets up implementation of the replacement fault model that must exist before/at fault injection.
-func armHelpModel(c cell, f *fleet) {
-	if c.help == helpNoLaunchFail {
-		// launch-fail (ICE/capacity): replacements can never be created. We clamp every pool so no new node beyond the
-		// current fleet can launch. The initial fleet is already provisioned, so this only blocks replacements.
-		// TODO(validate-on-cluster): confirm this reliably yields ICE-style failed launches (call inflation) rather
-		// than a silent no-op. An alternative is marking the KWOKNodeClass NotReady, which makes Create() return
-		// NodeClassNotReadyError in the deployed kwok provider.
-		for _, np := range f.nodePools {
-			stored := np.DeepCopy()
-			np.Spec.Limits = v1.Limits{corev1.ResourceCPU: resource.MustParse("0")}
-			Expect(env.Client.Patch(env.Context, np, client.MergeFrom(stored))).To(Succeed())
-		}
+// armImpairment sets up the replacement mechanism that must exist BEFORE the fault is injected. Only workload-broken
+// needs pre-arming: its pods carry an unsatisfied SimWorkloadReady readiness gate (added to the template in
+// newWorkload), so nothing is Ready until we gate every workload pod True to establish the healthy baseline. injectFault
+// then flips the impaired domain's pods back False. benign / node-broken / uncorrelated arm nothing here — their
+// mechanisms are either reactive (reflagInDomain, inside the poll) or need no replacement rig at all.
+func armImpairment(c cell, f *fleet) {
+	if !c.impairment.workloadBroken() {
+		return
 	}
+	// Gate every workload pod Ready and confirm the healthy baseline (nodes are healthy and every pod is Ready).
+	Expect(interruptibleEventually(provisionTimeout, func(g Gomega) {
+		setWorkloadReadyGate(f, corev1.ConditionTrue, false)
+		g.Expect(healthyOnGoodCapacity(f)).To(BeNumerically(">=", f.replicas))
+	})).To(Succeed())
 }
 
-// injectFault marks the fault-domain nodes with the repair-matching condition. For kubelet-dead it first blocks
-// eviction on those nodes' workload pods (so a graceful drain can never complete). workload-broken has no fault domain,
-// so this injects no node condition — the fault lives in the (readiness-gated) workload alone.
+// injectFault arms the cell's fault at t=faultOnset. For the node-level impairments (uncorrelated / benign /
+// node-broken) it marks the fault-domain nodes with the repair-matching SimUnhealthy condition, first blocking eviction
+// on those nodes' workload pods for kubelet-dead (so a graceful drain can never complete). For workload-broken it
+// injects NO node condition — the nodes stay healthy (Karpenter-blind) and the fault lives in the readiness-gated
+// workload: the impaired domain's pods are flipped un-ready.
 func injectFault(c cell, f *fleet) {
+	f.faultOnset = time.Now()
+	if c.impairment.workloadBroken() {
+		// SCHEDULE-time fault: flip the readiness gate False on the workload pods in the impaired domain so they go —
+		// and stay — un-ready while their nodes remain Ready. The poll re-applies this to fresh in-domain replacements.
+		setWorkloadReadyGate(f, corev1.ConditionFalse, true)
+		return
+	}
 	if c.drain == drainNoKubeletDead {
 		// "Eviction won't succeed": pin the faulted nodes' workload pods with the env's TestingFinalizer so an eviction
 		// (a DELETE) is accepted but never completes — the pod sticks in Terminating, exactly as when a dead kubelet
@@ -459,8 +418,7 @@ func injectFault(c cell, f *fleet) {
 		// strips TestingFinalizer, so this does not leak into teardown.
 		blockEvictionOnFaultNodes(f)
 	}
-	f.faultOnset = time.Now()
-	sustainFault(c, f)
+	sustainFault(c, f) // inject SimUnhealthy=True on the faulted nodes
 }
 
 // sustainFault (re-)asserts SimUnhealthy=True on every still-existing faulted node. It must be called repeatedly through
@@ -470,6 +428,9 @@ func injectFault(c cell, f *fleet) {
 // candidate. LastTransitionTime is pinned to faultOnset so re-asserting never resets the repair toleration clock. A node
 // that repair has already terminated (Get fails) is left alone, so the fault ends exactly when repair completes.
 func sustainFault(c cell, f *fleet) {
+	if c.impairment.workloadBroken() {
+		return // workload-broken injects no node condition; there is nothing to sustain
+	}
 	ltt := metav1.NewTime(f.faultOnset)
 	for i, n := range f.faultNodes {
 		fresh := &corev1.Node{}
@@ -499,12 +460,12 @@ func hasTrueSimUnhealthy(n *corev1.Node) bool {
 	return false
 }
 
-// faultReason is the Reason stamped on the injected SimUnhealthy condition. For unrelated multi-node failures each node
-// gets a DISTINCT reason (so they share no cause); every other structure shares one reason (a common cause — the
-// correlation signal for the reason structure, and harmless for zone/ami which correlate on a label instead).
+// faultReason is the Reason stamped on the injected SimUnhealthy condition. For uncorrelated multi-node failures each
+// node gets a DISTINCT reason (so they share no cause); the domained (zone-*/ami-*) impairments share one reason — the
+// correlation being carried by the shared zone/arch label rather than the reason string.
 func faultReason(c cell, i int) string {
-	if c.blast != blastSingle && c.structure == structUnrelated {
-		return fmt.Sprintf("RepairPerfUnrelated-%d", i)
+	if c.blast != blastSingle && c.impairment == impUncorrelated {
+		return fmt.Sprintf("RepairPerfUncorrelated-%d", i)
 	}
 	return "RepairPerfInjectedUnhealthy"
 }
@@ -528,40 +489,73 @@ func blockEvictionOnFaultNodes(f *fleet) {
 	}
 }
 
-// measureRecovery waits (Eventually) for the workload to be healthy again on non-faulted capacity, re-flagging fresh
-// replacements per the help model along the way. Returns whether recovery was observed within recoveryTimeout.
+// measureRecovery is the ONE poll every cell runs: each tick re-asserts the base fault and applies the domain-scoped
+// replacement mechanisms, then checks whether the workload is fully healthy on good capacity. Returns whether full
+// recovery was observed within recoveryTimeout.
 func measureRecovery(c cell, f *fleet) (recovered bool) {
 	err := interruptibleEventually(recoveryTimeout, func(g Gomega) {
-		// Keep the injected fault alive against KWOK's heartbeat clobber until repair actually terminates the node —
-		// otherwise a slow (dwell-gated) repair never sees a durable candidate.
+		// Keep the injected node fault alive against KWOK's heartbeat clobber until repair actually terminates the node
+		// (no-op for workload-broken) — otherwise a slow (dwell-gated) repair never sees a durable candidate.
 		sustainFault(c, f)
-		// Re-flag fresh replacements for the re-flag help models: any workload node that is not one of the originally
-		// faulted nodes and is Ready gets re-faulted (in-dwell vs after-dwell differ only in when we allow it).
-		maybeReflag(c, f)
+		// node-broken: any fresh replacement NODE that landed in the impaired domain is re-born unhealthy, so an
+		// in-domain replacement never proves out (repair helps only by escaping the domain).
+		reflagInDomain(c, f)
+		// workload-broken: any fresh replacement POD that landed in the impaired domain keeps the unsatisfied readiness
+		// gate, so it never becomes Ready even though its node is healthy.
+		gateInDomain(c, f)
 
-		// Recovered ⇒ at least `replicas` workload pods are Running on good capacity: not terminating and not on a
-		// still-faulted node. Terminating pods are excluded so an eviction-pinned pod (kubelet-dead) lingering in
-		// Terminating doesn't mask its healthy replacement.
+		// Fully recovered ⇒ at least `replicas` workload pods are Running, Ready, not terminating, and on GOOD capacity
+		// (a node that is not currently flagged SimUnhealthy — which excludes both the original faulted nodes and any
+		// node-broken in-domain replacements). Terminating pods are excluded so an eviction-pinned pod (kubelet-dead)
+		// lingering in Terminating doesn't mask its healthy replacement.
 		g.Expect(healthyOnGoodCapacity(f)).To(BeNumerically(">=", f.replicas))
 	})
 	return err == nil
 }
 
-// healthyOnGoodCapacity counts workload pods that are Running, not terminating, and not scheduled on a faulted node.
+// healthyOnGoodCapacity counts workload pods that are Running, Ready, not terminating, and scheduled on good capacity —
+// a node that exists and is not currently flagged SimUnhealthy. Requiring Ready (not just Running) is what makes a
+// workload-broken pod, whose node is healthy but whose readiness gate is unsatisfied, correctly NOT count as recovered.
 func healthyOnGoodCapacity(f *fleet) int {
 	list := &corev1.PodList{}
 	if err := env.Client.List(env.Context, list, client.MatchingLabelsSelector{Selector: f.selector}); err != nil {
 		return 0
 	}
-	faulted := f.faultedNodeNames()
+	unhealthy := unhealthyNodeNames()
 	n := 0
 	for i := range list.Items {
 		p := &list.Items[i]
-		if p.Status.Phase == corev1.PodRunning && p.DeletionTimestamp == nil && !faulted.Has(p.Spec.NodeName) {
+		if p.Status.Phase == corev1.PodRunning && p.DeletionTimestamp == nil && podReady(p) && !unhealthy.Has(p.Spec.NodeName) {
 			n++
 		}
 	}
 	return n
+}
+
+// podReady reports whether the pod's Ready condition is True (containers AND every readiness gate satisfied).
+func podReady(p *corev1.Pod) bool {
+	for i := range p.Status.Conditions {
+		if p.Status.Conditions[i].Type == corev1.PodReady {
+			return p.Status.Conditions[i].Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// unhealthyNodeNames is the set of nodes currently carrying SimUnhealthy=True — the original faulted nodes plus any
+// node-broken in-domain replacements. Pods on these nodes are not on "good capacity".
+func unhealthyNodeNames() sets.Set[string] {
+	s := sets.New[string]()
+	list := &corev1.NodeList{}
+	if err := env.Client.List(env.Context, list); err != nil {
+		return s
+	}
+	for i := range list.Items {
+		if hasTrueSimUnhealthy(&list.Items[i]) {
+			s.Insert(list.Items[i].Name)
+		}
+	}
+	return s
 }
 
 // --- repair-action observation (node signals) -----------------------------------------------------------------------
@@ -581,62 +575,34 @@ func nodeState(name string) (exists, disrupted, terminating bool) {
 	return true, disrupted, n.DeletionTimestamp != nil
 }
 
-// anyDisrupted reports whether repair has taken a disrupting action on any watched node: the node is gone, carries the
-// disrupted taint, or is terminating.
-func anyDisrupted(nodes []*corev1.Node) bool {
-	for _, n := range nodes {
-		exists, disrupted, terminating := nodeState(n.Name)
-		if !exists || disrupted || terminating {
-			return true
-		}
-	}
-	return false
-}
-
-// anyStuck reports whether any watched node tried to terminate (disrupted taint or deletion timestamp) but is still
-// present — i.e. an action that cannot finish (wedged).
-func anyStuck(nodes []*corev1.Node) bool {
-	for _, n := range nodes {
-		exists, disrupted, terminating := nodeState(n.Name)
-		if exists && (disrupted || terminating) {
-			return true
-		}
-	}
-	return false
-}
-
-// allGone reports whether every watched node has terminated (no longer exists).
-func allGone(nodes []*corev1.Node) bool {
-	for _, n := range nodes {
-		if exists, _, _ := nodeState(n.Name); exists {
-			return false
-		}
-	}
-	return true
-}
-
-// maybeReflag re-injects the fault onto fresh replacement nodes for the re-flag help models, so a "healthy" replacement
-// re-fails and the fault is never truly resolved.
-func maybeReflag(c cell, f *fleet) {
-	if c.help != helpNoUnhealthyInDwell && c.help != helpNoUnhealthyAfterDwell {
-		return
-	}
-	// after-dwell: let the replacement be "proven" healthy past the success dwell before it re-fails. in-dwell:
-	// re-fail immediately (before the dwell would credit it). reflagDwell is measured from fault onset.
-	if c.help == helpNoUnhealthyAfterDwell && time.Since(f.faultOnset) < reflagDwell {
+// reflagInDomain realizes the node-broken LAUNCH mechanism: any fresh replacement NODE that landed in the impaired
+// domain is re-born SimUnhealthy, so an in-domain replacement never proves out (repair helps only by ESCAPING the
+// domain). Domain-scoped — it touches ONLY replacements whose zone/arch matches the impaired domain. No-op for every
+// other impairment.
+func reflagInDomain(c cell, f *fleet) {
+	if !c.impairment.nodeBroken() {
 		return
 	}
 	orig := f.originalNodeNames()
 	for _, n := range env.Monitor.Nodes() {
 		if orig.Has(n.Name) {
-			continue
+			continue // only fresh replacements, never the originally-faulted nodes
 		}
-		// Only re-flag fresh replacement nodes that carry our workload.
-		if podUIDsOnNodes(f.selector, []*corev1.Node{n}).Len() == 0 {
-			continue
+		if n.Labels[f.impairedKey] != f.impairedValue {
+			continue // out-of-domain replacement stays healthy (escaping the domain is how repair helps)
 		}
-		patchNodeReady(n, corev1.ConditionFalse, "RepairPerfReflag")
+		markNodeUnhealthy(n, "RepairPerfNodeBroken")
 	}
+}
+
+// gateInDomain realizes the workload-broken SCHEDULE mechanism: any fresh replacement POD that landed in the impaired
+// domain keeps the unsatisfied readiness gate, so it never becomes Ready even though its node is healthy. Domain-scoped
+// to the impaired zone/arch. No-op for every other impairment.
+func gateInDomain(c cell, f *fleet) {
+	if !c.impairment.workloadBroken() {
+		return
+	}
+	setWorkloadReadyGate(f, corev1.ConditionFalse, true)
 }
 
 // countDisrupted returns how many of the originally-faulted workload pods no longer exist (were evicted/recreated).
@@ -673,15 +639,13 @@ func (f fleet) faultedNodeNames() sets.Set[string] {
 	return s
 }
 
-// patchNodeReady injects the repair-matching fault as the CUSTOM SimUnhealthy=True condition (not Ready). Why not
+// markNodeUnhealthy injects the repair-matching fault as the CUSTOM SimUnhealthy=True condition (not Ready). Why not
 // Ready: KWOK's node-initialize stage immediately reverts any Ready!=True back to Ready=True, AND a NotReady node isn't
 // a clean voluntary-disruption candidate — so a Ready-based fault neither holds nor triggers repair. KWOK does not
 // manage arbitrary conditions, so SimUnhealthy=True sticks while the node stays Ready=True (a valid candidate), exactly
-// like a node-monitoring-agent condition. The deployed KWOK RepairPolicies() must include {SimUnhealthy, True}.
-// The status/reason params are retained for call-site compatibility; any fault status maps to SimUnhealthy=True.
-// TODO(kubelet-dead): the drainNoKubeletDead case still wants Ready=Unknown⇒forceful semantics; model that via a
-// forceful (TGP=0) RepairPolicy for a distinct condition rather than the reverted Ready path.
-func patchNodeReady(n *corev1.Node, status corev1.ConditionStatus, reason string) {
+// like a node-monitoring-agent condition. The deployed KWOK RepairPolicies() must include {SimUnhealthy, True}. Used to
+// re-flag node-broken in-domain replacements (the initial faulted nodes are stamped by sustainFault instead).
+func markNodeUnhealthy(n *corev1.Node, reason string) {
 	GinkgoHelper()
 	fresh := &corev1.Node{}
 	if err := env.Client.Get(env.Context, client.ObjectKeyFromObject(n), fresh); err != nil {
@@ -706,6 +670,64 @@ func patchNodeReady(n *corev1.Node, status corev1.ConditionStatus, reason string
 	}
 	// Status subresource patch; ignore transient errors (measurement setup, retried by the Eventually caller).
 	_ = env.Client.Status().Patch(env.Context, fresh, client.MergeFrom(stored))
+}
+
+// setWorkloadReadyGate patches the SimWorkloadReady readiness-gate condition on the workload pods to `status`. When
+// inDomainOnly is true it patches ONLY pods on the blast's gated nodes — the faultNodes plus their fresh in-domain
+// replacements (see gatedNodeNames) — so the fault is bounded by the blast, not the whole impaired domain; otherwise it
+// patches every workload pod (establishing the healthy baseline in armImpairment). Transient patch errors are ignored —
+// the Eventually caller retries.
+func setWorkloadReadyGate(f *fleet, status corev1.ConditionStatus, inDomainOnly bool) {
+	list := &corev1.PodList{}
+	if err := env.Client.List(env.Context, list, client.MatchingLabelsSelector{Selector: f.selector}); err != nil {
+		return
+	}
+	var inDomain sets.Set[string]
+	if inDomainOnly {
+		inDomain = f.gatedNodeNames()
+	}
+	for i := range list.Items {
+		p := &list.Items[i]
+		if inDomainOnly && !inDomain.Has(p.Spec.NodeName) {
+			continue
+		}
+		stored := p.DeepCopy()
+		p.Status.Conditions = append(lo.Reject(p.Status.Conditions, func(cond corev1.PodCondition, _ int) bool {
+			return cond.Type == simWorkloadReadyGate
+		}), corev1.PodCondition{
+			Type: simWorkloadReadyGate, Status: status, LastTransitionTime: metav1.Now(),
+		})
+		_ = env.Client.Status().Patch(env.Context, p, client.MergeFrom(stored))
+	}
+}
+
+// gatedNodeNames is the set of nodes whose workload pods the workload-broken fault keeps un-ready: the originally-faulted
+// nodes (the `count` faultNodes chosen by the blast) PLUS any fresh replacement that landed in the impaired zone/arch.
+// This mirrors node-broken's mechanism (sustainFault stamps the count faultNodes; reflagInDomain re-flags their in-domain
+// replacements) so the blast bounds how much of the fleet breaks: a node merely CO-LOCATED in the impaired domain but not
+// part of the fault keeps its pods healthy, and minority vs majority produce different broken-pod sets. Scoping the
+// replacements to the impaired domain still guarantees no leak outside it. Empty domain ("" for uncorrelated) ⇒ just the
+// faultNodes.
+func (f *fleet) gatedNodeNames() sets.Set[string] {
+	s := f.faultedNodeNames()
+	if f.impairedKey == "" {
+		return s
+	}
+	orig := f.originalNodeNames()
+	list := &corev1.NodeList{}
+	if err := env.Client.List(env.Context, list); err != nil {
+		return s
+	}
+	for i := range list.Items {
+		n := &list.Items[i]
+		if orig.Has(n.Name) {
+			continue // originals beyond the faultNodes are healthy co-located nodes — never gate them
+		}
+		if n.Labels[f.impairedKey] == f.impairedValue {
+			s.Insert(n.Name) // a fresh in-domain replacement of a faulted node re-inherits the gate
+		}
+	}
+	return s
 }
 
 func podUIDs(selector labels.Selector) sets.Set[string] {

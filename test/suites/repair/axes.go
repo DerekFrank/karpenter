@@ -21,53 +21,82 @@ import (
 	"math"
 	"os"
 	"strconv"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 // The node-repair scenario space is a cross product of end-user-observable axes. A cell is one point in it. Every axis
 // value is expressed in end-user terms so the cases stay implementation-agnostic (black box) across options.
 //
 // Axes:
-//   help      — ground truth: will repairing actually help? (the scoring oracle + replacement fault model)
-//   scale     — fleet size, swept across orders of magnitude, because a fault's MEANING depends on the fraction of the
-//               fleet it hits (1 of 3 is 33% and trips a 20% breaker; 1 of 5000 is negligible).
-//   blast     — how much of the fleet fails: a single node, a minority (~10%), or a majority (~35%).
-//   structure — how the failing nodes relate: unrelated (share no failure domain — independent faults) vs a correlated
-//               outage sharing a zone / AMI / failure reason. Only meaningful when more than one node fails.
-//   drain     — can the node be drained, and do PDBs participate?
-//   strat     — replacement strategy (replace-first vs terminate-first; the latter is currently un-runnable, see
-//               enabledStrategies).
-//   topo      — the customer's NodePool topology (single / per-AZ / per-AMI).
+//   impairment — the correlation domain AND whether/where it is impaired. Replaces the old help + structure axes:
+//                "will repair help" is EMERGENT (derived from the physical situation crossed with the implementation),
+//                not an input.
+//   scale      — fleet size, swept across orders of magnitude, because a fault's MEANING depends on the fraction of the
+//                fleet it hits (1 of 3 is 33% and trips a 20% breaker; 1 of 5000 is negligible).
+//   blast      — how much of the fleet fails: a single node, a minority (~10%), or a majority (~35%).
+//   drain      — can the node be drained, and do PDBs participate?
+//   strat      — replacement strategy (replace-first vs terminate-first; the latter is currently un-runnable, see
+//                enabledStrategies).
+//   topo       — the customer's NodePool topology (single / per-AZ / per-AMI).
 
-// helpTruth — ground truth: will repairing actually help? This is the scoring oracle AND the replacement fault model.
-type helpTruth int
+// impairment encodes the correlation domain AND whether/where that domain is impaired. This single axis replaces the
+// old help + structure axes: whether repair helps is not a knob but a consequence of the physical situation. There are
+// 7 values across two domains (zone / ami) plus an uncorrelated baseline. The three impaired states per domain differ
+// by WHEN they manifest:
+//   - benign         — a replacement in the faulted domain comes up healthy; repair helps regardless of where the
+//     replacement lands (the false-correlation probe: does an implementation needlessly throttle a
+//     co-located-but-fine failure?).
+//   - node-broken    — manifests at LAUNCH: a replacement NODE placed in the impaired domain comes up unhealthy (it
+//     re-inherits the fault). Karpenter-observable (the replacement is itself repair-eligible), so a
+//     good restraint can detect the dead domain and back off. Repair helps ONLY by ESCAPING the domain.
+//   - workload-broken — manifests at SCHEDULE: the replacement node is genuinely healthy, but the WORKLOAD pod placed
+//     on it never becomes ready. Karpenter-BLIND (it sees a healthy node), so repair churns uselessly.
+//     Repair can NEVER help; the correct behavior is to decline.
+//
+// uncorrelated is a single value: independent node faults with no shared domain, each individually repairable by a
+// healthy replacement (benign by nature).
+type impairment int
 
 const (
-	helpYes                   helpTruth = iota // replacement comes up healthy and stays healthy → repair helps
-	helpNoLaunchFail                           // replacement never launches (ICE/capacity) → repair can't help
-	helpNoUnhealthyInDwell                     // replacement boots Ready, re-flagged WITHIN the success dwell
-	helpNoUnhealthyAfterDwell                  // replacement healthy PAST the dwell (scored "proven"), then fails
-	helpNoWorkloadBroken                       // node Ready+healthy to Karpenter, but the workload still fails (blind spot)
+	impUncorrelated       impairment = iota // independent node faults, no shared domain (benign by nature)
+	impZoneBenign                           // zone-correlated; an in-zone replacement comes up healthy
+	impZoneNodeBroken                       // zone-correlated; an in-zone replacement NODE is re-born unhealthy (launch)
+	impZoneWorkloadBroken                   // zone-correlated; an in-zone replacement's POD never becomes ready (schedule)
+	impAMIBenign                            // ami/arch-correlated; an in-arch replacement comes up healthy
+	impAMINodeBroken                        // ami/arch-correlated; an in-arch replacement NODE is re-born unhealthy (launch)
+	impAMIWorkloadBroken                    // ami/arch-correlated; an in-arch replacement's POD never becomes ready (schedule)
 )
 
-func (h helpTruth) String() string {
-	switch h {
-	case helpYes:
-		return "help"
-	case helpNoLaunchFail:
-		return "launchfail"
-	case helpNoUnhealthyInDwell:
-		return "reflag-in-dwell"
-	case helpNoUnhealthyAfterDwell:
-		return "reflag-after-dwell"
-	case helpNoWorkloadBroken:
-		return "workload-broken"
-	}
-	return "?"
+func (i impairment) String() string {
+	return [...]string{
+		"uncorrelated",
+		"zone-benign", "zone-node-broken", "zone-workload-broken",
+		"ami-benign", "ami-node-broken", "ami-workload-broken",
+	}[i]
 }
 
-// helps reports whether repairing genuinely resolves the fault (the oracle direction: minimize time-to-recovery when
-// true, minimize disruption/cp-calls when false). Note workload-broken is observationally healthy but does NOT help.
-func (h helpTruth) helps() bool { return h == helpYes }
+// domainKey is the node label whose value defines the impaired domain: zone for zone-*, arch for ami-*, "" for
+// uncorrelated (no shared domain).
+func (i impairment) domainKey() string {
+	switch i {
+	case impZoneBenign, impZoneNodeBroken, impZoneWorkloadBroken:
+		return corev1.LabelTopologyZone
+	case impAMIBenign, impAMINodeBroken, impAMIWorkloadBroken:
+		return corev1.LabelArchStable
+	default:
+		return ""
+	}
+}
+
+// nodeBroken reports the LAUNCH-time mechanism: a replacement NODE landing in the impaired domain is re-born unhealthy.
+func (i impairment) nodeBroken() bool { return i == impZoneNodeBroken || i == impAMINodeBroken }
+
+// workloadBroken reports the SCHEDULE-time mechanism: a replacement POD landing in the impaired domain never becomes
+// ready even though its node is healthy (the Karpenter-blind blind spot).
+func (i impairment) workloadBroken() bool {
+	return i == impZoneWorkloadBroken || i == impAMIWorkloadBroken
+}
 
 // scale — the fleet size the workload occupies. First-class because the fraction of the fleet a fault hits (not its
 // absolute count) is what a fraction-keyed breaker reacts to.
@@ -108,20 +137,6 @@ func (b blast) count(s scale) int {
 		return 1
 	}
 }
-
-// structure — how the failing nodes relate. unrelated failures share no failure domain (different zones, AMIs, and
-// reasons): independent faults a structure-aware repair may address in parallel. zone/ami/reason failures share a
-// domain: a correlated outage that should be paced. Meaningless for a single failure (blastSingle ignores it).
-type structure int
-
-const (
-	structUnrelated structure = iota
-	structZone
-	structAMI
-	structReason
-)
-
-func (st structure) String() string { return [...]string{"unrelated", "zone", "ami", "reason"}[st] }
 
 // drainability — can the node be drained, and do PDBs participate?
 type drainability int
@@ -167,46 +182,38 @@ func (t topology) String() string {
 
 // cell is one scenario in the cross product.
 type cell struct {
-	help      helpTruth
-	scale     scale
-	blast     blast
-	structure structure
-	drain     drainability
-	strat     strategy
-	topo      topology
+	impairment impairment
+	scale      scale
+	blast      blast
+	drain      drainability
+	strat      strategy
+	topo       topology
 }
 
-// id is a stable, compact identifier for the cell (used for ordering and report rows). structure is rendered "-" for a
-// single-node blast, where it does not apply.
+// id is a stable, compact identifier for the cell (used for ordering and report rows).
 func (c cell) id() string {
-	st := "-"
-	if c.blast != blastSingle {
-		st = c.structure.String()
-	}
-	return fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s", c.help, c.scale, c.blast, st, c.drain, c.strat, c.topo)
+	return fmt.Sprintf("%s|%s|%s|%s|%s|%s", c.impairment, c.scale, c.blast, c.drain, c.strat, c.topo)
 }
 
 // enumerateCells returns the FULL cross product — every cell is an explicit, authoritative entry. There is deliberately
 // no skip()/pruning predicate for DEGENERACY: which cells are degenerate is not a static property of a cell (a cell that
 // collapses for the breaker may not for restraint), so we run every cell and let identical metric rows reveal degeneracy
-// empirically (see the collapse report in report.go). The single-node blast is the one structural collapse baked into
-// enumeration — a single failure has no correlation structure, so it is emitted once rather than crossed with all four
-// structures.
+// empirically (see the collapse report in report.go). The impairment×blast coupling (see impairmentsFor) is the one
+// structural collapse baked into enumeration — a single-node fault has no correlation domain, so it is emitted once as
+// uncorrelated rather than crossed with every domained impairment.
 //
 // Note: the top scales (n1000/n5000) are enumerated for completeness but are expensive to actually run — provisioning
 // thousands of KWOK nodes per cell. Running the full product is a resourced activity; the enumeration stays authoritative
 // so no scale is silently dropped.
 func enumerateCells() []cell {
 	var cells []cell
-	for _, h := range []helpTruth{helpYes, helpNoLaunchFail, helpNoUnhealthyInDwell, helpNoUnhealthyAfterDwell, helpNoWorkloadBroken} {
-		for _, sc := range []scale{scale3, scale10, scale100, scale1000, scale5000} {
-			for _, b := range []blast{blastSingle, blastMinority, blastMajority} {
-				for _, st := range structuresFor(b) {
-					for _, d := range []drainability{drainYesNoPDB, drainYesPDB, drainNoPDBBlock, drainNoKubeletDead} {
-						for _, s := range enabledStrategies() {
-							for _, t := range []topology{topoSingle, topoPerAZ, topoPerAMI} {
-								cells = append(cells, cell{help: h, scale: sc, blast: b, structure: st, drain: d, strat: s, topo: t})
-							}
+	for _, sc := range []scale{scale3, scale10, scale100, scale1000, scale5000} {
+		for _, b := range []blast{blastSingle, blastMinority, blastMajority} {
+			for _, imp := range impairmentsFor(b) {
+				for _, d := range []drainability{drainYesNoPDB, drainYesPDB, drainNoPDBBlock, drainNoKubeletDead} {
+					for _, s := range enabledStrategies() {
+						for _, t := range []topology{topoSingle, topoPerAZ, topoPerAMI} {
+							cells = append(cells, cell{impairment: imp, scale: sc, blast: b, drain: d, strat: s, topo: t})
 						}
 					}
 				}
@@ -242,13 +249,22 @@ func envInt(name string, def int) int {
 	return def
 }
 
-// structuresFor returns the structure values to enumerate for a blast: a single failure has no correlation structure
-// (emitted once), a multi-node blast is crossed with all four.
-func structuresFor(b blast) []structure {
+// impairmentsFor returns the impairment values valid for a blast, enforcing the enumeration couplings (not a free cross):
+//   - blast=single ⟹ impairment=uncorrelated: a one-node fault has no correlation domain (the single-collapses-
+//     correlation rule).
+//   - the domained values (zone-*/ami-*) need more than one node to correlate, so they appear only at minority/majority.
+//   - uncorrelated is valid at every blast.
+//
+// So impairment×blast yields 15 valid combos: single→1, minority→7, majority→7.
+func impairmentsFor(b blast) []impairment {
 	if b == blastSingle {
-		return []structure{structUnrelated} // sentinel; id() renders "-" for single
+		return []impairment{impUncorrelated}
 	}
-	return []structure{structUnrelated, structZone, structAMI, structReason}
+	return []impairment{
+		impUncorrelated,
+		impZoneBenign, impZoneNodeBroken, impZoneWorkloadBroken,
+		impAMIBenign, impAMINodeBroken, impAMIWorkloadBroken,
+	}
 }
 
 // enabledStrategies is the strategy axis restricted to values that have a testable implementation on the deployed build.
