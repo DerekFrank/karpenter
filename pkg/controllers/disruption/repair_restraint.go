@@ -45,14 +45,16 @@ type RepairRestraint interface {
 	// CanDisrupt reports whether this candidate may be probed now.
 	CanDisrupt(c *Candidate) bool
 	// Record informs the policy of the outcome of a candidate it previously admitted (or one whose fault just cleared).
-	Record(c *Candidate, outcome RepairOutcome)
+	// replacement is the Node the repair pre-spun (nil for a delete-only/terminate-first repair, or a launch that never
+	// produced a node), so the policy can attribute a location-scoped outcome to where the replacement actually came up.
+	Record(c *Candidate, replacement *corev1.Node, outcome RepairOutcome)
 }
 
 // noRestraint is the identity policy: always admit, remember nothing — the behavior when only the budget paces repair.
 type noRestraint struct{}
 
-func (noRestraint) CanDisrupt(*Candidate) bool       { return true }
-func (noRestraint) Record(*Candidate, RepairOutcome) {}
+func (noRestraint) CanDisrupt(*Candidate) bool                     { return true }
+func (noRestraint) Record(*Candidate, *corev1.Node, RepairOutcome) {}
 
 // Correlated-failure restraint (Node Repair Under Correlated Failure, F3) — the default RepairRestraint. Per failure
 // domain (NodePool, zone, policy-condition), repair opens up geometrically while replacements prove out and backs off
@@ -163,21 +165,27 @@ func (r *restraint) CanDisrupt(c *Candidate) bool {
 //   - Failed → reset width to the floor and arm an exponentially-backed-off, capped cooldown (slow down when it doesn't).
 //   - Cleared → the fault episode is over with no in-flight probe left; forget the domains' earned width so a new
 //     correlated burst starts slow again (past success ≠ predictor of a new correlated failure).
-func (r *restraint) Record(c *Candidate, outcome RepairOutcome) {
-	domains := domainsOf(c)
-	for _, d := range domains {
+func (r *restraint) Record(c *Candidate, replacement *corev1.Node, outcome RepairOutcome) {
+	for _, d := range domainsOf(c) {
 		switch outcome {
 		case RepairProven:
 			if r.inFlight[d] > 0 {
 				r.inFlight[d]--
 			}
-			r.width[d] = r.widthFor(d) * 2
-			delete(r.cooldownUntil, d)
-			delete(r.failCount, d)
+			// Widen cautiously: only credit (speed up) a zone we actually tested — a replacement that came up healthy in a
+			// different zone says nothing about the candidate's zone, so it must not widen it (the C2 false-signal).
+			if r.credits(d, replacement) {
+				r.width[d] = r.widthFor(d) * 2
+				delete(r.cooldownUntil, d)
+				delete(r.failCount, d)
+			}
 		case RepairFailed:
 			if r.inFlight[d] > 0 {
 				r.inFlight[d]--
 			}
+			// Back off quickly: a failure is always a reason to slow this candidate's domains, so cool every one of them
+			// unconditionally. (Gating this on the replacement's zone too would let a re-flagged flood whose replacement
+			// landed elsewhere slip back through the still-fresh zone via the any-domain-out-of-cooldown admission rule.)
 			r.width[d] = restraintWidthFloor
 			r.failCount[d]++
 			backoff := restraintCooldownT0 << (r.failCount[d] - 1)
@@ -194,4 +202,19 @@ func (r *restraint) Record(c *Candidate, outcome RepairOutcome) {
 			}
 		}
 	}
+}
+
+// credits reports whether a SUCCESS may speed up (widen) domain d. Only a zone (location) domain can be mis-credited,
+// and only when the replacement came up in a DIFFERENT zone: a healthy replacement elsewhere says nothing about the
+// candidate's (possibly impaired) zone, so it must not widen it — this is the network-partition false-signal the review
+// flagged ("only learn about a failure domain if the replacement is in it"). A delete-only / launch-failed repair
+// (replacement == nil) has no other zone to attribute to, so it credits the candidate's zone as before. NodePool (the
+// replacement is always in the candidate's pool) and policy (the candidate's own condition — success means repairing
+// that condition worked) are always the candidate's, so they are always credited. Backing off on failure is NOT gated
+// by this — a failure always cools the candidate's own domains (see Record).
+func (r *restraint) credits(d failureDomain, replacement *corev1.Node) bool {
+	if d.kind != "zone" || replacement == nil {
+		return true
+	}
+	return replacement.Labels[corev1.LabelTopologyZone] == d.value
 }

@@ -51,6 +51,12 @@ func wbCandidate(providerID, nodePool, zone, condType string) *Candidate {
 	}
 }
 
+// wbReplacement builds a minimal healthy replacement Node in the given zone, so Record can attribute a location-scoped
+// outcome to where the replacement actually came up (its zone domain is learned only if it matches the candidate's).
+func wbReplacement(zone string) *corev1.Node {
+	return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{corev1.LabelTopologyZone: zone}}}
+}
+
 var _ = Describe("Repair/Restraint (dials)", func() {
 	var r *restraint
 	var fakeClock *clocktesting.FakeClock
@@ -73,7 +79,7 @@ var _ = Describe("Repair/Restraint (dials)", func() {
 	It("doubles concurrency on a proven success", func() {
 		c1 := wbCandidate("n1", "np", "z1", "BadNode")
 		Expect(r.CanDisrupt(c1)).To(BeTrue())
-		r.Record(c1, RepairProven) // proven → width doubles to 2, in-flight back to 0
+		r.Record(c1, wbReplacement("z1"), RepairProven) // proven → width doubles to 2, in-flight back to 0
 
 		c2, c3, c4 := wbCandidate("n2", "np", "z1", "BadNode"), wbCandidate("n3", "np", "z1", "BadNode"), wbCandidate("n4", "np", "z1", "BadNode")
 		Expect(r.CanDisrupt(c2)).To(BeTrue())
@@ -94,7 +100,7 @@ var _ = Describe("Repair/Restraint (dials)", func() {
 	It("pauses after a failed probe, then re-admits once the cooldown elapses", func() {
 		c := wbCandidate("n1", "np", "z1", "BadNode")
 		Expect(r.CanDisrupt(c)).To(BeTrue())
-		r.Record(c, RepairFailed) // floor + cooldown armed (t0 + 1m)
+		r.Record(c, wbReplacement("z1"), RepairFailed) // floor + cooldown armed (t0 + 1m)
 
 		Expect(r.CanDisrupt(wbCandidate("n2", "np", "z1", "BadNode"))).To(BeFalse()) // still in cooldown at t0
 		fakeClock.Step(2 * time.Minute)
@@ -121,12 +127,12 @@ var _ = Describe("Repair/Restraint (dials)", func() {
 	It("forgets a domain's width when its fault clears", func() {
 		c := wbCandidate("n1", "np", "z1", "BadNode")
 		Expect(r.CanDisrupt(c)).To(BeTrue())
-		r.Record(c, RepairProven) // width 2 across c's domains, in-flight back to 0
+		r.Record(c, wbReplacement("z1"), RepairProven) // width 2 across c's domains, in-flight back to 0
 		c2 := wbCandidate("n2", "np", "z1", "BadNode")
-		Expect(r.CanDisrupt(c2)).To(BeTrue()) // width 2 lets a 2nd concurrent probe in
-		r.Record(c2, RepairProven)            // resolve it so nothing dangles in-flight
+		Expect(r.CanDisrupt(c2)).To(BeTrue())           // width 2 lets a 2nd concurrent probe in
+		r.Record(c2, wbReplacement("z1"), RepairProven) // resolve it so nothing dangles in-flight
 
-		r.Record(c, RepairCleared) // episode over, no in-flight probes → forget earned width
+		r.Record(c, nil, RepairCleared) // episode over, no in-flight probes → forget earned width
 
 		// A fresh burst in the same domains starts at the floor again: one admitted, second blocked.
 		Expect(r.CanDisrupt(wbCandidate("m1", "np", "z1", "BadNode"))).To(BeTrue())
@@ -137,11 +143,28 @@ var _ = Describe("Repair/Restraint (dials)", func() {
 	It("does not forget a domain with an in-flight probe", func() {
 		c1 := wbCandidate("n1", "np", "z1", "BadNode")
 		Expect(r.CanDisrupt(c1)).To(BeTrue())
-		r.Record(c1, RepairProven) // width 2
+		r.Record(c1, wbReplacement("z1"), RepairProven) // width 2
 		c2 := wbCandidate("n2", "np", "z1", "BadNode")
 		Expect(r.CanDisrupt(c2)).To(BeTrue()) // in-flight in the domain
-		r.Record(c1, RepairCleared)           // c1's fault cleared, but c2 is still in flight → keep the width
+		r.Record(c1, nil, RepairCleared)      // c1's fault cleared, but c2 is still in flight → keep the width
 		Expect(r.width[failureDomain{kind: "zone", value: "z1"}]).To(Equal(2))
+	})
+
+	// FINDING (adversarial): a bad AMI rolled across a NodePool that spans multiple zones is NOT paced pool-wide the way a
+	// single-zone flood is. A failed probe cools the candidate's {NodePool, zone, policy} domains, but admission is
+	// "eligible if ANY domain is out of cooldown", so a sibling in the SAME NodePool + policy but a still-fresh OTHER zone
+	// is admitted anyway — the NodePool/policy cooldown only pauses same-zone siblings. So a bad AMI churns ~one probe per
+	// zone before the per-zone cooldowns catch up, rather than trickling as one. (Deterministic clock, so this is the
+	// bypass itself, not a cooldown that quietly expired.)
+	It("lets a still-fresh sibling zone bypass a cooling NodePool/policy backoff (multi-zone bad-AMI gap)", func() {
+		a := wbCandidate("a", "np", "z1", "BadNode")
+		Expect(r.CanDisrupt(a)).To(BeTrue())
+		r.Record(a, nil, RepairFailed) // launch-failed (never registered): cools NodePool np, zone z1, policy BadNode
+
+		// Same NodePool + same policy, DIFFERENT (fresh) zone → admitted despite the NodePool/policy cooldown.
+		Expect(r.CanDisrupt(wbCandidate("b", "np", "z2", "BadNode"))).To(BeTrue())
+		// Same NodePool + same policy, SAME (cooled) zone → correctly paused.
+		Expect(r.CanDisrupt(wbCandidate("c", "np", "z1", "BadNode"))).To(BeFalse())
 	})
 
 	// INV-S3 (structural): repair registers first in NewMethods when repair policies exist, and not at all otherwise.

@@ -758,19 +758,27 @@ func ExpectMakeNodesInitialized(ctx context.Context, c client.Client, clk clock.
 	}
 }
 
-func ExpectMakeNodesNotReady(ctx context.Context, c client.Client, clk clock.Clock, nodes ...*corev1.Node) {
+// ExpectMakeNodesStatusChanged marks each node Running and sets its status Conditions to the ones given (replacing any
+// existing conditions), then applies it. Each condition's LastHeartbeatTime / LastTransitionTime default to clk.Now()
+// when unset, so toleration and aging measure from the fake clock. ExpectMakeNodesReady / ExpectMakeNodesNotReady are
+// thin consumers for the common Ready case; callers needing other conditions (e.g. a repair-policy condition) pass them
+// directly — include a Ready=True condition alongside if the node should stay otherwise-ready.
+func ExpectMakeNodesStatusChanged(ctx context.Context, c client.Client, clk clock.Clock, conditions []corev1.NodeCondition, nodes ...*corev1.Node) {
+	GinkgoHelper()
 	for i := range nodes {
 		nodes[i] = ExpectExists(ctx, c, nodes[i])
 		nodes[i].Status.Phase = corev1.NodeRunning
-		nodes[i].Status.Conditions = []corev1.NodeCondition{
-			{
-				Type:               corev1.NodeReady,
-				Status:             corev1.ConditionFalse,
-				LastHeartbeatTime:  metav1.NewTime(clk.Now()),
-				LastTransitionTime: metav1.NewTime(clk.Now()),
-				Reason:             "NotReady",
-			},
+		conds := make([]corev1.NodeCondition, len(conditions))
+		for j, cond := range conditions {
+			if cond.LastHeartbeatTime.IsZero() {
+				cond.LastHeartbeatTime = metav1.NewTime(clk.Now())
+			}
+			if cond.LastTransitionTime.IsZero() {
+				cond.LastTransitionTime = metav1.NewTime(clk.Now())
+			}
+			conds[j] = cond
 		}
+		nodes[i].Status.Conditions = conds
 		if nodes[i].Labels == nil {
 			nodes[i].Labels = map[string]string{}
 		}
@@ -778,23 +786,21 @@ func ExpectMakeNodesNotReady(ctx context.Context, c client.Client, clk clock.Clo
 	}
 }
 
+func ExpectMakeNodesNotReady(ctx context.Context, c client.Client, clk clock.Clock, nodes ...*corev1.Node) {
+	GinkgoHelper()
+	ExpectMakeNodesStatusChanged(ctx, c, clk, []corev1.NodeCondition{
+		{Type: corev1.NodeReady, Status: corev1.ConditionFalse, Reason: "NotReady"},
+	}, nodes...)
+}
+
 func ExpectMakeNodesReady(ctx context.Context, c client.Client, clk clock.Clock, nodes ...*corev1.Node) {
+	GinkgoHelper()
+	ExpectMakeNodesStatusChanged(ctx, c, clk, []corev1.NodeCondition{
+		{Type: corev1.NodeReady, Status: corev1.ConditionTrue, Reason: "KubeletReady"},
+	}, nodes...)
+	// Remove any of the known ephemeral taints to make the Node ready
 	for i := range nodes {
 		nodes[i] = ExpectExists(ctx, c, nodes[i])
-		nodes[i].Status.Phase = corev1.NodeRunning
-		nodes[i].Status.Conditions = []corev1.NodeCondition{
-			{
-				Type:               corev1.NodeReady,
-				Status:             corev1.ConditionTrue,
-				LastHeartbeatTime:  metav1.NewTime(clk.Now()),
-				LastTransitionTime: metav1.NewTime(clk.Now()),
-				Reason:             "KubeletReady",
-			},
-		}
-		if nodes[i].Labels == nil {
-			nodes[i].Labels = map[string]string{}
-		}
-		// Remove any of the known ephemeral taints to make the Node ready
 		nodes[i].Spec.Taints = lo.Reject(nodes[i].Spec.Taints, func(taint corev1.Taint, _ int) bool {
 			_, found := lo.Find(pscheduling.KnownEphemeralTaints, func(t corev1.Taint) bool {
 				return t.MatchTaint(&taint)

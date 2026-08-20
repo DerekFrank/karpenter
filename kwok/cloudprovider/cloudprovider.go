@@ -163,12 +163,21 @@ func (c CloudProvider) RepairPolicies() []cloudprovider.RepairPolicy {
 		{
 			ConditionType:      corev1.NodeReady,
 			ConditionStatus:    corev1.ConditionFalse,
-			TolerationDuration: 10 * time.Minute,
+			TolerationDuration: 15 * time.Second,
 		},
 		{
 			ConditionType:      corev1.NodeReady,
 			ConditionStatus:    corev1.ConditionUnknown,
-			TolerationDuration: 10 * time.Minute,
+			TolerationDuration: 15 * time.Second,
+		},
+		// Custom repair condition for the e2e repair-perf sim: KWOK does not manage arbitrary node conditions (only
+		// Ready + the lease), so a fault injected as SimUnhealthy=True HOLDS — unlike Ready=False, which the
+		// node-initialize stage immediately reverts. The node stays Ready=True (so it's a normal disruption candidate),
+		// carrying an unhealthy condition, exactly as a node-monitoring-agent would emit one.
+		{
+			ConditionType:      "SimUnhealthy",
+			ConditionStatus:    corev1.ConditionTrue,
+			TolerationDuration: 15 * time.Second,
 		},
 	}
 }

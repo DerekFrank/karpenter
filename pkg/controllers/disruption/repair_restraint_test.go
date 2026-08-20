@@ -46,13 +46,11 @@ var _ = Describe("Repair/Restraint", func() {
 	var repairController *disruption.Controller
 
 	markUnhealthy := func(n *corev1.Node, condType corev1.NodeConditionType) {
-		n = ExpectExists(ctx, env.Client, n)
-		n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
-			Type:               condType,
-			Status:             corev1.ConditionFalse,
-			LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
-		})
-		ExpectApplied(ctx, env.Client, n)
+		// Stamp the repair-policy condition while keeping the node otherwise-Ready, then re-sync cluster state.
+		ExpectMakeNodesStatusChanged(ctx, env.Client, env.Clock, []corev1.NodeCondition{
+			{Type: corev1.NodeReady, Status: corev1.ConditionTrue, Reason: "KubeletReady"},
+			{Type: condType, Status: corev1.ConditionFalse},
+		}, n)
 		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(n))
 	}
 
@@ -182,6 +180,49 @@ var _ = Describe("Repair/Restraint", func() {
 		// After the capped cooldown elapses, the node is admitted again — paused, not halted.
 		env.Clock.Step(11 * time.Minute)
 		reconcileN(2)
+		Expect(queue.GetCommands()).To(HaveLen(1))
+	})
+
+	// End-to-end flood with REAL probe-outcome detection (not the whitebox dial sim): a correlated burst whose
+	// replacements come up Ready and are then RE-FLAGGED during the success dwell (the systematic false positive). This
+	// exercises observeProbes' replacement-health check: the dwell must verify the replacement STAYS healthy, so a
+	// re-flagged replacement is a FAILED probe — not a success timed out on a bare clock. A spurious "proven" here would
+	// widen the domain to two concurrent probes (cf. the "widens after proven" spec); the correct behavior holds at one.
+	It("treats a replacement re-flagged during the dwell as a failed probe, pacing the flood at one probe", func() {
+		// Bind a pod to each flood node so repair PRE-SPINS a replacement (replace-then-terminate) — an empty node would
+		// be delete-only with no replacement to re-flag.
+		for i := 0; i < 4; i++ {
+			_, n := newUnhealthyNode("test-zone-1a", "BadNode")
+			bindPod(n)
+		}
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+		cmds := queue.GetCommands()
+		Expect(cmds).To(HaveLen(1))
+		Expect(cmds[0].Replacements).To(HaveLen(1))
+
+		// The replacement initializes (looks healthy), so the queue terminates the original.
+		ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
+		ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+		ExpectNodeClaimsCascadeDeletion(ctx, env.Client, cmds[0].Candidates[0].NodeClaim)
+
+		// The false positive re-fires on the fresh replacement: mark it unhealthy during the dwell.
+		replNC := ExpectExists(ctx, env.Client, &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: cmds[0].Replacements[0].Name}})
+		Expect(replNC.Status.NodeName).ToNot(BeEmpty())
+		replNode := ExpectExists(ctx, env.Client, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: replNC.Status.NodeName}})
+		markUnhealthy(replNode, "BadNode")
+
+		// Past the dwell: original gone AND replacement unhealthy → observeProbes records RepairFailed and arms a cooldown,
+		// so the domain does NOT widen (a spurious proven would admit a second concurrent probe here).
+		env.Clock.Step(6 * time.Minute)
+		reconcileN(3)
+		Expect(queue.GetCommands()).To(HaveLen(0))
+
+		// Pause, not stop: once the cooldown elapses the flood is probed again — but still one at a time (floor 1), never
+		// widened by the false positive.
+		env.Clock.Step(2 * time.Minute)
+		reconcileN(3)
 		Expect(queue.GetCommands()).To(HaveLen(1))
 	})
 

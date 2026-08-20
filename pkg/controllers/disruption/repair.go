@@ -22,6 +22,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/awslabs/operatorpkg/option"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -69,13 +70,31 @@ type Repair struct {
 type repairProbe struct {
 	candidate     *Candidate
 	nodeClaimName string
-	succeededAt   time.Time // when the original was observed terminated (replacement came up); zero until then
+	replacements  []*Replacement // the pre-spun replacement(s) to watch for durable health; empty for terminate-first
+	succeededAt   time.Time      // when the replacement was first observed healthy after the original terminated; zero until then
 }
 
 // repairDwell is how long a replacement must hold Ready+Healthy before a probe counts as a durable success.
 const repairDwell = 5 * time.Minute
 
-func NewRepair(kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, clk clock.Clock, queue *Queue) *Repair {
+// RepairOptions carries optional overrides for NewRepair. The only override today is the restraint policy, which
+// defaults to the correlated-failure AIMD policy; a test (or an alternate build) can swap in noRestraint or any other
+// RepairRestraint without touching the constructor's callers.
+type RepairOptions struct {
+	restraint RepairRestraint
+}
+
+// WithRestraint overrides the RepairRestraint policy repair paces with (default: the correlated-failure AIMD policy).
+// Passing noRestraint recovers the budget-only behavior, which is useful as a control arm when demonstrating what
+// restraint changes.
+func WithRestraint(rr RepairRestraint) option.Function[RepairOptions] {
+	return func(o *RepairOptions) { o.restraint = rr }
+}
+
+func NewRepair(kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, clk clock.Clock, queue *Queue, opts ...option.Function[RepairOptions]) *Repair {
+	// The correlated-failure AIMD policy is the default RepairRestraint; WithRestraint swaps in another implementation
+	// (or noRestraint) without touching this method's callers.
+	o := option.Resolve(append([]option.Function[RepairOptions]{WithRestraint(newRestraint(clk))}, opts...)...)
 	return &Repair{
 		kubeClient:    kubeClient,
 		cluster:       cluster,
@@ -86,9 +105,7 @@ func NewRepair(kubeClient client.Client, cluster *state.Cluster, provisioner *pr
 		queue:         queue,
 		probes:        map[string]*repairProbe{},
 		acted:         map[string]*Candidate{},
-		// The correlated-failure AIMD policy is the default RepairRestraint; swap for another implementation (or
-		// noRestraint) without touching this method.
-		restraint: newRestraint(clk),
+		restraint:     o.restraint,
 	}
 }
 
@@ -203,10 +220,13 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 		if err := r.stampDrainBound(ctx, candidate, rr.merged); err != nil {
 			return []Command{}, err
 		}
-		r.trackProbe(candidate)
+		// Share the same *Replacement objects with the probe: the queue fills in each Replacement.Name on launch, so the
+		// probe can later find the replacement NodeClaim(s) and verify they stay healthy through the dwell.
+		replacements := replacementsFromNodeClaims(results.NewNodeClaims...)
+		r.trackProbe(candidate, replacements...)
 		return []Command{{
 			Candidates:          []*Candidate{candidate},
-			Replacements:        replacementsFromNodeClaims(results.NewNodeClaims...),
+			Replacements:        replacements,
 			Results:             results,
 			PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
 		}}, nil
@@ -232,8 +252,8 @@ func (r *Repair) terminateFirstCommand(ctx context.Context, candidate *Candidate
 // trackProbe records a just-issued repair as an in-flight probe (CanDisrupt already counted it in-flight in the
 // restraint policy) so observeProbes can later attribute its outcome. It is also remembered in acted so, once its
 // fault later clears, repair can tell the policy the domain's episode is over (RepairCleared).
-func (r *Repair) trackProbe(c *Candidate) {
-	r.probes[c.ProviderID()] = &repairProbe{candidate: c, nodeClaimName: c.NodeClaim.Name}
+func (r *Repair) trackProbe(c *Candidate, replacements ...*Replacement) {
+	r.probes[c.ProviderID()] = &repairProbe{candidate: c, nodeClaimName: c.NodeClaim.Name, replacements: replacements}
 	r.acted[c.ProviderID()] = c
 }
 
@@ -254,18 +274,37 @@ func (r *Repair) observeProbes(ctx context.Context) {
 		err := r.kubeClient.Get(ctx, types.NamespacedName{Name: p.nodeClaimName}, nc)
 		switch {
 		case apierrors.IsNotFound(err):
-			// Original terminated → replacement proved healthy enough for the queue to proceed. Require the dwell to
-			// elapse before counting it as a durable success (invariant: success = healthy for a while).
-			if p.succeededAt.IsZero() {
-				p.succeededAt = now
-			}
-			if !now.Before(p.succeededAt.Add(repairDwell)) {
-				r.restraint.Record(p.candidate, RepairProven)
+			// The original was terminated, so the queue proceeded — the replacement reached Initialized. But a durable
+			// success (invariant: Ready AND healthy for a while) requires the replacement to STAY healthy through the
+			// dwell. A systematic false positive re-flags the replacement too, so we must verify the replacement's health,
+			// not merely time out from the original's termination — otherwise a re-flagged replacement counts as a success.
+			health, replNode := r.replacementHealth(ctx, p)
+			switch health {
+			case replUnhealthy:
+				// The replacement is itself repair-eligible (fault re-inherited/re-flagged) or was reaped: not a durable
+				// success. Record a failure so the domain backs off; the unhealthy replacement is handled as its own candidate.
+				r.restraint.Record(p.candidate, replNode, RepairFailed)
 				delete(r.probes, providerID)
-				delete(r.acted, providerID) // outcome settled; the original is gone, nothing left to watch for clearance
+			case replPending:
+				// The replacement isn't observable yet (not launched, or its Node hasn't registered): don't start the dwell
+				// clock until we've confirmed a healthy replacement.
+			case replHealthy:
+				if p.succeededAt.IsZero() {
+					p.succeededAt = now // first observation of a healthy replacement — measure the dwell from here
+				}
+				if !now.Before(p.succeededAt.Add(repairDwell)) {
+					// Attribute the success to where the replacement actually came up (replNode), so a replacement in a
+					// different zone doesn't credit the candidate's zone (learn-from-replacement).
+					r.restraint.Record(p.candidate, replNode, RepairProven)
+					delete(r.probes, providerID)
+					delete(r.acted, providerID) // outcome settled; the original is gone, nothing left to watch for clearance
+				}
 			}
 		case err == nil:
-			r.restraint.Record(p.candidate, RepairFailed)
+			// The original still exists → the replacement never came up healthy enough to terminate it (bad-AMI loop,
+			// partitioned zone, command timeout). No replacement Node to attribute to, so the failure falls on the launch
+			// target (all the candidate's domains except zone, which learn-from-replacement can't confirm).
+			r.restraint.Record(p.candidate, nil, RepairFailed)
 			delete(r.probes, providerID)
 			// keep in acted: a failed repair leaves the original unhealthy; watch for it to clear on its own.
 		default:
@@ -292,11 +331,59 @@ func (r *Repair) observeProbes(ctx context.Context) {
 			continue
 		}
 		if _, cond := matchingPolicy(policies, freshNode); cond == nil {
-			// Node exists and is healthy again: the episode cleared without a repair.
-			r.restraint.Record(c, RepairCleared)
+			// Node exists and is healthy again: the episode cleared without a repair (no replacement involved).
+			r.restraint.Record(c, nil, RepairCleared)
 			delete(r.acted, providerID)
 		}
 	}
+}
+
+// replHealth is the observed health of a probe's pre-spun replacement(s) during the success dwell.
+type replHealth int
+
+const (
+	replHealthy   replHealth = iota // every replacement is up and not itself exhibiting a repair-worthy fault
+	replUnhealthy                   // a replacement is repair-eligible (fault re-inherited/re-flagged) or was reaped
+	replPending                     // a replacement is not yet observable (not launched, or its Node not registered yet)
+)
+
+// replacementHealth inspects a probe's pre-spun replacement(s) so the dwell judges a DURABLE success — Ready AND healthy
+// for a while (invariant) — rather than a bare timer from the original's termination. A systematic false positive
+// re-flags the replacement, and a bad AMI / partitioned zone produces a replacement that never comes up healthy; both
+// must be caught here as failures. A probe with no replacements (terminate-first / delete-only) has nothing to watch, so
+// the dwell timer alone governs it. It also returns the resolved replacement Node (nil when there is none / it isn't
+// observable) so the caller can attribute the outcome to the zone the replacement actually came up in.
+func (r *Repair) replacementHealth(ctx context.Context, p *repairProbe) (replHealth, *corev1.Node) {
+	if len(p.replacements) == 0 {
+		return replHealthy, nil // terminate-first: no pre-spun replacement to watch; the dwell timer is the only signal
+	}
+	policies := r.cloudProvider.RepairPolicies()
+	var lastNode *corev1.Node
+	for _, repl := range p.replacements {
+		if repl.Name == "" {
+			return replPending, nil // not launched yet (queue hasn't assigned a NodeClaim name)
+		}
+		nc := &v1.NodeClaim{}
+		if err := r.kubeClient.Get(ctx, types.NamespacedName{Name: repl.Name}, nc); err != nil {
+			if apierrors.IsNotFound(err) {
+				return replUnhealthy, nil // the replacement NodeClaim was reaped (ICE, init-TTL, or its own repair): not durable
+			}
+			return replPending, nil // transient get error; re-observe next pass
+		}
+		if nc.Status.NodeName == "" {
+			return replPending, nil // the replacement's Node hasn't registered yet
+		}
+		// Resolve the Node by name (not a providerID field-selector list), so this works without a registered index.
+		node := &corev1.Node{}
+		if err := r.kubeClient.Get(ctx, types.NamespacedName{Name: nc.Status.NodeName}, node); err != nil {
+			return replPending, nil // Node not readable yet
+		}
+		lastNode = node
+		if _, cond := matchingPolicy(policies, node); cond != nil {
+			return replUnhealthy, node // the replacement is itself repair-eligible: the fault was re-inherited/re-flagged
+		}
+	}
+	return replHealthy, lastNode
 }
 
 // score computes E = rank + age/τ − backoff for an already-resolved candidate. Age is time past toleration

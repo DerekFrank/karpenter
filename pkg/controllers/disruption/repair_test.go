@@ -71,16 +71,13 @@ var _ = Describe("Repair", func() {
 		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(n))
 	}
 
-	// markUnhealthy appends a condition matching a RepairPolicy at the current fake-clock time, re-applies the node,
-	// and re-syncs cluster state. Must be called AFTER initNode.
+	// markUnhealthy stamps a RepairPolicy-matching condition (at the current fake-clock time) while keeping the node
+	// otherwise-Ready, then re-syncs cluster state. Must be called AFTER initNode.
 	markUnhealthy := func(n *corev1.Node, condType corev1.NodeConditionType) {
-		n = ExpectExists(ctx, env.Client, n)
-		n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
-			Type:               condType,
-			Status:             corev1.ConditionFalse,
-			LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
-		})
-		ExpectApplied(ctx, env.Client, n)
+		ExpectMakeNodesStatusChanged(ctx, env.Client, env.Clock, []corev1.NodeCondition{
+			{Type: corev1.NodeReady, Status: corev1.ConditionTrue, Reason: "KubeletReady"},
+			{Type: condType, Status: corev1.ConditionFalse},
+		}, n)
 		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(n))
 	}
 
