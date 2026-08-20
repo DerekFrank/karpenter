@@ -269,14 +269,27 @@ func provisionCell(c cell) fleet {
 	return f
 }
 
-// newWorkload builds a Deployment forced one-pod-per-node (hostname spread) so faulting N nodes disrupts N pods, sized
-// so Karpenter must provision `replicas` nodes.
+// newWorkload builds a Deployment forced one-pod-per-node so faulting N nodes disrupts N pods, sized so Karpenter must
+// provision `replicas` nodes. One-pod-per-node is guaranteed by the CPU request (1000m) exceeding half the KWOK node's
+// allocatable (c-2x ≈ 1900m ⇒ a second pod never fits), so the hostname spread is only a placement nudge and is set to
+// ScheduleAnyway: a hard DoNotSchedule spread strands a pod whenever provisioning is briefly uneven, and a pending pod
+// keeps its target node "nominated", which makes Karpenter refuse to disrupt it — silently blocking repair on any
+// multi-node fault.
 func newWorkload(c cell, replicas int) *appsv1.Deployment {
 	name := "repair-" + test.RandomName()
-	mods := []test.DeploymentOptionModifier{test.WithHostnameSpread()}
-	// Requests large enough that each pod lands on its own node (with hostname spread as the belt-and-braces guard).
-	opts := test.CreateDeploymentOptions(name, int32(replicas), "1", "1Gi", mods...)
+	opts := test.CreateDeploymentOptions(name, int32(replicas), "1", "1Gi")
 	dep := test.Deployment(opts)
+	// Spread across ZONES (failure domains), not hostnames — this populates the zone/AMI domains the structure axis
+	// faults, so a correlated zonal blast actually lands on a zone's worth of pods. One-pod-per-node is still guaranteed
+	// by the CPU request (1000m) exceeding half a KWOK node's allocatable (c-2x ≈ 1900m). ScheduleAnyway (soft) so an
+	// uneven zone during provisioning never strands a pending pod — a pending pod keeps its target node "nominated",
+	// which makes Karpenter refuse to disrupt it and silently blocks multi-node repair.
+	dep.Spec.Template.Spec.TopologySpreadConstraints = []corev1.TopologySpreadConstraint{{
+		MaxSkew:           1,
+		TopologyKey:       corev1.LabelTopologyZone,
+		WhenUnsatisfiable: corev1.ScheduleAnyway,
+		LabelSelector:     &metav1.LabelSelector{MatchLabels: dep.Spec.Selector.MatchLabels},
+	}}
 	if c.help == helpNoWorkloadBroken {
 		// workload-broken blind spot: nodes stay Ready+healthy to Karpenter, but the workload itself is down. A readiness
 		// gate makes each pod's readiness depend on a custom condition KWOK does not set; provisioning patches it True to
