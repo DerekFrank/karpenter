@@ -224,16 +224,25 @@ func newWorkload(c cell, replicas int) *appsv1.Deployment {
 	name := "repair-" + test.RandomName()
 	opts := test.CreateDeploymentOptions(name, int32(replicas), "1", "1Gi")
 	dep := test.Deployment(opts)
-	// Spread across ZONES (failure domains), not hostnames — this populates the zone/AMI domains the impairment axis
-	// faults, so a correlated zonal blast actually lands on a zone's worth of pods. One-pod-per-node is still guaranteed
-	// by the CPU request (1000m) exceeding half a KWOK node's allocatable (c-2x ≈ 1900m). ScheduleAnyway (soft) so an
-	// uneven zone during provisioning never strands a pending pod — a pending pod keeps its target node "nominated",
-	// which makes Karpenter refuse to disrupt it and silently blocks multi-node repair.
+	// One pod per node is REQUIRED for the fault model (faulting N nodes must disrupt N pods, and blast is a fraction of
+	// nodes). CPU sizing alone does NOT guarantee it — freed of a per-node constraint, Karpenter bin-packs onto larger
+	// instances (e.g. 3× 1000m pods on a c-4x/3900m node), so `scale` nodes collapse to a third. Enforce it with
+	// REQUIRED hostname anti-affinity: each pod needs a node with no other workload pod, so Karpenter provisions one node
+	// per pod. This is disruption-FRIENDLY (unlike a DoNotSchedule topology spread, which strands pending pods and pins
+	// nominations that block repair) — a disrupted pod reschedules onto its fresh replacement node, which is empty.
+	sel := &metav1.LabelSelector{MatchLabels: dep.Spec.Selector.MatchLabels}
+	dep.Spec.Template.Spec.Affinity = &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{
+		RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+			TopologyKey: corev1.LabelHostname, LabelSelector: sel,
+		}},
+	}}
+	// Also spread across ZONES (failure domains) so a correlated zonal blast lands on a zone's worth of pods. Soft
+	// (ScheduleAnyway) — the anti-affinity already forces one-per-node; this only biases the zone distribution.
 	dep.Spec.Template.Spec.TopologySpreadConstraints = []corev1.TopologySpreadConstraint{{
 		MaxSkew:           1,
 		TopologyKey:       corev1.LabelTopologyZone,
 		WhenUnsatisfiable: corev1.ScheduleAnyway,
-		LabelSelector:     &metav1.LabelSelector{MatchLabels: dep.Spec.Selector.MatchLabels},
+		LabelSelector:     sel,
 	}}
 	if c.impairment.workloadBroken() {
 		// workload-broken blind spot: nodes stay Ready+healthy to Karpenter, but the workload itself is down. A readiness
