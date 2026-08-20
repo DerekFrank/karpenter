@@ -161,10 +161,16 @@ func runCell(c cell) repairMetrics {
 	injectFault(c, &f)
 
 	if measureRecovery(c, &f) {
+		// Fully recovered (workload healthy on good capacity): 100% mitigated. Computing fractionRepaired here instead
+		// would under-report — replace-first moves the pod to fresh capacity BEFORE the faulted node finishes
+		// terminating, so at the recovery instant the faulted node often still exists and reads as un-repaired.
 		d := time.Since(f.faultOnset)
 		m.timeToRecovery = &d
+		m.mitigatedFraction = 1.0
+	} else {
+		// Not fully recovered: the graded partial fraction of faulted nodes repair resolved by the deadline.
+		m.mitigatedFraction = fractionRepaired(&f)
 	}
-	m.mitigatedFraction = fractionRepaired(&f)
 	m.disruptedPods = countDisrupted(&f)
 	m.cpCalls = maxZero(scrapeCloudProviderCalls() - cpBefore)
 	return m
