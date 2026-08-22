@@ -228,14 +228,14 @@ func (e *balancedEvaluator) ApproveCommand(ctx context.Context, cmd Command) (bo
 		policy := string(candidate.NodePool.Spec.Disruption.ConsolidationPolicy)
 		result, scored := perPool[poolName]
 
-		decisionLabel := "approved"
+		moveDecision := string(ApprovedDecision)
 		if scored && !result.Approved() {
-			decisionLabel = "rejected"
+			moveDecision = string(RejectedDecision)
 		}
-		ConsolidationMovesTotal.Inc(map[string]string{"decision": decisionLabel, "nodepool": poolName, "policy": policy})
+		ConsolidationMovesTotal.Inc(map[string]string{"decision": moveDecision, "nodepool": poolName, "policy": policy})
 
 		if scored {
-			ConsolidationScoreHistogram.Observe(result.Score(), map[string]string{"decision": decisionLabel, "nodepool": poolName, "policy": policy})
+			ConsolidationScoreHistogram.Observe(result.Score(), map[string]string{"decision": moveDecision, "nodepool": poolName, "policy": policy})
 			if result.Approved() {
 				e.recorder.Publish(disruptionevents.ConsolidationApproved(
 					candidate.Node, candidate.NodeClaim,
@@ -252,9 +252,9 @@ func (e *balancedEvaluator) ApproveCommand(ctx context.Context, cmd Command) (bo
 func (e *balancedEvaluator) EmitMultiNodeEvents(ctx context.Context, cmd Command, perPoolResults map[string]ScoreResult, approved bool) {
 	byPool := lo.GroupBy(cmd.Candidates, func(c *Candidate) string { return c.NodePool.Name })
 
-	moveDecision := "approved"
+	moveDecision := string(ApprovedDecision)
 	if !approved {
-		moveDecision = "rejected"
+		moveDecision = string(RejectedDecision)
 	}
 
 	for poolName, poolCandidates := range byPool {
@@ -266,9 +266,9 @@ func (e *balancedEvaluator) EmitMultiNodeEvents(ctx context.Context, cmd Command
 		if !scored {
 			continue
 		}
-		poolDecision := "approved"
+		poolDecision := string(ApprovedDecision)
 		if !result.Approved() {
-			poolDecision = "rejected"
+			poolDecision = string(RejectedDecision)
 		}
 		ConsolidationScoreHistogram.Observe(result.Score(), map[string]string{"decision": poolDecision, "nodepool": poolName, "policy": policy})
 
