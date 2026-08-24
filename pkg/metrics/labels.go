@@ -56,8 +56,9 @@ var (
 			"`expired`; cloud-provider failure metrics use the provider error reason.",
 	}
 	ResourceType = Label{
-		Name: ResourceTypeLabel,
-		Help: "The Kubernetes resource type, e.g. `cpu`, `memory`, `pods`.",
+		Name:   ResourceTypeLabel,
+		Help:   "The Kubernetes resource type.",
+		Values: ResourceTypeValues,
 	}
 	CapacityType = Label{
 		Name: CapacityTypeLabel,
