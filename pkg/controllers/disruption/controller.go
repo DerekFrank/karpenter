@@ -115,7 +115,7 @@ func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Clien
 }
 
 func (c *Controller) Name() string {
-	return "disruption"
+	return metrics.DisruptionController.Name
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {

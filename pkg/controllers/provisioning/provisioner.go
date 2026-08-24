@@ -118,7 +118,7 @@ func (p *Provisioner) Trigger(uid types.UID) {
 }
 
 func (p *Provisioner) Name() string {
-	return "provisioner"
+	return metrics.ProvisionerController.Name
 }
 
 func (p *Provisioner) Register(_ context.Context, m manager.Manager) error {
