@@ -17,6 +17,7 @@ limitations under the License.
 package metrics
 
 import (
+	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -24,7 +25,7 @@ import (
 // dimension, referencing the corev1 resource-name consts as the source of truth.
 // The set is not exhaustive — a metric may report any resource (extended
 // resources, hugepages, etc.) — so this documents the common ones.
-var ResourceTypeValues = []Value{
+var ResourceTypeValues = []opmetrics.Value{
 	{Name: string(corev1.ResourceCPU), Help: "CPU, in cores."},
 	{Name: string(corev1.ResourceMemory), Help: "Memory, in bytes."},
 	{Name: string(corev1.ResourcePods), Help: "The number of pods."},

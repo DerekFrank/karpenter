@@ -17,6 +17,8 @@ limitations under the License.
 package metrics
 
 import (
+	opmetrics "github.com/awslabs/operatorpkg/metrics"
+
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
@@ -30,7 +32,7 @@ import (
 // reads and sets, and why. Keys are the object Kind (matching the type parameter
 // of status.NewController[T]); every value's Name references a ConditionType*
 // const so the set cannot drift from the API definitions.
-var ConditionTypeValues = map[string][]Value{
+var ConditionTypeValues = map[string][]opmetrics.Value{
 	"NodeClaim": {
 		{Name: v1.ConditionTypeLaunched, Help: "The instance backing the NodeClaim has been launched with the cloud provider."},
 		{Name: v1.ConditionTypeRegistered, Help: "The launched node has registered with the cluster."},
