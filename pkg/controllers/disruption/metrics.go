@@ -33,26 +33,26 @@ const (
 )
 
 var (
-	MultiNodeConsolidationType = metrics.Value{
+	MultiNodeConsolidationType = opmetrics.Value{
 		Name: "multi",
 		Help: "Consolidation that considers removing multiple nodes at once.",
 	}
-	SingleNodeConsolidationType = metrics.Value{
+	SingleNodeConsolidationType = opmetrics.Value{
 		Name: "single",
 		Help: "Consolidation that considers removing a single node.",
 	}
 )
 
 var (
-	ConsolidationType = metrics.Label{
+	ConsolidationType = opmetrics.Label{
 		Name:   ConsolidationTypeLabel,
 		Help:   "The consolidation algorithm that produced the decision.",
-		Values: []metrics.Value{MultiNodeConsolidationType, SingleNodeConsolidationType},
+		Values: []opmetrics.Value{MultiNodeConsolidationType, SingleNodeConsolidationType},
 	}
-	DecisionDim = metrics.Label{
+	DecisionDim = opmetrics.Label{
 		Name: decisionLabel,
 		Help: "The disruption decision taken for the candidate(s).",
-		Values: []metrics.Value{
+		Values: []opmetrics.Value{
 			{
 				Name: string(NoOpDecision),
 				Help: "No disruption action was taken.",
@@ -75,7 +75,7 @@ var (
 			},
 		},
 	}
-	Policy = metrics.Label{
+	Policy = opmetrics.Label{
 		Name: policyLabel,
 		Help: "The NodePool consolidation policy in effect for the move.",
 	}

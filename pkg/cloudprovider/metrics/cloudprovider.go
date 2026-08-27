@@ -38,18 +38,18 @@ const (
 )
 
 // Well-known `error` dimension values. These are metric-only values, so they are
-// first-class metrics.Value vars: the value string and its documentation live in
+// first-class opmetrics.Value vars: the value string and its documentation live in
 // one place and callers refer to it by .Name.
 var (
-	NodeClaimNotFoundError = metrics.Value{
+	NodeClaimNotFoundError = opmetrics.Value{
 		Name: "NodeClaimNotFoundError",
 		Help: "The NodeClaim's backing instance was not found.",
 	}
-	NodeClassNotReadyError = metrics.Value{
+	NodeClassNotReadyError = opmetrics.Value{
 		Name: "NodeClassNotReadyError",
 		Help: "The referenced NodeClass is not yet ready.",
 	}
-	InsufficientCapacityError = metrics.Value{
+	InsufficientCapacityError = opmetrics.Value{
 		Name: "InsufficientCapacityError",
 		Help: "The cloud provider had insufficient capacity to fulfill the request.",
 	}
@@ -58,18 +58,18 @@ var (
 // Package-local metric dimensions for the CloudProvider metrics. The controller
 // dimension reuses the shared metrics.Controller description.
 var (
-	Method = metrics.Label{
+	Method = opmetrics.Label{
 		Name: metricLabelMethod,
 		Help: "The CloudProvider interface method that was called, e.g. `Create`, `Delete`, `Get`, `List`, `GetInstanceTypes`, `IsDrifted`.",
 	}
-	Provider = metrics.Label{
+	Provider = opmetrics.Label{
 		Name: metricLabelProvider,
 		Help: "The name of the cloud provider implementation.",
 	}
-	Error = metrics.Label{
+	Error = opmetrics.Label{
 		Name:   metricLabelError,
 		Help:   "The category of error returned by the CloudProvider call.",
-		Values: []metrics.Value{NodeClaimNotFoundError, NodeClassNotReadyError, InsufficientCapacityError},
+		Values: []opmetrics.Value{NodeClaimNotFoundError, NodeClassNotReadyError, InsufficientCapacityError},
 	}
 )
 

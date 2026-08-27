@@ -32,7 +32,7 @@ const (
 )
 
 // Code describes the code dimension emitted by the pod eviction metric.
-var Code = metrics.Label{
+var Code = opmetrics.Label{
 	Name: CodeLabel,
 	Help: "The HTTP response code returned by the Kubernetes eviction API for the eviction request.",
 }
