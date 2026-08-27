@@ -16,6 +16,10 @@ limitations under the License.
 
 package metrics
 
+import (
+	opmetrics "github.com/awslabs/operatorpkg/metrics"
+)
+
 // Controller names are pure metric/log identifiers (the `controller` dimension and
 // the logger name) — they are never used in reconcile logic — so they are
 // centralized here as first-class metrics.Value vars. Each controller's Name()
@@ -26,13 +30,13 @@ package metrics
 // operatorpkg status/events controllers synthesized from their registration
 // sites). Add a controller here and reference it from the controller's Name().
 var (
-	DisruptionController         = Value{Name: "disruption", Help: "Disrupts nodes via consolidation, drift, and expiration."}
-	ProvisionerController        = Value{Name: "provisioner", Help: "Provisions nodes for unschedulable pods."}
-	NodeClaimLifecycleController = Value{Name: "nodeclaim.lifecycle", Help: "Launches, registers, and initializes the instance backing a NodeClaim."}
+	DisruptionController         = opmetrics.Value{Name: "disruption", Help: "Disrupts nodes via consolidation, drift, and expiration."}
+	ProvisionerController        = opmetrics.Value{Name: "provisioner", Help: "Provisions nodes for unschedulable pods."}
+	NodeClaimLifecycleController = opmetrics.Value{Name: "nodeclaim.lifecycle", Help: "Launches, registers, and initializes the instance backing a NodeClaim."}
 )
 
 // ControllerValues enumerates the core controllers for the `controller` dimension.
-var ControllerValues = []Value{
+var ControllerValues = []opmetrics.Value{
 	DisruptionController,
 	ProvisionerController,
 	NodeClaimLifecycleController,
