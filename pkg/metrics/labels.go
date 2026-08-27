@@ -17,16 +17,14 @@ limitations under the License.
 package metrics
 
 import (
-	pmetrics "github.com/awslabs/operatorpkg/metrics"
+	opmetrics "github.com/awslabs/operatorpkg/metrics"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
-// Label documents a Prometheus metric dimension; Value documents one of its
-// stable values. Both are aliased from operatorpkg so Karpenter and operatorpkg
-// share one type. See AGENTS.md for the conventions.
-type Label = pmetrics.Label
-type Value = pmetrics.Value
+// Metric dimensions and their values are described with opmetrics.Label /
+// opmetrics.Value (from operatorpkg, so Karpenter and operatorpkg share one type).
+// See AGENTS.md for the conventions.
 
 // Label-name constants, referenced by metric declarations.
 const (
@@ -44,25 +42,25 @@ const (
 // Shared core metric dimensions. Provider packages and core controllers should
 // reference these rather than redeclaring the same dimension.
 var (
-	NodePool = Label{
+	NodePool = opmetrics.Label{
 		Name: NodePoolLabel,
 		Help: "The name of the NodePool that owns the resource.",
 	}
-	Reason = Label{
+	Reason = opmetrics.Label{
 		Name: ReasonLabel,
 		Help: "Why the action was taken. Values are metric-specific: create/delete " +
 			"counters use `provisioned`, `expired`, or `unhealthy`; disruption metrics " +
 			"use the disruption reason such as `underutilized`, `empty`, `drifted`, or " +
 			"`expired`; cloud-provider failure metrics use the provider error reason.",
 	}
-	ResourceType = Label{
+	ResourceType = opmetrics.Label{
 		Name: ResourceTypeLabel,
 		Help: "The Kubernetes resource type, e.g. `cpu`, `memory`, `pods`.",
 	}
-	CapacityType = Label{
+	CapacityType = opmetrics.Label{
 		Name: CapacityTypeLabel,
 		Help: "The capacity type of the instance.",
-		Values: []Value{
+		Values: []opmetrics.Value{
 			{
 				Name: v1.CapacityTypeOnDemand,
 				Help: "On-demand capacity.",
@@ -77,18 +75,18 @@ var (
 			},
 		},
 	}
-	Zone = Label{
+	Zone = opmetrics.Label{
 		Name: ZoneLabel,
 		Help: "The availability zone of the instance.",
 	}
-	MinValuesRelaxed = Label{
+	MinValuesRelaxed = opmetrics.Label{
 		Name: MinValuesRelaxedLabel,
 		Help: "Whether minValues requirements were relaxed to satisfy scheduling.",
 	}
-	ConsolidationPolicy = Label{
+	ConsolidationPolicy = opmetrics.Label{
 		Name: ConsolidationPolicyLabel,
 		Help: "The NodePool consolidation policy in effect.",
-		Values: []Value{
+		Values: []opmetrics.Value{
 			{
 				Name: string(v1.ConsolidationPolicyWhenEmpty),
 				Help: "Consolidate only nodes with no workload pods.",
@@ -103,10 +101,10 @@ var (
 			},
 		},
 	}
-	TerminationMode = Label{
+	TerminationMode = opmetrics.Label{
 		Name: TerminationModeLabel,
 		Help: "The termination mode used to disrupt the node.",
-		Values: []Value{
+		Values: []opmetrics.Value{
 			{
 				Name: TerminationModeGraceful,
 				Help: "Graceful termination that respects the node's disruption budget and drains pods.",
@@ -121,7 +119,7 @@ var (
 			},
 		},
 	}
-	Controller = Label{
+	Controller = opmetrics.Label{
 		Name: ControllerLabel,
 		Help: "The name of the controller that emitted the metric.",
 	}

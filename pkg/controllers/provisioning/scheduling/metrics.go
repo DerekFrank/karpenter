@@ -34,7 +34,7 @@ const (
 
 // SchedulingID describes the scheduling_id dimension. It is co-located here
 // because its value is a package-local runtime UUID.
-var SchedulingID = metrics.Label{
+var SchedulingID = opmetrics.Label{
 	Name: schedulingIDLabel,
 	Help: "A unique identifier for a scheduling simulation run.",
 }
