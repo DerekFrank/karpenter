@@ -37,6 +37,15 @@ var Code = opmetrics.Label{
 	Help: "The HTTP response code returned by the Kubernetes eviction API for the eviction request.",
 }
 
+// DrainReason describes the reason dimension emitted by the pod drain metric.
+// The value is the owning NodeClaim's disruption-reason condition when set, or
+// "Forceful Termination" when the pod is force-deleted, so its value set is not
+// enumerated here.
+var DrainReason = opmetrics.Label{
+	Name: ReasonLabel,
+	Help: "Why the pod was drained: the owning NodeClaim's disruption reason, or forceful termination.",
+}
+
 var PodsEvictionRequestsTotal = opmetrics.NewPrometheusCounter(
 	crmetrics.Registry,
 	prometheus.CounterOpts{
@@ -45,7 +54,7 @@ var PodsEvictionRequestsTotal = opmetrics.NewPrometheusCounter(
 		Name:      "eviction_requests_total",
 		Help:      "The total number of pod eviction requests made by Karpenter, labeled by response code",
 	},
-	[]string{CodeLabel},
+	[]opmetrics.Label{Code},
 )
 
 var PodsDrainedTotal = opmetrics.NewPrometheusCounter(
@@ -56,5 +65,5 @@ var PodsDrainedTotal = opmetrics.NewPrometheusCounter(
 		Name:      "drained_total",
 		Help:      "The total number of pods drained during node termination by Karpenter, labeled by reason",
 	},
-	[]string{ReasonLabel},
+	[]opmetrics.Label{DrainReason},
 )

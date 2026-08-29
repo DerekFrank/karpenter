@@ -84,10 +84,10 @@ var MethodDuration = opmetrics.NewPrometheusHistogram(
 		Name:      "duration_seconds",
 		Help:      "Duration of cloud provider method calls. Labeled by the controller, method name and provider.",
 	},
-	[]string{
-		metrics.ControllerLabel,
-		metricLabelMethod,
-		metricLabelProvider,
+	[]opmetrics.Label{
+		metrics.Controller,
+		Method,
+		Provider,
 	},
 )
 
@@ -100,11 +100,11 @@ var (
 			Name:      "errors_total",
 			Help:      "Total number of errors returned from CloudProvider calls.",
 		},
-		[]string{
-			metrics.ControllerLabel,
-			metricLabelMethod,
-			metricLabelProvider,
-			metricLabelError,
+		[]opmetrics.Label{
+			metrics.Controller,
+			Method,
+			Provider,
+			Error,
 		},
 	)
 )

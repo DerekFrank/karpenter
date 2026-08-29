@@ -57,6 +57,31 @@ const (
 	managed             = "managed"
 )
 
+// Pod metric dimensions. zone, nodepool, and capacity_type reuse the shared
+// dimensions from pkg/metrics.
+var (
+	podNameLabel             = opmetrics.Label{Name: podName, Help: "The name of the pod."}
+	podNamespaceLabel        = opmetrics.Label{Name: podNamespace, Help: "The namespace of the pod."}
+	ownerLabel               = opmetrics.Label{Name: ownerSelfLink, Help: "The owning workload of the pod, formatted as `<kind>/<name>`."}
+	podHostNameLabel         = opmetrics.Label{Name: podHostName, Help: "The name of the node the pod is bound to."}
+	podHostArchitectureLabel = opmetrics.Label{Name: podHostArchitecture, Help: "The CPU architecture of the node the pod is bound to."}
+	podHostInstanceTypeLabel = opmetrics.Label{Name: podHostInstanceType, Help: "The instance type of the node the pod is bound to."}
+	podScheduledLabel        = opmetrics.Label{Name: podScheduled, Help: "Whether the pod has been scheduled to a node."}
+	podReadyLabel            = opmetrics.Label{Name: podReady, Help: "Whether the pod is ready."}
+	managedLabel             = opmetrics.Label{Name: managed, Help: "Whether the pod is bound to a Karpenter-managed node."}
+	podPhaseLabel            = opmetrics.Label{
+		Name: podPhase,
+		Help: "The pod's lifecycle phase.",
+		Values: []opmetrics.Value{
+			{Name: string(corev1.PodPending), Help: "The pod has been accepted but not all containers are running."},
+			{Name: string(corev1.PodRunning), Help: "The pod is bound to a node and all containers are running."},
+			{Name: string(corev1.PodSucceeded), Help: "All containers terminated successfully."},
+			{Name: string(corev1.PodFailed), Help: "All containers terminated and at least one failed."},
+			{Name: string(corev1.PodUnknown), Help: "The pod's state could not be obtained."},
+		},
+	}
+)
+
 var (
 	PodState = opmetrics.NewPrometheusGauge(
 		crmetrics.Registry,
@@ -77,7 +102,7 @@ var (
 			Help:       "The time from pod creation until the pod is running.",
 			Objectives: metrics.SummaryObjectives(),
 		},
-		[]string{},
+		[]opmetrics.Label{},
 	)
 	PodUnstartedTimeSeconds = opmetrics.NewPrometheusGauge(
 		crmetrics.Registry,
@@ -87,7 +112,7 @@ var (
 			Name:      "unstarted_time_seconds",
 			Help:      "The time from pod creation until the pod is running.",
 		},
-		[]string{podName, podNamespace},
+		[]opmetrics.Label{podNameLabel, podNamespaceLabel},
 	)
 	PodBoundDurationSeconds = opmetrics.NewPrometheusHistogram(
 		crmetrics.Registry,
@@ -98,7 +123,7 @@ var (
 			Help:      "The time from pod creation until the pod is bound.",
 			Buckets:   metrics.DurationBuckets(),
 		},
-		[]string{},
+		[]opmetrics.Label{},
 	)
 	PodUnboundTimeSeconds = opmetrics.NewPrometheusGauge(
 		crmetrics.Registry,
@@ -108,7 +133,7 @@ var (
 			Name:      "unbound_time_seconds",
 			Help:      "The time from pod creation until the pod is bound.",
 		},
-		[]string{podName, podNamespace},
+		[]opmetrics.Label{podNameLabel, podNamespaceLabel},
 	)
 	// Stage: alpha
 	PodProvisioningBoundDurationSeconds = opmetrics.NewPrometheusHistogram(
@@ -120,7 +145,7 @@ var (
 			Help:      "The time from when Karpenter first thinks the pod can schedule until it binds. Note: this calculated from a point in memory, not by the pod creation timestamp.",
 			Buckets:   metrics.DurationBuckets(),
 		},
-		[]string{},
+		[]opmetrics.Label{},
 	)
 	// Stage: alpha
 	PodProvisioningUnboundTimeSeconds = opmetrics.NewPrometheusGauge(
@@ -131,7 +156,7 @@ var (
 			Name:      "provisioning_unbound_time_seconds",
 			Help:      "The time from when Karpenter first thinks the pod can schedule until it binds. Note: this calculated from a point in memory, not by the pod creation timestamp.",
 		},
-		[]string{podName, podNamespace},
+		[]opmetrics.Label{podNameLabel, podNamespaceLabel},
 	)
 	// Stage: alpha
 	PodProvisioningStartupDurationSeconds = opmetrics.NewPrometheusHistogram(
@@ -143,7 +168,7 @@ var (
 			Help:      "The time from when Karpenter first thinks the pod can schedule until the pod is running. Note: this calculated from a point in memory, not by the pod creation timestamp.",
 			Buckets:   metrics.DurationBuckets(),
 		},
-		[]string{},
+		[]opmetrics.Label{},
 	)
 	// Stage: alpha
 	PodProvisioningUnstartedTimeSeconds = opmetrics.NewPrometheusGauge(
@@ -154,7 +179,7 @@ var (
 			Name:      "provisioning_unstarted_time_seconds",
 			Help:      "The time from when Karpenter first thinks the pod can schedule until the pod is running. Note: this calculated from a point in memory, not by the pod creation timestamp.",
 		},
-		[]string{podName, podNamespace},
+		[]opmetrics.Label{podNameLabel, podNamespaceLabel},
 	)
 	// Stage: alpha
 	PodSchedulingUndecidedTimeSeconds = opmetrics.NewPrometheusGauge(
@@ -165,7 +190,7 @@ var (
 			Name:      "provisioning_scheduling_undecided_time_seconds",
 			Help:      "The time from when Karpenter has seen a pod without making a scheduling decision for the pod. Note: this calculated from a point in memory, not by the pod creation timestamp.",
 		},
-		[]string{podName, podNamespace},
+		[]opmetrics.Label{podNameLabel, podNamespaceLabel},
 	)
 )
 
@@ -179,21 +204,21 @@ type Controller struct {
 	unscheduledPods sets.Set[string]
 }
 
-func labelNames() []string {
-	return []string{
-		podName,
-		podNamespace,
-		ownerSelfLink,
-		podHostName,
-		podScheduled,
-		metrics.NodePoolLabel,
-		podHostZone,
-		podHostArchitecture,
-		metrics.CapacityTypeLabel,
-		podHostInstanceType,
-		podPhase,
-		podReady,
-		managed,
+func labelNames() []opmetrics.Label {
+	return []opmetrics.Label{
+		podNameLabel,
+		podNamespaceLabel,
+		ownerLabel,
+		podHostNameLabel,
+		podScheduledLabel,
+		metrics.NodePool,
+		metrics.Zone,
+		podHostArchitectureLabel,
+		metrics.CapacityType,
+		podHostInstanceTypeLabel,
+		podPhaseLabel,
+		podReadyLabel,
+		managedLabel,
 	}
 }
 

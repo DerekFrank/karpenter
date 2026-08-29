@@ -50,8 +50,8 @@ var (
 			Name:      "cost_tracker_errors_total",
 			Help:      "Number of errors encountered during cost tracking operations. Labeled by nodepool and nodeclaim.",
 		},
-		[]string{
-			metrics.NodePoolLabel,
+		[]opmetrics.Label{
+			metrics.NodePool,
 		},
 	)
 )

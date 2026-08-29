@@ -17,10 +17,31 @@ limitations under the License.
 package metrics
 
 import (
+	"strings"
+
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
+
+// reason dimension values, shared across the reason Labels below. A value that
+// applies to more than one reason Label is declared once here and referenced by
+// each Label that emits it.
+var (
+	reasonProvisioned          = opmetrics.Value{Name: ProvisionedReason, Help: "Capacity was provisioned for pending pods."}
+	reasonExpired              = opmetrics.Value{Name: ExpiredReason, Help: "The NodeClaim exceeded its expiration."}
+	reasonUnhealthy            = opmetrics.Value{Name: UnhealthyReason, Help: "The node failed a node-repair health check."}
+	reasonGarbageCollected     = opmetrics.Value{Name: GarbageCollectedReason, Help: "The NodeClaim's backing instance was gone and it was garbage collected."}
+	reasonInsufficientCapacity = opmetrics.Value{Name: InsufficientCapacityReason, Help: "The cloud provider had insufficient capacity to launch the NodeClaim."}
+	reasonNodeClassNotReady    = opmetrics.Value{Name: NodeClassNotReadyReason, Help: "The NodeClaim's NodeClass was not ready."}
+	reasonUnderutilized        = opmetrics.Value{Name: strings.ToLower(string(v1.DisruptionReasonUnderutilized)), Help: "The node was underutilized."}
+	reasonEmpty                = opmetrics.Value{Name: strings.ToLower(string(v1.DisruptionReasonEmpty)), Help: "The node had no workload pods."}
+	reasonDrifted              = opmetrics.Value{Name: strings.ToLower(string(v1.DisruptionReasonDrifted)), Help: "The node drifted from its desired specification."}
+)
+
+// disruptionReasonValues are the voluntary-disruption reasons, shared by the
+// disruption metrics and the NodeClaim/Pod disruption counters.
+var disruptionReasonValues = []opmetrics.Value{reasonUnderutilized, reasonEmpty, reasonDrifted}
 
 // Metric dimensions and their values are described with opmetrics.Label /
 // opmetrics.Value (from operatorpkg, so Karpenter and operatorpkg share one type).
@@ -46,12 +67,32 @@ var (
 		Name: NodePoolLabel,
 		Help: "The name of the NodePool that owns the resource.",
 	}
-	Reason = opmetrics.Label{
+	// DisruptionReason is the `reason` dimension for voluntary-disruption metrics.
+	DisruptionReason = opmetrics.Label{
+		Name:   ReasonLabel,
+		Help:   "The voluntary-disruption reason.",
+		Values: disruptionReasonValues,
+	}
+	// NodeClaimCreatedReason is the `reason` dimension for the NodeClaim create
+	// counter: provisioning, plus the disruption reasons (disruption creates
+	// replacement NodeClaims).
+	NodeClaimCreatedReason = opmetrics.Label{
+		Name:   ReasonLabel,
+		Help:   "Why the NodeClaim was created.",
+		Values: append([]opmetrics.Value{reasonProvisioned}, disruptionReasonValues...),
+	}
+	// NodeClaimDisruptedReason is the `reason` dimension for the NodeClaim/Pod
+	// disruption counters: the union of every path that disrupts a NodeClaim.
+	NodeClaimDisruptedReason = opmetrics.Label{
 		Name: ReasonLabel,
-		Help: "Why the action was taken. Values are metric-specific: create/delete " +
-			"counters use `provisioned`, `expired`, or `unhealthy`; disruption metrics " +
-			"use the disruption reason such as `underutilized`, `empty`, `drifted`, or " +
-			"`expired`; cloud-provider failure metrics use the provider error reason.",
+		Help: "Why the NodeClaim was disrupted.",
+		Values: append([]opmetrics.Value{
+			reasonUnhealthy,
+			reasonExpired,
+			reasonGarbageCollected,
+			reasonInsufficientCapacity,
+			reasonNodeClassNotReady,
+		}, disruptionReasonValues...),
 	}
 	ResourceType = opmetrics.Label{
 		Name: ResourceTypeLabel,
