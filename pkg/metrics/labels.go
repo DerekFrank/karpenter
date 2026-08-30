@@ -95,8 +95,9 @@ var (
 		}, disruptionReasonValues...),
 	}
 	ResourceType = opmetrics.Label{
-		Name: ResourceTypeLabel,
-		Help: "The Kubernetes resource type, e.g. `cpu`, `memory`, `pods`.",
+		Name:   ResourceTypeLabel,
+		Help:   "The Kubernetes resource type.",
+		Values: ResourceTypeValues,
 	}
 	CapacityType = opmetrics.Label{
 		Name: CapacityTypeLabel,
