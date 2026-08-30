@@ -126,7 +126,7 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 }
 
 func (c *Controller) Name() string {
-	return "nodeclaim.lifecycle"
+	return metrics.NodeClaimLifecycleController.Name
 }
 
 // nolint:gocyclo
