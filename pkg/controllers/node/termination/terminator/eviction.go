@@ -344,5 +344,5 @@ func evictionReason(ctx context.Context, pod *corev1.Pod, kubeClient client.Clie
 	if cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeDisruptionReason); cond.IsTrue() {
 		return cond.Reason
 	}
-	return "Forceful Termination"
+	return ForcefulTerminationReason
 }

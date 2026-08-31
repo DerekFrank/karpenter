@@ -17,6 +17,7 @@ limitations under the License.
 package metrics
 
 import (
+	"strconv"
 	"strings"
 
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
@@ -24,12 +25,16 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
+// BoolValues is the value set for a boolean dimension. The values are
+// self-explanatory, so they carry no help text.
+var BoolValues = []opmetrics.Value{{Name: strconv.FormatBool(true)}, {Name: strconv.FormatBool(false)}}
+
 // reason dimension values, shared across the reason Labels below. A value that
 // applies to more than one reason Label is declared once here and referenced by
 // each Label that emits it.
 var (
 	reasonProvisioned          = opmetrics.Value{Name: ProvisionedReason, Help: "Capacity was provisioned for pending pods."}
-	reasonExpired              = opmetrics.Value{Name: ExpiredReason, Help: "The NodeClaim exceeded its expiration."}
+	reasonExpired              = opmetrics.Value{Name: ExpiredReason, Help: "The Node exceeded its expiration."}
 	reasonUnhealthy            = opmetrics.Value{Name: UnhealthyReason, Help: "The node failed a node-repair health check."}
 	reasonGarbageCollected     = opmetrics.Value{Name: GarbageCollectedReason, Help: "The NodeClaim's backing instance was gone and it was garbage collected."}
 	reasonInsufficientCapacity = opmetrics.Value{Name: InsufficientCapacityReason, Help: "The cloud provider had insufficient capacity to launch the NodeClaim."}
@@ -121,8 +126,9 @@ var (
 		Help: "The availability zone of the instance.",
 	}
 	MinValuesRelaxed = opmetrics.Label{
-		Name: MinValuesRelaxedLabel,
-		Help: "Whether minValues requirements were relaxed to satisfy scheduling.",
+		Name:   MinValuesRelaxedLabel,
+		Help:   "Whether minValues requirements were relaxed to satisfy scheduling.",
+		Values: BoolValues,
 	}
 	ConsolidationPolicy = opmetrics.Label{
 		Name: ConsolidationPolicyLabel,
@@ -134,7 +140,7 @@ var (
 			},
 			{
 				Name: string(v1.ConsolidationPolicyWhenEmptyOrUnderutilized),
-				Help: "Consolidate empty nodes and underutilized nodes.",
+				Help: "Consolidate when the cost savings outweighs the pod disruption incurred.",
 			},
 			{
 				Name: string(v1.ConsolidationPolicyBalanced),

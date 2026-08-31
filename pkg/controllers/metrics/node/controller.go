@@ -54,7 +54,7 @@ const (
 var (
 	nodeNameLabel  = opmetrics.Label{Name: nodeName, Help: "The name of the node."}
 	nodePhaseLabel = opmetrics.Label{Name: nodePhase, Help: "The node's lifecycle phase, e.g. `Pending`, `Running`."}
-	managedLabel   = opmetrics.Label{Name: managed, Help: "Whether the node is managed by Karpenter."}
+	managedLabel   = opmetrics.Label{Name: managed, Help: "Whether the node is managed by Karpenter.", Values: metrics.BoolValues}
 )
 
 var (

@@ -66,9 +66,9 @@ var (
 	podHostNameLabel         = opmetrics.Label{Name: podHostName, Help: "The name of the node the pod is bound to."}
 	podHostArchitectureLabel = opmetrics.Label{Name: podHostArchitecture, Help: "The CPU architecture of the node the pod is bound to."}
 	podHostInstanceTypeLabel = opmetrics.Label{Name: podHostInstanceType, Help: "The instance type of the node the pod is bound to."}
-	podScheduledLabel        = opmetrics.Label{Name: podScheduled, Help: "Whether the pod has been scheduled to a node."}
-	podReadyLabel            = opmetrics.Label{Name: podReady, Help: "Whether the pod is ready."}
-	managedLabel             = opmetrics.Label{Name: managed, Help: "Whether the pod is bound to a Karpenter-managed node."}
+	podScheduledLabel        = opmetrics.Label{Name: podScheduled, Help: "Whether the pod has been scheduled to a node.", Values: metrics.BoolValues}
+	podReadyLabel            = opmetrics.Label{Name: podReady, Help: "Whether the pod is ready.", Values: metrics.BoolValues}
+	managedLabel             = opmetrics.Label{Name: managed, Help: "Whether the pod is bound to a Karpenter-managed node.", Values: metrics.BoolValues}
 	podPhaseLabel            = opmetrics.Label{
 		Name: podPhase,
 		Help: "The pod's lifecycle phase.",
