@@ -48,6 +48,20 @@ var (
 // disruption metrics and the NodeClaim/Pod disruption counters.
 var disruptionReasonValues = []opmetrics.Value{reasonUnderutilized, reasonEmpty, reasonDrifted}
 
+// NodeClaimDisruptedReasonValues is the union of every reason a NodeClaim is
+// disrupted: the voluntary-disruption reasons plus the involuntary paths.
+// Exported so cross-package metrics (e.g. the pod-drain counter) can reuse it.
+var NodeClaimDisruptedReasonValues = []opmetrics.Value{
+	reasonUnhealthy,
+	reasonExpired,
+	reasonGarbageCollected,
+	reasonInsufficientCapacity,
+	reasonNodeClassNotReady,
+	reasonUnderutilized,
+	reasonEmpty,
+	reasonDrifted,
+}
+
 // Metric dimensions and their values are described with opmetrics.Label /
 // opmetrics.Value (from operatorpkg, so Karpenter and operatorpkg share one type).
 // See AGENTS.md for the conventions.
@@ -89,15 +103,9 @@ var (
 	// NodeClaimDisruptedReason is the `reason` dimension for the NodeClaim/Pod
 	// disruption counters: the union of every path that disrupts a NodeClaim.
 	NodeClaimDisruptedReason = opmetrics.Label{
-		Name: ReasonLabel,
-		Help: "Why the NodeClaim was disrupted.",
-		Values: append([]opmetrics.Value{
-			reasonUnhealthy,
-			reasonExpired,
-			reasonGarbageCollected,
-			reasonInsufficientCapacity,
-			reasonNodeClassNotReady,
-		}, disruptionReasonValues...),
+		Name:   ReasonLabel,
+		Help:   "Why the NodeClaim was disrupted.",
+		Values: NodeClaimDisruptedReasonValues,
 	}
 	ResourceType = opmetrics.Label{
 		Name: ResourceTypeLabel,
@@ -136,15 +144,15 @@ var (
 		Values: []opmetrics.Value{
 			{
 				Name: string(v1.ConsolidationPolicyWhenEmpty),
-				Help: "Consolidate only nodes with no workload pods.",
-			},
-			{
-				Name: string(v1.ConsolidationPolicyWhenEmptyOrUnderutilized),
-				Help: "Consolidate when the cost savings outweighs the pod disruption incurred.",
+				Help: "Consolidate only empty nodes (nodes running only pods with no disruption cost, e.g. DaemonSets).",
 			},
 			{
 				Name: string(v1.ConsolidationPolicyBalanced),
-				Help: "Consolidate using the balanced algorithm.",
+				Help: "Consolidate nodes where the cost savings outweigh the disruption to running pods.",
+			},
+			{
+				Name: string(v1.ConsolidationPolicyWhenEmptyOrUnderutilized),
+				Help: "Consolidate any node that can be removed or replaced to reduce cost.",
 			},
 		},
 	}
@@ -154,15 +162,15 @@ var (
 		Values: []opmetrics.Value{
 			{
 				Name: TerminationModeGraceful,
-				Help: "Graceful termination that respects the node's disruption budget and drains pods.",
+				Help: "The NodeClaim has no terminationGracePeriod, so termination respects blocking pod PDBs and the do-not-disrupt annotation.",
 			},
 			{
 				Name: TerminationModeEventual,
-				Help: "Eventual termination once the node's terminationGracePeriod elapses.",
+				Help: "The NodeClaim has a positive terminationGracePeriod, so termination is bounded by it and overrides blocking pod PDBs and the do-not-disrupt annotation.",
 			},
 			{
 				Name: TerminationModeForceful,
-				Help: "Forceful termination that deletes the node immediately.",
+				Help: "The NodeClaim has a zero terminationGracePeriod, so it is terminated immediately.",
 			},
 		},
 	}

@@ -53,7 +53,7 @@ var reasonForcefulTermination = opmetrics.Value{
 var DrainReason = opmetrics.Label{
 	Name:   ReasonLabel,
 	Help:   "Why the pod was drained: the owning NodeClaim's disruption reason, or forceful termination.",
-	Values: append(append([]opmetrics.Value{}, metrics.NodeClaimDisruptedReason.Values...), reasonForcefulTermination),
+	Values: append(metrics.NodeClaimDisruptedReasonValues, reasonForcefulTermination),
 }
 
 var PodsEvictionRequestsTotal = opmetrics.NewPrometheusCounter(
