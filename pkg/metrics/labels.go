@@ -51,10 +51,9 @@ var (
 // disruption metrics and the NodeClaim/Pod disruption counters.
 var disruptionReasonValues = []opmetrics.Value{reasonUnderutilized, reasonEmpty, reasonDrifted}
 
-// NodeClaimDisruptedReasonValues is the union of every reason a NodeClaim is
+// nodeClaimDisruptedReasonValues is the union of every reason a NodeClaim is
 // disrupted: the voluntary-disruption reasons plus the involuntary paths.
-// Exported so cross-package metrics (e.g. the pod-drain counter) can reuse it.
-var NodeClaimDisruptedReasonValues = []opmetrics.Value{
+var nodeClaimDisruptedReasonValues = []opmetrics.Value{
 	reasonUnhealthy,
 	reasonExpired,
 	reasonGarbageCollected,
@@ -110,7 +109,7 @@ var (
 	NodeClaimDisruptedReason = opmetrics.Label{
 		Name:   ReasonLabel,
 		Help:   "Why the NodeClaim was disrupted.",
-		Values: NodeClaimDisruptedReasonValues,
+		Values: nodeClaimDisruptedReasonValues,
 	}
 	ResourceType = opmetrics.Label{
 		Name: ResourceTypeLabel,

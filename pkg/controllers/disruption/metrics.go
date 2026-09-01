@@ -86,8 +86,10 @@ var (
 )
 
 func init() {
-	// Initialize each consolidation_type series to 0.
-	for _, ct := range ConsolidationType.Values {
+	// Initialize the consolidation_type series that can time out to 0. Only the
+	// multi- and single-node algorithms run a bounded search that can hit a timeout;
+	// empty-node consolidation does not, so it is not pre-initialized here.
+	for _, ct := range []opmetrics.Value{MultiNodeConsolidationType, SingleNodeConsolidationType} {
 		ConsolidationTimeoutsTotal.Add(0, map[string]string{ConsolidationTypeLabel: ct.Name})
 	}
 }
