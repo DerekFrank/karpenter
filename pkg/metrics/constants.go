@@ -36,6 +36,10 @@ const (
 	GarbageCollectedReason     = "garbage_collected"
 	InsufficientCapacityReason = "insufficient_capacity"
 	NodeClassNotReadyReason    = "nodeclass_not_ready"
+	// Reasons emitted by the NodeClaim liveness controller when a NodeClaim is
+	// disrupted for failing to register or launch in time.
+	RegistrationTimeoutReason = "registration_timeout"
+	LaunchTimeoutReason       = "launch_timeout"
 
 	// termination_mode label values. Graceful and Eventual are also the canonical
 	// values for the disruption Graceful/Eventual classes in the disruption controller.

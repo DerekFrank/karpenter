@@ -23,6 +23,7 @@ import (
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
 
 // BoolValues is the value set for a boolean dimension. The values are
@@ -39,6 +40,8 @@ var (
 	reasonGarbageCollected     = opmetrics.Value{Name: GarbageCollectedReason, Help: "The NodeClaim's backing instance was gone and it was garbage collected."}
 	reasonInsufficientCapacity = opmetrics.Value{Name: InsufficientCapacityReason, Help: "The cloud provider had insufficient capacity to launch the NodeClaim."}
 	reasonNodeClassNotReady    = opmetrics.Value{Name: NodeClassNotReadyReason, Help: "The NodeClaim's NodeClass was not ready."}
+	reasonRegistrationTimeout  = opmetrics.Value{Name: RegistrationTimeoutReason, Help: "The NodeClaim's node did not register within the liveness timeout."}
+	reasonLaunchTimeout        = opmetrics.Value{Name: LaunchTimeoutReason, Help: "The NodeClaim's backing instance did not launch within the liveness timeout."}
 	reasonUnderutilized        = opmetrics.Value{Name: strings.ToLower(string(v1.DisruptionReasonUnderutilized)), Help: "The node was underutilized."}
 	reasonEmpty                = opmetrics.Value{Name: strings.ToLower(string(v1.DisruptionReasonEmpty)), Help: "The node had no workload pods."}
 	reasonDrifted              = opmetrics.Value{Name: strings.ToLower(string(v1.DisruptionReasonDrifted)), Help: "The node drifted from its desired specification."}
@@ -57,6 +60,8 @@ var NodeClaimDisruptedReasonValues = []opmetrics.Value{
 	reasonGarbageCollected,
 	reasonInsufficientCapacity,
 	reasonNodeClassNotReady,
+	reasonRegistrationTimeout,
+	reasonLaunchTimeout,
 	reasonUnderutilized,
 	reasonEmpty,
 	reasonDrifted,
@@ -142,16 +147,17 @@ var (
 		Name: ConsolidationPolicyLabel,
 		Help: "The NodePool consolidation policy in effect.",
 		Values: []opmetrics.Value{
+			// Emitted snake-cased: queue.go applies pretty.ToSnakeCase to the policy.
 			{
-				Name: string(v1.ConsolidationPolicyWhenEmpty),
+				Name: pretty.ToSnakeCase(string(v1.ConsolidationPolicyWhenEmpty)),
 				Help: "Consolidate only empty nodes (nodes running only pods with no disruption cost, e.g. DaemonSets).",
 			},
 			{
-				Name: string(v1.ConsolidationPolicyBalanced),
+				Name: pretty.ToSnakeCase(string(v1.ConsolidationPolicyBalanced)),
 				Help: "Consolidate nodes where the cost savings outweigh the disruption to running pods.",
 			},
 			{
-				Name: string(v1.ConsolidationPolicyWhenEmptyOrUnderutilized),
+				Name: pretty.ToSnakeCase(string(v1.ConsolidationPolicyWhenEmptyOrUnderutilized)),
 				Help: "Consolidate any node that can be removed or replaced to reduce cost.",
 			},
 		},
@@ -170,7 +176,7 @@ var (
 			},
 			{
 				Name: TerminationModeForceful,
-				Help: "The NodeClaim has a zero terminationGracePeriod, so it is terminated immediately.",
+				Help: "The NodeClaim has a zero (non-positive) terminationGracePeriod, so it is terminated immediately.",
 			},
 		},
 	}

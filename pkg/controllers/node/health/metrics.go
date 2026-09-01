@@ -47,7 +47,7 @@ var NodeClaimsUnhealthyDisruptedTotal = opmetrics.NewPrometheusCounter(
 		Namespace: metrics.Namespace,
 		Subsystem: metrics.NodeClaimSubsystem,
 		Name:      "unhealthy_disrupted_total",
-		Help:      "Number of unhealthy nodeclaims disrupted in total by Karpenter. Labeled by condition on the node was disrupted, the owning nodepool, and the image ID.",
+		Help:      "Number of unhealthy nodeclaims disrupted in total by Karpenter. Labeled by the condition the node was disrupted on, the owning nodepool, the capacity type, and the image ID.",
 	},
 	[]opmetrics.Label{
 		Condition,

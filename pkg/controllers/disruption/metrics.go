@@ -41,13 +41,17 @@ var (
 		Name: "single",
 		Help: "Consolidation that considers removing a single node.",
 	}
+	EmptyConsolidationType = opmetrics.Value{
+		Name: "empty",
+		Help: "Consolidation that removes empty nodes.",
+	}
 )
 
 var (
 	ConsolidationType = opmetrics.Label{
 		Name:   ConsolidationTypeLabel,
 		Help:   "The consolidation algorithm that produced the decision.",
-		Values: []opmetrics.Value{MultiNodeConsolidationType, SingleNodeConsolidationType},
+		Values: []opmetrics.Value{MultiNodeConsolidationType, SingleNodeConsolidationType, EmptyConsolidationType},
 	}
 	DecisionDim = opmetrics.Label{
 		Name: decisionLabel,

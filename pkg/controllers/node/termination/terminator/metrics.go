@@ -41,19 +41,16 @@ var Code = opmetrics.Label{
 	Help: "The HTTP response code returned by the Kubernetes eviction API (https://kubernetes.io/docs/concepts/scheduling-eviction/api-eviction/) for the eviction request.",
 }
 
-// reasonForcefulTermination is the drain reason for force-deleted pods.
-var reasonForcefulTermination = opmetrics.Value{
-	Name: ForcefulTerminationReason,
-	Help: "The pod was force-deleted because the node's terminationGracePeriod elapsed.",
-}
-
 // DrainReason describes the reason dimension emitted by the pod drain metric.
-// A drained pod's reason is the owning NodeClaim's disruption reason, so the
-// value set is the disruption reasons plus forceful termination.
+// The emitted value is the owning NodeClaim's ConditionTypeDisruptionReason
+// condition reason when set (a voluntary-disruption reason), or
+// ForcefulTerminationReason otherwise. That condition reason is currently
+// emitted verbatim (PascalCase) rather than in the lowercase form the other
+// reason dimensions use, so the value set is left unenumerated until the reason
+// casing is standardized (see the reason-standardization follow-up).
 var DrainReason = opmetrics.Label{
-	Name:   ReasonLabel,
-	Help:   "Why the pod was drained: the owning NodeClaim's disruption reason, or forceful termination.",
-	Values: append(metrics.NodeClaimDisruptedReasonValues, reasonForcefulTermination),
+	Name: ReasonLabel,
+	Help: "Why the pod was drained: the owning NodeClaim's disruption reason, or forceful termination.",
 }
 
 var PodsEvictionRequestsTotal = opmetrics.NewPrometheusCounter(
