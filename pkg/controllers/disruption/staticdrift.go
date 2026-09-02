@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
@@ -79,6 +80,22 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 			int64(disruptionBudgetMapping[np.Name]),
 			int64(len(npCandidates)),
 		})
+
+		// Terminate-first (RFC #3203): a static NodePool runs a fixed replica count, so it can never stage a replacement
+		// first — a pre-spun replacement would be an (N+1)th node the operator capped out. Issue budget-paced delete-only
+		// commands; once the freed slot is released the static.provisioning controller refills the pool back to
+		// Spec.Replicas. The drain still honors PDBs and is bounded by TGP. No replacement is reserved here, so the
+		// limit-reservation dance below (which exists only to stage a replacement without bursting over the limit) is
+		// unnecessary.
+		if options.FromContext(ctx).FeatureGates.TerminateFirst {
+			for _, c := range npCandidates[:maxDrifts] {
+				cmds = append(cmds, Command{
+					Candidates:          []*Candidate{c},
+					PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{c}),
+				})
+			}
+			continue
+		}
 
 		// Acquire limits from cluster state without bursting over
 		maxAllowedDrifts := d.cluster.NodePoolState.ReserveNodeCount(npName, nodeLimit, maxDrifts)
