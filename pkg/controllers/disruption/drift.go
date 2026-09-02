@@ -95,11 +95,16 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 			continue
 		}
 
+		// Terminate-first (RFC #3203): a capacity-constrained pool (reserved/ODCR with no headroom) can't stage a
+		// replacement, so drift issues a delete-only command and lets reactive provisioning refill the freed slot.
+		// The shared primitive derives this from the candidate-gone simulation; a headroom pool replaces-first as usual.
 		cmd := Command{
 			Candidates:          []*Candidate{candidate},
-			Replacements:        replacementsFromNodeClaims(results.NewNodeClaims...),
 			Results:             results,
 			PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+		}
+		if !terminateFirst(ctx, candidate, results) {
+			cmd.Replacements = replacementsFromNodeClaims(results.NewNodeClaims...)
 		}
 		return []Command{cmd}, nil
 

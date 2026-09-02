@@ -201,7 +201,11 @@ func (env *Environment) ExpectTestingFinalizerRemoved(obj client.Object) error {
 	}
 	deepCopy := metaObj.DeepCopy()
 	metaObj.Finalizers = lo.Reject(metaObj.Finalizers, func(finalizer string, _ int) bool {
-		return finalizer == TestingFinalizer
+		// Strip the NodeClaim termination finalizer too, not just the testing finalizer: at teardown the KWOK nodes are
+		// fake (nothing real to drain), so waiting for the termination controller to drain a NodeClaim — which can be slow
+		// when its pods are finalizer-held or blocked by a PDB (the can't-drain cells) — just stalls cleanup. Force-remove
+		// it so cleanup deletes immediately.
+		return finalizer == TestingFinalizer || finalizer == "karpenter.sh/termination"
 	})
 
 	if !equality.Semantic.DeepEqual(metaObj, deepCopy) {

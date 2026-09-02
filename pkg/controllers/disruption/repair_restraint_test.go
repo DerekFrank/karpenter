@@ -36,48 +36,84 @@ import (
 
 // These tests exercise correlated-failure restraint (F3 / "Node Repair Under Correlated Failure"). Restraint layers
 // beneath the disruption budget: even when the budget would allow many, restraint starts a correlated burst at one
-// probe (width 1) and widens only as probes prove out. To isolate restraint from the budget, these tests set a wide
-// budget (100%), so any limiting below the eligible count is restraint, not the budget.
+// probe (width 1) and widens only as probes prove out. The budget is 100% throughout, so ANY limiting below the
+// eligible count is restraint, not the budget. Because the disruption loop issues one command per reconcile, these
+// tests reconcile ACROSS MULTIPLE PASSES and let probes accumulate — the number of *concurrent* in-flight probes is
+// the observable that distinguishes restraint from the one-command-per-pass structure.
 
 var _ = Describe("Repair/Restraint", func() {
 	var nodePool *v1.NodePool
 	var repairController *disruption.Controller
 
-	markUnhealthy := func(n *corev1.Node) {
-		n = ExpectExists(ctx, env.Client, n)
-		n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
-			Type:               "BadNode",
-			Status:             corev1.ConditionFalse,
-			LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
-		})
-		ExpectApplied(ctx, env.Client, n)
+	markUnhealthy := func(n *corev1.Node, condType corev1.NodeConditionType) {
+		// Stamp the repair-policy condition while keeping the node otherwise-Ready, then re-sync cluster state.
+		ExpectMakeNodesStatusChanged(ctx, env.Client, env.Clock, []corev1.NodeCondition{
+			{Type: corev1.NodeReady, Status: corev1.ConditionTrue, Reason: "KubeletReady"},
+			{Type: condType, Status: corev1.ConditionFalse},
+		}, n)
 		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(n))
 	}
 
-	// applyBurst creates n unhealthy nodes in the same NodePool + zone (one shared failure domain), all bound with a
-	// reschedulable pod so pre-spin produces a replacement, and steps past toleration.
-	applyBurst := func(n int) ([]*v1.NodeClaim, []*corev1.Node) {
-		nodeClaims, nodes := test.NodeClaimsAndNodes(n, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
-			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
-		}})
-		for i := range nodes {
-			ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
-		}
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+	// bindPod attaches a reschedulable (ReplicaSet-owned) pod so the node's repair command replaces-then-terminates —
+	// giving a probe a distinct success (make the replacement ready) vs. failure (never ready → queue times out, the
+	// original survives) outcome. An empty node's delete-only command instead terminates the original (a success).
+	bindPod := func(n *corev1.Node) {
 		rs := test.ReplicaSet()
 		ExpectApplied(ctx, env.Client, rs)
 		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
-		for i := range nodes {
-			pod := test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rs.Name, UID: rs.UID, Controller: lo.ToPtr(true), BlockOwnerDeletion: lo.ToPtr(true),
-			}}}})
-			ExpectApplied(ctx, env.Client, pod)
-			ExpectManualBinding(ctx, env.Client, pod, nodes[i])
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(nodes[i]))
-			markUnhealthy(nodes[i])
+		pod := test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rs.Name, UID: rs.UID, Controller: lo.ToPtr(true), BlockOwnerDeletion: lo.ToPtr(true),
+		}}}})
+		ExpectApplied(ctx, env.Client, pod)
+		ExpectManualBinding(ctx, env.Client, pod, n)
+		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(n))
+	}
+
+	// newUnhealthyNode creates + initializes an unhealthy (empty) node in the given zone with a matching condition.
+	newUnhealthyNode := func(zone string, condType corev1.NodeConditionType) (*v1.NodeClaim, *corev1.Node) {
+		nc, n := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: zone},
+		}})
+		ExpectApplied(ctx, env.Client, nc, n)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{n}, []*v1.NodeClaim{nc})
+		markUnhealthy(n, condType)
+		return nc, n
+	}
+
+	// burst creates n unhealthy nodes sharing NodePool + zone + policy (one collinear failure domain), stepping past
+	// toleration once at the end.
+	burst := func(n int, zone string, condType corev1.NodeConditionType) {
+		for i := 0; i < n; i++ {
+			newUnhealthyNode(zone, condType)
 		}
 		env.Clock.Step(31 * time.Minute)
-		return nodeClaims, nodes
+	}
+
+	// reconcileN runs the repair loop n times (each issues at most one command) so probes can accumulate in the queue.
+	reconcileN := func(n int) {
+		for i := 0; i < n; i++ {
+			ExpectSingletonReconciled(ctx, repairController)
+		}
+	}
+
+	// failInFlightProbe drives the single in-flight probe to a genuine FAILURE: never make its replacement ready, step
+	// past the queue's retry timeout, and reconcile the queue so the command times out and clears WITHOUT terminating
+	// the original. The timed-out command leaves an un-launched replacement NodeClaim (empty providerID); in production
+	// the NodeClaim GC / #3190 heal reaps it, but this focused suite doesn't run that controller, so we reap it here
+	// (delete it + drop it from cluster state) — otherwise cluster.Synced() stays false and the loop early-returns.
+	failInFlightProbe := func() {
+		cmds := queue.GetCommands()
+		Expect(cmds).To(HaveLen(1))
+		env.Clock.Step(2 * time.Hour)
+		ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+		Expect(queue.IsEmpty()).To(BeTrue())
+		// Reap the stranded, un-launched replacement so cluster state re-syncs (simulating the NodeClaim GC / #3190).
+		for _, nc := range ExpectNodeClaims(ctx, env.Client) {
+			if nc.Status.ProviderID == "" {
+				ExpectDeleted(ctx, env.Client, nc)
+				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nc))
+			}
+		}
 	}
 
 	BeforeEach(func() {
@@ -92,77 +128,108 @@ var _ = Describe("Repair/Restraint", func() {
 			disruption.WithMethods(disruption.NewRepair(env.Client, cluster, prov, cloudProvider, recorder, env.Clock, queue)))
 	})
 
-	// INV-F3-1 / INV-F3-6: a correlated burst starts at width 1 — one probe first, even though the budget allows all.
-	// A fresh (stateless) controller cold-starts every domain at the floor, so this is also the no-memory-safe case.
-	It("should start a correlated burst at a single probe", func() {
-		applyBurst(10)
-
-		// The disruption loop issues at most one command per pass anyway, but restraint is what holds the fanout at 1
-		// across passes until a probe proves out. Assert the queue holds exactly one in-flight probe.
-		ExpectSingletonReconciled(ctx, repairController)
+	// INV-F3-1 / INV-F3-6: a correlated burst holds at ONE concurrent probe across passes even though the budget allows
+	// all 10. Reconciling 5 times would let 5 concurrent probes through if restraint were absent (budget 100%);
+	// restraint's width-1 floor keeps it at one. Cold-start at the floor is also the stateless/no-memory-safe case.
+	It("should hold a correlated burst at a single concurrent probe across passes", func() {
+		burst(10, "test-zone-1a", "BadNode")
+		reconcileN(5)
 		Expect(queue.GetCommands()).To(HaveLen(1))
 	})
 
-	// INV-F3-3 / INV-F3-4: width doubles only after a probe is PROVEN — its replacement holds healthy for the dwell.
-	// Before the dwell elapses, restraint has not widened, so a second concurrent probe is not admitted.
-	It("should not widen until a probe is proven healthy for the dwell", func() {
-		applyBurst(10)
+	// INV-F3-3 / INV-F3-4: width doubles ONLY after a probe is PROVEN (its replacement holds healthy for the dwell).
+	// Before proving: one concurrent probe. After one proves out: TWO concurrent probes (width 1 -> 2). The widen does
+	// not happen until the dwell elapses (delayed success, F3-4).
+	It("should widen to two concurrent probes only after a probe proves healthy for the dwell", func() {
+		burst(10, "test-zone-1a", "BadNode")
 
-		// First probe.
 		ExpectSingletonReconciled(ctx, repairController)
 		cmds := queue.GetCommands()
 		Expect(cmds).To(HaveLen(1))
 
-		// Make the replacement healthy and terminate the original, but do NOT advance past the dwell yet.
+		// Prove it: replacement healthy, original terminated and gone.
 		ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
 		ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
 		ExpectNodeClaimsCascadeDeletion(ctx, env.Client, cmds[0].Candidates[0].NodeClaim)
 
-		// Reconcile again immediately: the probe is terminated but not yet proven (dwell not elapsed), so width stays 1
-		// and no new probe is admitted.
+		// Observe once: terminated but the dwell has NOT elapsed → not yet proven → width stays 1, no new probe.
 		ExpectSingletonReconciled(ctx, repairController)
 		Expect(queue.GetCommands()).To(HaveLen(0))
+
+		// Advance past the dwell and observe: proven → width doubles → two concurrent probes admitted.
+		env.Clock.Step(6 * time.Minute)
+		reconcileN(3)
+		Expect(queue.GetCommands()).To(HaveLen(2))
 	})
 
-	// INV-F3-2: repair never fully stops. A failed probe pins width at the floor (1) and arms a cooldown, but the floor
-	// is 1 (never 0), so after the cooldown a probe is admitted again — repair keeps trying, just slower.
-	It("should pause but never halt after a failed probe (cooldown, then floor)", func() {
-		// A single unhealthy node in the pool+zone+policy domain.
-		nc, n := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
-			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
-		}})
-		ExpectApplied(ctx, env.Client, nc, n)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{n}, []*v1.NodeClaim{nc})
-		markUnhealthy(n)
+	// INV-F3-2: repair pauses on failure but never halts. A failed probe pins width at the floor and arms a cooldown, so
+	// a still-unhealthy node is not re-probed immediately; once the capped cooldown elapses it is admitted again — the
+	// floor is 1 (never 0), so repair always eventually retries.
+	It("should pause after a failed probe, then re-admit once the cooldown elapses", func() {
+		_, n := newUnhealthyNode("test-zone-1a", "BadNode")
+		bindPod(n)
 		env.Clock.Step(31 * time.Minute)
 
-		// First probe.
+		ExpectSingletonReconciled(ctx, repairController)
+		failInFlightProbe()
+
+		// Observe the failure: the domain is in cooldown, so the still-unhealthy node is not re-probed — paused.
+		ExpectSingletonReconciled(ctx, repairController)
+		Expect(queue.GetCommands()).To(HaveLen(0))
+
+		// After the capped cooldown elapses, the node is admitted again — paused, not halted.
+		env.Clock.Step(11 * time.Minute)
+		reconcileN(2)
+		Expect(queue.GetCommands()).To(HaveLen(1))
+	})
+
+	// End-to-end flood with REAL probe-outcome detection (not the whitebox dial sim): a correlated burst whose
+	// replacements come up Ready and are then RE-FLAGGED during the success dwell (the systematic false positive). This
+	// exercises observeProbes' replacement-health check: the dwell must verify the replacement STAYS healthy, so a
+	// re-flagged replacement is a FAILED probe — not a success timed out on a bare clock. A spurious "proven" here would
+	// widen the domain to two concurrent probes (cf. the "widens after proven" spec); the correct behavior holds at one.
+	It("treats a replacement re-flagged during the dwell as a failed probe, pacing the flood at one probe", func() {
+		// Bind a pod to each flood node so repair PRE-SPINS a replacement (replace-then-terminate) — an empty node would
+		// be delete-only with no replacement to re-flag.
+		for i := 0; i < 4; i++ {
+			_, n := newUnhealthyNode("test-zone-1a", "BadNode")
+			bindPod(n)
+		}
+		env.Clock.Step(31 * time.Minute)
+
 		ExpectSingletonReconciled(ctx, repairController)
 		cmds := queue.GetCommands()
 		Expect(cmds).To(HaveLen(1))
+		Expect(cmds[0].Replacements).To(HaveLen(1))
 
-		// Fail the probe: never make the replacement ready, step past the queue retry timeout so the command times out.
-		// On timeout the queue clears the command WITHOUT terminating the original — the "replacement never came up
-		// healthy" outcome restraint reads as a failure.
-		env.Clock.Step(2 * time.Hour)
+		// The replacement initializes (looks healthy), so the queue terminates the original.
+		ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
 		ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
-		Expect(queue.IsEmpty()).To(BeTrue())
+		ExpectNodeClaimsCascadeDeletion(ctx, env.Client, cmds[0].Candidates[0].NodeClaim)
 
-		// The next reconcile observes the failed probe: width resets to the floor and the pool+zone+policy domains are
-		// put in cooldown. A FRESH unhealthy node in those same domains is now blocked — repair has paused.
-		freshNC, freshNode := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
-			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
-		}})
-		ExpectApplied(ctx, env.Client, freshNC, freshNode)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{freshNode}, []*v1.NodeClaim{freshNC})
-		markUnhealthy(freshNode)
-		env.Clock.Step(31 * time.Minute)
-		ExpectSingletonReconciled(ctx, repairController)
-		Expect(queue.GetCommands()).To(HaveLen(0)) // paused: domain in cooldown
+		// The false positive re-fires on the fresh replacement: mark it unhealthy during the dwell.
+		replNC := ExpectExists(ctx, env.Client, &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: cmds[0].Replacements[0].Name}})
+		Expect(replNC.Status.NodeName).ToNot(BeEmpty())
+		replNode := ExpectExists(ctx, env.Client, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: replNC.Status.NodeName}})
+		markUnhealthy(replNode, "BadNode")
 
-		// After the cooldown ceiling elapses, the fresh node is admitted — repair paused, it did not halt (floor ≥ 1).
-		env.Clock.Step(11 * time.Minute)
-		ExpectSingletonReconciled(ctx, repairController)
+		// Past the dwell: original gone AND replacement unhealthy → observeProbes records RepairFailed and arms a cooldown,
+		// so the domain does NOT widen (a spurious proven would admit a second concurrent probe here).
+		env.Clock.Step(6 * time.Minute)
+		reconcileN(3)
+		Expect(queue.GetCommands()).To(HaveLen(0))
+
+		// Pause, not stop: once the cooldown elapses the flood is probed again — but still one at a time (floor 1), never
+		// widened by the false positive.
+		env.Clock.Step(2 * time.Minute)
+		reconcileN(3)
 		Expect(queue.GetCommands()).To(HaveLen(1))
 	})
+
+	// INV-F3-5 (past success doesn't mask a new correlated failure — the idle-domain width reset) and the multi-domain
+	// combine rules (min-width across domains; eligible if ANY domain is out of cooldown) are verified deterministically
+	// in the white-box Ginkgo specs in repair_restraint_whitebox_test.go. Those dial mechanics are pure functions, and
+	// exercising them end-to-end here would require driving a full fault episode to completion and back — which in this
+	// focused harness collides with the fact that the per-condition toleration (30m) exceeds the cooldown cap (10m), so
+	// any clock step taken to make a fresh fault eligible also expires the cooldown under test.
 })

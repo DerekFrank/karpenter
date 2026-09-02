@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	kwok "sigs.k8s.io/karpenter/kwok/cloudprovider"
+	metricscloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider/metrics"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/overlay"
 	"sigs.k8s.io/karpenter/pkg/controllers"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -34,7 +35,9 @@ func main() {
 	}
 
 	overlayUndecoratedCloudProvider := kwok.NewCloudProvider(ctx, op.GetClient(), instanceTypes)
-	cloudProvider := overlay.Decorate(overlayUndecoratedCloudProvider, op.GetClient(), op.InstanceTypeStore)
+	// metrics.Decorate is outermost so karpenter_cloudprovider_duration_seconds{method=...} counts every Create/Delete
+	// (the e2e repair-perf suite scrapes this series for its cp-calls metric).
+	cloudProvider := metricscloudprovider.Decorate(overlay.Decorate(overlayUndecoratedCloudProvider, op.GetClient(), op.InstanceTypeStore))
 	clusterState := state.NewCluster(op.Clock, op.GetClient(), cloudProvider)
 	op.
 		WithControllers(ctx, controllers.NewControllers(

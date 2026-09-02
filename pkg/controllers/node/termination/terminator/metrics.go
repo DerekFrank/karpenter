@@ -52,3 +52,18 @@ var PodsDrainedTotal = opmetrics.NewPrometheusCounter(
 	},
 	[]string{ReasonLabel},
 )
+
+// PodsForceDeletedTotal counts pods that were force-deleted past the node's grace-period expiration (the terminator's
+// DeleteExpiringPods path). Unlike PodsDrainedTotal — which counts pods that completed a graceful eviction (honoring the
+// PDB and grace period) — this counts disruptions that BYPASSED the PDB and grace, i.e. "disrupted without a completed
+// drain". Together they split the disruption cost into graceful vs forceful.
+var PodsForceDeletedTotal = opmetrics.NewPrometheusCounter(
+	crmetrics.Registry,
+	prometheus.CounterOpts{
+		Namespace: metrics.Namespace,
+		Subsystem: metrics.PodSubsystem,
+		Name:      "force_deleted_total",
+		Help:      "The total number of pods force-deleted past their grace period during node termination by Karpenter (bypassing PDB and grace), labeled by reason",
+	},
+	[]string{ReasonLabel},
+)

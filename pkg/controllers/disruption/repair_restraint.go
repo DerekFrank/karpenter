@@ -17,73 +17,114 @@ limitations under the License.
 package disruption
 
 import (
-	"context"
-	"sync"
 	"time"
 
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-
-	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	corev1 "k8s.io/api/core/v1"
 )
 
-// Correlated-failure restraint (Node Repair Under Correlated Failure, F3). Per failure domain, repair opens up
-// geometrically while replacements prove out and backs off sharply when they don't — floored at one probe and capped
-// at a max cooldown, so it always keeps trying but never stampedes. It layers strictly *beneath* the disruption budget.
+// RepairOutcome is what happened to a candidate repair drove through the pipeline, reported back to the restraint
+// policy. Repair owns detecting these (from the queue + NodeClaim state + a success dwell); the policy only reacts.
+type RepairOutcome int
+
+const (
+	// RepairProven — the replacement came up and held Ready+Healthy for the success dwell: a durable success.
+	RepairProven RepairOutcome = iota
+	// RepairFailed — the repair did not produce a healthy replacement (bad-component loop, partitioned zone, timeout).
+	RepairFailed
+	// RepairCleared — the candidate's fault resolved on its own before/without a completed repair; its fault episode is
+	// over. Lets a policy forget any state it earned so a new episode starts fresh.
+	RepairCleared
+	// RepairClawedBack — a repair that was already reported RepairProven re-failed within the claw-back watch window
+	// (the optimistic-credit variant credits on first-healthy, then watches). The domain must undo the width it earned
+	// and back off, but WITHOUT a second in-flight decrement — RepairProven already released the probe.
+	RepairClawedBack
+)
+
+// RepairRestraint is the swappable policy that decides, beneath the disruption budget, whether repair may probe a
+// candidate right now. It is a pure decision policy over a stream of outcomes: repair owns all the I/O (tracking
+// in-flight probes, polling the queue and NodeClaims, timing the success dwell) and simply asks CanDisrupt and reports
+// Record. Nothing about the AIMD mechanism (failure domains, width, cooldown) appears in the interface, so an entirely
+// different policy — rate-based, signal-fed, or none — drops in without changing repair.
+type RepairRestraint interface {
+	// CanDisrupt reports whether this candidate may be probed now.
+	CanDisrupt(c *Candidate) bool
+	// Record informs the policy of the outcome of a candidate it previously admitted (or one whose fault just cleared).
+	// replacement is the Node the repair pre-spun (nil for a delete-only/terminate-first repair, or a launch that never
+	// produced a node), so the policy can attribute a location-scoped outcome to where the replacement actually came up.
+	Record(c *Candidate, replacement *corev1.Node, outcome RepairOutcome)
+}
+
+// noRestraint is the identity policy: always admit, remember nothing — the behavior when only the budget paces repair.
+type noRestraint struct{}
+
+func (noRestraint) CanDisrupt(*Candidate) bool                     { return true }
+func (noRestraint) Record(*Candidate, *corev1.Node, RepairOutcome) {}
+
+// Correlated-failure restraint (Node Repair Under Correlated Failure, F3) — the default RepairRestraint. Per failure
+// domain (NodePool, zone, policy-condition), repair opens up geometrically while replacements prove out and backs off
+// sharply when they don't — floored at one probe and capped at a max cooldown, so it always keeps trying but never
+// stampedes. It layers strictly *beneath* the disruption budget.
 //
-// Statelessness (invariant): the store is an optimization, never a correctness requirement. A freshly restarted
+// Statelessness (invariant): the dials are an optimization, never a correctness requirement. A freshly restarted
 // controller rebuilds an empty store, and an empty store cold-starts every domain at width 1 — the most conservative
 // value — so a zero-state restart is always safe.
-const (
-	restraintWidthFloor = 1                // never 0: repair always eventually retries (invariant: pause, don't stop)
-	restraintDwell      = 5 * time.Minute  // a probe is proven only after its replacement holds healthy this long
-	restraintCooldownT0 = 1 * time.Minute  // initial per-domain cooldown after a failure
-	restraintCooldownTMax = 10 * time.Minute // cooldown ceiling — so repair always eventually retries in a domain
-)
+// restraintWidthFloor is never 0: repair always eventually retries (invariant: pause, don't stop). The cooldown floor/
+// ceiling are NOT constants — they are the provider's RepairTiming (so the whole restraint timescale scales together).
+const restraintWidthFloor = 1
 
-// domainKind enumerates the failure domains repair scopes restraint to. A correlated burst collapses into one domain
-// that cold-starts at width 1, so correlation is handled by scoping + cold-start, not by a correlation statistic.
+// failureDomain is one axis restraint scopes to (NodePool, zone, or policy-condition). A correlated burst collapses into
+// one domain that cold-starts at width 1, so correlation is handled by scoping + cold-start, not a correlation statistic.
 type failureDomain struct {
 	kind  string // "nodepool" | "zone" | "policy"
 	value string
 }
 
-// probe is a single in-flight, not-yet-proven repair. Success is delayed: a probe counts as proven only once its
-// replacement has held healthy for restraintDwell after the original was terminated.
-type probe struct {
-	nodeClaimName string
-	domains       []failureDomain
-	succeededAt   time.Time // when the candidate was observed terminated (replacement came up); zero until then
-}
-
-// restraint holds the per-domain dials plus the set of in-flight probes. All access is guarded so the Repair method
-// (disruption loop) and any future queue callback don't race.
+// restraint is the AIMD RepairRestraint. width/cooldown/failCount are per-domain dials; inFlight counts the probes
+// currently admitted-but-unresolved per domain (repair reports resolution via Record). It is only ever accessed from
+// the disruption singleton reconciler, so it needs no locking.
 type restraint struct {
-	mu            sync.Mutex
-	width         map[failureDomain]int
-	cooldownUntil map[failureDomain]time.Time
-	failCount     map[failureDomain]int
-	probes        map[string]*probe // keyed by candidate providerID
+	width           map[failureDomain]int
+	cooldownUntil   map[failureDomain]time.Time
+	failCount       map[failureDomain]int
+	inFlight        map[failureDomain]int
+	clock           clockNow
+	cooldownFloor   time.Duration // first cooldown after a failure (provider RepairTiming.CooldownFloor)
+	cooldownCeiling time.Duration // exponential-backoff cap (provider RepairTiming.CooldownCeiling)
 }
 
-func newRestraint() *restraint {
+// clockNow is the sliver of the clock restraint needs; repair passes its own clock so tests control time.
+type clockNow interface{ Now() time.Time }
+
+func newRestraint(clk clockNow, cooldownFloor, cooldownCeiling time.Duration) *restraint {
 	return &restraint{
-		width:         map[failureDomain]int{},
-		cooldownUntil: map[failureDomain]time.Time{},
-		failCount:     map[failureDomain]int{},
-		probes:        map[string]*probe{},
+		width:           map[failureDomain]int{},
+		cooldownUntil:   map[failureDomain]time.Time{},
+		failCount:       map[failureDomain]int{},
+		inFlight:        map[failureDomain]int{},
+		clock:           clk,
+		cooldownFloor:   cooldownFloor,
+		cooldownCeiling: cooldownCeiling,
 	}
 }
 
-// domainsOf returns the failure domains a candidate belongs to. A candidate is in several at once, and pacing takes the
-// most conservative across them.
-func domainsOf(c *Candidate, policyConditionType string) []failureDomain {
-	return []failureDomain{
+// domainsOf returns the failure domains a candidate belongs to: its NodePool, its zone, and one per unhealthy
+// (Status=False) node condition — the condition type is a proxy for the detector, so a bad detector flooding one
+// condition cools that policy domain without touching an unrelated real fault. A candidate is in several domains at
+// once, and pacing takes the most conservative across them. Reading conditions straight off the node keeps the
+// interface a pure function of the candidate — restraint needs nothing threaded in from repair.
+func domainsOf(c *Candidate) []failureDomain {
+	domains := []failureDomain{
 		{kind: "nodepool", value: c.NodePool.Name},
 		{kind: "zone", value: c.zone},
-		{kind: "policy", value: policyConditionType},
 	}
+	if c.Node != nil {
+		for _, cond := range c.Node.Status.Conditions {
+			if cond.Status == corev1.ConditionFalse {
+				domains = append(domains, failureDomain{kind: "policy", value: string(cond.Type)})
+			}
+		}
+	}
+	return domains
 }
 
 func (r *restraint) widthFor(d failureDomain) int {
@@ -93,32 +134,19 @@ func (r *restraint) widthFor(d failureDomain) int {
 	return restraintWidthFloor
 }
 
-// inFlight counts not-yet-proven probes whose domain set includes d.
-func (r *restraint) inFlight(d failureDomain) int {
-	n := 0
-	for _, p := range r.probes {
-		for _, pd := range p.domains {
-			if pd == d {
-				n++
-				break
-			}
-		}
-	}
-	return n
-}
-
-// admit reports whether a candidate may probe now. Two combine rules across its domains:
-//   - Width — take the min: the candidate paces down if ANY of its domains is at its width ceiling of in-flight probes.
+// CanDisrupt admits a candidate under two combine rules across its domains:
+//   - Width — take the min: the candidate paces down if ANY domain is at its width ceiling of in-flight probes.
 //   - Cooldown — eligible if ANY domain is out of cooldown: a fault in a fresh domain runs right away even when it
 //     shares a backed-off domain with a flood.
-func (r *restraint) admit(c *Candidate, policyConditionType string, now time.Time) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	domains := domainsOf(c, policyConditionType)
+//
+// A CanDisrupt that returns true is treated as an admitted probe (its domains' in-flight counts increment), so repair
+// must follow an admitted candidate with a Record once its outcome is known.
+func (r *restraint) CanDisrupt(c *Candidate) bool {
+	domains := domainsOf(c)
 
 	eligibleByCooldown := false
 	for _, d := range domains {
-		if !now.Before(r.cooldownUntil[d]) {
+		if !r.clock.Now().Before(r.cooldownUntil[d]) {
 			eligibleByCooldown = true
 			break
 		}
@@ -126,67 +154,84 @@ func (r *restraint) admit(c *Candidate, policyConditionType string, now time.Tim
 	if !eligibleByCooldown {
 		return false
 	}
-	// Width: the most-constrained domain gates. Admit only if every domain has in-flight headroom under its width.
 	for _, d := range domains {
-		if r.inFlight(d) >= r.widthFor(d) {
+		if r.inFlight[d] >= r.widthFor(d) {
 			return false
 		}
+	}
+	// Admitted: count it in-flight in every domain until repair reports the outcome via Record.
+	for _, d := range domains {
+		r.inFlight[d]++
 	}
 	return true
 }
 
-// recordProbe registers a newly-issued repair as an in-flight probe.
-func (r *restraint) recordProbe(c *Candidate, policyConditionType string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.probes[c.ProviderID()] = &probe{nodeClaimName: c.NodeClaim.Name, domains: domainsOf(c, policyConditionType)}
-}
-
-// observe feeds probe outcomes back into the dials. It reads the current state of each in-flight probe:
-//   - still enqueued (queue holds it until the replacement initializes) → pending, no change.
-//   - dequeued and the original NodeClaim is gone → the replacement came up and the original was terminated; once it
-//     has held for the dwell, the probe is proven → double the width in every domain and clear their cooldown.
-//   - dequeued and the original NodeClaim still exists → the command failed (e.g. the replacement never came up healthy
-//     — a bad-AMI loop, a partitioned zone) → reset width to the floor and back the cooldown off exponentially.
-func (r *restraint) observe(ctx context.Context, kubeClient client.Client, queue *Queue, now time.Time) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for providerID, p := range r.probes {
-		if queue.HasAny(providerID) {
-			continue // replacement still launching/waiting; outcome not yet known
-		}
-		nc := &v1.NodeClaim{}
-		err := kubeClient.Get(ctx, types.NamespacedName{Name: p.nodeClaimName}, nc)
-		switch {
-		case errors.IsNotFound(err):
-			// The original was terminated — the replacement proved healthy enough for the queue to proceed. Require the
-			// dwell to elapse before counting it as a durable success (invariant: success = healthy for a while).
-			if p.succeededAt.IsZero() {
-				p.succeededAt = now
+// Record folds a candidate's outcome back into the dials:
+//   - Proven → double the width in every domain and clear their cooldown (speed up when it works).
+//   - Failed → reset width to the floor and arm an exponentially-backed-off, capped cooldown (slow down when it doesn't).
+//   - Cleared → the fault episode is over with no in-flight probe left; forget the domains' earned width so a new
+//     correlated burst starts slow again (past success ≠ predictor of a new correlated failure).
+func (r *restraint) Record(c *Candidate, replacement *corev1.Node, outcome RepairOutcome) {
+	for _, d := range domainsOf(c) {
+		switch outcome {
+		case RepairProven:
+			if r.inFlight[d] > 0 {
+				r.inFlight[d]--
 			}
-			if !now.Before(p.succeededAt.Add(restraintDwell)) {
-				for _, d := range p.domains {
-					r.width[d] = r.widthFor(d) * 2
-					delete(r.cooldownUntil, d)
-					delete(r.failCount, d)
-				}
-				delete(r.probes, providerID)
+			// Widen cautiously: only credit (speed up) a zone we actually tested — a replacement that came up healthy in a
+			// different zone says nothing about the candidate's zone, so it must not widen it (the C2 false-signal).
+			if r.credits(d, replacement) {
+				r.width[d] = r.widthFor(d) * 2
+				delete(r.cooldownUntil, d)
+				delete(r.failCount, d)
 			}
-		case err == nil:
-			// The command completed without terminating the original — a failed repair. Cut width to the floor and arm
-			// an exponentially-backed-off, capped cooldown so repair pauses in this domain but never stops.
-			for _, d := range p.domains {
-				r.width[d] = restraintWidthFloor
-				r.failCount[d]++
-				backoff := restraintCooldownT0 << (r.failCount[d] - 1)
-				if backoff > restraintCooldownTMax || backoff <= 0 {
-					backoff = restraintCooldownTMax
-				}
-				r.cooldownUntil[d] = now.Add(backoff)
+		case RepairFailed:
+			if r.inFlight[d] > 0 {
+				r.inFlight[d]--
 			}
-			delete(r.probes, providerID)
-		default:
-			// transient get error; leave the probe to be re-observed next pass
+			// Back off quickly: a failure is always a reason to slow this candidate's domains, so cool every one of them
+			// unconditionally. (Gating this on the replacement's zone too would let a re-flagged flood whose replacement
+			// landed elsewhere slip back through the still-fresh zone via the any-domain-out-of-cooldown admission rule.)
+			r.width[d] = restraintWidthFloor
+			r.failCount[d]++
+			backoff := r.cooldownFloor << (r.failCount[d] - 1)
+			if backoff > r.cooldownCeiling || backoff <= 0 {
+				backoff = r.cooldownCeiling
+			}
+			r.cooldownUntil[d] = r.clock.Now().Add(backoff)
+		case RepairCleared:
+			// Only forget a domain once nothing is in flight for it — an in-flight probe still owns its earned width.
+			if r.inFlight[d] == 0 {
+				delete(r.width, d)
+				delete(r.failCount, d)
+				delete(r.cooldownUntil, d)
+			}
+		case RepairClawedBack:
+			// A previously-proven repair re-failed inside the watch window: undo the widen and arm backoff exactly like
+			// RepairFailed, but do NOT touch inFlight (RepairProven already decremented it — a second decrement would
+			// under-count this domain's live probes and let a flood slip through the width gate).
+			r.width[d] = restraintWidthFloor
+			r.failCount[d]++
+			backoff := r.cooldownFloor << (r.failCount[d] - 1)
+			if backoff > r.cooldownCeiling || backoff <= 0 {
+				backoff = r.cooldownCeiling
+			}
+			r.cooldownUntil[d] = r.clock.Now().Add(backoff)
 		}
 	}
+}
+
+// credits reports whether a SUCCESS may speed up (widen) domain d. Only a zone (location) domain can be mis-credited,
+// and only when the replacement came up in a DIFFERENT zone: a healthy replacement elsewhere says nothing about the
+// candidate's (possibly impaired) zone, so it must not widen it — this is the network-partition false-signal the review
+// flagged ("only learn about a failure domain if the replacement is in it"). A delete-only / launch-failed repair
+// (replacement == nil) has no other zone to attribute to, so it credits the candidate's zone as before. NodePool (the
+// replacement is always in the candidate's pool) and policy (the candidate's own condition — success means repairing
+// that condition worked) are always the candidate's, so they are always credited. Backing off on failure is NOT gated
+// by this — a failure always cools the candidate's own domains (see Record).
+func (r *restraint) credits(d failureDomain, replacement *corev1.Node) bool {
+	if d.kind != "zone" || replacement == nil {
+		return true
+	}
+	return replacement.Labels[corev1.LabelTopologyZone] == d.value
 }
