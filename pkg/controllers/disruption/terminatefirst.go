@@ -35,6 +35,13 @@ import (
 // A launch *failure* must never select terminate-first: this reads structural capacity (a full reservation the
 // candidate itself holds), never launch outcomes, so a failed launch keeps replacing-first under the existing
 // per-NodePool launch backoff.
+//
+// This depends on the disruption simulation running in the scheduler's default (fallback) ReservedOfferingMode, which
+// SimulateScheduling does not override: fallback lets the candidate-gone simulation return a reserved-only replacement
+// even when the reservation is full (the launch would ICE, but the simulated NodeClaim still surfaces so we can read
+// its posture). Under strict mode the scheduler would instead return a ReservedOfferingError and no replacement, and
+// this detection would not fire. Reactive provisioning (Provisioner.Schedule) is the one that runs strict — that is
+// the refill path after the delete, not the detection path here.
 
 // terminateFirst reports whether a voluntary disruption of a reserved candidate must delete it before a replacement can
 // be provisioned. It is decided from the single candidate-gone simulation the caller already ran (no extra pass):
