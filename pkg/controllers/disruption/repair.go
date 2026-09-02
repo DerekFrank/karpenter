@@ -19,6 +19,9 @@ package disruption
 import (
 	"context"
 	"errors"
+	"math"
+	"math/rand"
+	"os"
 	"sort"
 	"time"
 
@@ -39,6 +42,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
@@ -60,8 +64,30 @@ type Repair struct {
 	queue         *Queue
 	restraint     RepairRestraint
 	probes        map[string]*repairProbe // providerID -> in-flight probe repair is tracking to an outcome
+	watching      map[string]*repairProbe // providerID -> optimistically-credited probe still watched for a re-break (claw-back)
 	acted         map[string]*Candidate   // providerID -> candidate repair has acted on, watched for fault clearance
+	// Repair-behavior variants (sim experiments, selected by REPAIR_OPTION), all default off:
+	//   - optimistic: credit success the instant the replacement is healthy (dwell 0), so the AIMD widens fast.
+	//   - clawback>0: pair with optimistic — after crediting, keep watching the replacement for this window; if it
+	//     re-breaks within it, retroactively claw back the credit (RepairClawedBack) so the domain undoes its widen and
+	//     backs off. Without it, optimistic re-credits a re-flapping replacement as a fresh success (width grows unbounded).
+	//   - dwellJitter>0: randomize each probe's dwell by a uniform [0, dwellJitter) offset (robustness to dwell timing).
+	//   - pinned: force each replacement into the CANDIDATE's zone (no escape) — models a replacement that must come from
+	//     the same failure domain, so a domain-scoped fault re-inherits and repair churns in-place instead of escaping.
+	optimistic  bool
+	clawback    time.Duration
+	dwellJitter time.Duration
+	pinned      bool
+	// breaker models the shipped node.health circuit breaker layered on top of the modern machinery: gate ALL repair in
+	// a NodePool while its unhealthy fraction exceeds breakerUnhealthyFraction (a fraction-keyed trip that, unlike the
+	// per-domain restraint, cannot tell an isolated fault in a small fleet from a correlated fault in a large one).
+	breaker   bool
+	dwellBase time.Duration // provider RepairTiming.Dwell, snapshotted at construction (freezes the timescale)
 }
+
+// breakerUnhealthyFraction is the shipped node.health breaker's allowedUnhealthyPercent (20%): if more than this
+// fraction of a NodePool's nodes are unhealthy, the breaker trips and blocks all repair in that pool.
+const breakerUnhealthyFraction = 0.20
 
 // repairProbe is a candidate repair admitted and is now watching to a terminal outcome, so it can report Proven/Failed
 // to the restraint policy. Repair (not the policy) owns this I/O: whether the replacement came up, and the success
@@ -72,10 +98,9 @@ type repairProbe struct {
 	nodeClaimName string
 	replacements  []*Replacement // the pre-spun replacement(s) to watch for durable health; empty for terminate-first
 	succeededAt   time.Time      // when the replacement was first observed healthy after the original terminated; zero until then
+	dwell         time.Duration  // this probe's success dwell, fixed when succeededAt is set (base ± jitter, or 0 if optimistic)
+	creditedAt    time.Time      // when RepairProven was reported; set only for claw-back watching, zero otherwise
 }
-
-// repairDwell is how long a replacement must hold Ready+Healthy before a probe counts as a durable success.
-const repairDwell = 5 * time.Minute
 
 // RepairOptions carries optional overrides for NewRepair. The only override today is the restraint policy, which
 // defaults to the correlated-failure AIMD policy; a test (or an alternate build) can swap in noRestraint or any other
@@ -92,9 +117,12 @@ func WithRestraint(rr RepairRestraint) option.Function[RepairOptions] {
 }
 
 func NewRepair(kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, clk clock.Clock, queue *Queue, opts ...option.Function[RepairOptions]) *Repair {
-	// The correlated-failure AIMD policy is the default RepairRestraint; WithRestraint swaps in another implementation
-	// (or noRestraint) without touching this method's callers.
-	o := option.Resolve(append([]option.Function[RepairOptions]{WithRestraint(newRestraint(clk))}, opts...)...)
+	// The restraint policy + dwell handling default from REPAIR_OPTION (a sim knob to compare implementations from one
+	// build); WithRestraint still overrides for tests. Cooldowns come from the provider's RepairTiming so the whole
+	// restraint timescale scales together with the dwell.
+	t := cp.RepairTiming()
+	tuning := repairOptionDefaults(clk, t)
+	o := option.Resolve(append([]option.Function[RepairOptions]{WithRestraint(tuning.restraint)}, opts...)...)
 	return &Repair{
 		kubeClient:    kubeClient,
 		cluster:       cluster,
@@ -104,9 +132,84 @@ func NewRepair(kubeClient client.Client, cluster *state.Cluster, provisioner *pr
 		clock:         clk,
 		queue:         queue,
 		probes:        map[string]*repairProbe{},
+		watching:      map[string]*repairProbe{},
 		acted:         map[string]*Candidate{},
 		restraint:     o.restraint,
+		optimistic:    tuning.optimistic,
+		clawback:      tuning.clawback,
+		dwellJitter:   tuning.dwellJitter,
+		pinned:        tuning.pinned,
+		breaker:       tuning.breaker,
+		dwellBase:     t.Dwell,
 	}
+}
+
+// repairTuning is the repair-behavior configuration selected from REPAIR_OPTION (restraint policy + dwell/credit +
+// replacement placement). Bundling it keeps repairOptionDefaults a single return and NewRepair readable.
+type repairTuning struct {
+	restraint   RepairRestraint
+	optimistic  bool
+	clawback    time.Duration
+	dwellJitter time.Duration
+	pinned      bool
+	breaker     bool
+}
+
+// repairOptionDefaults selects the repair-behavior config from the REPAIR_OPTION env var — a sim knob so one build can
+// be deployed as several implementations to compare. Unset/unknown ⇒ the correlated-failure AIMD policy.
+//
+//	norestraint                    → noRestraint (only the disruption budget paces repair — the aggressive baseline;
+//	                                 NOT the 20%-trip circuit breaker, which is a separate implementation not in this tree)
+//	restraint-unpinned (or unset)  → AIMD (default): replacement may land in any zone (can escape a bad domain)
+//	restraint-pinned               → AIMD, but each replacement is pinned to the candidate's zone (no escape)
+//	jittered                       → AIMD, each probe's dwell randomized by a one-sided [0,+Dwell) offset → [Dwell,2·Dwell)
+//	optimistic                     → AIMD, credit on first-healthy (dwell 0). Widens fast; does NOT claw back — the
+//	                                 no-dwell control (a re-flapping replacement is re-credited as a fresh success).
+//	clawback                       → AIMD, credit on first-healthy (dwell 0) AND watch the credited replacement for
+//	                                 ClawbackWindow; a re-break in that window retroactively undoes the credit + backs off.
+//	budgeted-breaker               → the 20%-unhealthy circuit-breaker trip layered on the modern budget + replace-first
+//	                                 machinery (no AIMD): repair when the pool is under the trip, freeze when over it.
+//	breaker-pinned                 → the breaker trip + budget + AIMD restraint + zone-pinned replacements (all mechanisms).
+//	(The bare "breaker" arm — the shipped node.health build, force-delete + trip, no budget/restraint — is a SEPARATE
+//	 image, not this unified binary; deploy it via REPAIR_OPTION=breaker → the :breaker ECR tag.)
+func repairOptionDefaults(clk clock.Clock, t cloudprovider.RepairTiming) repairTuning {
+	aimd := func() RepairRestraint { return newRestraint(clk, t.CooldownFloor, t.CooldownCeiling) }
+	switch os.Getenv("REPAIR_OPTION") {
+	case "norestraint":
+		return repairTuning{restraint: noRestraint{}}
+	case "restraint-pinned":
+		return repairTuning{restraint: aimd(), pinned: true}
+	case "budgeted-breaker":
+		return repairTuning{restraint: noRestraint{}, breaker: true}
+	case "breaker-pinned":
+		return repairTuning{restraint: aimd(), breaker: true, pinned: true}
+	case "jittered":
+		return repairTuning{restraint: aimd(), dwellJitter: t.Dwell}
+	case "jittered-pinned":
+		return repairTuning{restraint: aimd(), dwellJitter: t.Dwell, pinned: true}
+	case "optimistic":
+		return repairTuning{restraint: aimd(), optimistic: true}
+	case "optimistic-pinned":
+		return repairTuning{restraint: aimd(), optimistic: true, pinned: true}
+	case "clawback":
+		return repairTuning{restraint: aimd(), optimistic: true, clawback: t.ClawbackWindow}
+	case "clawback-pinned":
+		return repairTuning{restraint: aimd(), optimistic: true, clawback: t.ClawbackWindow, pinned: true}
+	default:
+		return repairTuning{restraint: aimd()}
+	}
+}
+
+// probeDwell is this probe's success dwell: 0 when optimistic (credit the instant it's healthy), else the provider's
+// base dwell plus a uniform [0, dwellJitter) offset when jitter is on.
+func (r *Repair) probeDwell(base time.Duration) time.Duration {
+	if r.optimistic {
+		return 0
+	}
+	if r.dwellJitter > 0 {
+		return base + time.Duration(rand.Int63n(int64(r.dwellJitter)))
+	}
+	return base
 }
 
 // ShouldDisrupt is a predicate that filters candidates to nodes that have an unhealthy condition matching a
@@ -180,9 +283,48 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 		return candidates[i].Name() < candidates[j].Name()
 	})
 
+	// Circuit-breaker trip (budgeted-breaker / breaker-pinned): mirror the shipped node.health breaker by freezing ALL
+	// repair in a NodePool whose unhealthy fraction exceeds breakerUnhealthyFraction. Unhealthy ≈ the repair-eligible
+	// candidates in the pool; the denominator is the pool's registered nodes. This is fraction-keyed, so it trips the
+	// same on a lone fault in a tiny fleet (1/3 = 33%) and a correlated burst in a huge one (350/1000 = 35%) — the
+	// scale/correlation blindness the per-domain restraint avoids.
+	var breakerTripped map[string]bool
+	if r.breaker {
+		poolNodes := map[string]int{}
+		for n := range r.cluster.Nodes() {
+			if np := n.Labels()[v1.NodePoolLabelKey]; np != "" {
+				poolNodes[np]++
+			}
+		}
+		poolUnhealthy := map[string]int{}
+		for _, c := range candidates {
+			poolUnhealthy[c.NodePool.Name]++
+		}
+		breakerTripped = map[string]bool{}
+		for np, u := range poolUnhealthy {
+			total := poolNodes[np]
+			if total == 0 {
+				continue
+			}
+			// Mirror node.health EXACTLY: threshold = ceil(allowedUnhealthyPercent * N) (round up), and the pool is
+			// unhealthy only when unhealthyCount EXCEEDS it. The round-up is why a lone fault in a small pool never trips
+			// (3 nodes ⇒ threshold 1, so 1 unhealthy is tolerated even though it's 33%).
+			threshold := int(math.Ceil(breakerUnhealthyFraction * float64(total)))
+			if u > threshold {
+				breakerTripped[np] = true
+			}
+		}
+	}
+
 	for _, candidate := range candidates {
 		rr, ok := res[candidate]
 		if !ok || disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
+			continue
+		}
+		// Breaker trip: while the pool is over the unhealthy-fraction line, block every repair in it (latched until
+		// enough nodes recover on their own to drop back under the line — which, for a durable correlated fault, never
+		// happens, so the pool stays frozen).
+		if r.breaker && breakerTripped[candidate.NodePool.Name] {
 			continue
 		}
 		// Correlated-failure restraint (F3): even within budget, only admit this candidate if the restraint policy
@@ -219,6 +361,20 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 		// unbounded hang and a forceful (0) policy skips the drain for conditions the kubelet can't evict through.
 		if err := r.stampDrainBound(ctx, candidate, rr.merged); err != nil {
 			return []Command{}, err
+		}
+		// Pinned variant: force each replacement into the candidate's own zone (no escape). Intersecting an In[zone]
+		// requirement onto the scheduled replacement makes the cloud provider launch it in the failed domain, so a
+		// domain-scoped fault re-inherits on the replacement and repair churns in place rather than escaping to a
+		// healthy zone. (Unpinned leaves placement free, which is how repair escapes a bad zone today.)
+		// On single-topo cells the pool spans all zones, so the intersection always keeps candidate.zone (non-empty). If
+		// a replacement already carried a conflicting zone constraint (e.g. a per-AZ pool that escaped to another zone),
+		// the intersection is empty and that NodeClaim never launches — which still yields the intended pinned outcome
+		// (repair can't produce a working in-zone replacement → churns → no recovery), and is safe because replace-then-
+		// terminate leaves the original in place (no outage), the stalled probe just resolves as RepairFailed.
+		if r.pinned && candidate.zone != "" {
+			for _, nc := range results.NewNodeClaims {
+				nc.Requirements.Add(scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, candidate.zone))
+			}
 		}
 		// Share the same *Replacement objects with the probe: the queue fills in each Replacement.Name on launch, so the
 		// probe can later find the replacement NodeClaim(s) and verify they stay healthy through the dwell.
@@ -291,13 +447,20 @@ func (r *Repair) observeProbes(ctx context.Context) {
 			case replHealthy:
 				if p.succeededAt.IsZero() {
 					p.succeededAt = now // first observation of a healthy replacement — measure the dwell from here
+					p.dwell = r.probeDwell(r.dwellBase)
 				}
-				if !now.Before(p.succeededAt.Add(repairDwell)) {
+				if !now.Before(p.succeededAt.Add(p.dwell)) {
 					// Attribute the success to where the replacement actually came up (replNode), so a replacement in a
 					// different zone doesn't credit the candidate's zone (learn-from-replacement).
 					r.restraint.Record(p.candidate, replNode, RepairProven)
 					delete(r.probes, providerID)
 					delete(r.acted, providerID) // outcome settled; the original is gone, nothing left to watch for clearance
+					// Claw-back variant: the credit is provisional. Keep watching the replacement for a re-break inside the
+					// window (observeClawback below finalizes or reverses it). Only optimistic (dwell 0) sets clawback>0.
+					if r.clawback > 0 {
+						p.creditedAt = now
+						r.watching[providerID] = p
+					}
 				}
 			}
 		case err == nil:
@@ -309,6 +472,31 @@ func (r *Repair) observeProbes(ctx context.Context) {
 			// keep in acted: a failed repair leaves the original unhealthy; watch for it to clear on its own.
 		default:
 			// transient get error; leave the probe to be re-observed next pass
+		}
+	}
+
+	// Claw-back watch: an optimistically-credited repair is provisional until its replacement survives the claw-back
+	// window. Re-check each watched replacement — a re-break inside the window reverses the credit (RepairClawedBack, so
+	// the domain undoes its widen and backs off); surviving the window finalizes the credit. Empty unless the claw-back
+	// variant is active. The re-flagged replacement is separately handled as its own repair candidate on a later pass.
+	for providerID, p := range r.watching {
+		health, replNode := r.replacementHealth(ctx, p)
+		switch {
+		case health == replUnhealthy && replNode != nil:
+			// A POSITIVELY-observed re-break: the credited replacement is itself repair-eligible again inside the window.
+			// Claw the credit back so the domain undoes its widen and backs off.
+			r.restraint.Record(p.candidate, replNode, RepairClawedBack)
+			delete(r.watching, providerID)
+		case health == replUnhealthy:
+			// replUnhealthy with no node (the replacement NodeClaim is simply gone/reaped): we cannot attribute a
+			// re-break to it, and in this post-credit context a disappearance is usually unrelated (an unrelated delete,
+			// not a fault re-inheriting). Let the credit stand rather than claw back on an ambiguous deletion.
+			delete(r.watching, providerID)
+		default:
+			// replHealthy or replPending: keep watching until the window closes, then the credit is final.
+			if !now.Before(p.creditedAt.Add(r.clawback)) {
+				delete(r.watching, providerID)
+			}
 		}
 	}
 

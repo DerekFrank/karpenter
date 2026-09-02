@@ -67,6 +67,7 @@ type CloudProvider struct {
 	Drifted                   cloudprovider.DriftReason
 	NodeClassGroupVersionKind []schema.GroupVersionKind
 	RepairPolicy              []cloudprovider.RepairPolicy
+	RepairTimingValue         cloudprovider.RepairTiming
 }
 
 func NewCloudProvider() *CloudProvider {
@@ -287,6 +288,25 @@ func (c *CloudProvider) IsDrifted(context.Context, *v1.NodeClaim) (cloudprovider
 	defer c.mu.RUnlock()
 
 	return c.Drifted, nil
+}
+
+func (c *CloudProvider) RepairTiming() cloudprovider.RepairTiming {
+	// Fast (seconds) defaults so tests using the fake provider on a real clock don't wait minutes; override the field for
+	// specific values. (Tests that assert AIMD backoff dynamics construct newRestraint with explicit durations instead.)
+	t := c.RepairTimingValue
+	if t.Dwell == 0 {
+		t.Dwell = 30 * time.Second
+	}
+	if t.CooldownFloor == 0 {
+		t.CooldownFloor = 5 * time.Second
+	}
+	if t.CooldownCeiling == 0 {
+		t.CooldownCeiling = 30 * time.Second
+	}
+	if t.ClawbackWindow == 0 {
+		t.ClawbackWindow = 4 * t.Dwell // large relative to the dwell — a re-break can surface several dwell periods later
+	}
+	return t
 }
 
 func (c *CloudProvider) RepairPolicies() []cloudprovider.RepairPolicy {

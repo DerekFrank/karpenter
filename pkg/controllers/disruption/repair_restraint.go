@@ -34,6 +34,10 @@ const (
 	// RepairCleared — the candidate's fault resolved on its own before/without a completed repair; its fault episode is
 	// over. Lets a policy forget any state it earned so a new episode starts fresh.
 	RepairCleared
+	// RepairClawedBack — a repair that was already reported RepairProven re-failed within the claw-back watch window
+	// (the optimistic-credit variant credits on first-healthy, then watches). The domain must undo the width it earned
+	// and back off, but WITHOUT a second in-flight decrement — RepairProven already released the probe.
+	RepairClawedBack
 )
 
 // RepairRestraint is the swappable policy that decides, beneath the disruption budget, whether repair may probe a
@@ -64,11 +68,9 @@ func (noRestraint) Record(*Candidate, *corev1.Node, RepairOutcome) {}
 // Statelessness (invariant): the dials are an optimization, never a correctness requirement. A freshly restarted
 // controller rebuilds an empty store, and an empty store cold-starts every domain at width 1 — the most conservative
 // value — so a zero-state restart is always safe.
-const (
-	restraintWidthFloor   = 1                // never 0: repair always eventually retries (invariant: pause, don't stop)
-	restraintCooldownT0   = 1 * time.Minute  // initial per-domain cooldown after a failure
-	restraintCooldownTMax = 10 * time.Minute // cooldown ceiling — so repair always eventually retries in a domain
-)
+// restraintWidthFloor is never 0: repair always eventually retries (invariant: pause, don't stop). The cooldown floor/
+// ceiling are NOT constants — they are the provider's RepairTiming (so the whole restraint timescale scales together).
+const restraintWidthFloor = 1
 
 // failureDomain is one axis restraint scopes to (NodePool, zone, or policy-condition). A correlated burst collapses into
 // one domain that cold-starts at width 1, so correlation is handled by scoping + cold-start, not a correlation statistic.
@@ -81,23 +83,27 @@ type failureDomain struct {
 // currently admitted-but-unresolved per domain (repair reports resolution via Record). It is only ever accessed from
 // the disruption singleton reconciler, so it needs no locking.
 type restraint struct {
-	width         map[failureDomain]int
-	cooldownUntil map[failureDomain]time.Time
-	failCount     map[failureDomain]int
-	inFlight      map[failureDomain]int
-	clock         clockNow
+	width           map[failureDomain]int
+	cooldownUntil   map[failureDomain]time.Time
+	failCount       map[failureDomain]int
+	inFlight        map[failureDomain]int
+	clock           clockNow
+	cooldownFloor   time.Duration // first cooldown after a failure (provider RepairTiming.CooldownFloor)
+	cooldownCeiling time.Duration // exponential-backoff cap (provider RepairTiming.CooldownCeiling)
 }
 
 // clockNow is the sliver of the clock restraint needs; repair passes its own clock so tests control time.
 type clockNow interface{ Now() time.Time }
 
-func newRestraint(clk clockNow) *restraint {
+func newRestraint(clk clockNow, cooldownFloor, cooldownCeiling time.Duration) *restraint {
 	return &restraint{
-		width:         map[failureDomain]int{},
-		cooldownUntil: map[failureDomain]time.Time{},
-		failCount:     map[failureDomain]int{},
-		inFlight:      map[failureDomain]int{},
-		clock:         clk,
+		width:           map[failureDomain]int{},
+		cooldownUntil:   map[failureDomain]time.Time{},
+		failCount:       map[failureDomain]int{},
+		inFlight:        map[failureDomain]int{},
+		clock:           clk,
+		cooldownFloor:   cooldownFloor,
+		cooldownCeiling: cooldownCeiling,
 	}
 }
 
@@ -188,9 +194,9 @@ func (r *restraint) Record(c *Candidate, replacement *corev1.Node, outcome Repai
 			// landed elsewhere slip back through the still-fresh zone via the any-domain-out-of-cooldown admission rule.)
 			r.width[d] = restraintWidthFloor
 			r.failCount[d]++
-			backoff := restraintCooldownT0 << (r.failCount[d] - 1)
-			if backoff > restraintCooldownTMax || backoff <= 0 {
-				backoff = restraintCooldownTMax
+			backoff := r.cooldownFloor << (r.failCount[d] - 1)
+			if backoff > r.cooldownCeiling || backoff <= 0 {
+				backoff = r.cooldownCeiling
 			}
 			r.cooldownUntil[d] = r.clock.Now().Add(backoff)
 		case RepairCleared:
@@ -200,6 +206,17 @@ func (r *restraint) Record(c *Candidate, replacement *corev1.Node, outcome Repai
 				delete(r.failCount, d)
 				delete(r.cooldownUntil, d)
 			}
+		case RepairClawedBack:
+			// A previously-proven repair re-failed inside the watch window: undo the widen and arm backoff exactly like
+			// RepairFailed, but do NOT touch inFlight (RepairProven already decremented it — a second decrement would
+			// under-count this domain's live probes and let a flood slip through the width gate).
+			r.width[d] = restraintWidthFloor
+			r.failCount[d]++
+			backoff := r.cooldownFloor << (r.failCount[d] - 1)
+			if backoff > r.cooldownCeiling || backoff <= 0 {
+				backoff = r.cooldownCeiling
+			}
+			r.cooldownUntil[d] = r.clock.Now().Add(backoff)
 		}
 	}
 }

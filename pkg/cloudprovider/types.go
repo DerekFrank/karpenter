@@ -59,6 +59,19 @@ var (
 
 type DriftReason string
 
+// RepairTiming is the repair restraint's timescale, owned by the CloudProvider so it can be scaled coherently (all
+// together) per provider. Dwell: how long a replacement must hold Ready+Healthy to count as a durable success.
+// CooldownFloor/CooldownCeiling: the failure backoff bounds (first cooldown after a failure, and its exponential cap).
+type RepairTiming struct {
+	Dwell           time.Duration
+	CooldownFloor   time.Duration
+	CooldownCeiling time.Duration
+	// ClawbackWindow is how long an optimistically-credited repair is watched for a re-break before the credit is
+	// final. Only the claw-back dwell variant uses it (see the disruption controller's REPAIR_OPTION handling); other
+	// variants leave it zero.
+	ClawbackWindow time.Duration
+}
+
 type RepairPolicy struct {
 	// ConditionType of unhealthy state that is found on the node
 	ConditionType corev1.NodeConditionType
@@ -108,6 +121,11 @@ type CloudProvider interface {
 	// RepairPolicy is for CloudProviders to define a set Unhealthy condition for Karpenter
 	// to monitor on the node.
 	RepairPolicies() []RepairPolicy
+	// RepairTiming returns the repair restraint's timescale (success dwell + failure-cooldown floor/ceiling).
+	// CloudProviders own it because the right values are provider-specific and MUST scale together — a real provider
+	// uses minutes; a fast simulation (KWOK) can compress the whole set to seconds. Scaling only the dwell without the
+	// cooldowns imbalances the AIMD (backoff dominates → domains freeze), so they are grouped in one struct.
+	RepairTiming() RepairTiming
 	// Name returns the CloudProvider implementation name.
 	Name() string
 	// GetSupportedNodeClasses returns CloudProvider NodeClass that implements status.Object

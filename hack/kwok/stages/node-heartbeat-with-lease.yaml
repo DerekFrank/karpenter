@@ -1,0 +1,72 @@
+apiVersion: kwok.x-k8s.io/v1alpha1
+kind: Stage
+metadata:
+  name: node-heartbeat-with-lease
+spec:
+  resourceRef:
+    apiGroup: v1
+    kind: Node
+  selector:
+    matchExpressions:
+    - key: .status.phase
+      operator: In
+      values: ["Running"]
+    - key: '.status.conditions.[] | select( .type == "Ready" ) | .status'
+      operator: In
+      values: ["True"]
+  delay:
+    durationMilliseconds: 600000
+    jitterDurationMilliseconds: 610000
+  next:
+    statusSubresource: status
+    # Faulted nodes MUST keep heart-beating (so their Lease stays fresh and Ready=True — a valid disruption candidate),
+    # but the heartbeat rebuilds status.conditions from KWOK's hardcoded managed set and would DROP the injected custom
+    # condition. So this owned override PRESERVES it: after the managed conditions, it re-emits any existing SimUnhealthy
+    # condition from the node's current status (keeping its pinned lastTransitionTime). This is robust regardless of KWOK
+    # stage scheduling — every heartbeat fire preserves the fault — unlike a selector "guard" that only skips faulted
+    # nodes: a guard does NOT cancel a heartbeat already scheduled (when the node was healthy) before the fault was
+    # injected, so on a ~10-min interval that in-flight heartbeat wipes the fault (observed on EKS+KWOK). See
+    # data/kwok-node-fault-design.md and data/RESUME-STATE.md. When the test clears SimUnhealthy (flaky path), it is
+    # absent from status so nothing re-emits it and the node heals.
+    statusTemplate: |
+      {{ $now := Now }}
+      {{ $lastTransitionTime := or .metadata.creationTimestamp $now }}
+      conditions:
+      {{ range NodeConditions }}
+      - lastHeartbeatTime: {{ $now | Quote }}
+        lastTransitionTime: {{ $lastTransitionTime | Quote }}
+        message: {{ .message | Quote }}
+        reason: {{ .reason | Quote }}
+        status: {{ .status | Quote }}
+        type: {{ .type | Quote }}
+      {{ end }}
+      {{ range .status.conditions }}
+      {{ if eq .type "SimUnhealthy" }}
+      - lastHeartbeatTime: {{ $now | Quote }}
+        lastTransitionTime: {{ .lastTransitionTime | Quote }}
+        message: {{ .message | Quote }}
+        reason: {{ .reason | Quote }}
+        status: {{ .status | Quote }}
+        type: {{ .type | Quote }}
+      {{ end }}
+      {{ end }}
+
+      addresses:
+      {{ with .status.addresses }}
+      {{ YAML . 1 }}
+      {{ else }}
+      {{ with NodeIP }}
+      - address: {{ . | Quote }}
+        type: InternalIP
+      {{ end }}
+      {{ with NodeName }}
+      - address: {{ . | Quote }}
+        type: Hostname
+      {{ end }}
+      {{ end }}
+
+      {{ with NodePort }}
+      daemonEndpoints:
+        kubeletEndpoint:
+          Port: {{ . }}
+      {{ end }}

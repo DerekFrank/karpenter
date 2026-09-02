@@ -21,6 +21,7 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 )
@@ -108,9 +109,10 @@ const (
 	scale100
 	scale1000
 	scale5000
+	scale10000
 )
 
-func (s scale) nodes() int { return [...]int{3, 10, 100, 1000, 5000}[s] }
+func (s scale) nodes() int { return [...]int{3, 10, 100, 1000, 5000, 10000}[s] }
 
 func (s scale) String() string { return fmt.Sprintf("n%d", s.nodes()) }
 
@@ -188,11 +190,41 @@ type cell struct {
 	drain      drainability
 	strat      strategy
 	topo       topology
+	// flakeTTL: 0 = durable fault (SimUnhealthy sticks until repair terminates the node); >0 = flaky fault that KWOK's
+	// node-fault-clear stage auto-clears after this long (models a flapping detector). See data/kwok-node-fault-design.md.
+	flakeTTL time.Duration
+	// reflag (node-broken only) — WHEN an in-domain replacement goes unhealthy after joining healthy (see reflagDelay).
+	reflag reflagDelay
 }
 
-// id is a stable, compact identifier for the cell (used for ordering and report rows).
+// reflagDelay controls, for a node-broken in-domain replacement, how long it stays HEALTHY after joining before it
+// re-flags unhealthy — the axis that stresses the success dwell / optimistic crediting:
+//   - immediate : reborn unhealthy at launch (never proves healthy) — the original launch-failure model.
+//   - tbelow    : healthy ~0.5× the reference dwell, then re-fails — WITHIN the confirmation window (AIMD should catch it).
+//   - tabove    : healthy ~2× the reference dwell, then re-fails — AFTER it's credited proven (retroactive claw-back case).
+//   - trand     : healthy a RANDOM window in [0, 2× dwell) per replacement — straddles the dwell (jitter/optimistic stress).
+type reflagDelay int
+
+const (
+	reflagImmediate reflagDelay = iota
+	reflagBelowDwell
+	reflagAboveDwell
+	reflagRandom
+)
+
+func (r reflagDelay) String() string { return [...]string{"immediate", "tbelow", "tabove", "trand"}[r] }
+
+// id is a stable, compact identifier for the cell (used for ordering and report rows). flakeTTL is appended only when
+// set, so durable cells keep their historical IDs (and aggregation across older runs) unchanged.
 func (c cell) id() string {
-	return fmt.Sprintf("%s|%s|%s|%s|%s|%s", c.impairment, c.scale, c.blast, c.drain, c.strat, c.topo)
+	base := fmt.Sprintf("%s|%s|%s|%s|%s|%s", c.impairment, c.scale, c.blast, c.drain, c.strat, c.topo)
+	if c.reflag != reflagImmediate {
+		base += "|" + c.reflag.String()
+	}
+	if c.flakeTTL > 0 {
+		base += "|flake" + c.flakeTTL.String()
+	}
+	return base
 }
 
 // enumerateCells returns the FULL cross product — every cell is an explicit, authoritative entry. There is deliberately
@@ -202,18 +234,26 @@ func (c cell) id() string {
 // structural collapse baked into enumeration — a single-node fault has no correlation domain, so it is emitted once as
 // uncorrelated rather than crossed with every domained impairment.
 //
-// Note: the top scales (n1000/n5000) are enumerated for completeness but are expensive to actually run — provisioning
-// thousands of KWOK nodes per cell. Running the full product is a resourced activity; the enumeration stays authoritative
-// so no scale is silently dropped.
+// Note: the top scales (n1000/n5000/n10000) are enumerated for completeness but are expensive to actually run —
+// provisioning thousands of KWOK nodes per cell. Running the full product is a resourced activity; the enumeration stays
+// authoritative so no scale is silently dropped.
 func enumerateCells() []cell {
 	var cells []cell
-	for _, sc := range []scale{scale3, scale10, scale100, scale1000, scale5000} {
+	for _, sc := range []scale{scale3, scale10, scale100, scale1000, scale5000, scale10000} {
 		for _, b := range []blast{blastSingle, blastMinority, blastMajority} {
 			for _, imp := range impairmentsFor(b) {
 				for _, d := range []drainability{drainYesNoPDB, drainYesPDB, drainNoPDBBlock, drainNoKubeletDead} {
 					for _, s := range enabledStrategies() {
 						for _, t := range []topology{topoSingle, topoPerAZ, topoPerAMI} {
-							cells = append(cells, cell{impairment: imp, scale: sc, blast: b, drain: d, strat: s, topo: t})
+							// reflag-delay only means anything for node-broken (the only impairment that re-flags an
+							// in-domain replacement); every other impairment gets a single "immediate" cell.
+							reflags := []reflagDelay{reflagImmediate}
+							if imp.nodeBroken() {
+								reflags = append(reflags, reflagBelowDwell, reflagAboveDwell, reflagRandom)
+							}
+							for _, rf := range reflags {
+								cells = append(cells, cell{impairment: imp, scale: sc, blast: b, drain: d, strat: s, topo: t, reflag: rf})
+							}
 						}
 					}
 				}

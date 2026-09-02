@@ -64,7 +64,7 @@ var _ = Describe("Repair/Restraint (dials)", func() {
 
 	BeforeEach(func() {
 		fakeClock = clocktesting.NewFakeClock(t0)
-		r = newRestraint(fakeClock)
+		r = newRestraint(fakeClock, time.Minute, 10*time.Minute)
 	})
 
 	// INV-F3-1 / INV-F3-6: cold start at width 1 — the first probe in a domain is admitted, a second concurrent probe in

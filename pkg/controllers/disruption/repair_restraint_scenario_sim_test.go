@@ -256,7 +256,7 @@ var _ = Describe("Repair/Restraint/Scenarios (simulation)", func() {
 		const horizon = 120 // 2h
 
 		It("restraint bounds the flood's wasted launches while still repairing the genuine fault", func() {
-			r := runSim(newRestraint(clk), clk, build(), 13, horizon, nil, nil)
+			r := runSim(newRestraint(clk, time.Minute, 10*time.Minute), clk, build(), 13, horizon, nil, nil)
 			emit("flood", "restraint", r)
 
 			// The genuine ECC fault is repaired, and early (within the first dwell + a couple rounds).
@@ -316,7 +316,7 @@ var _ = Describe("Repair/Restraint/Scenarios (simulation)", func() {
 		const horizon = 90
 
 		It("restraint disrupts zero healthy workloads and wastes few launches; the partition self-heals", func() {
-			r := runSim(newRestraint(clk), clk, build(), 6, horizon, nil, nil)
+			r := runSim(newRestraint(clk, time.Minute, 10*time.Minute), clk, build(), 6, horizon, nil, nil)
 			emit("partition-c1", "restraint", r)
 
 			Expect(r.terminated).To(Equal(0))                  // pre-spin: failed probes never remove an original → no workload harm
@@ -353,7 +353,7 @@ var _ = Describe("Repair/Restraint/Scenarios (simulation)", func() {
 		const horizon = 90
 
 		It("learn-from-replacement stops the acceleration: the impaired zone never widens (concurrency stays at one)", func() {
-			r := runSim(newRestraint(clk), clk, build(), 8, horizon, nil, nil)
+			r := runSim(newRestraint(clk, time.Minute, 10*time.Minute), clk, build(), 8, horizon, nil, nil)
 			emit("partition-c2", "restraint", r)
 			// A healthy replacement in zone-h does not credit the impaired zone-p, so its width stays at the floor and
 			// min-width across the candidate's domains keeps concurrency at one — restraint no longer accelerates into the
@@ -376,7 +376,7 @@ var _ = Describe("Repair/Restraint/Scenarios (simulation)", func() {
 			}
 			var width []int
 			d := failureDomain{kind: "nodepool", value: "pool"}
-			r := runSim(newRestraint(clk), clk, nodes, 64, 120, &d, &width)
+			r := runSim(newRestraint(clk, time.Minute, 10*time.Minute), clk, nodes, 64, 120, &d, &width)
 			emit("fastclimb", "restraint", r)
 			fmt.Fprintf(GinkgoWriter, "SIMWIDTH scenario=fastclimb arm=restraint nodepool_width=%v\n", width)
 

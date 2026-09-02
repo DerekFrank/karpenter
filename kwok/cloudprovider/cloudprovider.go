@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"maps"
 	"math/rand"
+	"os"
 	"strings"
 	"time"
 
@@ -158,28 +159,64 @@ func (c CloudProvider) GetSupportedNodeClasses() []status.Object {
 }
 
 func (c CloudProvider) RepairPolicies() []cloudprovider.RepairPolicy {
+	tol := simDuration("REPAIR_TOLERATION", 2*time.Second)
+	// Per-condition drain bound (Axis 2). Set explicitly on the policy so repair's drain bound comes from the policy, not
+	// the NodePool: the sim sets the NodePool TGP to ~1h (effectively nil), so the effective bound is min(polTGP, 1h) =
+	// polTGP. This makes the drain axis test the policy TGP knob rather than a pool default. Env-tunable per run.
+	polTGP := simDuration("REPAIR_POLICY_TGP", 45*time.Second)
 	return []cloudprovider.RepairPolicy{
 		// Supported Kubelet Node Conditions
 		{
-			ConditionType:      corev1.NodeReady,
-			ConditionStatus:    corev1.ConditionFalse,
-			TolerationDuration: 15 * time.Second,
+			ConditionType:          corev1.NodeReady,
+			ConditionStatus:        corev1.ConditionFalse,
+			TolerationDuration:     tol,
+			TerminationGracePeriod: &polTGP,
 		},
 		{
-			ConditionType:      corev1.NodeReady,
-			ConditionStatus:    corev1.ConditionUnknown,
-			TolerationDuration: 15 * time.Second,
+			ConditionType:          corev1.NodeReady,
+			ConditionStatus:        corev1.ConditionUnknown,
+			TolerationDuration:     tol,
+			TerminationGracePeriod: &polTGP,
 		},
 		// Custom repair condition for the e2e repair-perf sim: KWOK does not manage arbitrary node conditions (only
 		// Ready + the lease), so a fault injected as SimUnhealthy=True HOLDS — unlike Ready=False, which the
 		// node-initialize stage immediately reverts. The node stays Ready=True (so it's a normal disruption candidate),
 		// carrying an unhealthy condition, exactly as a node-monitoring-agent would emit one.
 		{
-			ConditionType:      "SimUnhealthy",
-			ConditionStatus:    corev1.ConditionTrue,
-			TolerationDuration: 15 * time.Second,
+			ConditionType:          "SimUnhealthy",
+			ConditionStatus:        corev1.ConditionTrue,
+			TolerationDuration:     tol,
+			TerminationGracePeriod: &polTGP,
 		},
 	}
+}
+
+// RepairTiming — see cloudprovider.CloudProvider. KWOK is the simulation provider, so the whole restraint timescale is
+// compressed and env-tunable, scaled TOGETHER (a real provider is ~5m dwell / 1m / 10m). Defaults are a ~10x-compressed
+// version of the production ratios (dwell:floor:ceiling ≈ 5:1:10), which keeps the AIMD dynamics intact while running in
+// seconds — scaling the dwell alone (leaving the cooldowns at minutes) freezes escape domains and reports false 0%.
+// Override any of them per run: REPAIR_DWELL, REPAIR_COOLDOWN_FLOOR, REPAIR_COOLDOWN_CEIL (use 5m/1m/10m for realistic).
+func (c CloudProvider) RepairTiming() cloudprovider.RepairTiming {
+	dwell := simDuration("REPAIR_DWELL", 30*time.Second)
+	return cloudprovider.RepairTiming{
+		Dwell:           dwell,
+		CooldownFloor:   simDuration("REPAIR_COOLDOWN_FLOOR", 6*time.Second),
+		CooldownCeiling: simDuration("REPAIR_COOLDOWN_CEIL", 60*time.Second),
+		// The claw-back window is deliberately LARGE relative to the dwell (~4×): a re-break can surface well after the
+		// replacement first looks healthy, so the watch must outlast several dwell periods (e.g. dwell 5m ⇒ ~20m).
+		ClawbackWindow: simDuration("REPAIR_CLAWBACK_WINDOW", 4*dwell),
+	}
+}
+
+// simDuration reads a sim-tunable duration from an env var (Go duration string, e.g. "20s"), falling back to def. Lets
+// the KWOK provider compress repair timescales for fast test loops without rebuilding the image.
+func simDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
 }
 
 func (c CloudProvider) getInstanceType(instanceTypeName string) (*cloudprovider.InstanceType, error) {

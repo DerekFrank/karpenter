@@ -50,8 +50,11 @@ import (
 type repairMetrics struct {
 	timeToRecovery    *time.Duration
 	disruptedPods     int
+	gracefulPods      int // pods gracefully disrupted (drained via eviction, PDB+grace honored)
+	forcedPods        int // pods disrupted WITHOUT drain (force-deleted past the drain bound, PDB+grace bypassed)
 	cpCalls           int
-	mitigatedFraction float64 // fraction of the faulted nodes repair resolved by the deadline (0..1); 1.0 == fully mitigated
+	mitigatedFraction float64       // fraction of the faulted nodes repair resolved by the deadline (0..1); 1.0 == fully mitigated
+	wallTime          time.Duration // total wall-clock the cell took (setup+measure+teardown) — for "how fast does each case run"
 }
 
 // repairResult is one (cell, option) measurement.
@@ -90,11 +93,12 @@ func formatReport(results []repairResult) string {
 		return sorted[i].cell.id() < sorted[j].cell.id()
 	})
 	var b strings.Builder
-	b.WriteString("| option | cell | mitigated% | time-to-recovery | disrupted-pods | cp-calls |\n")
-	b.WriteString("|---|---|---|---|---|---|\n")
+	b.WriteString("| option | cell | mitigated% | time-to-recovery | disrupted-pods | graceful-pods | forced-pods | cp-calls | runtime |\n")
+	b.WriteString("|---|---|---|---|---|---|---|---|---|\n")
 	for _, r := range sorted {
-		b.WriteString(fmt.Sprintf("| %s | %s | %d%% | %s | %d | %d |\n",
-			r.option, r.cell.id(), int(r.m.mitigatedFraction*100+0.5), ttrString(r), r.m.disruptedPods, r.m.cpCalls))
+		b.WriteString(fmt.Sprintf("| %s | %s | %d%% | %s | %d | %d | %d | %d | %s |\n",
+			r.option, r.cell.id(), int(r.m.mitigatedFraction*100+0.5), ttrString(r), r.m.disruptedPods,
+			r.m.gracefulPods, r.m.forcedPods, r.m.cpCalls, r.m.wallTime.Round(time.Second)))
 	}
 	return b.String()
 }
@@ -106,7 +110,7 @@ func formatReport(results []repairResult) string {
 func formatCollapseReport(results []repairResult) string {
 	byOption := map[string]map[string][]string{} // option -> metric-signature -> []cellID
 	for _, r := range results {
-		sig := fmt.Sprintf("mit=%d%%|ttr=%s|pods=%d|cp=%d", int(r.m.mitigatedFraction*100+0.5), ttrString(r), r.m.disruptedPods, r.m.cpCalls)
+		sig := fmt.Sprintf("mit=%d%%|ttr=%s|pods=%d|graceful=%d|forced=%d|cp=%d", int(r.m.mitigatedFraction*100+0.5), ttrString(r), r.m.disruptedPods, r.m.gracefulPods, r.m.forcedPods, r.m.cpCalls)
 		if byOption[r.option] == nil {
 			byOption[r.option] = map[string][]string{}
 		}

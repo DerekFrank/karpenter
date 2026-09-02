@@ -150,8 +150,12 @@ func (t *Terminator) DeleteExpiringPods(ctx context.Context, pods []*corev1.Pod,
 			opts := &client.DeleteOptions{
 				GracePeriodSeconds: gracePeriodSeconds,
 			}
-			if err := t.kubeClient.Delete(ctx, pod, opts); err != nil && !apierrors.IsNotFound(err) { // ignore 404, not a problem
+			err := t.kubeClient.Delete(ctx, pod, opts)
+			if err != nil && !apierrors.IsNotFound(err) { // ignore 404, not a problem
 				return fmt.Errorf("deleting pod, %w", err) // otherwise, bubble up the error
+			}
+			if err == nil { // count only pods we actually force-deleted (a 404 means it was already gone)
+				PodsForceDeletedTotal.Inc(map[string]string{ReasonLabel: evictionReason(ctx, pod, t.kubeClient)})
 			}
 			log.FromContext(ctx).WithValues(
 				"namespace", pod.Namespace,
