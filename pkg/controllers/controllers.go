@@ -163,7 +163,7 @@ func NewControllers(
 	}
 
 	// Node repair is no longer a standalone force-deleting controller with a hardcoded 20% breaker. It now runs as a
-	// voluntary disruption method (reason "Repair") inside the disruption controller: budgeted, ordered, pre-spinning,
+	// voluntary disruption method (reason "Unhealthy") inside the disruption controller: budgeted, ordered, pre-spinning,
 	// and vetoable via do-not-repair. Registration lives in disruption.NewMethods, gated on RepairPolicies + the gate.
 
 	if options.FromContext(ctx).FeatureGates.StaticCapacity {

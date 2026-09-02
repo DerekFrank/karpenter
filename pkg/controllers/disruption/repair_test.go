@@ -95,7 +95,7 @@ var _ = Describe("Repair", func() {
 		ExpectApplied(ctx, env.Client, nodePool)
 		// Repair runs as an isolated method so tests assert repair behavior only.
 		repairController = disruption.NewController(env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
-			disruption.WithMethods(disruption.NewRepair(env.Client, cluster, prov, cloudProvider, recorder, env.Clock)))
+			disruption.WithMethods(disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue))))
 	})
 
 	// INV-S6 / INV-S9: repair pre-spins a replacement (replace-then-terminate) and only after the toleration elapses.
