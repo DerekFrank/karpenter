@@ -242,20 +242,20 @@ func faultMitigated(c cell, f *fleet) float64 {
 	if n == 0 {
 		return 0
 	}
-	// Recovery is measured directly as HEALTHY NODES / TOTAL NODES at the end — the fleet-health fraction, mechanism-
-	// agnostic (a fault fixed by escaping the domain, healing in place, or a healthy in-domain replacement all raise it;
-	// only nodes still flagged SimUnhealthy — unrepaired originals + re-flagged in-domain replacements — hold it down).
-	// Note this dilutes by the untouched majority (a lone fault in a large fleet reads near 100%), which is the literal
-	// fleet-health reading. EXCEPTION: workload-broken leaves the node healthy but the pod unready (no SimUnhealthy node
-	// exists), so it is measured as healthy PODS / total pods instead.
+	// Mitigated = fraction of the ORIGINALLY-unhealthy nodes that are now remediated:
+	//   (initialFaulted - stillUnhealthy) / initialFaulted   (clamped 0..1)
+	// Normalizing against the BLAST count (nodes unhealthy at the start), not the whole fleet, is what makes this a real
+	// mitigation reading: an untouched fault reads 0% (not diluted UP by the healthy majority — a breaker that freezes a
+	// 4-of-10 fault reads 0%, not 60%), a fully escaped/healed fault reads 100%, partial reads in between. stillUnhealthy
+	// = everything currently SimUnhealthy on workload capacity = unrepaired originals + re-flagged in-domain replacements.
+	// EXCEPTION: workload-broken (deferred) leaves the node healthy but the pod unready — measured on pods; when it is
+	// re-enabled this should likewise normalize against the impaired-domain pod count.
 	if c.impairment.workloadBroken() {
 		return math.Max(0, math.Min(float64(healthyOnGoodCapacity(f))/float64(f.replicas), 1.0))
 	}
 	healthy, total := nodeHealth(f)
-	if total == 0 {
-		return 0
-	}
-	return float64(healthy) / float64(total)
+	stillUnhealthy := total - healthy
+	return math.Max(0, math.Min(float64(n-stillUnhealthy)/float64(n), 1.0))
 }
 
 // nodeHealth counts the workload nodes at the end: total = karpenter-managed workload nodes not terminating; healthy =
