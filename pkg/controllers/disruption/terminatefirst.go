@@ -17,12 +17,10 @@ limitations under the License.
 package disruption
 
 import (
-	"context"
-
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
 // Terminate-First Disruption (RFC kubernetes-sigs/karpenter#3203). A voluntary disruption normally replace-firsts:
@@ -32,34 +30,33 @@ import (
 //
 // This is a shared primitive, not a per-method bolt-on: any voluntary disruption method decides it the same way, from
 // the candidate's capacity posture and the candidate-gone scheduling simulation it already runs — there is no new API.
-// It is gated by the TerminateFirst feature flag.
+// Callers gate it on the TerminateFirst feature flag.
 //
-// A launch *failure* must never select terminate-first: this reads structural capacity (static replicas, a full
-// reservation with no fallback), never launch outcomes, so a failed launch keeps replacing-first under the existing
+// A launch *failure* must never select terminate-first: this reads structural capacity (a full reservation the
+// candidate itself holds), never launch outcomes, so a failed launch keeps replacing-first under the existing
 // per-NodePool launch backoff.
 
 // terminateFirst reports whether a voluntary disruption of a reserved candidate must delete it before a replacement can
-// be provisioned, because its NodePool has no room to grow. It is decided from the single candidate-gone simulation the
-// caller already ran (no extra pass): terminate-first exactly when the simulated replacement can only launch as
-// reserved capacity (no on-demand/spot fallback) AND the candidate's own reservation is full — so the only way to place
-// that replacement is to free the candidate's slot first. A reservation with a spare slot, or any non-reserved
-// fallback, replaces-first as usual.
-func terminateFirst(ctx context.Context, c *Candidate, results pscheduling.Results) bool {
-	if !options.FromContext(ctx).FeatureGates.TerminateFirst {
-		return false
-	}
+// be provisioned. It is decided from the single candidate-gone simulation the caller already ran (no extra pass):
+// terminate-first exactly when every simulated replacement can launch ONLY into the candidate's own reservation
+// (reserved-only, no on-demand/spot fallback, and the candidate's reservation its only reserved option) AND that
+// reservation is full — so the only way to place the replacement is to free the candidate's slot first. A spare
+// reservation slot, a different reservation with capacity, or any non-reserved fallback all replace-first as usual.
+func terminateFirst(c *Candidate, results pscheduling.Results) bool {
 	if c.capacityType != v1.CapacityTypeReserved {
 		return false
 	}
-	return onlyReservedReplacements(results.NewNodeClaims) && reservationFull(c)
+	return replacementsReuseCandidateReservation(c, results.NewNodeClaims) && reservationFull(c)
 }
 
-// onlyReservedReplacements reports whether every simulated replacement can launch only as reserved capacity — i.e. the
-// pool has no on-demand/spot fallback to grow into. An empty set (no replacement needed) is not "reserved-only": that
-// is an ordinary empty-node delete, handled on the normal path. A replacement that permits on-demand or spot is not
-// reserved-only: it can replace-first by growing into that fallback.
-func onlyReservedReplacements(newNodeClaims []*pscheduling.NodeClaim) bool {
-	if len(newNodeClaims) == 0 {
+// replacementsReuseCandidateReservation reports whether every simulated replacement can launch only into the
+// candidate's own capacity reservation: reserved-only (no on-demand/spot fallback) and the candidate's reservation is
+// the only reserved offering the replacement could use. If any replacement permits a non-reserved fallback, or could
+// use a different reservation (which carries its own capacity), the pool can grow elsewhere and replaces-first. An
+// empty set (no replacement needed) is an ordinary empty-node delete, handled on the normal path.
+func replacementsReuseCandidateReservation(c *Candidate, newNodeClaims []*pscheduling.NodeClaim) bool {
+	reservationID := c.Labels()[cloudprovider.ReservationIDLabel]
+	if reservationID == "" || len(newNodeClaims) == 0 {
 		return false
 	}
 	for _, nc := range newNodeClaims {
@@ -67,8 +64,33 @@ func onlyReservedReplacements(newNodeClaims []*pscheduling.NodeClaim) bool {
 		if !ct.Has(v1.CapacityTypeReserved) || ct.Has(v1.CapacityTypeOnDemand) || ct.Has(v1.CapacityTypeSpot) {
 			return false
 		}
+		if !reservedOfferingsOnlyForReservation(nc, reservationID) {
+			return false
+		}
 	}
 	return true
+}
+
+// reservedOfferingsOnlyForReservation reports whether the reserved offerings the replacement could launch into are all
+// the given reservation — the candidate's own. A different reservation among the options means the pool can grow into
+// that reservation's capacity without freeing the candidate, so it is not terminate-first.
+func reservedOfferingsOnlyForReservation(nc *pscheduling.NodeClaim, reservationID string) bool {
+	sawReserved := false
+	for _, it := range nc.InstanceTypeOptions {
+		for _, o := range it.Offerings {
+			if o.CapacityType() != v1.CapacityTypeReserved || !o.Available {
+				continue
+			}
+			if !nc.Requirements.IsCompatible(o.Requirements, scheduling.AllowUndefinedWellKnownLabels) {
+				continue
+			}
+			sawReserved = true
+			if o.ReservationID() != reservationID {
+				return false
+			}
+		}
+	}
+	return sawReserved
 }
 
 // reservationFull reports whether the candidate's own capacity reservation has no spare slot. The candidate's reserved

@@ -22,42 +22,45 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
-// White-box specs for the pure terminate-first helper (onlyReservedReplacements), isolated from the disruption
-// pipeline. The end-to-end behavior (reservationFull, the feature-flag gate, delete-only vs replace commands) is
-// covered by the integration specs in terminatefirst_test.go.
+// White-box specs for the pure offering-matching helper reservedOfferingsOnlyForReservation, isolated from the
+// disruption pipeline. The end-to-end behavior (capacity-type fallback, reservationFull, the feature-flag gate, and
+// delete-only vs replace commands) is covered by the integration specs in terminatefirst_test.go.
 
-// replacementWith builds a simulated replacement NodeClaim whose capacity-type requirement permits exactly the given
-// capacity types (mirroring what FinalizeScheduling leaves on a NodeClaim).
-func replacementWith(capacityTypes ...string) *pscheduling.NodeClaim {
+// reservedNodeClaimWith builds a simulated replacement NodeClaim, reserved-only, whose instance-type options expose one
+// reserved offering per given reservation id.
+func reservedNodeClaimWith(reservationIDs ...string) *pscheduling.NodeClaim {
 	nc := &pscheduling.NodeClaim{}
-	nc.Requirements = scheduling.NewRequirements(scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, capacityTypes...))
+	nc.Requirements = scheduling.NewRequirements(scheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, v1.CapacityTypeReserved))
+	var offerings cloudprovider.Offerings
+	for _, id := range reservationIDs {
+		offerings = append(offerings, &cloudprovider.Offering{
+			Available: true,
+			Requirements: scheduling.NewLabelRequirements(map[string]string{
+				v1.CapacityTypeLabelKey:          v1.CapacityTypeReserved,
+				cloudprovider.ReservationIDLabel: id,
+			}),
+		})
+	}
+	nc.InstanceTypeOptions = cloudprovider.InstanceTypes{{Offerings: offerings}}
 	return nc
 }
 
-var _ = Describe("TerminateFirst/onlyReservedReplacements", func() {
-	It("is true when every replacement can launch only as reserved", func() {
-		Expect(onlyReservedReplacements([]*pscheduling.NodeClaim{replacementWith(v1.CapacityTypeReserved)})).To(BeTrue())
+var _ = Describe("TerminateFirst/reservedOfferingsOnlyForReservation", func() {
+	It("is true when the candidate's reservation is the only reserved option", func() {
+		Expect(reservedOfferingsOnlyForReservation(reservedNodeClaimWith("r-a"), "r-a")).To(BeTrue())
 	})
-	It("is false for an empty set (an empty-node delete, not terminate-first)", func() {
-		Expect(onlyReservedReplacements(nil)).To(BeFalse())
+	It("is false when a different reservation is also an option (the pool can grow there)", func() {
+		Expect(reservedOfferingsOnlyForReservation(reservedNodeClaimWith("r-a", "r-b"), "r-a")).To(BeFalse())
 	})
-	It("is false when a replacement permits on-demand fallback", func() {
-		Expect(onlyReservedReplacements([]*pscheduling.NodeClaim{replacementWith(v1.CapacityTypeReserved, v1.CapacityTypeOnDemand)})).To(BeFalse())
+	It("is false when the only reserved option is a different reservation", func() {
+		Expect(reservedOfferingsOnlyForReservation(reservedNodeClaimWith("r-b"), "r-a")).To(BeFalse())
 	})
-	It("is false when a replacement permits spot fallback", func() {
-		Expect(onlyReservedReplacements([]*pscheduling.NodeClaim{replacementWith(v1.CapacityTypeReserved, v1.CapacityTypeSpot)})).To(BeFalse())
-	})
-	It("is false when a replacement is not reserved at all", func() {
-		Expect(onlyReservedReplacements([]*pscheduling.NodeClaim{replacementWith(v1.CapacityTypeOnDemand)})).To(BeFalse())
-	})
-	It("is false when any one of several replacements has a fallback", func() {
-		Expect(onlyReservedReplacements([]*pscheduling.NodeClaim{
-			replacementWith(v1.CapacityTypeReserved),
-			replacementWith(v1.CapacityTypeReserved, v1.CapacityTypeOnDemand),
-		})).To(BeFalse())
+	It("is false when the replacement has no reserved offerings at all", func() {
+		Expect(reservedOfferingsOnlyForReservation(reservedNodeClaimWith(), "r-a")).To(BeFalse())
 	})
 })

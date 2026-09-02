@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 )
 
 // Drift is a subreconciler that deletes drifted candidates.
@@ -100,7 +101,7 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 		// let reactive provisioning refill the freed slot; the drain still honors PDBs and is bounded by TGP. A headroom
 		// pool (spare reservation slot, or an on-demand/spot fallback) replaces-first as usual. Don't carry the
 		// simulation Results on the delete-only command — the freed pods pend and reactive provisioning re-places them.
-		if terminateFirst(ctx, candidate, results) {
+		if options.FromContext(ctx).FeatureGates.TerminateFirst && terminateFirst(candidate, results) {
 			return []Command{{
 				Candidates:          []*Candidate{candidate},
 				PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
