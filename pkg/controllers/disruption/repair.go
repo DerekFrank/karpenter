@@ -25,15 +25,11 @@ import (
 	"github.com/samber/lo"
 	"k8s.io/apimachinery/pkg/api/equality"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
-	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
-	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
@@ -44,39 +40,25 @@ import (
 const agingConstant = 30 * time.Minute
 
 // Repair is a voluntary disruption method that remediates unhealthy nodes. It replaces the standalone node.health
-// controller: repair rides the shared disruption budget (reason "Repair"), pre-spins a replacement before terminating
-// (replace-then-terminate), orders candidates by rank + age/τ − backoff, and is vetoed by the do-not-repair annotation.
+// controller: repair rides the shared disruption budget (reason "Unhealthy"), pre-spins a replacement before
+// terminating (replace-then-terminate), orders candidates by rank + age/τ − backoff, and is vetoed by do-not-repair.
 type Repair struct {
-	kubeClient    client.Client
-	cluster       *state.Cluster
-	provisioner   *provisioning.Provisioner
-	cloudProvider cloudprovider.CloudProvider
-	recorder      events.Recorder
-	clock         clock.Clock
+	consolidation
 }
 
-func NewRepair(kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, clk clock.Clock) *Repair {
-	return &Repair{
-		kubeClient:    kubeClient,
-		cluster:       cluster,
-		provisioner:   provisioner,
-		cloudProvider: cp,
-		recorder:      recorder,
-		clock:         clk,
-	}
+func NewRepair(c consolidation) *Repair {
+	return &Repair{consolidation: c}
 }
 
 // ShouldDisrupt is a predicate that filters candidates to nodes that have an unhealthy condition matching a
 // RepairPolicy, have waited past that policy's toleration, and are not vetoed by the do-not-repair annotation.
 func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 	// Repair is behind the NodeRepair feature gate, matching the old node.health controller's gating.
-	if !options.FromContext(ctx).FeatureGates.NodeRepair {
-		return false
-	}
-	if c.Node == nil {
+	if !options.FromContext(ctx).FeatureGates.NodeRepair || c.Node == nil {
 		return false
 	}
 	// do-not-repair is the operator's escape hatch: it blocks all repair on this node, whatever the drain bound.
+	// TODO: revisit whether do-not-disrupt should also imply do-not-repair (kubernetes-sigs/karpenter#2424).
 	if c.Annotations()[v1.DoNotRepairAnnotationKey] == "true" {
 		return false
 	}
@@ -108,9 +90,7 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			continue
 		}
-		// Pre-spin: simulate scheduling to build the replacement(s). The queue launches them first and only
-		// terminates the original once they are healthy — so a replacement that boots unhealthy (bad AMI, partitioned
-		// zone) is never followed by terminating the original. Replace-then-terminate is the loop's circuit breaker.
+		// Pre-spin the replacement; the queue terminates the original only once the replacement is healthy.
 		results, err := SimulateScheduling(ctx, r.kubeClient, r.cluster, r.provisioner, r.clock, r.recorder, nil, candidate)
 		if err != nil {
 			if errors.Is(err, errCandidateDeleting) {
@@ -175,8 +155,9 @@ func (r *Repair) backoff(np *v1.NodePool) float64 {
 	return 0
 }
 
-// matchingPolicy returns the RepairPolicy whose (type,status) matches an unhealthy condition on the node, choosing the
-// one closest to (or furthest past) its toleration deadline, plus the matched condition.
+// matchingPolicy returns the highest-priority RepairPolicy whose (type,status) matches an unhealthy condition on the
+// node, plus the matched condition. When a node trips multiple policies, the highest priority wins (ties broken by the
+// earlier toleration deadline) so a node with several unhealthy reasons is ordered by its most urgent one.
 func (r *Repair) matchingPolicy(node *corev1.Node) (*cloudprovider.RepairPolicy, *corev1.NodeCondition) {
 	var best *cloudprovider.RepairPolicy
 	var bestCond *corev1.NodeCondition
@@ -188,7 +169,8 @@ func (r *Repair) matchingPolicy(node *corev1.Node) (*cloudprovider.RepairPolicy,
 			continue
 		}
 		terminationTime := cond.LastTransitionTime.Add(policy.TolerationDuration)
-		if deadline.IsZero() || terminationTime.Before(deadline) {
+		if best == nil || policy.Priority > best.Priority ||
+			(policy.Priority == best.Priority && terminationTime.Before(deadline)) {
 			p := policy
 			c := cond
 			best, bestCond, deadline = &p, &c, terminationTime
@@ -218,7 +200,7 @@ func (r *Repair) stampDrainBound(ctx context.Context, c *Candidate) error {
 	return r.kubeClient.Patch(ctx, c.NodeClaim, client.MergeFrom(stored))
 }
 
-func (r *Repair) Reason() v1.DisruptionReason { return v1.DisruptionReasonRepair }
+func (r *Repair) Reason() v1.DisruptionReason { return v1.DisruptionReasonUnhealthy }
 
 func (r *Repair) Class() string { return RepairDisruptionClass }
 

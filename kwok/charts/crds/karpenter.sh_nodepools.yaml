@@ -114,14 +114,14 @@ spec:
                             description: |-
                               reasons is a list of disruption methods that this budget applies to. If Reasons is not set, this budget applies to all methods.
                               Otherwise, this will apply to each reason defined.
-                              allowed reasons are Underutilized, Empty, Drifted, and Repair.
+                              allowed reasons are Underutilized, Empty, Drifted, and Unhealthy.
                             items:
                               description: DisruptionReason defines valid reasons for disruption budgets.
                               enum:
                                 - Underutilized
                                 - Empty
                                 - Drifted
-                                - Repair
+                                - Unhealthy
                               type: string
                             maxItems: 50
                             type: array
