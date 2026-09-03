@@ -99,20 +99,21 @@ var _ = Describe("Reserved Instance Types/Full-but-available (capacity-availabil
 		ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacity: lo.ToPtr(true)}}))
 	})
 
-	It("fallback: a full-but-available reservation still yields a reserved NodeClaim (disruption terminate-first keys off this)", func() {
+	It("fallback: a full reservation with no fallback yields no NodeClaim (pod falls through / pends, not a phantom reserved NodeClaim)", func() {
 		cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{newReservedType("reserved-type", reservedOffering("r-full", true, 0))}
 		nodePool = reservedOnlyNodePool("reserved-type")
 		ExpectApplied(ctx, env.Client, nodePool)
 
-		results := solveFallback(smallPod())
+		pod := smallPod()
+		results := solveFallback(pod)
 
-		Expect(results.NewNodeClaims).To(HaveLen(1))
-		nc := results.NewNodeClaims[0]
-		// The pod scheduled onto a reserved-only NodeClaim...
-		Expect(nc.Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeReserved)).To(BeTrue())
-		Expect(nc.Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeOnDemand)).To(BeFalse())
-		// ...but no reservation was held (it was full), so no reservation-id was pinned onto the NodeClaim.
-		Expect(nc.Requirements.Get(v1alpha1.LabelReservationID).Values()).To(BeEmpty())
+		// Fallback mode used to build a reserved-only NodeClaim holding no reservation (a phantom that would ICE at
+		// launch). Now a full reservation with no fallback fails with a plain error, so the pod falls through — and with
+		// no other NodePool it simply pends. This mirrors the pre-decouple behavior when a full reservation was
+		// Available=false and was never offered here. It is NOT a ReservedOfferingError (that would poison fallthrough).
+		Expect(results.NewNodeClaims).To(HaveLen(0))
+		Expect(results.PodErrors).To(HaveKey(pod))
+		Expect(results.ReservedOfferingErrors()).ToNot(HaveKey(pod))
 	})
 
 	It("fallback: a reservation that still has capacity is reserved normally (regression guard)", func() {
@@ -228,8 +229,8 @@ var _ = Describe("Reserved Instance Types/Full-but-available (capacity-availabil
 		return results
 	}
 
-	Context("RequireReservedCapacity (replace-first feasibility pass)", func() {
-		It("falls through to a lower-weight on-demand NodePool when the reserved NodePool's reservation is full", func() {
+	Context("fallback: full reservation falls through across NodePools", func() {
+		It("falls through to a lower-weight on-demand NodePool when the higher-weight reserved NodePool's reservation is full", func() {
 			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{newReservedType("reserved-type", reservedOffering("r-full", true, 0))}
 			reserved := reservedOnlyNodePool("reserved-type")
 			reserved.Spec.Weight = lo.ToPtr(int32(100))
@@ -237,25 +238,13 @@ var _ = Describe("Reserved Instance Types/Full-but-available (capacity-availabil
 			ExpectApplied(ctx, env.Client, reserved, od)
 
 			pod := smallPod()
-			results := solveWith([]*corev1.Pod{pod}, scheduling.RequireReservedCapacity)
+			results := solveWith([]*corev1.Pod{pod}) // default fallback mode
 
-			// The full reservation doesn't satisfy the pod, so it falls through to the on-demand NodePool.
+			// In fallback mode the full reservation doesn't satisfy the pod (plain error), so it falls through to the
+			// lower-weight on-demand NodePool — the same fallthrough that happened pre-decouple via Available=false.
 			Expect(results.PodErrors).ToNot(HaveKey(pod))
 			Expect(results.NewNodeClaims).To(HaveLen(1))
 			Expect(results.NewNodeClaims[0].Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeOnDemand)).To(BeTrue())
-		})
-
-		It("leaves the pod pending when the reservation is full and there is no fallback NodePool", func() {
-			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{newReservedType("reserved-type", reservedOffering("r-full", true, 0))}
-			ExpectApplied(ctx, env.Client, reservedOnlyNodePool("reserved-type"))
-
-			pod := smallPod()
-			results := solveWith([]*corev1.Pod{pod}, scheduling.RequireReservedCapacity)
-
-			// A plain (non-ReservedOffering) failure, and nowhere to fall through to -> pod stays pending, no NodeClaim.
-			Expect(results.NewNodeClaims).To(HaveLen(0))
-			Expect(results.PodErrors).To(HaveKey(pod))
-			Expect(results.ReservedOfferingErrors()).ToNot(HaveKey(pod))
 		})
 	})
 

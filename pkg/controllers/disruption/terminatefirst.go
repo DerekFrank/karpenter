@@ -40,14 +40,14 @@ import (
 //
 // The decision is made by simulating twice (see shouldTerminateFirst):
 //
-//  1. REPLACE-FIRST feasibility, in the usual fallback ReservedOfferingMode. We add RequireReservedCapacity so a full
-//     reservation (Available=true, ReservationCapacity=0) does not "satisfy" a pod: instead of creating a reserved-only
-//     NodeClaim against the full reservation, the reserved NodePool fails with a plain (non-ReservedOffering) error so
-//     the scheduler falls through to any lower-weight fallback (e.g. an on-demand NodePool) or a different reservation
-//     that still has capacity. (A ReservedOfferingError, i.e. strict mode, would instead poison cross-NodePool
-//     fallthrough and defer the pod — which is why pass 1 must be fallback, not strict.) If every reschedulable pod
-//     places, we replace-first as usual: a drifted reserved node prefers moving its pods onto an on-demand NodePool
-//     over terminating first.
+//  1. REPLACE-FIRST feasibility, in the usual fallback ReservedOfferingMode. In fallback mode a full reservation
+//     (Available=true, ReservationCapacity=0) does not "satisfy" a pod: instead of creating a reserved-only NodeClaim
+//     against the full reservation, the reserved NodePool fails with a plain (non-ReservedOffering) error so the
+//     scheduler falls through to any lower-weight fallback (e.g. an on-demand NodePool) or a different reservation that
+//     still has capacity. (A ReservedOfferingError, i.e. strict mode, would instead poison cross-NodePool fallthrough
+//     and defer the pod — which is why pass 1 must be fallback, not strict.) If every reschedulable pod places, we
+//     replace-first as usual: a drifted reserved node prefers moving its pods onto an on-demand NodePool over
+//     terminating first.
 //
 //  2. TERMINATE-FIRST feasibility. Only if pass 1 can't place every pod AND the candidate itself holds a reservation:
 //     simulate again in strict mode with the candidate's own reservation slot credited back (CreditReservationCapacity),
@@ -80,10 +80,9 @@ func shouldTerminateFirst(
 	recorder events.Recorder,
 	candidate *Candidate,
 ) (bool, pscheduling.Results, error) {
-	// Pass 1: replace-first feasibility, in the usual fallback mode. RequireReservedCapacity keeps a full reservation
-	// from satisfying a pod, so the scheduler falls through to a fallback NodePool / another reservation with capacity.
-	results, err := SimulateScheduling(ctx, kubeClient, cluster, provisioner, clk, recorder,
-		[]pscheduling.Options{pscheduling.RequireReservedCapacity}, candidate)
+	// Pass 1: replace-first feasibility, in the usual fallback mode. In fallback mode a full reservation doesn't satisfy
+	// a pod, so the scheduler falls through to a fallback NodePool / another reservation with capacity.
+	results, err := SimulateScheduling(ctx, kubeClient, cluster, provisioner, clk, recorder, nil, candidate)
 	if err != nil {
 		return false, results, err
 	}
