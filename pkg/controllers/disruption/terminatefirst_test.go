@@ -115,15 +115,18 @@ var _ = Describe("TerminateFirst", func() {
 		var driftController *disruption.Controller
 		var reservationID string
 
-		// setupReservedOffering appends a reserved offering to mostExpensiveInstance with the given remaining capacity
-		// and constrains the NodePool to that instance type. capacityTypes are the capacity types the NodePool permits.
-		setupReservedOffering := func(reservationCapacity int, capacityTypes ...string) {
+		// setupReservedOffering appends a reserved offering to mostExpensiveInstance and constrains the NodePool to that
+		// instance type. reservationCapacity is the remaining free slots (0 = full) and available reflects whether the
+		// reservation is usable for non-capacity reasons — matching the provider model where Available is decoupled from
+		// ReservationCapacity (full-but-healthy = available:true, cap:0; something-else-wrong = available:false).
+		// capacityTypes are the capacity types the NodePool permits.
+		setupReservedOffering := func(reservationCapacity int, available bool, capacityTypes ...string) {
 			reservationID = "r-" + mostExpensiveInstance.Name
 			mostExpensiveInstance.Requirements.Add(scheduling.NewRequirement(cloudprovider.ReservationIDLabel, corev1.NodeSelectorOpIn, reservationID))
 			mostExpensiveInstance.Requirements.Get(v1.CapacityTypeLabelKey).Insert(v1.CapacityTypeReserved)
 			mostExpensiveInstance.Offerings = append(mostExpensiveInstance.Offerings, &cloudprovider.Offering{
 				Price:               mostExpensiveOffering.Price / 1_000_000.0,
-				Available:           true,
+				Available:           available,
 				ReservationCapacity: reservationCapacity,
 				Requirements: scheduling.NewLabelRequirements(map[string]string{
 					v1.CapacityTypeLabelKey:          v1.CapacityTypeReserved,
@@ -160,7 +163,7 @@ var _ = Describe("TerminateFirst", func() {
 
 		It("issues a delete-only command when the reservation is full and there is no fallback", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirst: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
-			setupReservedOffering(0, v1.CapacityTypeReserved) // full reservation, reserved-only pool
+			setupReservedOffering(0, true, v1.CapacityTypeReserved) // full but healthy (row 1), reserved-only pool
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			bindReschedulablePod(node)
@@ -174,9 +177,24 @@ var _ = Describe("TerminateFirst", func() {
 			Expect(cmds[0].Replacements).To(HaveLen(0))
 		})
 
+		It("does NOT terminate-first when the reservation is full AND otherwise unavailable (something else wrong)", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirst: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
+			setupReservedOffering(0, false, v1.CapacityTypeReserved) // full AND unavailable (row 2): expiring / ICE'd / incompatible
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			bindReschedulablePod(node)
+			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
+
+			ExpectSingletonReconciled(ctx, driftController)
+
+			// The offering is unavailable, so the simulation can't stage a reserved replacement and drift is Blocked.
+			// Freeing the candidate's slot wouldn't fix an expiring/ICE'd reservation, so we must NOT terminate-first.
+			Expect(queue.GetCommands()).To(HaveLen(0))
+		})
+
 		It("replaces-first (into the full reservation) when TerminateFirst is disabled — the sim already yields the reserved-only replacement, no crediting needed", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirst: lo.ToPtr(false), ReservedCapacity: lo.ToPtr(true)}}))
-			setupReservedOffering(0, v1.CapacityTypeReserved) // full reservation, reserved-only pool
+			setupReservedOffering(0, true, v1.CapacityTypeReserved) // full but healthy (row 1), reserved-only pool
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			bindReschedulablePod(node)
@@ -196,7 +214,7 @@ var _ = Describe("TerminateFirst", func() {
 
 		It("replaces-first when the reservation is full but an on-demand fallback exists", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirst: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
-			setupReservedOffering(0, v1.CapacityTypeReserved, v1.CapacityTypeOnDemand) // full reservation, but on-demand fallback allowed
+			setupReservedOffering(0, true, v1.CapacityTypeReserved, v1.CapacityTypeOnDemand) // full but healthy, on-demand fallback allowed
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			bindReschedulablePod(node)
@@ -212,7 +230,7 @@ var _ = Describe("TerminateFirst", func() {
 
 		It("replaces-first when the reservation still has a spare slot", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirst: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
-			setupReservedOffering(5, v1.CapacityTypeReserved) // spare reservation capacity -> can grow in place
+			setupReservedOffering(5, true, v1.CapacityTypeReserved) // spare reservation capacity -> can grow in place
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			bindReschedulablePod(node)

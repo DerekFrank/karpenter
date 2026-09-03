@@ -36,6 +36,12 @@ import (
 // candidate itself holds), never launch outcomes, so a failed launch keeps replacing-first under the existing
 // per-NodePool launch backoff.
 //
+// This relies on the cloud provider modeling a full-but-otherwise-healthy reservation as an offering with
+// Available=true and ReservationCapacity=0 (capacity and usability are independent axes): "out of capacity, nothing
+// else wrong". A reservation that is unavailable for another reason (expiring, ICE'd, incompatible) must be
+// Available=false, and the simulation then can't stage a replacement, so drift stays Blocked and we correctly do not
+// terminate-first — freeing the candidate's slot wouldn't fix those. See the karpenter-provider-aws offering model.
+//
 // This depends on the disruption simulation running in the scheduler's default (fallback) ReservedOfferingMode, which
 // SimulateScheduling does not override: fallback lets the candidate-gone simulation return a reserved-only replacement
 // even when the reservation is full (the launch would ICE, but the simulated NodeClaim still surfaces so we can read
