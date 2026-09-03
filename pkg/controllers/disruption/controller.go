@@ -63,8 +63,11 @@ type Controller struct {
 	cloudProvider cloudprovider.CloudProvider
 	clusterCost   *cost.ClusterCost
 	methods       []Method
-	mu            sync.Mutex
-	lastRun       map[string]time.Time
+	// repairPolicies is a single RepairPolicies() snapshot taken at construction and shared with the Repair method and
+	// the candidate drain-bound gate, so both agree on which policy governs a node (providers must not mutate it).
+	repairPolicies []cloudprovider.RepairPolicy
+	mu             sync.Mutex
+	lastRun        map[string]time.Time
 }
 
 // pollingPeriod that we inspect cluster to look for opportunities to disrupt
@@ -83,28 +86,31 @@ func WithMethods(methods ...Method) option.Function[ControllerOptions] {
 func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
 	cp cloudprovider.CloudProvider, recorder events.Recorder, cluster *state.Cluster, queue *Queue, clusterCost *cost.ClusterCost, opts ...option.Function[ControllerOptions]) *Controller {
 
-	o := option.Resolve(append([]option.Function[ControllerOptions]{WithMethods(NewMethods(clk, cluster, kubeClient, provisioner, cp, recorder, queue)...)}, opts...)...)
+	// Snapshot RepairPolicies() once and share it with both the Repair method and the candidate drain-bound gate.
+	repairPolicies := cp.RepairPolicies()
+	o := option.Resolve(append([]option.Function[ControllerOptions]{WithMethods(NewMethods(clk, cluster, kubeClient, provisioner, cp, recorder, queue, repairPolicies)...)}, opts...)...)
 	return &Controller{
-		queue:         queue,
-		clock:         clk,
-		kubeClient:    kubeClient,
-		cluster:       cluster,
-		provisioner:   provisioner,
-		recorder:      recorder,
-		cloudProvider: cp,
-		clusterCost:   clusterCost,
-		lastRun:       map[string]time.Time{},
-		methods:       o.methods,
+		queue:          queue,
+		clock:          clk,
+		kubeClient:     kubeClient,
+		cluster:        cluster,
+		provisioner:    provisioner,
+		recorder:       recorder,
+		cloudProvider:  cp,
+		clusterCost:    clusterCost,
+		repairPolicies: repairPolicies,
+		lastRun:        map[string]time.Time{},
+		methods:        o.methods,
 	}
 }
 
-func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Client, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue) []Method {
+func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Client, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue, repairPolicies []cloudprovider.RepairPolicy) []Method {
 	c := MakeConsolidation(clk, cluster, kubeClient, provisioner, cp, recorder, queue)
 	methods := []Method{}
 	// Repair runs first: fixing a fault outranks any discretionary rebalance. Only registered when a cloud provider
 	// defines repair policies and the NodeRepair feature gate is on, matching the old node.health controller's gating.
-	if len(cp.RepairPolicies()) != 0 {
-		methods = append(methods, NewRepair(c))
+	if len(repairPolicies) != 0 {
+		methods = append(methods, NewRepair(c, repairPolicies))
 	}
 	return append(methods, []Method{
 		// Delete empty nodes across all consolidation policies (WhenEmpty, WhenEmptyOrUnderutilized, Balanced).
@@ -193,7 +199,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		metrics.ReasonLabel:    strings.ToLower(string(disruption.Reason())),
 		ConsolidationTypeLabel: disruption.ConsolidationType(),
 	})()
-	candidates, nodePoolTotals, err := GetCandidatesWithTotals(ctx, c.cluster, c.kubeClient, c.recorder, c.clock, c.cloudProvider, disruption.ShouldDisrupt, disruption.Class(), c.queue, c.clusterCost)
+	candidates, nodePoolTotals, err := GetCandidatesWithTotals(ctx, c.cluster, c.kubeClient, c.recorder, c.clock, c.cloudProvider, disruption.ShouldDisrupt, disruption.Class(), c.queue, c.clusterCost, c.repairPolicies)
 	if err != nil {
 		return false, fmt.Errorf("determining candidates, %w", err)
 	}

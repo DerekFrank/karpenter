@@ -164,7 +164,7 @@ func (c *Candidate) IsEmpty() bool {
 //nolint:gocyclo
 func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events.Recorder, clk clock.Clock, node *state.StateNode, pdbs pdb.Limits,
 	nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType, queue *Queue, disruptionClass string,
-	cloudProvider cloudprovider.CloudProvider,
+	repairPolicies []cloudprovider.RepairPolicy,
 ) (*Candidate, error) {
 	var err error
 	var pods []*corev1.Pod
@@ -210,7 +210,7 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 		case EventualDisruptionClass:
 			drainBoundedCandidate = node.NodeClaim.Spec.TerminationGracePeriod != nil
 		case RepairDisruptionClass:
-			policy, _ := matchRepairPolicy(node.Node, cloudProvider.RepairPolicies())
+			policy, _ := matchRepairPolicy(node.Node, repairPolicies)
 			drainBoundedCandidate = (policy != nil && policy.TerminationGracePeriod != nil) ||
 				node.NodeClaim.Spec.TerminationGracePeriod != nil
 		}

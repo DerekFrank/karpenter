@@ -33,7 +33,7 @@ import (
 )
 
 func NewMethodsWithRealValidator() []disruption.Method {
-	return disruption.NewMethods(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue)
+	return disruption.NewMethods(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, cloudProvider.RepairPolicies())
 }
 
 type NopValidator struct{}
