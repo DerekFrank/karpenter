@@ -44,10 +44,14 @@ const agingConstant = 30 * time.Minute
 // terminating (replace-then-terminate), orders candidates by rank + age/τ − backoff, and is vetoed by do-not-repair.
 type Repair struct {
 	consolidation
+	// repairPolicies is cached at construction. Provider-authored defaults are static, so re-reading
+	// cloudProvider.RepairPolicies() on every pass (per candidate, in score and matchingPolicy) is wasted work;
+	// cloud providers must not mutate it after startup.
+	repairPolicies []cloudprovider.RepairPolicy
 }
 
 func NewRepair(c consolidation) *Repair {
-	return &Repair{consolidation: c}
+	return &Repair{consolidation: c, repairPolicies: c.cloudProvider.RepairPolicies()}
 }
 
 // ShouldDisrupt is a predicate that filters candidates to nodes that have an unhealthy condition matching a
@@ -137,10 +141,8 @@ func (r *Repair) score(c *Candidate, ranks map[int]int) float64 {
 
 // denseRanks compresses the set of configured policy priorities into contiguous tiers (adjacent tiers one apart),
 // so arbitrary priority magnitudes can't change what τ means — only the ordering of priorities matters.
-// TODO: RepairPolicies() is re-read on every pass (here, in score, and in matchingPolicy). Cloud providers should
-// not mutate it, so cache it once at startup instead of re-fetching per candidate per pass.
 func (r *Repair) denseRanks() map[int]int {
-	priorities := lo.Uniq(lo.Map(r.cloudProvider.RepairPolicies(), func(p cloudprovider.RepairPolicy, _ int) int { return p.Priority }))
+	priorities := lo.Uniq(lo.Map(r.repairPolicies, func(p cloudprovider.RepairPolicy, _ int) int { return p.Priority }))
 	sort.Ints(priorities)
 	ranks := make(map[int]int, len(priorities))
 	for i, p := range priorities {
@@ -170,8 +172,8 @@ func (r *Repair) matchingPolicy(node *corev1.Node) (*cloudprovider.RepairPolicy,
 	var best *cloudprovider.RepairPolicy
 	var bestCond *corev1.NodeCondition
 	deadline := time.Time{}
-	for i := range r.cloudProvider.RepairPolicies() {
-		policy := r.cloudProvider.RepairPolicies()[i]
+	for i := range r.repairPolicies {
+		policy := r.repairPolicies[i]
 		cond := nodeutils.GetCondition(node, policy.ConditionType)
 		if cond.Status != policy.ConditionStatus {
 			continue
