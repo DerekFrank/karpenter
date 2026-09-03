@@ -44,14 +44,16 @@ const agingConstant = 30 * time.Minute
 // terminating (replace-then-terminate), orders candidates by rank + age/τ − backoff, and is vetoed by do-not-repair.
 type Repair struct {
 	consolidation
-	// repairPolicies is cached at construction. Provider-authored defaults are static, so re-reading
-	// cloudProvider.RepairPolicies() on every pass (per candidate, in score and matchingPolicy) is wasted work;
-	// cloud providers must not mutate it after startup.
+	// repairPolicies and ranks are cached at construction from a single RepairPolicies() snapshot. Provider-authored
+	// defaults are static, so re-reading them on every pass (per candidate, in score/matchingPolicy/denseRanks) is
+	// wasted work; cloud providers must not mutate them after startup. The candidate drain-bound gate in NewCandidate
+	// reads the SAME snapshot (threaded from the controller) so the two never disagree about which policy governs a node.
 	repairPolicies []cloudprovider.RepairPolicy
+	ranks          map[int]int
 }
 
-func NewRepair(c consolidation) *Repair {
-	return &Repair{consolidation: c, repairPolicies: c.cloudProvider.RepairPolicies()}
+func NewRepair(c consolidation, repairPolicies []cloudprovider.RepairPolicy) *Repair {
+	return &Repair{consolidation: c, repairPolicies: repairPolicies, ranks: denseRanks(repairPolicies)}
 }
 
 // ShouldDisrupt is a predicate that filters candidates to nodes that have an unhealthy condition matching a
@@ -77,7 +79,7 @@ func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 // ComputeCommands orders eligible candidates by the repair score and returns one replace-then-terminate command for the
 // highest-scoring candidate whose NodePool has budget. Only one command per pass, mirroring drift.
 func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
-	ranks := r.denseRanks()
+	ranks := r.ranks
 	sort.SliceStable(candidates, func(i, j int) bool {
 		si, sj := r.score(candidates[i], ranks), r.score(candidates[j], ranks)
 		if si != sj {
@@ -140,9 +142,10 @@ func (r *Repair) score(c *Candidate, ranks map[int]int) float64 {
 }
 
 // denseRanks compresses the set of configured policy priorities into contiguous tiers (adjacent tiers one apart),
-// so arbitrary priority magnitudes can't change what τ means — only the ordering of priorities matters.
-func (r *Repair) denseRanks() map[int]int {
-	priorities := lo.Uniq(lo.Map(r.repairPolicies, func(p cloudprovider.RepairPolicy, _ int) int { return p.Priority }))
+// so arbitrary priority magnitudes can't change what τ means — only the ordering of priorities matters. Computed once
+// at construction (the policy set is static) and cached on the Repair as ranks.
+func denseRanks(policies []cloudprovider.RepairPolicy) map[int]int {
+	priorities := lo.Uniq(lo.Map(policies, func(p cloudprovider.RepairPolicy, _ int) int { return p.Priority }))
 	sort.Ints(priorities)
 	ranks := make(map[int]int, len(priorities))
 	for i, p := range priorities {
