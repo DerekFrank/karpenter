@@ -74,7 +74,8 @@ type Controller struct {
 const pollingPeriod = 10 * time.Second
 
 type ControllerOptions struct {
-	methods []Method
+	methods      []Method
+	repairWindow *Window
 }
 
 func WithMethods(methods ...Method) option.Function[ControllerOptions] {
@@ -83,12 +84,24 @@ func WithMethods(methods ...Method) option.Function[ControllerOptions] {
 	}
 }
 
+// WithRepairWindow injects the shared correlated-failure restraint Window into the default repair method, so repair
+// (reader) and the clawback controller (writer) pace against the same per-domain dial. Ignored when WithMethods
+// overrides the method set (the caller then supplies its own Repair).
+func WithRepairWindow(w *Window) option.Function[ControllerOptions] {
+	return func(o *ControllerOptions) {
+		o.repairWindow = w
+	}
+}
+
 func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
 	cp cloudprovider.CloudProvider, recorder events.Recorder, cluster *state.Cluster, queue *Queue, clusterCost *cost.ClusterCost, opts ...option.Function[ControllerOptions]) *Controller {
 
 	// Snapshot RepairPolicies() once and share it with both the Repair method and the candidate drain-bound gate.
 	repairPolicies := cp.RepairPolicies()
-	o := option.Resolve(append([]option.Function[ControllerOptions]{WithMethods(NewMethods(clk, cluster, kubeClient, provisioner, cp, recorder, queue, repairPolicies)...)}, opts...)...)
+	o := option.Resolve(opts...)
+	if o.methods == nil {
+		o.methods = NewMethods(clk, cluster, kubeClient, provisioner, cp, recorder, queue, repairPolicies, o.repairWindow)
+	}
 	return &Controller{
 		queue:          queue,
 		clock:          clk,
@@ -104,13 +117,14 @@ func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provi
 	}
 }
 
-func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Client, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue, repairPolicies []cloudprovider.RepairPolicy) []Method {
+func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Client, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue, repairPolicies []cloudprovider.RepairPolicy, repairWindow *Window) []Method {
 	c := MakeConsolidation(clk, cluster, kubeClient, provisioner, cp, recorder, queue)
 	methods := []Method{}
 	// Repair runs first: fixing a fault outranks any discretionary rebalance. Only registered when a cloud provider
 	// defines repair policies and the NodeRepair feature gate is on, matching the old node.health controller's gating.
+	// repairWindow is the shared restraint dial the clawback controller writes; nil ⇒ repair builds a standalone one.
 	if len(repairPolicies) != 0 {
-		methods = append(methods, NewRepair(c, repairPolicies))
+		methods = append(methods, NewRepair(c, repairPolicies, repairWindow))
 	}
 	return append(methods, []Method{
 		// Delete empty nodes across all consolidation policies (WhenEmpty, WhenEmptyOrUnderutilized, Balanced).

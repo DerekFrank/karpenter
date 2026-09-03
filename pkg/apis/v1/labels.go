@@ -47,7 +47,7 @@ const (
 
 // Karpenter specific annotations
 const (
-	DoNotDisruptAnnotationKey                  = apis.Group + "/do-not-disrupt"
+	DoNotDisruptAnnotationKey = apis.Group + "/do-not-disrupt"
 	// DoNotRepairAnnotationKey vetoes voluntary node repair on a node, distinct from do-not-disrupt.
 	DoNotRepairAnnotationKey                   = apis.Group + "/do-not-repair"
 	ProviderCompatibilityAnnotationKey         = apis.CompatibilityGroup + "/provider"
@@ -59,6 +59,12 @@ const (
 	// scheduled to this NodeClaim. The initialization controller can gate on these drivers having published their
 	// ResourceSlices before marking the node initialized.
 	DRADriversAnnotationKey = apis.Group + "/requested-dra-drivers"
+	// LaunchContextAnnotationKey records launch-time provenance for a NodeClaim: why it was created (LaunchCause) and,
+	// for a disruption replacement, which NodeClaim it superseded. It is the durable, crash-surviving marker the
+	// correlated-failure repair loop reads to identify its own in-flight replacements — and the failure domain they
+	// belong to — from cluster state alone, without an in-memory ledger. Its value is the JSON of a LaunchContext.
+	// POC: this rides in an annotation so it needs no CRD change; it is a candidate to promote to spec.launchContext.
+	LaunchContextAnnotationKey = apis.Group + "/launch-context"
 )
 
 // Karpenter specific finalizers

@@ -462,6 +462,21 @@ func (in *StateNode) DisruptionCost() float64 {
 	return cost
 }
 
+// DisruptionReason returns the reason of an in-flight Karpenter-initiated disruption on this node, read from the
+// durable DisruptionReason condition (set when a disruption command is issued, cleared when it completes). ok=false
+// when the node is not currently being disrupted. This is the crash-safe, observable signal for "how many nodes are
+// undergoing an operation" — unlike the in-memory markedForDeletion flag, it is rebuilt from the object on resync.
+func (in *StateNode) DisruptionReason() (v1.DisruptionReason, bool) {
+	if in.NodeClaim == nil {
+		return "", false
+	}
+	cond := in.NodeClaim.StatusConditions().Get(v1.ConditionTypeDisruptionReason)
+	if !cond.IsTrue() {
+		return "", false
+	}
+	return v1.DisruptionReason(cond.Reason), true
+}
+
 func (in *StateNode) MarkedForDeletion() bool {
 	// The Node is marked for deletion if:
 	//  1. The Node has MarkedForDeletion set

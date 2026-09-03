@@ -56,6 +56,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
+	"sigs.k8s.io/karpenter/pkg/utils/launchcontext"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
@@ -314,7 +315,14 @@ func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, 
 
 // createReplacementNodeClaims creates replacement NodeClaims
 func (q *Queue) createReplacementNodeClaims(ctx context.Context, cmd *Command) error {
-	nodeClaimNames, err := q.provisioner.CreateNodeClaims(ctx, lo.Map(cmd.Replacements, func(r *Replacement, _ int) *pscheduling.NodeClaim { return r.NodeClaim }), provisioning.WithReason(strings.ToLower(string(cmd.Reason()))))
+	// Stamp durable launch provenance on each replacement: its cause (the disruption reason) and — for a single-
+	// candidate command like repair — the NodeClaim it supersedes. This lets a disruption method (correlated-failure
+	// repair) identify its own in-flight replacements and dwell-tail from cluster state alone, no in-memory ledger.
+	lc := launchcontext.Context{Cause: launchcontext.ForReason(cmd.Reason())}
+	if len(cmd.Candidates) == 1 {
+		lc.Replaces = cmd.Candidates[0].NodeClaim.Name
+	}
+	nodeClaimNames, err := q.provisioner.CreateNodeClaims(ctx, lo.Map(cmd.Replacements, func(r *Replacement, _ int) *pscheduling.NodeClaim { return r.NodeClaim }), provisioning.WithReason(strings.ToLower(string(cmd.Reason()))), provisioning.WithLaunchContext(lc))
 	if err != nil {
 		return err
 	}

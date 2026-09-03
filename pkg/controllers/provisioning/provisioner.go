@@ -59,6 +59,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
 	"sigs.k8s.io/karpenter/pkg/utils/daemonset"
+	"sigs.k8s.io/karpenter/pkg/utils/launchcontext"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
@@ -69,6 +70,9 @@ import (
 type LaunchOptions struct {
 	RecordPodNomination bool
 	Reason              string
+	// LaunchContext, when its Cause is set, is stamped onto the created NodeClaim as durable launch provenance
+	// (LaunchContextAnnotationKey) so a disruption method can later identify its own replacements from cluster state.
+	LaunchContext launchcontext.Context
 }
 
 // RecordPodNomination causes nominate pod events to be recorded against the node.
@@ -78,6 +82,11 @@ func RecordPodNomination(o *LaunchOptions) {
 
 func WithReason(reason string) func(*LaunchOptions) {
 	return func(o *LaunchOptions) { o.Reason = reason }
+}
+
+// WithLaunchContext stamps launch-time provenance (cause + the NodeClaim it replaces) onto the created NodeClaim.
+func WithLaunchContext(lc launchcontext.Context) func(*LaunchOptions) {
+	return func(o *LaunchOptions) { o.LaunchContext = lc }
 }
 
 // Provisioner waits for enqueued pods, batches them, creates capacity and binds the pods to the capacity.
@@ -162,7 +171,7 @@ func (p *Provisioner) Reconcile(ctx context.Context) (result reconciler.Result, 
 	if len(results.NewNodeClaims) == 0 {
 		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
 	}
-	if _, err = p.CreateNodeClaims(ctx, results.NewNodeClaims, WithReason(metrics.ProvisionedReason), RecordPodNomination); err != nil {
+	if _, err = p.CreateNodeClaims(ctx, results.NewNodeClaims, WithReason(metrics.ProvisionedReason), WithLaunchContext(launchcontext.Context{Cause: launchcontext.CauseProvisioned}), RecordPodNomination); err != nil {
 		return reconciler.Result{}, err
 	}
 	return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
@@ -472,6 +481,12 @@ func (p *Provisioner) Create(ctx context.Context, n *scheduler.NodeClaim, opts .
 		return "", err
 	}
 	nodeClaim := n.ToNodeClaim()
+
+	// Stamp durable launch provenance so disruption methods can identify this NodeClaim's origin (and, for a
+	// replacement, what it superseded) from cluster state alone — no in-memory ledger, crash-safe on resync.
+	if options.LaunchContext.Cause != "" {
+		options.LaunchContext.StampOn(nodeClaim)
+	}
 
 	if err := p.kubeClient.Create(ctx, nodeClaim); err != nil {
 		return "", err

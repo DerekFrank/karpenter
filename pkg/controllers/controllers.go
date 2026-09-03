@@ -104,9 +104,13 @@ func NewControllers(
 	disruptionQueue := disruption.NewQueue(kubeClient, recorder, cluster, clock, p)
 	npState := nodepoolhealth.NewState()
 	clusterCost := cost.NewClusterCost(ctx, cloudProvider, kubeClient)
+	// Shared correlated-failure restraint dial: repair (reader, inside the disruption controller) paces admission
+	// against it, and the clawback controller (writer) widens/slams it as replacements prove Ready or re-break. One
+	// instance so both see the same per-domain width/cooldown.
+	repairWindow := disruption.NewWindow(clock.Now)
 	controllers := []controller.Controller{
 		p, evictionQueue, disruptionQueue,
-		disruption.NewController(clock, kubeClient, p, cloudProvider, recorder, cluster, disruptionQueue, clusterCost),
+		disruption.NewController(clock, kubeClient, p, cloudProvider, recorder, cluster, disruptionQueue, clusterCost, disruption.WithRepairWindow(repairWindow)),
 		provisioning.NewPodController(kubeClient, p, cluster),
 		provisioning.NewNodeController(kubeClient, p),
 		nodepoolhash.NewController(kubeClient, cloudProvider),
@@ -160,6 +164,14 @@ func NewControllers(
 				status.WithHistogramBuckets(prometheus.ExponentialBuckets(0.5, 2, 15)), // 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192
 				status.WithLabels(append(lo.Map(cloudProvider.GetSupportedNodeClasses(), func(obj status.Object, _ int) string { return v1.NodeClassLabelKey(object.GVK(obj).GroupKind()) }), v1.NodePoolLabelKey, v1.NodeInitializedLabelKey)...)),
 		)
+	}
+
+	// The clawback controller is repair's correlated-failure restraint writer (optimistic + clawback): it widens the
+	// shared window when a repair replacement holds Ready and slams it shut if the replacement re-breaks inside the
+	// clawback window. Gated identically to the repair method — a cloud provider with repair policies and the
+	// NodeRepair feature gate on.
+	if len(cloudProvider.RepairPolicies()) != 0 && options.FromContext(ctx).FeatureGates.NodeRepair {
+		controllers = append(controllers, disruption.NewClawbackController(clock, kubeClient, cloudProvider, repairWindow))
 	}
 
 	if options.FromContext(ctx).FeatureGates.StaticCapacity {

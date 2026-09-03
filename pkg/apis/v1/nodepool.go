@@ -120,7 +120,7 @@ type Disruption struct {
 type Budget struct {
 	// reasons is a list of disruption methods that this budget applies to. If Reasons is not set, this budget applies to all methods.
 	// Otherwise, this will apply to each reason defined.
-	// allowed reasons are Underutilized, Empty, and Drifted.
+	// allowed reasons are Underutilized, Empty, Drifted, and Unhealthy.
 	// +kubebuilder:validation:MaxItems=50
 	// +optional
 	// +listType=set
