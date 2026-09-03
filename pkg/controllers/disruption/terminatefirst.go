@@ -38,13 +38,16 @@ import (
 // This is a shared primitive, not a per-method bolt-on: any voluntary disruption method decides it the same way, from
 // two scheduling simulations of the candidate-gone fleet. Callers gate it on the TerminateFirst feature flag.
 //
-// The decision is made by simulating twice (see simulateReservedAwareDisruption):
+// The decision is made by simulating twice (see shouldTerminateFirst):
 //
-//  1. REPLACE-FIRST feasibility. Simulate with RequireReservedCapacity so a full reservation (Available=true,
-//     ReservationCapacity=0) does not "satisfy" a pod — the reserved-only NodePool is skipped and the scheduler falls
-//     through to any lower-weight fallback (e.g. an on-demand NodePool) or a different reservation that still has
-//     capacity. If every reschedulable pod places, we replace-first as usual: a drifted reserved node prefers moving
-//     its pods onto an on-demand NodePool over terminating first.
+//  1. REPLACE-FIRST feasibility, in the usual fallback ReservedOfferingMode. We add RequireReservedCapacity so a full
+//     reservation (Available=true, ReservationCapacity=0) does not "satisfy" a pod: instead of creating a reserved-only
+//     NodeClaim against the full reservation, the reserved NodePool fails with a plain (non-ReservedOffering) error so
+//     the scheduler falls through to any lower-weight fallback (e.g. an on-demand NodePool) or a different reservation
+//     that still has capacity. (A ReservedOfferingError, i.e. strict mode, would instead poison cross-NodePool
+//     fallthrough and defer the pod — which is why pass 1 must be fallback, not strict.) If every reschedulable pod
+//     places, we replace-first as usual: a drifted reserved node prefers moving its pods onto an on-demand NodePool
+//     over terminating first.
 //
 //  2. TERMINATE-FIRST feasibility. Only if pass 1 can't place every pod AND the candidate itself holds a reservation:
 //     simulate again in strict mode with the candidate's own reservation slot credited back (CreditReservationCapacity),
@@ -61,24 +64,14 @@ import (
 // Available=true and ReservationCapacity=0 (capacity and usability are independent axes): "out of capacity, nothing
 // else wrong". See the karpenter-provider-aws offering model.
 
-// reservedDisruptionDecision is the outcome of the two-pass reserved-aware disruption simulation.
-type reservedDisruptionDecision int
-
-const (
-	// decisionReplaceFirst: stage a replacement and then remove the candidate (the normal disruption path).
-	decisionReplaceFirst reservedDisruptionDecision = iota
-	// decisionTerminateFirst: remove the candidate first; reactive provisioning refills the freed reservation slot.
-	decisionTerminateFirst
-	// decisionBlocked: neither replace-first nor terminate-first can place the candidate's pods right now.
-	decisionBlocked
-)
-
-// simulateReservedAwareDisruption runs the two-pass simulation for a voluntary disruption of a single candidate and
-// returns the decision plus the scheduling Results to build the command from (pass-1 results for replace-first and for
-// the blocked event's pod-scheduling errors; pass-2 results for terminate-first). See the package doc above for the
-// full rationale. The returned error is non-nil only on a simulation error (e.g. the candidate began deleting), which
-// the caller should treat as retry.
-func simulateReservedAwareDisruption(
+// shouldTerminateFirst runs the two-pass simulation for a voluntary disruption of a single candidate. It returns:
+//   - (true, pass-2 results, nil)  — terminate-first: delete the candidate and let reactive provisioning refill.
+//   - (false, pass-1 results, nil) — NOT terminate-first: the caller replace-firsts with these results if every pod
+//     scheduled, otherwise treats them as a Blocked event (the pods can't be rescheduled at all).
+//
+// See the package doc above for the full rationale. The returned error is non-nil only on a simulation error (e.g. the
+// candidate began deleting), which the caller should treat as retry.
+func shouldTerminateFirst(
 	ctx context.Context,
 	kubeClient client.Client,
 	cluster *state.Cluster,
@@ -86,23 +79,24 @@ func simulateReservedAwareDisruption(
 	clk clock.Clock,
 	recorder events.Recorder,
 	candidate *Candidate,
-) (reservedDisruptionDecision, pscheduling.Results, error) {
-	// Pass 1: replace-first feasibility. Full reservations don't satisfy pods, so the scheduler falls through to
-	// on-demand/spot NodePools or a different reservation with real capacity.
+) (bool, pscheduling.Results, error) {
+	// Pass 1: replace-first feasibility, in the usual fallback mode. RequireReservedCapacity keeps a full reservation
+	// from satisfying a pod, so the scheduler falls through to a fallback NodePool / another reservation with capacity.
 	results, err := SimulateScheduling(ctx, kubeClient, cluster, provisioner, clk, recorder,
 		[]pscheduling.Options{pscheduling.RequireReservedCapacity}, candidate)
 	if err != nil {
-		return decisionBlocked, results, err
+		return false, results, err
 	}
 	if results.AllNonPendingPodsScheduled() {
-		return decisionReplaceFirst, results, nil
+		return false, results, nil // replace-first
 	}
 
 	// Pass 1 couldn't place every pod without reusing the candidate's own reservation. Only a reserved candidate can
-	// terminate-first — its freed slot is the headroom that unblocks the reschedule.
+	// terminate-first — its freed slot is the headroom that unblocks the reschedule. Otherwise return the pass-1
+	// results so the caller emits a Blocked event.
 	reservationID := candidate.Labels()[cloudprovider.ReservationIDLabel]
 	if candidate.capacityType != v1.CapacityTypeReserved || reservationID == "" {
-		return decisionBlocked, results, nil
+		return false, results, nil
 	}
 
 	// Pass 2: terminate-first feasibility. Credit the candidate's reservation slot back and require every pod to place
@@ -110,13 +104,13 @@ func simulateReservedAwareDisruption(
 	tfResults, err := SimulateScheduling(ctx, kubeClient, cluster, provisioner, clk, recorder,
 		[]pscheduling.Options{pscheduling.DisableReservedCapacityFallback, pscheduling.CreditReservationCapacity(reservationID, 1)}, candidate)
 	if err != nil {
-		return decisionBlocked, results, err
+		return false, results, err
 	}
 	if tfResults.AllNonPendingPodsScheduled() {
-		return decisionTerminateFirst, tfResults, nil
+		return true, tfResults, nil
 	}
 
-	// Neither replace-first nor terminate-first works. Report the replace-first (pass-1) pod errors in the blocked
-	// event, since that is the reschedule we attempted first.
-	return decisionBlocked, results, nil
+	// Neither replace-first nor terminate-first works. Return the pass-1 results so the Blocked event reports the
+	// replace-first pod errors (the reschedule we attempted first).
+	return false, results, nil
 }
