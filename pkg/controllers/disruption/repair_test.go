@@ -83,6 +83,13 @@ var _ = Describe("Repair", func() {
 		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(n))
 	}
 
+	// newRepairController builds an isolated repair-only disruption controller. Repair caches RepairPolicies() at
+	// construction, so specs that override cloudProvider.RepairPolicy must call this again to pick up the new policies.
+	newRepairController := func() {
+		repairController = disruption.NewController(env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
+			disruption.WithMethods(disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue))))
+	}
+
 	BeforeEach(func() {
 		// Enable the NodeRepair feature gate for the repair suite.
 		ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeRepair: lo.ToPtr(true)}}))
@@ -94,8 +101,7 @@ var _ = Describe("Repair", func() {
 		nodeClaim, node = test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
 		ExpectApplied(ctx, env.Client, nodePool)
 		// Repair runs as an isolated method so tests assert repair behavior only.
-		repairController = disruption.NewController(env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
-			disruption.WithMethods(disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue))))
+		newRepairController()
 	})
 
 	// INV-S6 / INV-S9: repair pre-spins a replacement (replace-then-terminate) and only after the toleration elapses.
@@ -196,6 +202,7 @@ var _ = Describe("Repair", func() {
 			{ConditionType: "LowPriority", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, Priority: 10},
 			{ConditionType: "HighPriority", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, Priority: 90},
 		}
+		newRepairController()
 		lowClaim, lowNode := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
 		highClaim, highNode := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
 		initNode(lowClaim, lowNode)
@@ -217,6 +224,7 @@ var _ = Describe("Repair", func() {
 		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
 			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, TerminationGracePeriod: lo.ToPtr(time.Duration(0))},
 		}
+		newRepairController()
 		initNode(nodeClaim, node)
 		markUnhealthy(node, "BadNode")
 		env.Clock.Step(31 * time.Minute)
