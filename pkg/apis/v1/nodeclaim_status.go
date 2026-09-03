@@ -33,6 +33,13 @@ const (
 	ConditionTypeInstanceTerminating  = "InstanceTerminating"
 	ConditionTypeConsistentStateFound = "ConsistentStateFound"
 	ConditionTypeDisruptionReason     = "DisruptionReason"
+	// ConditionTypeRepairCredited / ConditionTypeRepairClawedBack are the terminal outcomes the clawback controller
+	// stamps on a repair-launched replacement (LaunchContext.Cause=Unhealthy). Credited: the replacement held Ready, so
+	// its failure domains were widened (optimistic). ClawedBack: the replacement re-broke inside the clawback window, so
+	// its domains were slammed shut and backed off. They make the controller idempotent (credit/claw back once) and its
+	// decision auditable straight from the NodeClaim.
+	ConditionTypeRepairCredited   = "RepairCredited"
+	ConditionTypeRepairClawedBack = "RepairClawedBack"
 )
 
 // NodeClaimStatus defines the observed state of NodeClaim

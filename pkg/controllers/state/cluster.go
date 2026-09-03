@@ -276,6 +276,17 @@ func (c *Cluster) DeepCopyNodes() StateNodes {
 
 // IsNodeNominated returns true if the given node was expected to have a pod bound to it during a recent scheduling
 // batch
+// GetActiveDisruptions returns every managed node with an in-flight Karpenter disruption of the given reason, read from
+// the durable DisruptionReason condition. It is cluster-wide by design — callers bucket into their own failure domains
+// (a zone or policy domain spans NodePools). Crash-safe: rebuilt from the condition on resync, so it needs no in-memory
+// disruption ledger. Derived from the cached node snapshot, matching how BuildDisruptionBudgetMapping already reads state.
+func (c *Cluster) GetActiveDisruptions(reason v1.DisruptionReason) StateNodes {
+	return lo.Filter(c.DeepCopyNodes(), func(n *StateNode, _ int) bool {
+		r, ok := n.DisruptionReason()
+		return n.Managed() && ok && r == reason
+	})
+}
+
 func (c *Cluster) IsNodeNominated(providerID string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

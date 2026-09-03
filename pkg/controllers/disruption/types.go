@@ -48,7 +48,7 @@ import (
 
 const (
 	GracefulDisruptionClass = metrics.TerminationModeGraceful // graceful disruption always respects blocking pod PDBs and the do-not-disrupt annotation
-	EventualDisruptionClass = metrics.TerminationModeEventual  // eventual disruption is bounded by a NodePool's TerminationGracePeriod, regardless of blocking pod PDBs and the do-not-disrupt annotation
+	EventualDisruptionClass = metrics.TerminationModeEventual // eventual disruption is bounded by a NodePool's TerminationGracePeriod, regardless of blocking pod PDBs and the do-not-disrupt annotation
 	// RepairDisruptionClass is voluntary node repair. Like graceful, it drains and honors PDBs; unlike graceful, it
 	// ignores do-not-disrupt (repair is not discretionary — it honors the separate do-not-repair veto) and its drain
 	// is bounded by the per-condition RepairPolicy TerminationGracePeriod (0 = forceful), like eventual.
