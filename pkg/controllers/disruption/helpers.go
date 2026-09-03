@@ -206,7 +206,7 @@ func GetCandidatesWithTotals(ctx context.Context, cluster *state.Cluster, kubeCl
 	}
 	allNodes := cluster.DeepCopyNodes()
 	allCandidates := lo.FilterMap(allNodes, func(n *state.StateNode, _ int) (*Candidate, bool) {
-		cn, e := NewCandidate(ctx, kubeClient, recorder, clk, n, pdbs, nodePoolMap, nodePoolToInstanceTypesMap, queue, disruptionClass)
+		cn, e := NewCandidate(ctx, kubeClient, recorder, clk, n, pdbs, nodePoolMap, nodePoolToInstanceTypesMap, queue, disruptionClass, cloudProvider)
 		return cn, e == nil
 	})
 	// Compute totals using ALL nodes for disruption cost denominator (RFC requirement:

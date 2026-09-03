@@ -169,11 +169,17 @@ func (r *Repair) backoff(np *v1.NodePool) float64 {
 // TODO: rip out for the reason-aware matching model (kubernetes-sigs/karpenter#3263, reason-aware repair policy
 // matching + escalation) — picking a single highest-priority policy is a placeholder for multi-reason semantics.
 func (r *Repair) matchingPolicy(node *corev1.Node) (*cloudprovider.RepairPolicy, *corev1.NodeCondition) {
+	return matchRepairPolicy(node, r.repairPolicies)
+}
+
+// matchRepairPolicy is the package-level matcher shared by the Repair method and the candidate drain-bound gate in
+// NewCandidate, so both agree on which policy governs a node. See matchingPolicy for the selection rule.
+func matchRepairPolicy(node *corev1.Node, policies []cloudprovider.RepairPolicy) (*cloudprovider.RepairPolicy, *corev1.NodeCondition) {
 	var best *cloudprovider.RepairPolicy
 	var bestCond *corev1.NodeCondition
 	deadline := time.Time{}
-	for i := range r.repairPolicies {
-		policy := r.repairPolicies[i]
+	for i := range policies {
+		policy := policies[i]
 		cond := nodeutils.GetCondition(node, policy.ConditionType)
 		if cond.Status != policy.ConditionStatus {
 			continue

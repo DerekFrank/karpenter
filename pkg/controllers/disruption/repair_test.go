@@ -70,6 +70,15 @@ var _ = Describe("Repair", func() {
 		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(n))
 	}
 
+	// bindBlockingPod places a do-not-disrupt pod on the node. Such a pod blocks eviction, so the node is only a
+	// disruption candidate when the drain is bounded by a hard deadline (repair's RepairPolicy TGP, or the NodeClaim TGP).
+	bindBlockingPod := func(n *corev1.Node) {
+		pod := test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{v1.DoNotDisruptAnnotationKey: "true"}}})
+		ExpectApplied(ctx, env.Client, pod)
+		ExpectManualBinding(ctx, env.Client, pod, n)
+		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(n))
+	}
+
 	// markUnhealthy appends a condition matching a RepairPolicy at the current fake-clock time, re-applies the node,
 	// and re-syncs cluster state. Must be called AFTER initNode.
 	markUnhealthy := func(n *corev1.Node, condType corev1.NodeConditionType) {
@@ -233,6 +242,50 @@ var _ = Describe("Repair", func() {
 		Expect(queue.GetCommands()).To(HaveLen(1))
 		// The forceful policy stamps the termination-timestamp annotation (now), so termination skips the drain window.
 		Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).To(HaveKey(v1.NodeClaimTerminationTimestampAnnotationKey))
+	})
+
+	// INV-S10: a broken node must not be stranded by a pod that blocks eviction. When the matched RepairPolicy bounds
+	// the drain (here forceful/0), the node is still a candidate even though the NodePool/NodeClaim set no TGP — the
+	// bound comes from the policy, not from NodeClaim.Spec.TerminationGracePeriod.
+	It("should repair an unhealthy node with a blocking pod when the RepairPolicy bounds the drain", func() {
+		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, TerminationGracePeriod: lo.ToPtr(time.Duration(0))},
+		}
+		newRepairController()
+		initNode(nodeClaim, node)
+		bindBlockingPod(node)
+		markUnhealthy(node, "BadNode")
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+		Expect(queue.GetCommands()).To(HaveLen(1))
+	})
+
+	// The drain bound may instead be inherited from the NodeClaim's own TGP when the RepairPolicy leaves it nil — that
+	// is still a hard deadline, so a blocking pod does not strand the node.
+	It("should repair an unhealthy node with a blocking pod when the NodeClaim TGP bounds the drain", func() {
+		// Default policy (from BeforeEach) leaves TerminationGracePeriod nil, so the bound is inherited from the NodeClaim.
+		nodeClaim.Spec.TerminationGracePeriod = &metav1.Duration{Duration: 5 * time.Minute}
+		initNode(nodeClaim, node)
+		bindBlockingPod(node)
+		markUnhealthy(node, "BadNode")
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+		Expect(queue.GetCommands()).To(HaveLen(1))
+	})
+
+	// Boundary: when neither the RepairPolicy nor the NodeClaim bounds the drain, the drain is unbounded, so a blocking
+	// pod must still gate repair — otherwise repair could hang indefinitely on the PDB/do-not-disrupt pod.
+	It("should not repair an unhealthy node with a blocking pod when no drain bound exists", func() {
+		// Default policy (nil TGP) and no NodeClaim TGP -> unbounded.
+		initNode(nodeClaim, node)
+		bindBlockingPod(node)
+		markUnhealthy(node, "BadNode")
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+		Expect(queue.GetCommands()).To(HaveLen(0))
 	})
 
 	// A node whose unhealthy condition does not match any RepairPolicy is left alone.
