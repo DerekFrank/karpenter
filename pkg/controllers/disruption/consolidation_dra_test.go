@@ -67,7 +67,7 @@ var _ = Describe("Consolidation/DRA", func() {
 		Expect(err).To(Succeed())
 		candidates := lo.Map(nodes, func(node *corev1.Node, _ int) *disruption.Candidate {
 			stateNode := ExpectStateNodeExists(cluster, node)
-			candidate, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, stateNode, pdbs, nodePoolMap, nodePoolToInstanceTypesMap, queue, disruption.GracefulDisruptionClass)
+			candidate, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, stateNode, pdbs, nodePoolMap, nodePoolToInstanceTypesMap, queue, disruption.GracefulDisruptionClass, cloudProvider)
 			Expect(err).To(Succeed())
 			return candidate
 		})

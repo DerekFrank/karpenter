@@ -164,6 +164,7 @@ func (c *Candidate) IsEmpty() bool {
 //nolint:gocyclo
 func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events.Recorder, clk clock.Clock, node *state.StateNode, pdbs pdb.Limits,
 	nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType, queue *Queue, disruptionClass string,
+	cloudProvider cloudprovider.CloudProvider,
 ) (*Candidate, error) {
 	var err error
 	var pods []*corev1.Pod
@@ -199,12 +200,20 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 	// We only care if instanceType in non-empty consolidation to do price-comparison.
 	instanceType := instanceTypeMap[node.Labels()[corev1.LabelInstanceTypeStable]]
 	if pods, err = node.ValidatePodsDisruptable(ctx, kubeClient, pdbs, clk, recorder); err != nil {
-		// If the NodeClaim has a TerminationGracePeriod set and the disruption class is eventual, the node should be
-		// considered a candidate even if there's a pod that will block eviction. Other error types should still cause
-		// failure creating the candidate. Repair behaves the same when its per-condition drain bound is set (that bound
-		// is stamped onto the NodeClaim TGP before repair runs), so a broken node is never stranded by a blocking pod.
-		drainBoundedCandidate := node.NodeClaim.Spec.TerminationGracePeriod != nil &&
-			(disruptionClass == EventualDisruptionClass || disruptionClass == RepairDisruptionClass)
+		// A node with a pod that blocks eviction (PDB, do-not-disrupt) is only a candidate when the drain is bounded by
+		// a hard deadline, so disruption can't hang indefinitely. Eventual disruption bounds it with the NodeClaim's
+		// TerminationGracePeriod. Repair bounds it with the matched RepairPolicy's TerminationGracePeriod (a forceful 0
+		// counts; it is stamped as the termination-timestamp annotation in ComputeCommands), falling back to the
+		// NodeClaim's own TerminationGracePeriod. Other classes never override a blocking pod.
+		var drainBoundedCandidate bool
+		switch disruptionClass {
+		case EventualDisruptionClass:
+			drainBoundedCandidate = node.NodeClaim.Spec.TerminationGracePeriod != nil
+		case RepairDisruptionClass:
+			policy, _ := matchRepairPolicy(node.Node, cloudProvider.RepairPolicies())
+			drainBoundedCandidate = (policy != nil && policy.TerminationGracePeriod != nil) ||
+				node.NodeClaim.Spec.TerminationGracePeriod != nil
+		}
 		if lo.Ternary(drainBoundedCandidate, state.IgnorePodBlockEvictionError(err), err) != nil {
 			recorder.Publish(disruptionevents.Blocked(node.Node, node.NodeClaim, pretty.Sentence(err.Error()))...)
 			return nil, err
