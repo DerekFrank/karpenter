@@ -23,9 +23,7 @@ import (
 	"time"
 
 	"github.com/samber/lo"
-	"k8s.io/apimachinery/pkg/api/equality"
 	corev1 "k8s.io/api/core/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -108,16 +106,15 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 			r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
 			continue
 		}
-		// Bound the drain per the matched policy before the queue terminates the candidate, so repair is never an
-		// unbounded hang and a forceful (0) policy skips the drain for conditions the kubelet can't evict through.
-		if err := r.stampDrainBound(ctx, candidate); err != nil {
-			return []Command{}, err
-		}
+		// Carry the drain bound on the command; the queue stamps the absolute deadline at actual deletion time (after
+		// the replacement is healthy), so repair is never an unbounded hang and a forceful (0) policy skips the drain
+		// for conditions the kubelet can't evict through — without pre-spin latency eroding the window.
 		return []Command{{
-			Candidates:          []*Candidate{candidate},
-			Replacements:        replacementsFromNodeClaims(results.NewNodeClaims...),
-			Results:             results,
-			PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+			Candidates:             []*Candidate{candidate},
+			Replacements:           replacementsFromNodeClaims(results.NewNodeClaims...),
+			Results:                results,
+			PoolDisruptionCosts:    computePoolDisruptionCosts([]*Candidate{candidate}),
+			TerminationGracePeriod: r.effectiveDrainBound(candidate),
 		}}, nil
 	}
 	return []Command{}, nil
@@ -198,12 +195,12 @@ func matchRepairPolicy(node *corev1.Node, policies []cloudprovider.RepairPolicy)
 	return best, bestCond
 }
 
-// stampDrainBound sets the NodeClaim termination-timestamp annotation the termination controller reads as the hard
-// drain deadline: now + effective TGP (min of the policy bound and the NodeClaim's own TGP), or now for a forceful
-// (0) policy. A nil policy bound leaves the NodeClaim's TGP untouched (inherit).
-// TODO: stamping the termination-timestamp annotation is a stopgap — replace once the termination flow has a formal
-// contract (kubernetes-sigs/karpenter#3029, Formalize Node Termination Contract).
-func (r *Repair) stampDrainBound(ctx context.Context, c *Candidate) error {
+// effectiveDrainBound returns the drain bound for the candidate, carried on the Command and applied by the queue at
+// deletion time: min(matched policy TGP, NodeClaim TGP), or 0 for a forceful policy. nil means the policy sets no
+// bound, so the NodeClaim's own TerminationGracePeriod is inherited (the default disruption behavior).
+// TODO: the termination-timestamp deadline is a stopgap — replace once the termination flow has a formal contract
+// (kubernetes-sigs/karpenter#3029, Formalize Node Termination Contract).
+func (r *Repair) effectiveDrainBound(c *Candidate) *time.Duration {
 	policy, _ := r.matchingPolicy(c.Node)
 	if policy == nil || policy.TerminationGracePeriod == nil {
 		return nil // inherit the NodeClaim's own TerminationGracePeriod
@@ -212,13 +209,7 @@ func (r *Repair) stampDrainBound(ctx context.Context, c *Candidate) error {
 	if ncTGP := c.NodeClaim.Spec.TerminationGracePeriod; ncTGP != nil && ncTGP.Duration < effective {
 		effective = ncTGP.Duration
 	}
-	stored := c.NodeClaim.DeepCopy()
-	deadline := r.clock.Now().Add(effective).Format(time.RFC3339)
-	c.NodeClaim.Annotations = lo.Assign(c.NodeClaim.Annotations, map[string]string{v1.NodeClaimTerminationTimestampAnnotationKey: deadline})
-	if equality.Semantic.DeepEqual(stored, c.NodeClaim) {
-		return nil
-	}
-	return r.kubeClient.Patch(ctx, c.NodeClaim, client.MergeFrom(stored))
+	return &effective
 }
 
 func (r *Repair) Reason() v1.DisruptionReason { return v1.DisruptionReasonUnhealthy }

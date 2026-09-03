@@ -260,6 +260,11 @@ type Command struct {
 	Candidates          []*Candidate
 	Replacements        []*Replacement
 	PoolDisruptionCosts map[string]float64
+
+	// TerminationGracePeriod, when set, bounds the drain of this command's candidates. The queue stamps the absolute
+	// termination deadline (now + this) at actual deletion time, so replace-then-terminate latency does not erode the
+	// window. nil means inherit the NodeClaim's own TerminationGracePeriod (the default disruption behavior).
+	TerminationGracePeriod *time.Duration
 }
 
 // Reason returns the disruption reason for this command.
