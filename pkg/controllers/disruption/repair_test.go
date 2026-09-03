@@ -227,21 +227,75 @@ var _ = Describe("Repair", func() {
 		Expect(cmds[0].Candidates[0].Node.Name).To(Equal(highNode.Name))
 	})
 
-	// INV-S10: repair supplies a bounded drain even when the NodePool set no TGP — a forceful (0) policy stamps an
-	// immediate termination deadline, so repair is never the unbounded hang.
-	It("should stamp a forceful termination deadline for a forceful policy", func() {
+	// INV-S10: the drain deadline is stamped at actual deletion time (not command-computation time), so pre-spin latency
+	// can't erode the window — mirroring how the lifecycle controller stamps DeletionTimestamp+TGP for other reasons.
+	// A forceful (0) policy stamps an immediate deadline, so repair is never the unbounded hang.
+	It("should stamp a forceful (immediate) termination deadline at deletion for a forceful policy", func() {
 		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
 			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, TerminationGracePeriod: lo.ToPtr(time.Duration(0))},
 		}
 		newRepairController()
+		nodeClaim.Finalizers = append(nodeClaim.Finalizers, "karpenter.sh/test-finalizer") // survive Delete so we can read the stamp
 		initNode(nodeClaim, node)
 		markUnhealthy(node, "BadNode")
 		env.Clock.Step(31 * time.Minute)
 
 		ExpectSingletonReconciled(ctx, repairController)
-		Expect(queue.GetCommands()).To(HaveLen(1))
-		// The forceful policy stamps the termination-timestamp annotation (now), so termination skips the drain window.
-		Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).To(HaveKey(v1.NodeClaimTerminationTimestampAnnotationKey))
+		cmds := queue.GetCommands()
+		Expect(cmds).To(HaveLen(1))
+		// Not stamped at command-computation time...
+		Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).ToNot(HaveKey(v1.NodeClaimTerminationTimestampAnnotationKey))
+		// ...stamped when the queue terminates the candidate, anchored to that moment (forceful 0 -> now).
+		ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+		nc := ExpectExists(ctx, env.Client, nodeClaim)
+		ts, err := time.Parse(time.RFC3339, nc.Annotations[v1.NodeClaimTerminationTimestampAnnotationKey])
+		Expect(err).ToNot(HaveOccurred())
+		Expect(ts).To(BeTemporally("~", env.Clock.Now(), time.Second))
+	})
+
+	// INV-S10: when both the policy and the NodeClaim bound the drain, the smaller (most forceful) wins.
+	It("should stamp min(policy TGP, NodeClaim TGP) at deletion", func() {
+		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, TerminationGracePeriod: lo.ToPtr(20 * time.Minute)},
+		}
+		newRepairController()
+		nodeClaim.Spec.TerminationGracePeriod = &metav1.Duration{Duration: 5 * time.Minute}
+		nodeClaim.Finalizers = append(nodeClaim.Finalizers, "karpenter.sh/test-finalizer") // survive Delete so we can read the stamp
+		initNode(nodeClaim, node)
+		markUnhealthy(node, "BadNode")
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+		cmds := queue.GetCommands()
+		Expect(cmds).To(HaveLen(1))
+		ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+		nc := ExpectExists(ctx, env.Client, nodeClaim)
+		ts, err := time.Parse(time.RFC3339, nc.Annotations[v1.NodeClaimTerminationTimestampAnnotationKey])
+		Expect(err).ToNot(HaveOccurred())
+		Expect(ts).To(BeTemporally("~", env.Clock.Now().Add(5*time.Minute), time.Second)) // min(20m, 5m)
+	})
+
+	// The deadline is stamped only at actual deletion, so a replacement that never becomes healthy leaves the original
+	// both un-terminated AND un-stamped — the circuit breaker never starts the drain clock (bounded policy proves it
+	// would stamp if termination ran).
+	It("should not stamp a termination deadline when the replacement never becomes healthy", func() {
+		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, TerminationGracePeriod: lo.ToPtr(10 * time.Minute)},
+		}
+		newRepairController()
+		initNode(nodeClaim, node)
+		bindReschedulablePod(node)
+		markUnhealthy(node, "BadNode")
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+		cmds := queue.GetCommands()
+		Expect(cmds).To(HaveLen(1))
+		// Do NOT make the replacement ready; reconciling the queue must neither terminate nor stamp the original.
+		ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+		nc := ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(nc.DeletionTimestamp.IsZero()).To(BeTrue())
+		Expect(nc.Annotations).ToNot(HaveKey(v1.NodeClaimTerminationTimestampAnnotationKey))
 	})
 
 	// INV-S10: a broken node must not be stranded by a pod that blocks eviction. When the matched RepairPolicy bounds
