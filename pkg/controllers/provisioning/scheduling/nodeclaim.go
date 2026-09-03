@@ -323,21 +323,21 @@ func (n *NodeClaim) offeringsToReserve(
 	}
 
 	hasCompatibleOffering := false
-	// hasCompatibleUnreservedFallback tracks whether the NodeClaim has a compatible, available on-demand/spot offering
-	// to fall back to. It lets us distinguish a NodePool that can spill to on-demand/spot from a reserved-only pool
-	// that has nowhere to go when its reservation is full. It is only consulted in fallback mode.
-	hasCompatibleUnreservedFallback := false
 	var reservedOfferings cloudprovider.Offerings
 	for _, it := range instanceTypes {
 		for _, o := range it.Offerings {
-			if !o.Available {
+			// A reserved offering with no remaining ReservationCapacity is treated as non-reservable here — the same as
+			// if it were unavailable. Once reservation capacity and offering availability are decoupled (a full-but-healthy
+			// reservation is Available=true, ReservationCapacity=0), this keeps scheduling behavior identical to before the
+			// decoupling: a full reservation is not a reservable option, so strict mode doesn't raise a ReservedOfferingError
+			// for it (provisioning still falls back to on-demand/spot as it does today), and fallback mode doesn't reserve
+			// it. It stays Available for the disruption terminate-first detection, which reads the offering directly.
+			if o.CapacityType() != v1.CapacityTypeReserved || !o.Available || o.ReservationCapacity == 0 {
 				continue
 			}
+			// Track every incompatible reserved offering for release. Since releasing a reservation is a no-op when there is no
+			// reservation for the given host, there's no need to check that a reservation actually exists for the offering.
 			if !nodeClaimRequirements.IsCompatible(o.Requirements, scheduling.AllowUndefinedWellKnownLabels) {
-				continue
-			}
-			if o.CapacityType() != v1.CapacityTypeReserved {
-				hasCompatibleUnreservedFallback = true
 				continue
 			}
 			hasCompatibleOffering = true
@@ -364,19 +364,6 @@ func (n *NodeClaim) offeringsToReserve(
 		if len(n.reservedOfferings) != 0 && len(reservedOfferings) == 0 {
 			return nil, NewReservedOfferingError(fmt.Errorf("satisfying updated nodeclaim constraints would remove all compatible reserved offering options"))
 		}
-	} else if hasCompatibleOffering && len(reservedOfferings) == 0 && !hasCompatibleUnreservedFallback {
-		// Fallback mode. Every compatible reserved offering is currently unreservable (its reservation is full) and the
-		// NodeClaim has no on-demand/spot offering to fall back to. Proceeding would mint a reserved NodeClaim that can
-		// only ICE at launch — and on a higher-weight NodePool it would win over a lower-weight on-demand NodePool that
-		// could actually satisfy the pod. Fail so the scheduler falls through to other NodePools, matching the behavior
-		// from before reservation capacity and offering availability were decoupled (a full reservation used to be
-		// Available=false, so it was never a viable offering here).
-		//
-		// This is deliberately NOT a ReservedOfferingError: that type is reserved for strict mode, where it blocks
-		// fallback to lower-weight NodePools so provisioning can retry into reserved capacity on a later loop. Here, in
-		// fallback mode, we WANT to fall through to a lower-weight on-demand NodePool now, so we return a plain error
-		// that addToNewNodeClaim treats as an ordinary per-template failure.
-		return nil, fmt.Errorf("compatible reserved offerings are at capacity and no on-demand or spot fallback is available")
 	}
 	return reservedOfferings, nil
 }
