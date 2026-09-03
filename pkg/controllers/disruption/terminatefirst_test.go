@@ -192,7 +192,7 @@ var _ = Describe("TerminateFirst", func() {
 			Expect(queue.GetCommands()).To(HaveLen(0))
 		})
 
-		It("replaces-first (into the full reservation) when TerminateFirst is disabled — the sim already yields the reserved-only replacement, no crediting needed", func() {
+		It("does NOT drift when TerminateFirst is disabled and the reservation is full with no fallback (Blocked)", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirst: lo.ToPtr(false), ReservedCapacity: lo.ToPtr(true)}}))
 			setupReservedOffering(0, true, v1.CapacityTypeReserved) // full but healthy (row 1), reserved-only pool
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
@@ -202,14 +202,11 @@ var _ = Describe("TerminateFirst", func() {
 
 			ExpectSingletonReconciled(ctx, driftController)
 
-			// With the gate off, drift takes its normal replace-first path — and the plain (uncredited) fallback-mode
-			// simulation still returns a reserved-only replacement for the full reservation, so a replacement is staged
-			// (it would ICE at launch until the slot frees; terminate-first is exactly what avoids that).
-			cmds := queue.GetCommands()
-			Expect(cmds).To(HaveLen(1))
-			Expect(cmds[0].Decision()).To(Equal(disruption.ReplaceDecision))
-			Expect(cmds[0].Replacements).To(HaveLen(1))
-			Expect(cmds[0].Replacements[0].Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeReserved)).To(BeTrue())
+			// With the gate off, drift takes its normal replace-first path. In fallback mode a full reservation no longer
+			// yields a phantom reserved-only replacement — it can't stage a replacement, so drift is Blocked and issues
+			// no command (matching upstream behavior for a full reserved-only node). Terminate-first is exactly what
+			// unblocks this case, and it's gated off here.
+			Expect(queue.GetCommands()).To(HaveLen(0))
 		})
 
 		It("replaces-first when the reservation is full but an on-demand fallback exists", func() {

@@ -60,9 +60,6 @@ type NodeClaim struct {
 	//   this expansion.
 	reservedOfferings    cloudprovider.Offerings
 	reservedOfferingMode ReservedOfferingMode
-	// requireReservedCapacity: see options.requireReservedCapacity. When set, a reserved-only pod whose only reserved
-	// option is a full reservation fails with a plain error so the pod falls through to a lower-weight NodePool.
-	requireReservedCapacity bool
 	// creditReservationCapacity: see options.creditReservationCapacity. A reservation with a positive credit here is
 	// classified as reservable even if its offering's static ReservationCapacity is 0 — modeling a slot a disruption
 	// candidate will free on termination.
@@ -97,7 +94,6 @@ func NewNodeClaim(
 	instanceTypes []*cloudprovider.InstanceType,
 	reservationManager *ReservationManager,
 	reservedOfferingMode ReservedOfferingMode,
-	requireReservedCapacity bool,
 	creditReservationCapacity map[string]int,
 ) *NodeClaim {
 	hostname := fmt.Sprintf("hostname-placeholder-%04d", atomic.AddInt64(&nodeID, 1))
@@ -126,7 +122,6 @@ func NewNodeClaim(
 		reservedOfferings:         cloudprovider.Offerings{},
 		reservationManager:        reservationManager,
 		reservedOfferingMode:      reservedOfferingMode,
-		requireReservedCapacity:   requireReservedCapacity,
 		creditReservationCapacity: creditReservationCapacity,
 	}
 }
@@ -376,14 +371,18 @@ func (n *NodeClaim) offeringsToReserve(
 		}
 	}
 
-	// Replace-first feasibility pass (terminate-first disruption): the pod's only placement is a reservation that is
-	// full right now (no reservable reserved offering, no on-demand/spot fallback). Return a PLAIN error — NOT a
-	// ReservedOfferingError — so the scheduler falls through to a lower-weight NodePool (e.g. on-demand) instead of
-	// deferring the pod (a ReservedOfferingError poisons cross-NodePool fallthrough). If nothing else can host it, the
-	// pod stays pending and the disruption caller proceeds to the terminate-first pass. This is mode-independent: the
-	// replace-first pass runs in fallback mode, so it wouldn't hit the strict checks below.
-	if n.requireReservedCapacity && hasFullReservedOffering && !hasReservableOffering && !hasCompatibleUnreservedFallback {
-		return nil, fmt.Errorf("reserved capacity required but the only compatible reservation is full")
+	// Fallback mode: if the pod's only compatible option is a reservation that is full right now (no reservable
+	// reserved offering with real or credited capacity, and no on-demand/spot fallback), fail with a PLAIN error — NOT
+	// a ReservedOfferingError — so the scheduler falls through to a lower-weight NodePool (e.g. on-demand). This
+	// restores the pre-decouple behavior: a full reservation used to be Available=false and simply wasn't offered here,
+	// so the pod fell through; now that a full-but-healthy reservation is Available=true, cap=0, we reproduce that
+	// fallthrough explicitly. A ReservedOfferingError would instead poison cross-NodePool fallthrough and defer the pod,
+	// so we must not use one here. A reservation with a slot credited back for this loop is classified reservable (not
+	// full) above, so this does not fire for the terminate-first credit-back pass (which runs strict, below). Strict
+	// mode raises a ReservedOfferingError for this case instead (defer), handled below.
+	if n.reservedOfferingMode != ReservedOfferingModeStrict &&
+		hasFullReservedOffering && !hasReservableOffering && !hasCompatibleUnreservedFallback {
+		return nil, fmt.Errorf("the only compatible reserved offering is full; falling through to other NodePools")
 	}
 
 	if n.reservedOfferingMode == ReservedOfferingModeStrict {

@@ -96,13 +96,6 @@ type options struct {
 	minValuesPolicy         karpopts.MinValuesPolicy
 	numConcurrentReconciles int
 	enforceConsolidateAfter bool
-	// requireReservedCapacity, when set, makes a NodeClaim whose only placement is a full reservation (a reserved-only
-	// pod with no on-demand/spot fallback and no reservable reserved offering) fail with a PLAIN error rather than
-	// being created against that full reservation. The plain error lets the scheduler fall through to a lower-weight
-	// NodePool (e.g. on-demand); a ReservedOfferingError would instead poison fallthrough and defer the pod. Used by
-	// the terminate-first disruption "can we replace-first?" pass so a drifted reserved node prefers falling back to an
-	// on-demand NodePool over terminating first.
-	requireReservedCapacity bool
 	// creditReservationCapacity adds slots back to specific reservation ids before scheduling, modeling capacity that a
 	// disruption candidate will free when it is terminated. Used by the terminate-first "would the pods fit once the
 	// slot is freed?" pass.
@@ -113,12 +106,6 @@ type Options = option.Function[options]
 
 var DisableReservedCapacityFallback = func(opts *options) {
 	opts.reservedOfferingMode = ReservedOfferingModeStrict
-}
-
-// RequireReservedCapacity makes the scheduler fall through to a lower-weight NodePool (rather than defer) when a pod's
-// only reserved placement is a full reservation. See options.requireReservedCapacity.
-var RequireReservedCapacity = func(opts *options) {
-	opts.requireReservedCapacity = true
 }
 
 // CreditReservationCapacity credits `count` slots back to the given reservation id before scheduling, modeling a
@@ -222,7 +209,6 @@ func NewScheduler(
 		clock:                     clock,
 		reservationManager:        reservationManager,
 		reservedOfferingMode:      resolved.reservedOfferingMode,
-		requireReservedCapacity:   resolved.requireReservedCapacity,
 		creditReservationCapacity: resolved.creditReservationCapacity,
 		preferencePolicy:          resolved.preferencePolicy,
 		minValuesPolicy:           minValuesPolicy,
@@ -267,23 +253,22 @@ type PodData struct {
 }
 
 type Scheduler struct {
-	uuid                    types.UID // Unique UUID attached to this scheduling loop
-	newNodeClaims           []*NodeClaim
-	existingNodes           []*ExistingNode
-	nodeClaimTemplates      []*NodeClaimTemplate
-	remainingResources      map[string]corev1.ResourceList // (NodePool name) -> remaining resources for that NodePool
-	daemonOverheadGroups    map[*NodeClaimTemplate][]DaemonOverheadGroup
-	cachedPodData           map[types.UID]*PodData                  // (Pod Namespace/Name) -> pre-computed data for pods to avoid re-computation and memory usage
-	volumeReqsByPod         map[types.UID][]scheduling.Requirements // Volume topology requirement alternatives per pod
-	preferences             *Preferences
-	topology                *Topology
-	cluster                 *state.Cluster
-	recorder                events.Recorder
-	kubeClient              client.Client
-	clock                   clock.Clock
-	reservationManager      *ReservationManager
-	reservedOfferingMode    ReservedOfferingMode
-	requireReservedCapacity bool
+	uuid                 types.UID // Unique UUID attached to this scheduling loop
+	newNodeClaims        []*NodeClaim
+	existingNodes        []*ExistingNode
+	nodeClaimTemplates   []*NodeClaimTemplate
+	remainingResources   map[string]corev1.ResourceList // (NodePool name) -> remaining resources for that NodePool
+	daemonOverheadGroups map[*NodeClaimTemplate][]DaemonOverheadGroup
+	cachedPodData        map[types.UID]*PodData                  // (Pod Namespace/Name) -> pre-computed data for pods to avoid re-computation and memory usage
+	volumeReqsByPod      map[types.UID][]scheduling.Requirements // Volume topology requirement alternatives per pod
+	preferences          *Preferences
+	topology             *Topology
+	cluster              *state.Cluster
+	recorder             events.Recorder
+	kubeClient           client.Client
+	clock                clock.Clock
+	reservationManager   *ReservationManager
+	reservedOfferingMode ReservedOfferingMode
 	// creditReservationCapacity is the per-reservation slot credit applied for this scheduling loop (a disruption
 	// candidate's freed slots). Threaded to each NodeClaim so a credited full reservation is classified as reservable
 	// rather than full — the ReservationManager capacity alone can't distinguish a genuinely-full reservation from one
@@ -769,7 +754,7 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod, volu
 					"total", len(s.nodeClaimTemplates[i].InstanceTypeOptions))
 			}
 		}
-		nodeClaim := NewNodeClaim(s.nodeClaimTemplates[i], s.topology, s.daemonOverheadGroups[s.nodeClaimTemplates[i]], its, s.reservationManager, s.reservedOfferingMode, s.requireReservedCapacity, s.creditReservationCapacity)
+		nodeClaim := NewNodeClaim(s.nodeClaimTemplates[i], s.topology, s.daemonOverheadGroups[s.nodeClaimTemplates[i]], its, s.reservationManager, s.reservedOfferingMode, s.creditReservationCapacity)
 		r, its, ofs, result, err := nodeClaim.CanAdd(ctx, pod, s.cachedPodData[pod.UID], volumes, s.minValuesPolicy == karpopts.MinValuesPolicyBestEffort, s.allocator)
 		if err != nil {
 			errs[i] = err
