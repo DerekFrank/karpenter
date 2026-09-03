@@ -247,10 +247,8 @@ var _ = Describe("Repair", func() {
 		Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).ToNot(HaveKey(v1.NodeClaimTerminationTimestampAnnotationKey))
 		// ...stamped when the queue terminates the candidate, anchored to that moment (forceful 0 -> now).
 		ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
-		nc := ExpectExists(ctx, env.Client, nodeClaim)
-		ts, err := time.Parse(time.RFC3339, nc.Annotations[v1.NodeClaimTerminationTimestampAnnotationKey])
-		Expect(err).ToNot(HaveOccurred())
-		Expect(ts).To(BeTemporally("~", env.Clock.Now(), time.Second))
+		Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).To(
+			HaveKeyWithValue(v1.NodeClaimTerminationTimestampAnnotationKey, env.Clock.Now().Format(time.RFC3339)))
 	})
 
 	// INV-S10: when both the policy and the NodeClaim bound the drain, the smaller (most forceful) wins.
@@ -269,10 +267,9 @@ var _ = Describe("Repair", func() {
 		cmds := queue.GetCommands()
 		Expect(cmds).To(HaveLen(1))
 		ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
-		nc := ExpectExists(ctx, env.Client, nodeClaim)
-		ts, err := time.Parse(time.RFC3339, nc.Annotations[v1.NodeClaimTerminationTimestampAnnotationKey])
-		Expect(err).ToNot(HaveOccurred())
-		Expect(ts).To(BeTemporally("~", env.Clock.Now().Add(5*time.Minute), time.Second)) // min(20m, 5m)
+		// min(20m, 5m) -> 5m, stamped from the deletion moment.
+		Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).To(
+			HaveKeyWithValue(v1.NodeClaimTerminationTimestampAnnotationKey, env.Clock.Now().Add(5*time.Minute).Format(time.RFC3339)))
 	})
 
 	// The deadline is stamped only at actual deletion, so a replacement that never becomes healthy leaves the original
