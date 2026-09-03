@@ -162,10 +162,6 @@ func NewControllers(
 		)
 	}
 
-	// Node repair is no longer a standalone force-deleting controller with a hardcoded 20% breaker. It now runs as a
-	// voluntary disruption method (reason "Unhealthy") inside the disruption controller: budgeted, ordered, pre-spinning,
-	// and vetoable via do-not-repair. Registration lives in disruption.NewMethods, gated on RepairPolicies + the gate.
-
 	if options.FromContext(ctx).FeatureGates.StaticCapacity {
 		controllers = append(controllers, staticprovisioning.NewController(kubeClient, cluster, recorder, cloudProvider, p, clock, deviceAllocationController, virtualPodCache))
 		controllers = append(controllers, staticdeprovisioning.NewController(kubeClient, cluster, cloudProvider, clock, recorder))
