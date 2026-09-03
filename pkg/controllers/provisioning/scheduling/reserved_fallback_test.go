@@ -22,6 +22,7 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -205,5 +206,93 @@ var _ = Describe("Reserved Instance Types/Full-but-available (capacity-availabil
 		node := lo.Values(bindings.Bindings)[0].Node
 		Expect(node.Labels).To(HaveKeyWithValue(v1.CapacityTypeLabelKey, v1.CapacityTypeReserved))
 		Expect(node.Labels).To(HaveKeyWithValue(cloudprovider.ReservationIDLabel, "r-has-cap"))
+	})
+
+	// The two knobs the terminate-first disruption passes use. onDemandNodePool builds a lower-weight on-demand pool on
+	// the same instance type (which keeps its default on-demand offerings) so we can observe cross-NodePool fallthrough.
+	onDemandNodePool := func(instanceTypeName string) *v1.NodePool {
+		return test.NodePool(v1.NodePool{Spec: v1.NodePoolSpec{
+			Weight: lo.ToPtr(int32(1)),
+			Template: v1.NodeClaimTemplate{Spec: v1.NodeClaimTemplateSpec{Requirements: []v1.NodeSelectorRequirementWithMinValues{
+				{Key: corev1.LabelInstanceTypeStable, Operator: corev1.NodeSelectorOpIn, Values: []string{instanceTypeName}},
+				{Key: v1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{v1.CapacityTypeOnDemand}},
+			}}},
+		}})
+	}
+	solveWith := func(pods []*corev1.Pod, opts ...scheduling.Options) scheduling.Results {
+		GinkgoHelper()
+		s, err := prov.NewScheduler(ctx, pods, nil, nil, opts...)
+		Expect(err).ToNot(HaveOccurred())
+		results, err := s.Solve(injection.WithControllerName(ctx, "provisioner"), pods)
+		Expect(err).ToNot(HaveOccurred())
+		return results
+	}
+
+	Context("RequireReservedCapacity (replace-first feasibility pass)", func() {
+		It("falls through to a lower-weight on-demand NodePool when the reserved NodePool's reservation is full", func() {
+			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{newReservedType("reserved-type", reservedOffering("r-full", true, 0))}
+			reserved := reservedOnlyNodePool("reserved-type")
+			reserved.Spec.Weight = lo.ToPtr(int32(100))
+			od := onDemandNodePool("reserved-type")
+			ExpectApplied(ctx, env.Client, reserved, od)
+
+			pod := smallPod()
+			results := solveWith([]*corev1.Pod{pod}, scheduling.RequireReservedCapacity)
+
+			// The full reservation doesn't satisfy the pod, so it falls through to the on-demand NodePool.
+			Expect(results.PodErrors).ToNot(HaveKey(pod))
+			Expect(results.NewNodeClaims).To(HaveLen(1))
+			Expect(results.NewNodeClaims[0].Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeOnDemand)).To(BeTrue())
+		})
+
+		It("leaves the pod pending when the reservation is full and there is no fallback NodePool", func() {
+			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{newReservedType("reserved-type", reservedOffering("r-full", true, 0))}
+			ExpectApplied(ctx, env.Client, reservedOnlyNodePool("reserved-type"))
+
+			pod := smallPod()
+			results := solveWith([]*corev1.Pod{pod}, scheduling.RequireReservedCapacity)
+
+			// A plain (non-ReservedOffering) failure, and nowhere to fall through to -> pod stays pending, no NodeClaim.
+			Expect(results.NewNodeClaims).To(HaveLen(0))
+			Expect(results.PodErrors).To(HaveKey(pod))
+			Expect(results.ReservedOfferingErrors()).ToNot(HaveKey(pod))
+		})
+	})
+
+	Context("CreditReservationCapacity (terminate-first feasibility pass)", func() {
+		It("schedules onto a full reservation once a slot is credited back (strict)", func() {
+			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{newReservedType("reserved-type", reservedOffering("r-full", true, 0))}
+			ExpectApplied(ctx, env.Client, reservedOnlyNodePool("reserved-type"))
+
+			pod := smallPod()
+			results := solveWith([]*corev1.Pod{pod}, scheduling.DisableReservedCapacityFallback, scheduling.CreditReservationCapacity("r-full", 1))
+
+			Expect(results.PodErrors).ToNot(HaveKey(pod))
+			Expect(results.NewNodeClaims).To(HaveLen(1))
+			Expect(results.NewNodeClaims[0].Requirements.Get(v1alpha1.LabelReservationID).Values()).To(ConsistOf("r-full"))
+		})
+
+		It("credits only the granted number of slots — a surplus pod still fails under strict (multi-pod/single-slot)", func() {
+			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{newReservedType("reserved-type", reservedOffering("r-full", true, 0))}
+			// Anti-affinity forces each pod onto its own node, so two pods need two reserved slots.
+			antiAffinityPod := func() *corev1.Pod {
+				return test.UnschedulablePod(test.PodOptions{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "spread"}},
+					PodAntiRequirements: []corev1.PodAffinityTerm{{
+						TopologyKey:   corev1.LabelHostname,
+						LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "spread"}},
+					}},
+				})
+			}
+			ExpectApplied(ctx, env.Client, reservedOnlyNodePool("reserved-type"))
+
+			p1, p2 := antiAffinityPod(), antiAffinityPod()
+			results := solveWith([]*corev1.Pod{p1, p2}, scheduling.DisableReservedCapacityFallback, scheduling.CreditReservationCapacity("r-full", 1))
+
+			// Exactly one pod gets the single credited slot; the other has nowhere to go and fails.
+			Expect(results.NewNodeClaims).To(HaveLen(1))
+			scheduled := lo.Filter([]*corev1.Pod{p1, p2}, func(p *corev1.Pod, _ int) bool { _, pending := results.PodErrors[p]; return !pending })
+			Expect(scheduled).To(HaveLen(1))
+		})
 	})
 })

@@ -96,12 +96,40 @@ type options struct {
 	minValuesPolicy         karpopts.MinValuesPolicy
 	numConcurrentReconciles int
 	enforceConsolidateAfter bool
+	// requireReservedCapacity, when set, makes a NodeClaim whose only placement is a full reservation (a reserved-only
+	// pod with no on-demand/spot fallback and no reservable reserved offering) fail with a PLAIN error rather than
+	// being created against that full reservation. The plain error lets the scheduler fall through to a lower-weight
+	// NodePool (e.g. on-demand); a ReservedOfferingError would instead poison fallthrough and defer the pod. Used by
+	// the terminate-first disruption "can we replace-first?" pass so a drifted reserved node prefers falling back to an
+	// on-demand NodePool over terminating first.
+	requireReservedCapacity bool
+	// creditReservationCapacity adds slots back to specific reservation ids before scheduling, modeling capacity that a
+	// disruption candidate will free when it is terminated. Used by the terminate-first "would the pods fit once the
+	// slot is freed?" pass.
+	creditReservationCapacity map[string]int
 }
 
 type Options = option.Function[options]
 
 var DisableReservedCapacityFallback = func(opts *options) {
 	opts.reservedOfferingMode = ReservedOfferingModeStrict
+}
+
+// RequireReservedCapacity makes the scheduler fall through to a lower-weight NodePool (rather than defer) when a pod's
+// only reserved placement is a full reservation. See options.requireReservedCapacity.
+var RequireReservedCapacity = func(opts *options) {
+	opts.requireReservedCapacity = true
+}
+
+// CreditReservationCapacity credits `count` slots back to the given reservation id before scheduling, modeling a
+// disruption candidate that will free the slot on termination. See options.creditReservationCapacity.
+var CreditReservationCapacity = func(reservationID string, count int) Options {
+	return func(opts *options) {
+		if opts.creditReservationCapacity == nil {
+			opts.creditReservationCapacity = map[string]int{}
+		}
+		opts.creditReservationCapacity[reservationID] += count
+	}
 }
 
 var IgnorePreferences = func(opts *options) {
@@ -139,7 +167,15 @@ func NewScheduler(
 	allocator *dynamicresources.Allocator,
 	opts ...Options,
 ) *Scheduler {
-	minValuesPolicy := option.Resolve(opts...).minValuesPolicy
+	resolved := option.Resolve(opts...)
+	minValuesPolicy := resolved.minValuesPolicy
+
+	// Seed the reservation manager, then credit back any slots the caller expects a disruption candidate to free on
+	// termination (terminate-first "would the pods fit once freed?" pass).
+	reservationManager := NewReservationManager(instanceTypes)
+	for reservationID, count := range resolved.creditReservationCapacity {
+		reservationManager.Credit(reservationID, count)
+	}
 
 	// if any of the nodePools add a taint with a prefer no schedule effect, we add a toleration for the taint
 	// during preference relaxation
@@ -183,15 +219,17 @@ func NewScheduler(
 		remainingResources: lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, corev1.ResourceList) {
 			return np.Name, corev1.ResourceList(np.Spec.Limits)
 		}),
-		clock:                   clock,
-		reservationManager:      NewReservationManager(instanceTypes),
-		reservedOfferingMode:    option.Resolve(opts...).reservedOfferingMode,
-		preferencePolicy:        option.Resolve(opts...).preferencePolicy,
-		minValuesPolicy:         minValuesPolicy,
-		numConcurrentReconciles: lo.Ternary(option.Resolve(opts...).numConcurrentReconciles > 0, option.Resolve(opts...).numConcurrentReconciles, 1),
-		allocator:               allocator,
-		instanceTypes:           instanceTypes,
-		cachedResourceClaims:    map[types.NamespacedName]*resourcev1.ResourceClaim{},
+		clock:                     clock,
+		reservationManager:        reservationManager,
+		reservedOfferingMode:      resolved.reservedOfferingMode,
+		requireReservedCapacity:   resolved.requireReservedCapacity,
+		creditReservationCapacity: resolved.creditReservationCapacity,
+		preferencePolicy:          resolved.preferencePolicy,
+		minValuesPolicy:           minValuesPolicy,
+		numConcurrentReconciles:   lo.Ternary(resolved.numConcurrentReconciles > 0, resolved.numConcurrentReconciles, 1),
+		allocator:                 allocator,
+		instanceTypes:             instanceTypes,
+		cachedResourceClaims:      map[types.NamespacedName]*resourcev1.ResourceClaim{},
 	}
 
 	npByName := lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, *v1.NodePool) {
@@ -210,7 +248,7 @@ func NewScheduler(
 		}
 	}
 	s.deletingNodeNames = deletingNodeNames
-	s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods, nodeToNodePool, option.Resolve(opts...).enforceConsolidateAfter)
+	s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods, nodeToNodePool, resolved.enforceConsolidateAfter)
 	return s
 }
 
@@ -245,10 +283,16 @@ type Scheduler struct {
 	clock                   clock.Clock
 	reservationManager      *ReservationManager
 	reservedOfferingMode    ReservedOfferingMode
-	preferencePolicy        PreferencePolicy
-	minValuesPolicy         karpopts.MinValuesPolicy
-	numConcurrentReconciles int
-	deletingNodeNames       sets.Set[string]
+	requireReservedCapacity bool
+	// creditReservationCapacity is the per-reservation slot credit applied for this scheduling loop (a disruption
+	// candidate's freed slots). Threaded to each NodeClaim so a credited full reservation is classified as reservable
+	// rather than full — the ReservationManager capacity alone can't distinguish a genuinely-full reservation from one
+	// pessimistically drained this pass, so the offering's static capacity plus this credit is the source of truth.
+	creditReservationCapacity map[string]int
+	preferencePolicy          PreferencePolicy
+	minValuesPolicy           karpopts.MinValuesPolicy
+	numConcurrentReconciles   int
+	deletingNodeNames         sets.Set[string]
 
 	// allocator simulates DRA device allocation for pods with ResourceClaims. It is nil when DRA support is disabled.
 	allocator *dynamicresources.Allocator
@@ -725,7 +769,7 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod, volu
 					"total", len(s.nodeClaimTemplates[i].InstanceTypeOptions))
 			}
 		}
-		nodeClaim := NewNodeClaim(s.nodeClaimTemplates[i], s.topology, s.daemonOverheadGroups[s.nodeClaimTemplates[i]], its, s.reservationManager, s.reservedOfferingMode)
+		nodeClaim := NewNodeClaim(s.nodeClaimTemplates[i], s.topology, s.daemonOverheadGroups[s.nodeClaimTemplates[i]], its, s.reservationManager, s.reservedOfferingMode, s.requireReservedCapacity, s.creditReservationCapacity)
 		r, its, ofs, result, err := nodeClaim.CanAdd(ctx, pod, s.cachedPodData[pod.UID], volumes, s.minValuesPolicy == karpopts.MinValuesPolicyBestEffort, s.allocator)
 		if err != nil {
 			errs[i] = err

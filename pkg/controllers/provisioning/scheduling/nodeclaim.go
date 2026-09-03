@@ -60,6 +60,13 @@ type NodeClaim struct {
 	//   this expansion.
 	reservedOfferings    cloudprovider.Offerings
 	reservedOfferingMode ReservedOfferingMode
+	// requireReservedCapacity: see options.requireReservedCapacity. When set, a reserved-only pod whose only reserved
+	// option is a full reservation fails with a plain error so the pod falls through to a lower-weight NodePool.
+	requireReservedCapacity bool
+	// creditReservationCapacity: see options.creditReservationCapacity. A reservation with a positive credit here is
+	// classified as reservable even if its offering's static ReservationCapacity is 0 — modeling a slot a disruption
+	// candidate will free on termination.
+	creditReservationCapacity map[string]int
 }
 
 // ReservedOfferingError indicates a NodeClaim couldn't be created or a pod couldn't be added to an exxisting NodeClaim
@@ -90,6 +97,8 @@ func NewNodeClaim(
 	instanceTypes []*cloudprovider.InstanceType,
 	reservationManager *ReservationManager,
 	reservedOfferingMode ReservedOfferingMode,
+	requireReservedCapacity bool,
+	creditReservationCapacity map[string]int,
 ) *NodeClaim {
 	hostname := fmt.Sprintf("hostname-placeholder-%04d", atomic.AddInt64(&nodeID, 1))
 	template := *nodeClaimTemplate
@@ -109,14 +118,16 @@ func NewNodeClaim(
 	}
 
 	return &NodeClaim{
-		NodeClaimTemplate:    template,
-		volumes:              scheduling.Volumes{},
-		topology:             topology,
-		daemonOverheadGroups: groupsForNodeClaim,
-		hostname:             hostname,
-		reservedOfferings:    cloudprovider.Offerings{},
-		reservationManager:   reservationManager,
-		reservedOfferingMode: reservedOfferingMode,
+		NodeClaimTemplate:         template,
+		volumes:                   scheduling.Volumes{},
+		topology:                  topology,
+		daemonOverheadGroups:      groupsForNodeClaim,
+		hostname:                  hostname,
+		reservedOfferings:         cloudprovider.Offerings{},
+		reservationManager:        reservationManager,
+		reservedOfferingMode:      reservedOfferingMode,
+		requireReservedCapacity:   requireReservedCapacity,
+		creditReservationCapacity: creditReservationCapacity,
 	}
 }
 
@@ -327,8 +338,8 @@ func (n *NodeClaim) offeringsToReserve(
 	// I couldn't grab a slot this pessimistic pass" (ReservationCapacity>0, CanReserve==false) require opposite handling in
 	// strict mode: the former should fall back to on-demand/spot (or, with no fallback, defer), while the latter must defer
 	// so pessimistic reservation only schedules one NodeClaim per loop.
-	hasReservableOffering := false        // compatible reserved offering with real capacity (cap>0) — a pessimism candidate
-	hasFullReservedOffering := false      // compatible reserved offering that is full right now (Available, cap==0)
+	hasReservableOffering := false           // compatible reserved offering with real capacity (cap>0) — a pessimism candidate
+	hasFullReservedOffering := false         // compatible reserved offering that is full right now (Available, cap==0)
 	hasCompatibleUnreservedFallback := false // compatible on-demand/spot offering to fall back to
 	var reservedOfferings cloudprovider.Offerings
 	for _, it := range instanceTypes {
@@ -348,7 +359,10 @@ func (n *NodeClaim) offeringsToReserve(
 			// A full-but-healthy reservation (Available=true, ReservationCapacity=0) can't be reserved right now, but it is
 			// NOT a pessimism candidate — it has no real capacity to wait for this loop, so it must not force a defer that
 			// would starve the on-demand/spot fallback. Track it separately for the reserved-only exhaustion case below.
-			if o.ReservationCapacity == 0 {
+			// A reservation with a slot credited back for this loop (a disruption candidate that will free it) is treated
+			// as reservable even though its static capacity is 0 — this is the terminate-first "would the pods fit once
+			// the slot is freed?" pass. The ReservationManager was credited to match, so CanReserve reflects the slot.
+			if o.ReservationCapacity == 0 && n.creditReservationCapacity[o.ReservationID()] == 0 {
 				hasFullReservedOffering = true
 				continue
 			}
@@ -360,6 +374,16 @@ func (n *NodeClaim) offeringsToReserve(
 				reservedOfferings = append(reservedOfferings, o)
 			}
 		}
+	}
+
+	// Replace-first feasibility pass (terminate-first disruption): the pod's only placement is a reservation that is
+	// full right now (no reservable reserved offering, no on-demand/spot fallback). Return a PLAIN error — NOT a
+	// ReservedOfferingError — so the scheduler falls through to a lower-weight NodePool (e.g. on-demand) instead of
+	// deferring the pod (a ReservedOfferingError poisons cross-NodePool fallthrough). If nothing else can host it, the
+	// pod stays pending and the disruption caller proceeds to the terminate-first pass. This is mode-independent: the
+	// replace-first pass runs in fallback mode, so it wouldn't hit the strict checks below.
+	if n.requireReservedCapacity && hasFullReservedOffering && !hasReservableOffering && !hasCompatibleUnreservedFallback {
+		return nil, fmt.Errorf("reserved capacity required but the only compatible reservation is full")
 	}
 
 	if n.reservedOfferingMode == ReservedOfferingModeStrict {

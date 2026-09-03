@@ -81,6 +81,41 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			continue
 		}
+		// Terminate-first (RFC #3203): decide replace-first vs terminate-first from two candidate-gone simulations (see
+		// simulateReservedAwareDisruption). A reserved candidate whose reservation is full — with no on-demand/spot
+		// fallback and no other reservation with capacity — can't stage a replacement first, so we issue a delete-only
+		// command and let reactive provisioning refill the freed slot (the drain still honors PDBs and is bounded by
+		// TGP). Any pool that can grow elsewhere (fallback NodePool, spare reservation slot) replaces-first as usual.
+		if options.FromContext(ctx).FeatureGates.TerminateFirst {
+			decision, results, err := simulateReservedAwareDisruption(ctx, d.kubeClient, d.cluster, d.provisioner, d.clock, d.recorder, candidate)
+			if err != nil {
+				// if a candidate is now deleting, just retry
+				if errors.Is(err, errCandidateDeleting) {
+					continue
+				}
+				return []Command{}, err
+			}
+			switch decision {
+			case decisionTerminateFirst:
+				// Delete-only: don't carry the simulation Results — the freed pods pend and reactive provisioning
+				// re-places them onto the freed reservation slot.
+				return []Command{{
+					Candidates:          []*Candidate{candidate},
+					PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+				}}, nil
+			case decisionReplaceFirst:
+				return []Command{{
+					Candidates:          []*Candidate{candidate},
+					Replacements:        replacementsFromNodeClaims(results.NewNodeClaims...),
+					Results:             results,
+					PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+				}}, nil
+			default: // decisionBlocked
+				d.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
+				continue
+			}
+		}
+
 		// Check if we need to create any NodeClaims.
 		results, err := SimulateScheduling(ctx, d.kubeClient, d.cluster, d.provisioner, d.clock, d.recorder, nil, candidate)
 		if err != nil {
@@ -94,18 +129,6 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 		if !results.AllNonPendingPodsScheduled() {
 			d.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
 			continue
-		}
-
-		// Terminate-first (RFC #3203): a reserved candidate whose reservation is full can't stage a replacement first —
-		// the simulated replacement can only launch back into that same reservation. Issue a delete-only command and
-		// let reactive provisioning refill the freed slot; the drain still honors PDBs and is bounded by TGP. A headroom
-		// pool (spare reservation slot, or an on-demand/spot fallback) replaces-first as usual. Don't carry the
-		// simulation Results on the delete-only command — the freed pods pend and reactive provisioning re-places them.
-		if options.FromContext(ctx).FeatureGates.TerminateFirst && terminateFirst(candidate, results) {
-			return []Command{{
-				Candidates:          []*Candidate{candidate},
-				PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
-			}}, nil
 		}
 
 		cmd := Command{

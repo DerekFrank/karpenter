@@ -243,8 +243,10 @@ var _ = Describe("TerminateFirst", func() {
 			Expect(cmds[0].Decision()).To(Equal(disruption.ReplaceDecision))
 		})
 
-		// DIAGNOSTIC: two weighted nodepools — reserved-only NP1 (higher weight, full reservation) + on-demand NP2
-		// (lower weight). Does drift of the NP1 node fall through to NP2 (OD), or stick to NP1?
+		// Two weighted NodePools — reserved-only NP1 (higher weight) + on-demand NP2 (lower weight). Drift of the NP1
+		// node should fall through to NP2 (replace-first onto on-demand) rather than terminate-first, whenever the OD
+		// NodePool can host the pods. This is the two-pass behavior: pass 1 (RequireReservedCapacity) makes NP1's full
+		// reservation not satisfy the pod, so the scheduler falls through to NP2.
 		setupODFallbackNodePool := func() *v1.NodePool {
 			nodePool.Spec.Weight = lo.ToPtr(int32(100))
 			od := test.NodePool(v1.NodePool{Spec: v1.NodePoolSpec{
@@ -257,9 +259,9 @@ var _ = Describe("TerminateFirst", func() {
 			return od
 		}
 
-		It("DIAGNOSTIC weighted: provider-change model (Available=true, cap=0)", func() {
+		It("weighted: a full-but-healthy reserved NodePool replaces-first onto a lower-weight on-demand NodePool (does NOT terminate-first)", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirst: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
-			setupReservedOffering(0, true, v1.CapacityTypeReserved)
+			setupReservedOffering(0, true, v1.CapacityTypeReserved) // full but healthy (Available=true, cap=0)
 			od := setupODFallbackNodePool()
 			ExpectApplied(ctx, env.Client, nodePool, od, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
@@ -268,15 +270,17 @@ var _ = Describe("TerminateFirst", func() {
 
 			ExpectSingletonReconciled(ctx, driftController)
 			cmds := queue.GetCommands()
-			// HYPOTHESIS: with the provider change (Available=true), the pod sticks to higher-weight reserved NP1
-			// (fallback creates the reserved-only nodeclaim) -> terminate-first, NP2 (OD) is never used.
+			// Pass 1 (RequireReservedCapacity): NP1's full reservation doesn't satisfy the pod, so it falls through to
+			// the lower-weight on-demand NP2 and we replace-first there — no terminate-first when the pool can grow
+			// elsewhere.
 			Expect(cmds).To(HaveLen(1))
-			Expect(cmds[0].Decision()).To(Equal(disruption.DeleteDecision))
+			Expect(cmds[0].Decision()).To(Equal(disruption.ReplaceDecision))
+			Expect(cmds[0].Replacements[0].Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeOnDemand)).To(BeTrue())
 		})
 
-		It("DIAGNOSTIC weighted: current-provider model (Available=false, cap=0)", func() {
+		It("weighted: an unavailable reserved NodePool replaces-first onto a lower-weight on-demand NodePool", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirst: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
-			setupReservedOffering(0, false, v1.CapacityTypeReserved)
+			setupReservedOffering(0, false, v1.CapacityTypeReserved) // full AND unavailable (Available=false)
 			od := setupODFallbackNodePool()
 			ExpectApplied(ctx, env.Client, nodePool, od, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
@@ -285,8 +289,8 @@ var _ = Describe("TerminateFirst", func() {
 
 			ExpectSingletonReconciled(ctx, driftController)
 			cmds := queue.GetCommands()
-			// HYPOTHESIS: today (Available=false), NP1 CanAdd fails (no available offering) with a non-reserved error,
-			// so the scheduler falls through to lower-weight OD NP2 -> replace-first with an on-demand replacement.
+			// NP1's reserved offering is unavailable (skipped entirely), so NP1 can't host the pod and it falls through
+			// to the lower-weight OD NP2 -> replace-first with an on-demand replacement.
 			Expect(cmds).To(HaveLen(1))
 			Expect(cmds[0].Decision()).To(Equal(disruption.ReplaceDecision))
 			Expect(cmds[0].Replacements[0].Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeOnDemand)).To(BeTrue())
