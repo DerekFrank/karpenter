@@ -168,6 +168,29 @@ var _ = Describe("Reserved Instance Types/Full-but-available (capacity-availabil
 		Expect(results.NewNodeClaims[0].Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeOnDemand)).To(BeTrue())
 	})
 
+	It("strict (provisioning): a reserved-only pool with a full reservation defers instead of launching on-demand", func() {
+		// A reserved-ONLY NodePool (capacity-type In [reserved], no on-demand/spot fallback) whose reservation is full
+		// but Available. There is no non-reserved fallback, so strict must defer (ReservedOfferingError) rather than
+		// create a NodeClaim that would be launched on-demand — this is the reserved-only mislaunch guard.
+		cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{newReservedType("reserved-type", reservedOffering("r-full", true, 0))}
+		nodePool = test.NodePool(v1.NodePool{Spec: v1.NodePoolSpec{Template: v1.NodeClaimTemplate{Spec: v1.NodeClaimTemplateSpec{
+			Requirements: []v1.NodeSelectorRequirementWithMinValues{
+				{Key: corev1.LabelInstanceTypeStable, Operator: corev1.NodeSelectorOpIn, Values: []string{"reserved-type"}},
+				{Key: v1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{v1.CapacityTypeReserved}},
+			},
+		}}}})
+		ExpectApplied(ctx, env.Client, nodePool)
+
+		pod := smallPod()
+		s, err := prov.NewScheduler(ctx, []*corev1.Pod{pod}, nil, nil, scheduling.DisableReservedCapacityFallback)
+		Expect(err).ToNot(HaveOccurred())
+		results, err := s.Solve(injection.WithControllerName(ctx, "provisioner"), []*corev1.Pod{pod})
+		Expect(err).ToNot(HaveOccurred())
+		// No on-demand mislaunch: no NodeClaim is created and the pod defers via a (retryable) ReservedOfferingError.
+		Expect(results.NewNodeClaims).To(HaveLen(0))
+		Expect(results.ReservedOfferingErrors()).To(HaveKey(pod))
+	})
+
 	It("strict (provisioning): a reservation with capacity is preferred over on-demand (regression guard)", func() {
 		cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{newReservedType("reserved-type", reservedOffering("r-has-cap", true, 1))}
 		nodePool = test.NodePool(v1.NodePool{Spec: v1.NodePoolSpec{Template: v1.NodeClaimTemplate{Spec: v1.NodeClaimTemplateSpec{

@@ -242,5 +242,54 @@ var _ = Describe("TerminateFirst", func() {
 			Expect(cmds).To(HaveLen(1))
 			Expect(cmds[0].Decision()).To(Equal(disruption.ReplaceDecision))
 		})
+
+		// DIAGNOSTIC: two weighted nodepools — reserved-only NP1 (higher weight, full reservation) + on-demand NP2
+		// (lower weight). Does drift of the NP1 node fall through to NP2 (OD), or stick to NP1?
+		setupODFallbackNodePool := func() *v1.NodePool {
+			nodePool.Spec.Weight = lo.ToPtr(int32(100))
+			od := test.NodePool(v1.NodePool{Spec: v1.NodePoolSpec{
+				Weight:     lo.ToPtr(int32(1)),
+				Disruption: v1.Disruption{ConsolidateAfter: v1.MustParseNillableDuration("1h"), Budgets: []v1.Budget{{Nodes: "100%"}}},
+				Template: v1.NodeClaimTemplate{Spec: v1.NodeClaimTemplateSpec{Requirements: []v1.NodeSelectorRequirementWithMinValues{
+					{Key: v1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{v1.CapacityTypeOnDemand}},
+				}}},
+			}})
+			return od
+		}
+
+		It("DIAGNOSTIC weighted: provider-change model (Available=true, cap=0)", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirst: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
+			setupReservedOffering(0, true, v1.CapacityTypeReserved)
+			od := setupODFallbackNodePool()
+			ExpectApplied(ctx, env.Client, nodePool, od, nodeClaim, node)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			bindReschedulablePod(node)
+			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
+
+			ExpectSingletonReconciled(ctx, driftController)
+			cmds := queue.GetCommands()
+			// HYPOTHESIS: with the provider change (Available=true), the pod sticks to higher-weight reserved NP1
+			// (fallback creates the reserved-only nodeclaim) -> terminate-first, NP2 (OD) is never used.
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Decision()).To(Equal(disruption.DeleteDecision))
+		})
+
+		It("DIAGNOSTIC weighted: current-provider model (Available=false, cap=0)", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirst: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
+			setupReservedOffering(0, false, v1.CapacityTypeReserved)
+			od := setupODFallbackNodePool()
+			ExpectApplied(ctx, env.Client, nodePool, od, nodeClaim, node)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			bindReschedulablePod(node)
+			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
+
+			ExpectSingletonReconciled(ctx, driftController)
+			cmds := queue.GetCommands()
+			// HYPOTHESIS: today (Available=false), NP1 CanAdd fails (no available offering) with a non-reserved error,
+			// so the scheduler falls through to lower-weight OD NP2 -> replace-first with an on-demand replacement.
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Decision()).To(Equal(disruption.ReplaceDecision))
+			Expect(cmds[0].Replacements[0].Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeOnDemand)).To(BeTrue())
+		})
 	})
 })
