@@ -53,6 +53,12 @@ var (
 		Name: "InsufficientCapacityError",
 		Help: "The cloud provider had insufficient capacity to fulfill the request.",
 	}
+	// UncategorizedError is the value emitted for any error that isn't one of the
+	// well-known categories above (GetErrorTypeLabelValue returns the empty default).
+	UncategorizedError = opmetrics.Value{
+		Name: MetricLabelErrorDefaultVal,
+		Help: "An error that does not match a well-known CloudProvider error category.",
+	}
 )
 
 // Package-local metric dimensions for the CloudProvider metrics. The controller
@@ -69,7 +75,7 @@ var (
 	Error = opmetrics.Label{
 		Name:   metricLabelError,
 		Help:   "The category of error returned by the CloudProvider call.",
-		Values: []opmetrics.Value{NodeClaimNotFoundError, NodeClassNotReadyError, InsufficientCapacityError},
+		Values: []opmetrics.Value{NodeClaimNotFoundError, NodeClassNotReadyError, InsufficientCapacityError, UncategorizedError},
 	}
 )
 
