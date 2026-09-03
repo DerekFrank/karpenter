@@ -429,7 +429,10 @@ func (n *NodeClaim) FinalizeScheduling(drivers ...string) {
 
 func (n *NodeClaim) RemoveInstanceTypeOptionsByPriceAndMinValues(reqs scheduling.Requirements, maxPrice float64) (*NodeClaim, error) {
 	n.InstanceTypeOptions = lo.Filter(n.InstanceTypeOptions, func(it *cloudprovider.InstanceType, _ int) bool {
-		launchPrice := it.Offerings.Available().WorstLaunchPrice(reqs)
+		// Launchable (not Available): a full-but-healthy reservation is Available with 0 capacity and a near-zero
+		// price, but the node will really launch at on-demand/spot price. Pricing this filter off Available would let a
+		// cost-increasing consolidation through; pricing it off what can actually launch keeps the cost guarantee.
+		launchPrice := it.Offerings.Launchable().WorstLaunchPrice(reqs)
 		return launchPrice < maxPrice
 	})
 	if _, _, err := n.InstanceTypeOptions.SatisfiesMinValues(reqs); err != nil {
