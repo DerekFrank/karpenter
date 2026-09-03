@@ -31,8 +31,10 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
+	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 )
 
 // Drift is a subreconciler that deletes drifted candidates.
@@ -80,15 +82,44 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			continue
 		}
-		// Check if we need to create any NodeClaims.
-		results, err := SimulateScheduling(ctx, d.kubeClient, d.cluster, d.provisioner, d.clock, d.recorder, nil, candidate)
-		if err != nil {
-			// if a candidate is now deleting, just retry
-			if errors.Is(err, errCandidateDeleting) {
-				continue
+		// Terminate-first (RFC #3203): a reserved candidate whose reservation is full — with no on-demand/spot fallback
+		// and no other reservation with capacity — can't stage a replacement first, so we issue a delete-only command
+		// and let reactive provisioning refill the freed slot (the drain still honors PDBs and is bounded by TGP). Any
+		// pool that can grow elsewhere (fallback NodePool, spare reservation slot) replaces-first as usual. The decision
+		// comes from two candidate-gone simulations (see shouldTerminateFirst); its pass-1 results double as the
+		// replace-first / Blocked inputs below.
+		var results scheduling.Results
+		if options.FromContext(ctx).FeatureGates.TerminateFirst {
+			terminate, r, err := shouldTerminateFirst(ctx, d.kubeClient, d.cluster, d.provisioner, d.clock, d.recorder, candidate)
+			if err != nil {
+				// if a candidate is now deleting, just retry
+				if errors.Is(err, errCandidateDeleting) {
+					continue
+				}
+				return []Command{}, err
 			}
-			return []Command{}, err
+			if terminate {
+				// Delete-only: don't carry the simulation Results — the freed pods pend and reactive provisioning
+				// re-places them onto the freed reservation slot.
+				return []Command{{
+					Candidates:          []*Candidate{candidate},
+					PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+				}}, nil
+			}
+			results = r
+		} else {
+			// Check if we need to create any NodeClaims.
+			r, err := SimulateScheduling(ctx, d.kubeClient, d.cluster, d.provisioner, d.clock, d.recorder, nil, candidate)
+			if err != nil {
+				// if a candidate is now deleting, just retry
+				if errors.Is(err, errCandidateDeleting) {
+					continue
+				}
+				return []Command{}, err
+			}
+			results = r
 		}
+
 		// Emit an event that we couldn't reschedule the pods on the node.
 		if !results.AllNonPendingPodsScheduled() {
 			d.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
