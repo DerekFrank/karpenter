@@ -42,16 +42,15 @@ const agingConstant = 30 * time.Minute
 // terminating (replace-then-terminate), orders candidates by rank + age/τ − backoff, and is vetoed by do-not-repair.
 type Repair struct {
 	consolidation
-	// repairPolicies and ranks are cached at construction from a single RepairPolicies() snapshot. Provider-authored
-	// defaults are static, so re-reading them on every pass (per candidate, in score/matchingPolicy/denseRanks) is
-	// wasted work; cloud providers must not mutate them after startup. The candidate drain-bound gate in NewCandidate
-	// reads the SAME snapshot (threaded from the controller) so the two never disagree about which policy governs a node.
+	// repairPolicies and ranks are cached at construction. Provider-authored defaults are static, so re-reading them on
+	// every pass (per candidate, in score/matchingPolicy/denseRanks) is wasted work; providers must not mutate them.
 	repairPolicies []cloudprovider.RepairPolicy
 	ranks          map[int]int
 }
 
-func NewRepair(c consolidation, repairPolicies []cloudprovider.RepairPolicy) *Repair {
-	return &Repair{consolidation: c, repairPolicies: repairPolicies, ranks: denseRanks(repairPolicies)}
+func NewRepair(c consolidation) *Repair {
+	policies := c.cloudProvider.RepairPolicies()
+	return &Repair{consolidation: c, repairPolicies: policies, ranks: denseRanks(policies)}
 }
 
 // ShouldDisrupt is a predicate that filters candidates to nodes that have an unhealthy condition matching a
@@ -106,15 +105,15 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 			r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
 			continue
 		}
-		// Carry the drain bound on the command; the queue stamps the absolute deadline at actual deletion time (after
-		// the replacement is healthy), so repair is never an unbounded hang and a forceful (0) policy skips the drain
-		// for conditions the kubelet can't evict through — without pre-spin latency eroding the window.
+		// Set the candidate's drain bound; the queue stamps the absolute deadline at actual deletion time (after the
+		// replacement is healthy), so repair is never an unbounded hang and a forceful (0) policy skips the drain for
+		// conditions the kubelet can't evict through — without pre-spin latency eroding the window.
+		candidate.TerminationGracePeriod = r.effectiveDrainBound(candidate)
 		return []Command{{
-			Candidates:             []*Candidate{candidate},
-			Replacements:           replacementsFromNodeClaims(results.NewNodeClaims...),
-			Results:                results,
-			PoolDisruptionCosts:    computePoolDisruptionCosts([]*Candidate{candidate}),
-			TerminationGracePeriod: r.effectiveDrainBound(candidate),
+			Candidates:          []*Candidate{candidate},
+			Replacements:        replacementsFromNodeClaims(results.NewNodeClaims...),
+			Results:             results,
+			PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
 		}}, nil
 	}
 	return []Command{}, nil

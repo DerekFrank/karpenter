@@ -92,6 +92,10 @@ type Candidate struct {
 	// RescheduleDisruptionCost is 1.0 (base) + sum of positive pod eviction costs
 	// for reschedulable pods. Used by balanced scoring.
 	RescheduleDisruptionCost float64
+	// TerminationGracePeriod, when set, bounds this candidate's drain. The queue stamps the absolute termination
+	// deadline (now + this) at actual deletion time, so replace-then-terminate latency doesn't erode the window. nil
+	// inherits the NodeClaim's own TerminationGracePeriod. Repair sets it (min(policy, NodeClaim TGP)) in ComputeCommands.
+	TerminationGracePeriod *time.Duration
 }
 
 // ScoreResult holds the three values needed to decide whether a move passes.
@@ -164,7 +168,6 @@ func (c *Candidate) IsEmpty() bool {
 //nolint:gocyclo
 func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events.Recorder, clk clock.Clock, node *state.StateNode, pdbs pdb.Limits,
 	nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType, queue *Queue, disruptionClass string,
-	repairPolicies []cloudprovider.RepairPolicy,
 ) (*Candidate, error) {
 	var err error
 	var pods []*corev1.Pod
@@ -205,19 +208,12 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 	instanceType := instanceTypeMap[node.Labels()[corev1.LabelInstanceTypeStable]]
 	if pods, err = node.ValidatePodsDisruptable(ctx, kubeClient, pdbs, clk, recorder); err != nil {
 		// A node with a pod that blocks eviction (PDB, do-not-disrupt) is only a candidate when the drain is bounded by
-		// a hard deadline, so disruption can't hang indefinitely. Eventual disruption bounds it with the NodeClaim's
-		// TerminationGracePeriod. Repair bounds it with the matched RepairPolicy's TerminationGracePeriod (a forceful 0
-		// counts; it is stamped as the termination-timestamp annotation in ComputeCommands), falling back to the
-		// NodeClaim's own TerminationGracePeriod. Other classes never override a blocking pod.
-		var drainBoundedCandidate bool
-		switch disruptionClass {
-		case EventualDisruptionClass:
-			drainBoundedCandidate = node.NodeClaim.Spec.TerminationGracePeriod != nil
-		case RepairDisruptionClass:
-			policy, _ := matchRepairPolicy(node.Node, repairPolicies)
-			drainBoundedCandidate = (policy != nil && policy.TerminationGracePeriod != nil) ||
-				node.NodeClaim.Spec.TerminationGracePeriod != nil
-		}
+		// a hard deadline, so disruption can't hang indefinitely. Repair is not discretionary — like it ignores
+		// node-level do-not-disrupt above, a broken node is never stranded by a blocking pod (its drain bound is set on
+		// the candidate in ComputeCommands and stamped at deletion). Eventual disruption proceeds only when the
+		// NodeClaim's TerminationGracePeriod bounds the drain. Other classes never override a blocking pod.
+		drainBoundedCandidate := disruptionClass == RepairDisruptionClass ||
+			(disruptionClass == EventualDisruptionClass && node.NodeClaim.Spec.TerminationGracePeriod != nil)
 		if lo.Ternary(drainBoundedCandidate, state.IgnorePodBlockEvictionError(err), err) != nil {
 			recorder.Publish(disruptionevents.Blocked(node.Node, node.NodeClaim, pretty.Sentence(err.Error()))...)
 			return nil, serrors.Wrap(fmt.Errorf("validating pod disruption, %w", err), "Node", klog.KObj(node.Node))
@@ -264,11 +260,6 @@ type Command struct {
 	Candidates          []*Candidate
 	Replacements        []*Replacement
 	PoolDisruptionCosts map[string]float64
-
-	// TerminationGracePeriod, when set, bounds the drain of this command's candidates. The queue stamps the absolute
-	// termination deadline (now + this) at actual deletion time, so replace-then-terminate latency does not erode the
-	// window. nil means inherit the NodeClaim's own TerminationGracePeriod (the default disruption behavior).
-	TerminationGracePeriod *time.Duration
 }
 
 // Reason returns the disruption reason for this command.

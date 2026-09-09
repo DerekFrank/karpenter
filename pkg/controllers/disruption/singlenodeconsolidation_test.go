@@ -273,7 +273,6 @@ func createCandidates(disruptionCost float64, nodesPerNodePool ...int) ([]*disru
 			nodePoolInstanceTypeMap,
 			queue,
 			disruption.GracefulDisruptionClass,
-			cloudProvider.RepairPolicies(),
 		)
 		if err != nil {
 			return nil
