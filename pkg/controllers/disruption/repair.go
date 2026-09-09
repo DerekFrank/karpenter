@@ -93,21 +93,44 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			continue
 		}
-		// Pre-spin the replacement; the queue terminates the original only once the replacement is healthy.
-		results, err := SimulateScheduling(ctx, r.kubeClient, r.cluster, r.provisioner, r.clock, r.recorder, nil, candidate)
+		// Terminate-first (RFC #3203): a static NodePool runs a fixed replica count, so it can never pre-spin a
+		// replacement — a pre-spun node would be an (N+1)th the operator capped out. Free the slot first and let
+		// static.provisioning refill it. This mirrors StaticDrift and reads static configuration, never launch outcomes.
+		if candidate.OwnedByStaticNodePool() {
+			candidate.TerminationGracePeriod = r.effectiveDrainBound(candidate)
+			return []Command{{
+				Candidates:          []*Candidate{candidate},
+				PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+			}}, nil
+		}
+		// Simulate rescheduling the candidate's pods. When they can't be pre-spun elsewhere and the candidate holds a
+		// full reservation, this reports terminate-first: free the reservation slot first and let reactive provisioning
+		// refill it (identical to how Drift decides — see SimulateSchedulingWithReservedFallback). Any pool that can grow
+		// (fallback NodePool, spare reservation slot) pre-spins the replacement as usual.
+		results, terminateFirst, err := SimulateSchedulingWithReservedFallback(ctx, r.kubeClient, r.cluster, r.provisioner, r.clock, r.recorder, candidate)
 		if err != nil {
 			if errors.Is(err, errCandidateDeleting) {
 				continue
 			}
 			return []Command{}, err
 		}
+		if terminateFirst {
+			// Delete-only: don't carry the simulation Results — the freed pods pend and reactive provisioning re-places
+			// them onto the freed reservation slot. Still bound the drain per the matched policy.
+			candidate.TerminationGracePeriod = r.effectiveDrainBound(candidate)
+			return []Command{{
+				Candidates:          []*Candidate{candidate},
+				PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+			}}, nil
+		}
 		if !results.AllNonPendingPodsScheduled() {
 			r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
 			continue
 		}
-		// Set the candidate's drain bound; the queue stamps the absolute deadline at actual deletion time (after the
-		// replacement is healthy), so repair is never an unbounded hang and a forceful (0) policy skips the drain for
-		// conditions the kubelet can't evict through — without pre-spin latency eroding the window.
+		// Pre-spin the replacement; the queue terminates the original only once the replacement is healthy. Set the
+		// candidate's drain bound; the queue stamps the absolute deadline at actual deletion time (after the replacement
+		// is healthy), so repair is never an unbounded hang and a forceful (0) policy skips the drain for conditions the
+		// kubelet can't evict through — without pre-spin latency eroding the window.
 		candidate.TerminationGracePeriod = r.effectiveDrainBound(candidate)
 		return []Command{{
 			Candidates:          []*Candidate{candidate},
