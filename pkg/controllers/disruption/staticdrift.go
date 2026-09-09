@@ -81,13 +81,19 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 			int64(len(npCandidates)),
 		})
 
-		// Terminate-first (RFC #3203): a static NodePool runs a fixed replica count, so it can never stage a replacement
-		// first — a pre-spun replacement would be an (N+1)th node the operator capped out. Issue budget-paced delete-only
-		// commands; once the freed slot is released the static.provisioning controller refills the pool back to
-		// Spec.Replicas. The drain still honors PDBs and is bounded by TGP. No replacement is reserved here, so the
-		// limit-reservation dance below (which exists only to stage a replacement without bursting over the limit) is
-		// unnecessary.
-		if options.FromContext(ctx).FeatureGates.TerminateFirst {
+		// Acquire limits from cluster state without bursting over. maxAllowedDrifts is how many candidates we can drift
+		// while staging a replacement for each without exceeding the NodePool's node limit; 0 means the pool is at its
+		// limit and can't stage any replacement.
+		maxAllowedDrifts := d.cluster.NodePoolState.ReserveNodeCount(npName, nodeLimit, maxDrifts)
+		npIsAtLimits := maxAllowedDrifts == 0
+
+		// Terminate-first (RFC #3203): when the NodePool is at its node limit it can't stage a replacement first — a
+		// pre-spun replacement would be an (N+1)th node the operator capped out. Issue budget-paced delete-only commands;
+		// once the freed slot is released the static.provisioning controller refills the pool back to Spec.Replicas. The
+		// drain still honors PDBs and is bounded by TGP. When the pool has room under its limit, fall through to the
+		// normal replace-first path below. No replacement is reserved for terminate-first, so the reservation above is a
+		// no-op in that case (it reserved nothing).
+		if options.FromContext(ctx).FeatureGates.TerminateFirstDrift && npIsAtLimits {
 			for _, c := range npCandidates[:maxDrifts] {
 				cmds = append(cmds, Command{
 					Candidates:          []*Candidate{c},
@@ -96,9 +102,6 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 			}
 			continue
 		}
-
-		// Acquire limits from cluster state without bursting over
-		maxAllowedDrifts := d.cluster.NodePoolState.ReserveNodeCount(npName, nodeLimit, maxDrifts)
 
 		// We will not get a negative value here
 		if maxAllowedDrifts == 0 {

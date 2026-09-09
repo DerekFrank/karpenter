@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
+	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
 // Terminate-First Disruption (RFC kubernetes-sigs/karpenter#3203) end-to-end. A voluntary disruption of a
@@ -39,7 +40,7 @@ import (
 // full) issues a delete-only command and lets reactive provisioning refill the freed slot, instead of the
 // replace-first it cannot stage.
 
-var _ = Describe("TerminateFirst", func() {
+var _ = Describe("TerminateFirstDrift", func() {
 	// bindReschedulablePod places a ReplicaSet-owned (reschedulable) pod on the node so the scheduling simulation has a
 	// workload to protect — the replacement it produces is what terminate-first suppresses.
 	bindReschedulablePod := func(node *corev1.Node) {
@@ -81,8 +82,11 @@ var _ = Describe("TerminateFirst", func() {
 				disruption.WithMethods(disruption.NewStaticDrift(cluster, prov, cloudProvider)))
 		})
 
-		It("issues a delete-only command for a static NodePool when TerminateFirst is enabled", func() {
-			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirst: lo.ToPtr(true)}}))
+		It("issues a delete-only command for a static NodePool at its node limit when TerminateFirstDrift is enabled", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(true)}}))
+			// At the node limit (limit == replicas == 1): the pool can't stage a replacement without bursting over the
+			// limit, so terminate-first applies.
+			nodePool.Spec.Limits = v1.Limits{resources.Node: resource.MustParse("1")}
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
@@ -94,8 +98,24 @@ var _ = Describe("TerminateFirst", func() {
 			Expect(cmds[0].Replacements).To(HaveLen(0))
 		})
 
-		It("replaces-first for a static NodePool when TerminateFirst is disabled", func() {
-			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirst: lo.ToPtr(false)}}))
+		It("replaces-first for a static NodePool below its node limit even when TerminateFirstDrift is enabled", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(true)}}))
+			// Below the node limit (limit 2 > replicas 1): the pool can stage a replacement without bursting over the
+			// limit, so it replaces-first rather than terminating first even with the gate on.
+			nodePool.Spec.Limits = v1.Limits{resources.Node: resource.MustParse("2")}
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+
+			ExpectSingletonReconciled(ctx, staticDriftController)
+
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Decision()).To(Equal(disruption.ReplaceDecision))
+			Expect(cmds[0].Replacements).To(HaveLen(1))
+		})
+
+		It("replaces-first for a static NodePool when TerminateFirstDrift is disabled", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(false)}}))
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
@@ -162,7 +182,7 @@ var _ = Describe("TerminateFirst", func() {
 		}
 
 		It("issues a delete-only command when the reservation is full and there is no fallback", func() {
-			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirst: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
 			setupReservedOffering(0, true, v1.CapacityTypeReserved) // full but healthy (row 1), reserved-only pool
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
@@ -178,7 +198,7 @@ var _ = Describe("TerminateFirst", func() {
 		})
 
 		It("does NOT terminate-first when the reservation is full AND otherwise unavailable (something else wrong)", func() {
-			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirst: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
 			setupReservedOffering(0, false, v1.CapacityTypeReserved) // full AND unavailable (row 2): expiring / ICE'd / incompatible
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
@@ -192,8 +212,8 @@ var _ = Describe("TerminateFirst", func() {
 			Expect(queue.GetCommands()).To(HaveLen(0))
 		})
 
-		It("does NOT drift when TerminateFirst is disabled and the reservation is full with no fallback (Blocked)", func() {
-			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirst: lo.ToPtr(false), ReservedCapacity: lo.ToPtr(true)}}))
+		It("does NOT drift when TerminateFirstDrift is disabled and the reservation is full with no fallback (Blocked)", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(false), ReservedCapacity: lo.ToPtr(true)}}))
 			setupReservedOffering(0, true, v1.CapacityTypeReserved) // full but healthy (row 1), reserved-only pool
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
@@ -210,7 +230,7 @@ var _ = Describe("TerminateFirst", func() {
 		})
 
 		It("replaces-first when the reservation is full but an on-demand fallback exists", func() {
-			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirst: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
 			setupReservedOffering(0, true, v1.CapacityTypeReserved, v1.CapacityTypeOnDemand) // full but healthy, on-demand fallback allowed
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
@@ -226,7 +246,7 @@ var _ = Describe("TerminateFirst", func() {
 		})
 
 		It("replaces-first when the reservation still has a spare slot", func() {
-			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirst: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
 			setupReservedOffering(5, true, v1.CapacityTypeReserved) // spare reservation capacity -> can grow in place
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
@@ -257,7 +277,7 @@ var _ = Describe("TerminateFirst", func() {
 		}
 
 		It("weighted: a full-but-healthy reserved NodePool replaces-first onto a lower-weight on-demand NodePool (does NOT terminate-first)", func() {
-			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirst: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
 			setupReservedOffering(0, true, v1.CapacityTypeReserved) // full but healthy (Available=true, cap=0)
 			od := setupODFallbackNodePool()
 			ExpectApplied(ctx, env.Client, nodePool, od, nodeClaim, node)
@@ -276,7 +296,7 @@ var _ = Describe("TerminateFirst", func() {
 		})
 
 		It("weighted: an unavailable reserved NodePool replaces-first onto a lower-weight on-demand NodePool", func() {
-			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirst: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
 			setupReservedOffering(0, false, v1.CapacityTypeReserved) // full AND unavailable (Available=false)
 			od := setupODFallbackNodePool()
 			ExpectApplied(ctx, env.Client, nodePool, od, nodeClaim, node)

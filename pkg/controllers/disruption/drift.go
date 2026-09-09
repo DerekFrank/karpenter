@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
@@ -82,46 +83,47 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			continue
 		}
-		// Terminate-first (RFC #3203): a reserved candidate whose reservation is full — with no on-demand/spot fallback
-		// and no other reservation with capacity — can't stage a replacement first, so we issue a delete-only command
-		// and let reactive provisioning refill the freed slot (the drain still honors PDBs and is bounded by TGP). Any
-		// pool that can grow elsewhere (fallback NodePool, spare reservation slot) replaces-first as usual. The decision
-		// comes from two candidate-gone simulations (see shouldTerminateFirst); its pass-1 results double as the
-		// replace-first / Blocked inputs below.
-		var results scheduling.Results
-		if options.FromContext(ctx).FeatureGates.TerminateFirst {
-			terminate, r, err := shouldTerminateFirst(ctx, d.kubeClient, d.cluster, d.provisioner, d.clock, d.recorder, candidate)
-			if err != nil {
-				// if a candidate is now deleting, just retry
-				if errors.Is(err, errCandidateDeleting) {
-					continue
-				}
-				return []Command{}, err
+		// Pass 1 (replace-first feasibility): simulate the candidate-gone fleet in the usual fallback mode. In fallback
+		// mode a full reservation (Available=true, ReservationCapacity=0) doesn't satisfy a pod, so the scheduler falls
+		// through to a lower-weight NodePool (e.g. on-demand) or a different reservation with capacity. If every pod
+		// places, we replace-first as usual below.
+		results, err := SimulateScheduling(ctx, d.kubeClient, d.cluster, d.provisioner, d.clock, d.recorder, nil, candidate)
+		if err != nil {
+			// if a candidate is now deleting, just retry
+			if errors.Is(err, errCandidateDeleting) {
+				continue
 			}
-			if terminate {
-				// Delete-only: don't carry the simulation Results — the freed pods pend and reactive provisioning
-				// re-places them onto the freed reservation slot.
-				return []Command{{
-					Candidates:          []*Candidate{candidate},
-					PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
-				}}, nil
-			}
-			results = r
-		} else {
-			// Check if we need to create any NodeClaims.
-			r, err := SimulateScheduling(ctx, d.kubeClient, d.cluster, d.provisioner, d.clock, d.recorder, nil, candidate)
-			if err != nil {
-				// if a candidate is now deleting, just retry
-				if errors.Is(err, errCandidateDeleting) {
-					continue
-				}
-				return []Command{}, err
-			}
-			results = r
+			return []Command{}, err
 		}
 
-		// Emit an event that we couldn't reschedule the pods on the node.
 		if !results.AllNonPendingPodsScheduled() {
+			// Pass 1 couldn't stage a replacement. Terminate-first (RFC #3203): if the candidate holds a reservation,
+			// re-simulate strict with its slot credited back (pass 2) — if every pod then places, deleting the candidate
+			// frees exactly the slot that unblocks the reschedule, so issue a delete-only command and let reactive
+			// provisioning refill it (the drain honors PDBs and is bounded by TGP). Strict mode ensures surplus pods that
+			// wouldn't fit the freed slot fail rather than fall back, and a reservation that is unavailable for another
+			// reason stays unschedulable — so we don't terminate uselessly. Otherwise (or with the gate off) the pods
+			// can't be rescheduled at all: emit a Blocked event.
+			reservationID := candidate.Labels()[cloudprovider.ReservationIDLabel]
+			if options.FromContext(ctx).FeatureGates.TerminateFirstDrift && candidate.capacityType == v1.CapacityTypeReserved && reservationID != "" {
+				tfResults, err := SimulateScheduling(ctx, d.kubeClient, d.cluster, d.provisioner, d.clock, d.recorder,
+					[]scheduling.Options{scheduling.DisableReservedCapacityFallback, scheduling.CreditReservationCapacity(reservationID, 1)}, candidate)
+				if err != nil {
+					if errors.Is(err, errCandidateDeleting) {
+						continue
+					}
+					return []Command{}, err
+				}
+				if tfResults.AllNonPendingPodsScheduled() {
+					// Delete-only: don't carry the simulation Results — the freed pods pend and reactive provisioning
+					// re-places them onto the freed reservation slot.
+					return []Command{{
+						Candidates:          []*Candidate{candidate},
+						PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+					}}, nil
+				}
+			}
+			// Emit an event that we couldn't reschedule the pods on the node.
 			d.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
 			continue
 		}
