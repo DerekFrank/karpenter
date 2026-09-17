@@ -35,6 +35,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
@@ -82,8 +83,10 @@ func (c *Controller) Reconcile(ctx context.Context, n *corev1.Node) (reconcile.R
 	return reconcile.Result{}, nil
 }
 
+var controllerMetric = metrics.Value{Name: "node.hydration", Help: "Backfills labels expected by newer Karpenter versions onto pre-existing Nodes."}
+
 func (c *Controller) Name() string {
-	return "node.hydration"
+	return controllerMetric.Name
 }
 
 func (c *Controller) Register(ctx context.Context, m manager.Manager) error {

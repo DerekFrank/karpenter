@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 )
@@ -47,8 +48,10 @@ func NewDaemonSetController(kubeClient client.Client, cluster *state.Cluster) *D
 	}
 }
 
+var daemonsetControllerMetric = metrics.Value{Name: "state.daemonset", Help: "Watches DaemonSets to track daemon resource overhead in cluster state."}
+
 func (c *DaemonSetController) Name() string {
-	return "state.daemonset"
+	return daemonsetControllerMetric.Name
 }
 
 func (c *DaemonSetController) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {

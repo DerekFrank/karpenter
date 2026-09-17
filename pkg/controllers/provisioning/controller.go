@@ -30,6 +30,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	"sigs.k8s.io/karpenter/pkg/utils/pod"
@@ -57,8 +58,10 @@ func NewPodController(kubeClient client.Client, provisioner *Provisioner, cluste
 }
 
 // Reconcile the resource
+var podTriggerControllerMetric = metrics.Value{Name: "provisioner.trigger.pod", Help: "Triggers provisioning in response to unschedulable pod changes."}
+
 func (c *PodController) Name() string {
-	return "provisioner.trigger.pod"
+	return podTriggerControllerMetric.Name
 }
 
 func (c *PodController) Reconcile(ctx context.Context, p *corev1.Pod) (reconcile.Result, error) {
@@ -100,8 +103,10 @@ func NewNodeController(kubeClient client.Client, provisioner *Provisioner) *Node
 }
 
 // Reconcile the resource
+var nodeTriggerControllerMetric = metrics.Value{Name: "provisioner.trigger.node", Help: "Triggers provisioning for nodes tainted for disruption so their pods can reschedule."}
+
 func (c *NodeController) Name() string {
-	return "provisioner.trigger.node"
+	return nodeTriggerControllerMetric.Name
 }
 
 func (c *NodeController) Reconcile(ctx context.Context, n *corev1.Node) (reconcile.Result, error) {

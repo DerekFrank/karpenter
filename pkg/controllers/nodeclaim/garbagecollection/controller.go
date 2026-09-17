@@ -57,8 +57,10 @@ func NewController(c clock.Clock, kubeClient client.Client, cloudProvider cloudp
 	}
 }
 
+var controllerMetric = metrics.Value{Name: "nodeclaim.garbagecollection", Help: "Deletes NodeClaims whose backing cloud provider instance no longer exists."}
+
 func (c *Controller) Name() string {
-	return "nodeclaim.garbagecollection"
+	return controllerMetric.Name
 }
 
 func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {

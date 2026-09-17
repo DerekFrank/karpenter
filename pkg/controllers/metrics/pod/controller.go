@@ -492,8 +492,10 @@ func (c *Controller) makeLabels(ctx context.Context, pod *corev1.Pod) (prometheu
 	return metricLabels, nil
 }
 
+var controllerMetric = metrics.Value{Name: "metrics.pod", Help: "Emits per-pod metrics such as pod state and scheduling latency."}
+
 func (c *Controller) Name() string {
-	return "metrics.pod"
+	return controllerMetric.Name
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {

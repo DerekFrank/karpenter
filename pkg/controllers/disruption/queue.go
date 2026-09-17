@@ -122,8 +122,10 @@ func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state
 	return queue
 }
 
+var queueControllerMetric = metrics.Value{Name: "disruption.queue", Help: "Executes queued disruption commands, launching replacements and terminating nodes."}
+
 func (q *Queue) Name() string {
-	return "disruption.queue"
+	return queueControllerMetric.Name
 }
 
 func (q *Queue) Register(ctx context.Context, m manager.Manager) error {

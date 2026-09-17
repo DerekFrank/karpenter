@@ -107,8 +107,10 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 	return reconcile.Result{}, nil
 }
 
+var controllerMetric = metrics.Value{Name: "nodeclaim.expiration", Help: "Expires NodeClaims that exceed their configured maximum lifetime."}
+
 func (c *Controller) Name() string {
-	return "nodeclaim.expiration"
+	return controllerMetric.Name
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {

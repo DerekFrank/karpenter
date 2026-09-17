@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 )
@@ -53,8 +54,10 @@ func NewPodController(kubeClient client.Client, cluster *state.Cluster) *PodCont
 	}
 }
 
+var podControllerMetric = metrics.Value{Name: "state.pod", Help: "Watches Pods to maintain cluster state."}
+
 func (c *PodController) Name() string {
-	return "state.pod"
+	return podControllerMetric.Name
 }
 
 func (c *PodController) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {

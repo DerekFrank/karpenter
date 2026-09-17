@@ -31,6 +31,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 )
 
@@ -75,8 +76,10 @@ func (c *PricingController) Reconcile(ctx context.Context) (reconciler.Result, e
 	return reconciler.Result{RequeueAfter: 1 * time.Hour}, nil
 }
 
+var pricingControllerMetric = metrics.Value{Name: "state.pricing", Help: "Polls NodePools hourly to refresh cloud provider instance-type offerings in the cost store."}
+
 func (c *PricingController) Name() string {
-	return "state.pricing"
+	return pricingControllerMetric.Name
 }
 
 func (c *PricingController) Register(_ context.Context, m manager.Manager) error {
