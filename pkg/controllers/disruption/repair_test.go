@@ -19,6 +19,7 @@ package disruption_test
 import (
 	"time"
 
+	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -29,6 +30,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -189,21 +191,29 @@ var _ = Describe("Repair", func() {
 		Expect(queue.GetCommands()).To(HaveLen(1))
 	})
 
-	// INV-S1 / INV-S5: within the breaker's allowance, repair is still paced by the disruption budget — a cohort is
-	// disrupted a fraction at a time, not all at once. 2 of 10 unhealthy is at the 20% breaker line (not tripped), and
-	// the default 10% budget permits one concurrent repair.
-	It("should pace repair by the disruption budget", func() {
-		const count = 10
-		nodeClaims, nodes := test.NodeClaimsAndNodes(count, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
-		for i := range nodes {
-			initNode(nodeClaims[i], nodes[i])
-		}
-		markUnhealthy(nodes[0], "BadNode")
-		markUnhealthy(nodes[1], "BadNode")
+	// do-not-repair blocks only on the literal value "true"; any other value does not block repair.
+	It("should still repair a node whose do-not-repair annotation is not \"true\"", func() {
+		node.Annotations = lo.Assign(node.Annotations, map[string]string{v1.DoNotRepairAnnotationKey: "false"})
+		initNode(nodeClaim, node)
+		markUnhealthy(node, "BadNode")
 		env.Clock.Step(31 * time.Minute)
 
 		ExpectSingletonReconciled(ctx, repairController)
 		Expect(queue.GetCommands()).To(HaveLen(1))
+	})
+
+	// INV-S1 / INV-S5: repair rides the shared disruption budget. A 0-node budget blocks repair entirely — this is the
+	// spec that actually pins the budget gate (asserting HaveLen(1) with a non-zero budget is tautological because
+	// ComputeCommands returns at most one command per pass regardless of budget).
+	It("should not repair when the NodePool disruption budget is zero", func() {
+		nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "0"}}
+		ExpectApplied(ctx, env.Client, nodePool)
+		initNode(nodeClaim, node)
+		markUnhealthy(node, "BadNode")
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+		Expect(queue.GetCommands()).To(HaveLen(0))
 	})
 
 	// The circuit breaker halts repair for a NodePool when more than 20% of its nodes are unhealthy — a correlated
@@ -222,6 +232,21 @@ var _ = Describe("Repair", func() {
 
 		ExpectSingletonReconciled(ctx, repairController)
 		Expect(queue.GetCommands()).To(HaveLen(0))
+	})
+
+	// The breaker threshold rounds UP: a 3-node pool tolerates 1 unhealthy node (ceil(0.2*3)=1), so repair proceeds.
+	// A floor would give 0 and wrongly trip on the first unhealthy node.
+	It("should not trip the breaker for one unhealthy node in a small pool (round-up)", func() {
+		const count = 3
+		nodeClaims, nodes := test.NodeClaimsAndNodes(count, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
+		for i := range nodes {
+			initNode(nodeClaims[i], nodes[i])
+		}
+		markUnhealthy(nodes[0], "BadNode")
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+		Expect(queue.GetCommands()).To(HaveLen(1))
 	})
 
 	// INV-S4: ordering is prioritizable — a higher-priority fault repairs before a lower-priority one in the same pass.
@@ -286,6 +311,58 @@ var _ = Describe("Repair", func() {
 		Expect(cmds[0].Candidates[0].Node.Name).To(Equal(aNode.Name))
 	})
 
+	// Eligibility: matchRepairPolicy considers only ELIGIBLE (past-toleration) conditions, so a node with a fresh
+	// (not-yet-eligible) highest-priority condition still repairs on an overdue lower-priority one — and the ACTION is
+	// governed by that eligible condition. Here LowPriority (eligible, 15m TGP) governs, not HighPriority (fresh, 5m).
+	It("should repair and act on the eligible lower-priority condition when the higher-priority one is not yet eligible", func() {
+		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+			{ConditionType: "LowPriority", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, Priority: 10, TerminationGracePeriod: lo.ToPtr(15 * time.Minute)},
+			{ConditionType: "HighPriority", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, Priority: 90, TerminationGracePeriod: lo.ToPtr(5 * time.Minute)},
+		}
+		newRepairController()
+		nodeClaim.Finalizers = append(nodeClaim.Finalizers, "karpenter.sh/test-finalizer")
+		initNode(nodeClaim, node)
+		markUnhealthy(node, "LowPriority")  // eligible after the step
+		env.Clock.Step(31 * time.Minute)    //
+		markUnhealthy(node, "HighPriority") // fresh: still inside its 30m toleration at reconcile
+
+		ExpectSingletonReconciled(ctx, repairController)
+		cmds := queue.GetCommands()
+		Expect(cmds).To(HaveLen(1))
+		// The eligible LowPriority governs the drain bound (15m), not the ineligible HighPriority (5m).
+		ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+		Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).To(
+			HaveKeyWithValue(v1.NodeClaimTerminationTimestampAnnotationKey, env.Clock.Now().Add(15*time.Minute).Format(time.RFC3339)))
+	})
+
+	// Pure inter-node aging/τ overtake (one condition per node, differing rank): node A (low rank, aged 5τ) outscores
+	// node B (high rank, aged 0.5τ) because 0+5 > 1+0.5. Dropping the age/τ term flips it (0 < 1) and B would win.
+	It("should let a long-starving lower-priority node overtake a fresher higher-priority node", func() {
+		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+			{ConditionType: "LowPriority", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, Priority: 10},
+			{ConditionType: "HighPriority", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, Priority: 90},
+		}
+		newRepairController()
+		// 8 healthy nodes keep the 2 unhealthy at/under the 20% breaker.
+		healthyClaims, healthyNodes := test.NodeClaimsAndNodes(8, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
+		for i := range healthyNodes {
+			initNode(healthyClaims[i], healthyNodes[i])
+		}
+		aClaim, aNode := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
+		bClaim, bNode := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
+		initNode(aClaim, aNode)
+		initNode(bClaim, bNode)
+		markUnhealthy(aNode, "LowPriority")  // aged 5τ below
+		env.Clock.Step(135 * time.Minute)    //
+		markUnhealthy(bNode, "HighPriority") // aged 0.5τ below
+		env.Clock.Step(45 * time.Minute)     // now: A.low age=150m=5τ (score 5), B.high age=15m=0.5τ (score 1.5)
+
+		ExpectSingletonReconciled(ctx, repairController)
+		cmds := queue.GetCommands()
+		Expect(cmds).To(HaveLen(1))
+		Expect(cmds[0].Candidates[0].Node.Name).To(Equal(aNode.Name))
+	})
+
 	// INV-S10: the drain deadline is stamped at actual deletion time (not command-computation time), so pre-spin latency
 	// can't erode the window — mirroring how the lifecycle controller stamps DeletionTimestamp+TGP for other reasons.
 	// A forceful (0) policy stamps an immediate deadline, so repair is never the unbounded hang.
@@ -331,6 +408,61 @@ var _ = Describe("Repair", func() {
 			HaveKeyWithValue(v1.NodeClaimTerminationTimestampAnnotationKey, env.Clock.Now().Add(5*time.Minute).Format(time.RFC3339)))
 	})
 
+	// The repair ACTION (drain bound + per-condition metric) uses the highest-priority ELIGIBLE condition — distinct
+	// from how score orders nodes. Two eligible conditions on one node: HighPriority (5m TGP) governs over LowPriority
+	// (15m), and the unhealthy-disrupted metric is emitted once at termination, labeled by condition/nodepool/ct/image.
+	It("should act on and meter the highest-priority eligible condition", func() {
+		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+			{ConditionType: "LowPriority", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, Priority: 10, TerminationGracePeriod: lo.ToPtr(15 * time.Minute)},
+			{ConditionType: "HighPriority", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, Priority: 90, TerminationGracePeriod: lo.ToPtr(5 * time.Minute)},
+		}
+		newRepairController()
+		nodeClaim.Status.ImageID = "ami-test-1234"
+		nodeClaim.Finalizers = append(nodeClaim.Finalizers, "karpenter.sh/test-finalizer")
+		initNode(nodeClaim, node)
+		markUnhealthy(node, "LowPriority")
+		markUnhealthy(node, "HighPriority")
+		env.Clock.Step(31 * time.Minute) // both eligible
+
+		ExpectSingletonReconciled(ctx, repairController)
+		cmds := queue.GetCommands()
+		Expect(cmds).To(HaveLen(1))
+		ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+		// HighPriority governs the action: its 5m TGP is stamped (not LowPriority's 15m)...
+		Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).To(
+			HaveKeyWithValue(v1.NodeClaimTerminationTimestampAnnotationKey, env.Clock.Now().Add(5*time.Minute).Format(time.RFC3339)))
+		// ...and the metric is emitted once at termination, labeled by the HighPriority condition and the node's image.
+		ExpectMetricCounterValue(disruption.NodeClaimsUnhealthyDisruptedTotal, 1, map[string]string{
+			disruption.RepairCondition.Name: "high_priority",
+			metrics.NodePoolLabel:           nodePool.Name,
+			metrics.CapacityTypeLabel:       v1.CapacityTypeOnDemand,
+			disruption.ImageID.Name:         "ami-test-1234",
+		})
+	})
+
+	// The unhealthy-disrupted metric is emitted at ACTUAL termination, not at command production — an abandoned command
+	// (replacement never becomes healthy) must not increment it, or repeated attempts would over-count the same node.
+	It("should not meter an abandoned repair (replacement never healthy)", func() {
+		initNode(nodeClaim, node)
+		bindReschedulablePod(node)
+		markUnhealthy(node, "BadNode")
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+		cmds := queue.GetCommands()
+		Expect(cmds).To(HaveLen(1))
+		// Replacement is never made healthy, so the queue reconcile does not terminate — the metric must stay unrecorded.
+		ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+		name := ExpectMetricName(disruption.NodeClaimsUnhealthyDisruptedTotal.(*opmetrics.PrometheusCounter))
+		_, ok := FindMetricWithLabelValues(name, map[string]string{
+			disruption.RepairCondition.Name: "bad_node",
+			metrics.NodePoolLabel:           nodePool.Name,
+			metrics.CapacityTypeLabel:       v1.CapacityTypeOnDemand,
+			disruption.ImageID.Name:         "",
+		})
+		Expect(ok).To(BeFalse())
+	})
+
 	// The deadline is stamped only at actual deletion, so a replacement that never becomes healthy leaves the original
 	// both un-terminated AND un-stamped — the circuit breaker never starts the drain clock (bounded policy proves it
 	// would stamp if termination ran).
@@ -371,6 +503,22 @@ var _ = Describe("Repair", func() {
 	It("should not repair a node whose condition does not match any policy", func() {
 		initNode(nodeClaim, node)
 		markUnhealthy(node, "SomeOtherCondition")
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+		Expect(queue.GetCommands()).To(HaveLen(0))
+	})
+
+	// A condition of the matching TYPE but the wrong STATUS does not match (policy wants BadNode=False; node has
+	// BadNode=True) — the node is left alone.
+	It("should not repair a node whose matching condition has the wrong status", func() {
+		initNode(nodeClaim, node)
+		n := ExpectExists(ctx, env.Client, node)
+		n.Status.Conditions = append(n.Status.Conditions, corev1.NodeCondition{
+			Type: "BadNode", Status: corev1.ConditionTrue, LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
+		})
+		ExpectApplied(ctx, env.Client, n)
+		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(n))
 		env.Clock.Step(31 * time.Minute)
 
 		ExpectSingletonReconciled(ctx, repairController)
