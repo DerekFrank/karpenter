@@ -268,6 +268,16 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 		}
 		metrics.NodeClaimsDisruptedTotal.Inc(labels)
 		metrics.PodsDisruptionInitiatedTotal.Add(float64(len(cmd.Candidates[i].reschedulablePods)), labels)
+		// Repair records the eligible condition on the candidate; emit the per-condition/per-image unhealthy-disrupted
+		// metric here (at actual termination), not at command production, so an abandoned command doesn't over-count.
+		if cond := cmd.Candidates[i].RepairCondition; cond != "" {
+			NodeClaimsUnhealthyDisruptedTotal.Inc(map[string]string{
+				conditionLabel:            pretty.ToSnakeCase(string(cond)),
+				metrics.NodePoolLabel:     cmd.Candidates[i].NodeClaim.Labels[v1.NodePoolLabelKey],
+				metrics.CapacityTypeLabel: cmd.Candidates[i].NodeClaim.Labels[v1.CapacityTypeLabelKey],
+				imageIDLabel:              cmd.Candidates[i].NodeClaim.Status.ImageID,
+			})
+		}
 	})
 	// If there were any deletion failures, we should requeue.
 	// In the case where we requeue, but the timeout for the command is reached, we'll mark this as a failure.

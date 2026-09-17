@@ -96,6 +96,9 @@ type Candidate struct {
 	// deadline (now + this) at actual deletion time, so replace-then-terminate latency doesn't erode the window. nil
 	// inherits the NodeClaim's own TerminationGracePeriod. Repair sets it (min(policy, NodeClaim TGP)) in ComputeCommands.
 	TerminationGracePeriod *time.Duration
+	// RepairCondition, when non-empty, is the node condition that made this candidate eligible for repair. Repair sets
+	// it in ComputeCommands; the queue emits the per-condition unhealthy-disrupted metric off it at actual termination.
+	RepairCondition corev1.NodeConditionType
 }
 
 // ScoreResult holds the three values needed to decide whether a move passes.

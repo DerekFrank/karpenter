@@ -31,7 +31,6 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
-	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
@@ -79,12 +78,10 @@ func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 	if c.Annotations()[v1.DoNotRepairAnnotationKey] == "true" {
 		return false
 	}
-	policy, cond := r.matchRepairPolicy(c.Node)
-	if policy == nil {
-		return false
-	}
-	// Eligibility is delayed by the policy's toleration — a confidence window before repair acts.
-	return !r.clock.Now().Before(cond.LastTransitionTime.Add(policy.TolerationDuration))
+	// matchRepairPolicy already requires an eligible (past-toleration) matching condition, so a non-nil match means
+	// the node is repairable now.
+	policy, _ := r.matchRepairPolicy(c.Node)
+	return policy != nil
 }
 
 // ComputeCommands orders eligible candidates by the repair score and returns one replace-then-terminate command for the
@@ -134,14 +131,10 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 		// replacement is healthy), so repair is never an unbounded hang and a forceful (0) policy skips the drain for
 		// conditions the kubelet can't evict through — without pre-spin latency eroding the window.
 		candidate.TerminationGracePeriod = r.effectiveDrainBound(candidate)
-		// Preserve the per-condition/per-image disruption metric the retired node.health controller emitted.
+		// Record the eligible condition driving this repair; the queue emits the per-condition disruption metric when
+		// the candidate is actually terminated, so an abandoned command (replacement never healthy) doesn't over-count.
 		if _, cond := r.matchRepairPolicy(candidate.Node); cond != nil {
-			NodeClaimsUnhealthyDisruptedTotal.Inc(map[string]string{
-				conditionLabel:            pretty.ToSnakeCase(string(cond.Type)),
-				metrics.NodePoolLabel:     candidate.NodePool.Name,
-				metrics.CapacityTypeLabel: candidate.NodeClaim.Labels[v1.CapacityTypeLabelKey],
-				imageIDLabel:              candidate.NodeClaim.Status.ImageID,
-			})
+			candidate.RepairCondition = cond.Type
 		}
 		return []Command{{
 			Candidates:          []*Candidate{candidate},
@@ -171,7 +164,7 @@ func (r *Repair) breakerTrippedPools(ctx context.Context) (map[string]bool, erro
 			continue
 		}
 		total[nodePool]++
-		if policy, _ := r.matchRepairPolicy(node); policy != nil {
+		if r.matchesUnhealthyPolicy(node) {
 			unhealthy[nodePool]++
 		}
 	}
@@ -185,11 +178,12 @@ func (r *Repair) breakerTrippedPools(ctx context.Context) (map[string]bool, erro
 	return tripped, nil
 }
 
-// score computes E = rank + age/τ for a node: the argmax of that expression over ALL of the node's matching
-// conditions, not just the highest-priority one. Age is time past toleration (post-eligibility), so a flakier signal's
+// score computes E = rank + age/τ for a node: the argmax of that expression over all of the node's ELIGIBLE matching
+// conditions (past toleration), not just the highest-priority one. Age is time past toleration, so a flakier signal's
 // longer toleration never leaks into its standing. Taking the argmax (rather than reusing matchRepairPolicy's
-// priority-first pick) keeps inter-node ordering consistent: a node's importance is its most urgent condition, so a
-// low-priority-but-long-starving condition still lifts the node even when a fresh high-priority condition also trips.
+// priority-first pick) keeps inter-node ordering consistent: a node's importance is its most urgent eligible condition,
+// so a low-priority-but-long-starving condition still lifts the node even when a fresh high-priority condition also
+// trips. Not-yet-eligible conditions are skipped entirely — they don't contribute standing before repair may act.
 // TODO: re-introduce a per-NodePool backoff term (subtracted here) once the NodePool backoff implementation lands
 // (kubernetes-sigs/karpenter#3178) — it was ripped out to avoid duplicating that mechanism.
 func (r *Repair) score(c *Candidate, ranks map[int]int) float64 {
@@ -202,7 +196,7 @@ func (r *Repair) score(c *Candidate, ranks map[int]int) float64 {
 		}
 		age := r.clock.Now().Sub(cond.LastTransitionTime.Add(policy.TolerationDuration))
 		if age < 0 {
-			age = 0
+			continue // not yet eligible — a condition inside its toleration window earns no standing
 		}
 		best = max(best, float64(ranks[policy.Priority])+age.Minutes()/agingConstant.Minutes())
 	}
@@ -223,10 +217,12 @@ func denseRanks(policies []cloudprovider.RepairPolicy) map[int]int {
 }
 
 // matchRepairPolicy returns the highest-priority RepairPolicy whose (type,status) matches an unhealthy condition on
-// the node, plus the matched condition — the single policy that governs the repair ACTION (its drain bound). When a
-// node trips multiple policies the highest priority wins, ties broken by the earlier toleration deadline. Note this is
-// deliberately NOT how score orders nodes (score argmaxes rank+age across all conditions); this pick is for the action,
-// score is for inter-node ordering.
+// the node AND has waited past its toleration (is eligible), plus the matched condition — the single policy that
+// governs both eligibility and the repair ACTION (its drain bound). Only eligible conditions are considered, so a
+// node with a fresh higher-priority condition still matches on a lower-priority condition that is already eligible
+// (that node is repairable now, on the eligible condition). When several eligible conditions match, the highest
+// priority wins, ties broken by the earlier toleration deadline. This is deliberately NOT how score orders nodes
+// (score argmaxes rank+age over all eligible conditions); this pick is for eligibility+action, score is for ordering.
 // TODO: rip out for the reason-aware matching model (kubernetes-sigs/karpenter#3263, reason-aware repair policy
 // matching + escalation) — picking a single highest-priority policy is a placeholder for multi-reason semantics.
 func (r *Repair) matchRepairPolicy(node *corev1.Node) (*cloudprovider.RepairPolicy, *corev1.NodeCondition) {
@@ -240,6 +236,9 @@ func (r *Repair) matchRepairPolicy(node *corev1.Node) (*cloudprovider.RepairPoli
 			continue
 		}
 		terminationTime := cond.LastTransitionTime.Add(policy.TolerationDuration)
+		if r.clock.Now().Before(terminationTime) {
+			continue // not yet eligible — still inside the toleration/confidence window
+		}
 		if best == nil || policy.Priority > best.Priority ||
 			(policy.Priority == best.Priority && terminationTime.Before(deadline)) {
 			p := policy
@@ -248,6 +247,18 @@ func (r *Repair) matchRepairPolicy(node *corev1.Node) (*cloudprovider.RepairPoli
 		}
 	}
 	return best, bestCond
+}
+
+// matchesUnhealthyPolicy reports whether the node currently exhibits any RepairPolicy condition, REGARDLESS of
+// toleration. The circuit breaker's census counts a node as unhealthy the moment it matches (like the retired
+// node.health breaker), not once it becomes eligible — so it must not use matchRepairPolicy, which filters to eligible.
+func (r *Repair) matchesUnhealthyPolicy(node *corev1.Node) bool {
+	for i := range r.repairPolicies {
+		if nodeutils.GetCondition(node, r.repairPolicies[i].ConditionType).Status == r.repairPolicies[i].ConditionStatus {
+			return true
+		}
+	}
+	return false
 }
 
 // effectiveDrainBound returns the drain bound for the candidate, carried on the Command and applied by the queue at
