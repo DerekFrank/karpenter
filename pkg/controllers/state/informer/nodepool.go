@@ -31,6 +31,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
@@ -54,8 +55,13 @@ func NewNodePoolController(kubeClient client.Client, cloudProvider cloudprovider
 	}
 }
 
+var nodepoolControllerMetric = metrics.Value{
+	Name: "state.nodepool",
+	Help: "Watches NodePools to re-trigger consolidation on change and drop deleted NodePools from cost tracking.",
+}
+
 func (c *NodePoolController) Name() string {
-	return "state.nodepool"
+	return nodepoolControllerMetric.Name
 }
 
 func (c *NodePoolController) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {

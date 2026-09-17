@@ -155,8 +155,13 @@ func makeLabels(nodePool *v1.NodePool, resourceTypeName string) prometheus.Label
 	}
 }
 
+var controllerMetric = metrics.Value{
+	Name: "metrics.nodepool",
+	Help: "Emits per-NodePool metrics such as usage and limits.",
+}
+
 func (c *Controller) Name() string {
-	return "metrics.nodepool"
+	return controllerMetric.Name
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {

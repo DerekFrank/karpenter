@@ -45,6 +45,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	disruptionutils "sigs.k8s.io/karpenter/pkg/utils/disruption"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
@@ -77,8 +78,13 @@ func NewController(kubeClient client.Client, cluster *state.Cluster, cloudProvid
 
 // Reconcile the resource
 // Requeue after computing Static NodePool to ensure we don't miss any events
+var controllerMetric = metrics.Value{
+	Name: "static.deprovisioning",
+	Help: "Deletes excess NodeClaims to scale a static NodePool down to its desired replica count.",
+}
+
 func (c *Controller) Name() string {
-	return "static.deprovisioning"
+	return controllerMetric.Name
 }
 
 func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.Result, error) {

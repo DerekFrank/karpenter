@@ -114,8 +114,13 @@ func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Clien
 	}
 }
 
+var controllerMetric = metrics.Value{
+	Name: "disruption",
+	Help: "Disrupts nodes via emptiness, drift, and consolidation.",
+}
+
 func (c *Controller) Name() string {
-	return "disruption"
+	return controllerMetric.Name
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {

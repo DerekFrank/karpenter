@@ -215,8 +215,13 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	return reconciler.Result{RequeueAfter: time.Second * 5}, nil
 }
 
+var controllerMetric = metrics.Value{
+	Name: "metrics.node",
+	Help: "Emits per-node metrics (allocatable, pod/daemon requests/limits, overhead, lifetime) and cluster utilization.",
+}
+
 func (c *Controller) Name() string {
-	return "metrics.node"
+	return controllerMetric.Name
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {

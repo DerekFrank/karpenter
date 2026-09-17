@@ -116,8 +116,13 @@ func NewQueue(clk clock.Clock, kubeClient client.Client, recorder events.Recorde
 	}
 }
 
+var controllerMetric = metrics.Value{
+	Name: "eviction-queue",
+	Help: "Rate-limited queue that evicts pods during node termination.",
+}
+
 func (q *Queue) Name() string {
-	return "eviction-queue"
+	return controllerMetric.Name
 }
 
 func (q *Queue) Register(ctx context.Context, m manager.Manager) error {

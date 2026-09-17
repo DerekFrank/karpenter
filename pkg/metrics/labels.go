@@ -26,6 +26,11 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
 
+// Value aliases opmetrics.Value so callers (e.g. controllers documenting their own
+// `controller` dimension value) can reference it as metrics.Value without importing
+// operatorpkg directly.
+type Value = opmetrics.Value
+
 // BoolValues is the value set for a boolean dimension. The values are
 // self-explanatory, so they carry no help text.
 var BoolValues = []opmetrics.Value{{Name: strconv.FormatBool(true)}, {Name: strconv.FormatBool(false)}}

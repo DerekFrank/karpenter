@@ -38,6 +38,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
@@ -70,8 +71,13 @@ func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider clou
 }
 
 // Reconcile executes a control loop for the resource
+var controllerMetric = metrics.Value{
+	Name: "nodeclaim.disruption",
+	Help: "Marks NodeClaims as drifted or consolidatable for disruption.",
+}
+
 func (c *Controller) Name() string {
-	return "nodeclaim.disruption"
+	return controllerMetric.Name
 }
 
 func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {

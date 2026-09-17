@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 
 	autoscalingv1beta1 "sigs.k8s.io/karpenter/pkg/apis/autoscaling/v1beta1"
@@ -66,8 +67,13 @@ func NewController(kubeClient client.Client, trigger ProvisionerTrigger, virtual
 	}
 }
 
+var controllerMetric = metrics.Value{
+	Name: "capacitybuffer",
+	Help: "Resolves each CapacityBuffer's pod template and target replicas, updating its status for the provisioner.",
+}
+
 func (c *Controller) Name() string {
-	return "capacitybuffer"
+	return controllerMetric.Name
 }
 
 func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {

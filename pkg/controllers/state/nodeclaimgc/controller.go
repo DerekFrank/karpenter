@@ -34,6 +34,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 )
 
@@ -53,8 +54,13 @@ func NewController(kubeClient client.Client, cluster *state.Cluster) *Controller
 	}
 }
 
+var controllerMetric = metrics.Value{
+	Name: "state.nodeclaimgc",
+	Help: "Garbage-collects stale unlaunched NodeClaim entries from cluster state once deleted from the API server.",
+}
+
 func (c *Controller) Name() string {
-	return "state.nodeclaimgc"
+	return controllerMetric.Name
 }
 
 // Garbage collects unlaunched NodeClaim entries from cluster state that no longer exist on the API
