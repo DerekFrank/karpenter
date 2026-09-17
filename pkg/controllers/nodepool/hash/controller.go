@@ -31,6 +31,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
@@ -52,8 +53,10 @@ func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudPr
 }
 
 // Reconcile the resource
+var controllerMetric = metrics.Value{Name: "nodepool.hash", Help: "Maintains the configuration hash annotation used for NodePool drift detection."}
+
 func (c *Controller) Name() string {
-	return "nodepool.hash"
+	return controllerMetric.Name
 }
 
 func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.Result, error) {

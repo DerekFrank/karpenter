@@ -32,6 +32,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
@@ -53,8 +54,10 @@ func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider clou
 	}
 }
 
+var controllerMetric = metrics.Value{Name: "nodepool.readiness", Help: "Sets NodePool readiness from its resolved NodeClass."}
+
 func (c *Controller) Name() string {
-	return "nodepool.readiness"
+	return controllerMetric.Name
 }
 
 func (c *Controller) Reconcile(ctx context.Context, nodePool *v1.NodePool) (reconcile.Result, error) {

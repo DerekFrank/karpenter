@@ -41,6 +41,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/apis/v1alpha1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
@@ -54,8 +55,10 @@ type Controller struct {
 	clock             clock.Clock
 }
 
+var controllerMetric = metrics.Value{Name: "nodeoverlay.controller", Help: "Validates NodeOverlays for conflicts and applies their price/capacity overrides to the instance type store."}
+
 func (c *Controller) Name() string {
-	return "nodeoverlay.controller"
+	return controllerMetric.Name
 }
 
 // NewController constructs a controller for node overlay validation

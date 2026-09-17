@@ -69,8 +69,10 @@ func NewController(kubeClient client.Client, cluster *state.Cluster, recorder ev
 
 // Reconcile the resource
 // Requeue after computing Static NodePool to ensure we don't miss any events
+var controllerMetric = metrics.Value{Name: "static.provisioning", Help: "Creates NodeClaims to scale a static NodePool up to its desired replica count."}
+
 func (c *Controller) Name() string {
-	return "static.provisioning"
+	return controllerMetric.Name
 }
 
 func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.Result, error) {

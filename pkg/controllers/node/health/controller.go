@@ -71,8 +71,10 @@ func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudPr
 	}
 }
 
+var controllerMetric = metrics.Value{Name: "node.health", Help: "Terminates nodes the cloud provider reports as unhealthy."}
+
 func (c *Controller) Name() string {
-	return "node.health"
+	return controllerMetric.Name
 }
 
 func (c *Controller) Register(ctx context.Context, m manager.Manager) error {

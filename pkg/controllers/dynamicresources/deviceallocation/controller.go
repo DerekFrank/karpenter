@@ -40,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 )
 
@@ -117,8 +118,10 @@ func NewController(kubeClient client.Client) *Controller {
 	}
 }
 
+var controllerMetric = metrics.Value{Name: "dynamicresources.deviceallocation", Help: "Tracks allocated DRA devices from ResourceClaims, maintaining per-device metadata for consumers to query."}
+
 func (c *Controller) Name() string {
-	return "dynamicresources.deviceallocation"
+	return controllerMetric.Name
 }
 
 func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {

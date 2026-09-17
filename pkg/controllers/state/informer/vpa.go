@@ -37,6 +37,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 
 	"sigs.k8s.io/karpenter/pkg/state/prediction"
@@ -131,8 +132,10 @@ func (c *VPAController) processVPA(ctx context.Context, vpa *vpav1.VerticalPodAu
 	return true
 }
 
+var vpaControllerMetric = metrics.Value{Name: "vpa.prediction", Help: "Polls VerticalPodAutoscaler objects and caches predicted post-recreation pod resources in a prediction store."}
+
 func (c *VPAController) Name() string {
-	return "vpa.prediction"
+	return vpaControllerMetric.Name
 }
 
 func (c *VPAController) Register(_ context.Context, m manager.Manager) error {
