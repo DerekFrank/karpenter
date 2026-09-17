@@ -112,8 +112,9 @@ var (
 		Values: nodeClaimDisruptedReasonValues,
 	}
 	ResourceType = opmetrics.Label{
-		Name: ResourceTypeLabel,
-		Help: "The Kubernetes resource type, e.g. `cpu`, `memory`, `pods`.",
+		Name:   ResourceTypeLabel,
+		Help:   "The Kubernetes resource type, e.g. `cpu`, `memory`, `pods`.",
+		Values: ResourceTypeValues,
 	}
 	CapacityType = opmetrics.Label{
 		Name: CapacityTypeLabel,
