@@ -48,6 +48,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
@@ -80,10 +81,10 @@ func WithMethods(methods ...Method) option.Function[ControllerOptions] {
 	}
 }
 
-func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
+func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
 	cp cloudprovider.CloudProvider, recorder events.Recorder, cluster *state.Cluster, queue *Queue, clusterCost *cost.ClusterCost, opts ...option.Function[ControllerOptions]) *Controller {
 
-	o := option.Resolve(append([]option.Function[ControllerOptions]{WithMethods(NewMethods(clk, cluster, kubeClient, provisioner, cp, recorder, queue)...)}, opts...)...)
+	o := option.Resolve(append([]option.Function[ControllerOptions]{WithMethods(NewMethods(ctx, clk, cluster, kubeClient, provisioner, cp, recorder, queue)...)}, opts...)...)
 	return &Controller{
 		queue:         queue,
 		clock:         clk,
@@ -98,12 +99,12 @@ func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provi
 	}
 }
 
-func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Client, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue) []Method {
+func NewMethods(ctx context.Context, clk clock.Clock, cluster *state.Cluster, kubeClient client.Client, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue) []Method {
 	c := MakeConsolidation(clk, cluster, kubeClient, provisioner, cp, recorder, queue)
 	methods := []Method{}
-	// Repair runs first: fixing a fault outranks any discretionary rebalance. Only registered when a cloud provider
-	// defines repair policies and the NodeRepair feature gate is on, matching the old node.health controller's gating.
-	if len(cp.RepairPolicies()) != 0 {
+	// Repair runs first: fixing a fault outranks any discretionary rebalance. Registered only when the NodeRepair
+	// feature gate is on; NewRepair then panics if the provider defines no RepairPolicies (repair could never act).
+	if options.FromContext(ctx).FeatureGates.NodeRepair {
 		methods = append(methods, NewRepair(c))
 	}
 	return append(methods, []Method{

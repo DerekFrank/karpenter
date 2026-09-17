@@ -59,6 +59,10 @@ type Repair struct {
 
 func NewRepair(c consolidation) *Repair {
 	policies := c.cloudProvider.RepairPolicies()
+	// Repair can't do anything without policies to match on; an empty set is a provider misconfiguration, so fail loud.
+	if len(policies) == 0 {
+		panic("node repair requires the cloud provider to define RepairPolicies, but it defines none")
+	}
 	return &Repair{consolidation: c, repairPolicies: policies, ranks: denseRanks(policies)}
 }
 

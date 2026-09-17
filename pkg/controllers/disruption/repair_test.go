@@ -97,7 +97,7 @@ var _ = Describe("Repair", func() {
 	// newRepairController builds an isolated repair-only disruption controller. Repair caches RepairPolicies() at
 	// construction, so specs that override cloudProvider.RepairPolicy must call this again to pick up the new policies.
 	newRepairController := func() {
-		repairController = disruption.NewController(env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
+		repairController = disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
 			disruption.WithMethods(disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue))))
 	}
 
