@@ -167,7 +167,7 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 //     reservation that still has capacity. If every reschedulable pod places, terminateFirst is false and the caller
 //     replaces-first with these Results (as it always has).
 //
-//  2. Only if pass 1 leaves pods pending AND the TerminateFirstDrift gate is on AND the candidate itself holds a
+//  2. Only if pass 1 leaves pods pending AND terminateFirstEnabled is set by the caller AND the candidate itself holds a
 //     reservation: re-simulate in strict mode with the candidate's reservation slot credited back (modeling the slot it
 //     will free on termination). If every pod then places, terminateFirst is true — deleting the candidate is exactly
 //     what unblocks the reschedule. Strict mode makes surplus pods that wouldn't fit the freed slot fail rather than
@@ -183,6 +183,7 @@ func SimulateSchedulingWithReservedFallback(
 	clk clock.Clock,
 	recorder events.Recorder,
 	candidate *Candidate,
+	terminateFirstEnabled bool,
 ) (results scheduling.Results, terminateFirst bool, err error) {
 	// Pass 1: replace-first feasibility.
 	results, err = SimulateScheduling(ctx, kubeClient, cluster, provisioner, clk, recorder, nil, candidate)
@@ -190,10 +191,12 @@ func SimulateSchedulingWithReservedFallback(
 		return results, false, err
 	}
 
-	// Terminate-first only applies when enabled and the candidate holds a reservation whose freed slot could unblock
-	// the reschedule. Otherwise the pending pods in results are a Blocked signal for the caller.
+	// Terminate-first only applies when the caller has it enabled and the candidate holds a reservation whose freed slot
+	// could unblock the reschedule. The gate is caller-supplied so each disruption method controls it independently:
+	// drift passes the TerminateFirstDrift feature gate; repair passes true (terminate-first is inherent to repair,
+	// under the existing NodeRepair gate). Otherwise the pending pods in results are a Blocked signal for the caller.
 	reservationID := candidate.Labels()[cloudprovider.ReservationIDLabel]
-	if !options.FromContext(ctx).FeatureGates.TerminateFirstDrift || candidate.capacityType != v1.CapacityTypeReserved || reservationID == "" {
+	if !terminateFirstEnabled || candidate.capacityType != v1.CapacityTypeReserved || reservationID == "" {
 		return results, false, nil
 	}
 
