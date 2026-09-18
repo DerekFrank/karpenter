@@ -31,18 +31,35 @@ import (
 // NodeRepairBlocked warns that node repair is being withheld from a node (e.g. the circuit breaker tripped because too
 // much of the NodePool is unhealthy). Unlike the discretionary DisruptionBlocked event, this is a Warning: an operator
 // should notice that a broken node is deliberately not being repaired.
-func NodeRepairBlocked(node *corev1.Node, nodeClaim *v1.NodeClaim, nodePool *v1.NodePool, msg string) (evs []events.Event) {
-	for _, uid := range []string{string(node.UID), string(nodeClaim.UID), string(nodePool.UID)} {
-		evs = append(evs, events.Event{
+func NodeRepairBlocked(node *corev1.Node, nodeClaim *v1.NodeClaim, nodePool *v1.NodePool, msg string) []events.Event {
+	// One event per involved object (node, NodeClaim, NodePool) so each surfaces the block on its own timeline —
+	// not three identical events on the node.
+	return []events.Event{
+		{
 			InvolvedObject: node,
 			Type:           corev1.EventTypeWarning,
 			Reason:         events.NodeRepairBlocked,
 			Message:        msg,
-			DedupeValues:   []string{uid},
+			DedupeValues:   []string{string(node.UID)},
 			DedupeTimeout:  15 * time.Minute,
-		})
+		},
+		{
+			InvolvedObject: nodeClaim,
+			Type:           corev1.EventTypeWarning,
+			Reason:         events.NodeRepairBlocked,
+			Message:        msg,
+			DedupeValues:   []string{string(nodeClaim.UID)},
+			DedupeTimeout:  15 * time.Minute,
+		},
+		{
+			InvolvedObject: nodePool,
+			Type:           corev1.EventTypeWarning,
+			Reason:         events.NodeRepairBlocked,
+			Message:        msg,
+			DedupeValues:   []string{string(nodePool.UID)},
+			DedupeTimeout:  15 * time.Minute,
+		},
 	}
-	return evs
 }
 
 func Launching(nodeClaim *v1.NodeClaim, reason string) events.Event {
