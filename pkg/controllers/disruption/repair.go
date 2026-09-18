@@ -119,27 +119,53 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			continue
 		}
-		// Pre-spin the replacement; the queue terminates the original only once the replacement is healthy.
-		results, err := SimulateScheduling(ctx, r.kubeClient, r.cluster, r.provisioner, r.clock, r.recorder, nil, candidate)
+		// Bound the drain per the matched policy and record the eligible condition up front — both apply whether we
+		// replace-first or terminate-first. The queue stamps the absolute deadline at actual deletion time (after any
+		// replacement is healthy), so repair is never an unbounded hang and a forceful (0) policy skips the drain for
+		// conditions the kubelet can't evict through; the queue emits the per-condition metric only at actual
+		// termination, so an abandoned command (replacement never healthy) doesn't over-count.
+		candidate.TerminationGracePeriod = r.effectiveDrainBound(candidate)
+		if _, cond := r.matchRepairPolicy(candidate.Node); cond != nil {
+			candidate.RepairCondition = cond.Type
+		}
+		// Terminate-first (RFC #3203) is behind the TerminateFirstRepair feature gate. A static NodePool runs a fixed
+		// replica count, so it can never pre-spin a replacement — a pre-spun node would be an (N+1)th the operator capped
+		// out. Free the slot first and let reactive provisioning refill it. Mirrors StaticDrift; reads static
+		// configuration, never launch outcomes.
+		terminateFirstEnabled := options.FromContext(ctx).FeatureGates.TerminateFirstRepair
+		if terminateFirstEnabled && candidate.OwnedByStaticNodePool() {
+			return []Command{{
+				Candidates:          []*Candidate{candidate},
+				PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+				TerminateFirst:      true,
+			}}, nil
+		}
+		// Simulate rescheduling the candidate's pods. When they can't be pre-spun elsewhere and the candidate holds a
+		// full reservation, this reports terminate-first — the identical decision Drift makes (see
+		// SimulateSchedulingWithReservedFallback). Gated on TerminateFirstRepair; when disabled the candidate always
+		// pre-spins (replace-first), the prior behavior.
+		results, terminateFirst, err := SimulateSchedulingWithReservedFallback(ctx, r.kubeClient, r.cluster, r.provisioner, r.clock, r.recorder, candidate, terminateFirstEnabled)
 		if err != nil {
 			if errors.Is(err, errCandidateDeleting) {
 				continue
 			}
 			return []Command{}, err
 		}
+		if terminateFirst {
+			// Delete-only (no Replacements): carry the Results so existing nodes that can absorb the freed pods get
+			// nominated. Reactive provisioning refills the freed reservation slot.
+			return []Command{{
+				Candidates:          []*Candidate{candidate},
+				Results:             results,
+				PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+				TerminateFirst:      true,
+			}}, nil
+		}
 		if !results.AllNonPendingPodsScheduled() {
 			r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
 			continue
 		}
-		// Set the candidate's drain bound; the queue stamps the absolute deadline at actual deletion time (after the
-		// replacement is healthy), so repair is never an unbounded hang and a forceful (0) policy skips the drain for
-		// conditions the kubelet can't evict through — without pre-spin latency eroding the window.
-		candidate.TerminationGracePeriod = r.effectiveDrainBound(candidate)
-		// Record the eligible condition driving this repair; the queue emits the per-condition disruption metric when
-		// the candidate is actually terminated, so an abandoned command (replacement never healthy) doesn't over-count.
-		if _, cond := r.matchRepairPolicy(candidate.Node); cond != nil {
-			candidate.RepairCondition = cond.Type
-		}
+		// Pre-spin the replacement; the queue terminates the original only once the replacement is healthy.
 		return []Command{{
 			Candidates:          []*Candidate{candidate},
 			Replacements:        replacementsFromNodeClaims(results.NewNodeClaims...),
