@@ -125,8 +125,13 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 		Complete(reconcile.AsReconciler(m.GetClient(), c))
 }
 
+var controllerMetric = metrics.Value{
+	Name: "nodeclaim.lifecycle",
+	Help: "Launches, registers, initializes, and terminates the instance backing a NodeClaim.",
+}
+
 func (c *Controller) Name() string {
-	return "nodeclaim.lifecycle"
+	return controllerMetric.Name
 }
 
 // nolint:gocyclo

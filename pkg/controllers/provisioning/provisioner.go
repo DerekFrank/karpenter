@@ -117,8 +117,13 @@ func (p *Provisioner) Trigger(uid types.UID) {
 	p.batcher.Trigger(uid)
 }
 
+var provisionerControllerMetric = metrics.Value{
+	Name: "provisioner",
+	Help: "Batches triggered pods/nodes, runs scheduling, and creates NodeClaims for unschedulable pods.",
+}
+
 func (p *Provisioner) Name() string {
-	return "provisioner"
+	return provisionerControllerMetric.Name
 }
 
 func (p *Provisioner) Register(_ context.Context, m manager.Manager) error {

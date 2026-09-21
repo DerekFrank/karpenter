@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/utils/clock"
 
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/state/nodepoolhealth"
 
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
@@ -59,8 +60,13 @@ func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider clou
 	}
 }
 
+var controllerMetric = metrics.Value{
+	Name: "nodepool.registrationhealth",
+	Help: "Resets the NodeRegistrationHealthy condition to Unknown when the NodePool or NodeClass spec changes.",
+}
+
 func (c *Controller) Name() string {
-	return "nodepool.registrationhealth"
+	return controllerMetric.Name
 }
 
 //nolint:gocyclo

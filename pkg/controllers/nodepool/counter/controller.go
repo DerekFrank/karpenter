@@ -36,6 +36,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
@@ -67,8 +68,13 @@ func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudPr
 }
 
 // Reconcile a control loop for the resource
+var controllerMetric = metrics.Value{
+	Name: "nodepool.counter",
+	Help: "Maintains per-NodePool resource counts in status.",
+}
+
 func (c *Controller) Name() string {
-	return "nodepool.counter"
+	return controllerMetric.Name
 }
 
 func (c *Controller) Reconcile(ctx context.Context, nodePool *v1.NodePool) (reconcile.Result, error) {

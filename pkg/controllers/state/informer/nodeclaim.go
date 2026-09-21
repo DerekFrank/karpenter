@@ -30,6 +30,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
@@ -54,8 +55,13 @@ func NewNodeClaimController(kubeClient client.Client, cloudProvider cloudprovide
 	}
 }
 
+var nodeclaimControllerMetric = metrics.Value{
+	Name: "state.nodeclaim",
+	Help: "Watches NodeClaims to maintain cluster state and cost.",
+}
+
 func (c *NodeClaimController) Name() string {
-	return "state.nodeclaim"
+	return nodeclaimControllerMetric.Name
 }
 
 func (c *NodeClaimController) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {

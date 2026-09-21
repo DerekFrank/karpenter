@@ -405,8 +405,13 @@ func (c *Controller) nodeTerminationTime(node *corev1.Node, nodeClaim *v1.NodeCl
 	return &expirationTime, nil
 }
 
+var controllerMetric = metrics.Value{
+	Name: "node.termination",
+	Help: "Cordons, drains, and terminates nodes that are being removed.",
+}
+
 func (c *Controller) Name() string {
-	return "node.termination"
+	return controllerMetric.Name
 }
 
 func (c *Controller) Register(ctx context.Context, m manager.Manager) error {

@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 )
@@ -46,8 +47,13 @@ func NewNodeController(kubeClient client.Client, cluster *state.Cluster) *NodeCo
 	}
 }
 
+var nodeControllerMetric = metrics.Value{
+	Name: "state.node",
+	Help: "Watches Nodes to maintain cluster state.",
+}
+
 func (c *NodeController) Name() string {
-	return "state.node"
+	return nodeControllerMetric.Name
 }
 
 func (c *NodeController) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {

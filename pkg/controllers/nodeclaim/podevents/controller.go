@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
@@ -97,8 +98,13 @@ func (c *Controller) Reconcile(ctx context.Context, pod *corev1.Pod) (reconcile.
 	return reconcile.Result{}, nil
 }
 
+var controllerMetric = metrics.Value{
+	Name: "nodeclaim.podevents",
+	Help: "Stamps a NodeClaim with the time of its latest pod bind, terminal, or terminating event.",
+}
+
 func (c *Controller) Name() string {
-	return "nodeclaim.podevents"
+	return controllerMetric.Name
 }
 
 func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
