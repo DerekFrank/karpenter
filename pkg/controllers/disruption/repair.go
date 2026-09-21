@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -31,9 +32,11 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
+	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
+	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
 // agingConstant (τ) is the time a node must wait past its toleration to earn one rank tier of standing. It sets the
@@ -128,16 +131,37 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 		if _, cond := r.matchRepairPolicy(candidate.Node); cond != nil {
 			candidate.RepairCondition = cond.Type
 		}
-		// Terminate-first (RFC #3203) is behind the TerminateFirstRepair feature gate. A static NodePool runs a fixed
-		// replica count, so it can never pre-spin a replacement — a pre-spun node would be an (N+1)th the operator capped
-		// out. Free the slot first and let reactive provisioning refill it. Mirrors StaticDrift; reads static
-		// configuration, never launch outcomes.
 		terminateFirstEnabled := options.FromContext(ctx).FeatureGates.TerminateFirstRepair
-		if terminateFirstEnabled && candidate.OwnedByStaticNodePool() {
+
+		// Static NodePools run a fixed replica count and aren't reactively scheduled, so repair can't SimulateScheduling
+		// a replacement for them — it mirrors StaticDrift instead. Below the pool's node limit it has room to grow, so it
+		// stages a synthetic replacement from the template (replace-first). At the limit it can't pre-spin without
+		// bursting past the cap, so — when TerminateFirstRepair is on — it terminates first and lets static provisioning
+		// refill the freed slot; with the gate off there's nothing it can safely do this pass.
+		if candidate.OwnedByStaticNodePool() {
+			np := candidate.NodePool
+			limit, ok := np.Spec.Limits[resources.Node]
+			nodeLimit := lo.Ternary(ok, limit.Value(), int64(math.MaxInt64))
+			if r.cluster.NodePoolState.ReserveNodeCount(np.Name, nodeLimit, 1) == 0 {
+				// At the node limit — no room to stage a replacement.
+				if !terminateFirstEnabled {
+					r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, "static NodePool is at its node limit and terminate-first repair is disabled")...)
+					continue
+				}
+				return []Command{{
+					Candidates:          []*Candidate{candidate},
+					PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+					TerminateFirst:      true,
+				}}, nil
+			}
+			// Below the limit — stage a synthetic replacement from the template (replace-then-terminate).
+			nct := scheduling.NewNodeClaimTemplate(np)
+			result := scheduling.Results{NewNodeClaims: []*scheduling.NodeClaim{{NodeClaimTemplate: *nct}}}
 			return []Command{{
 				Candidates:          []*Candidate{candidate},
+				Replacements:        replacementsFromNodeClaims(result.NewNodeClaims...),
+				Results:             result,
 				PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
-				TerminateFirst:      true,
 			}}, nil
 		}
 		// Simulate rescheduling the candidate's pods. When they can't be pre-spun elsewhere and the candidate holds a

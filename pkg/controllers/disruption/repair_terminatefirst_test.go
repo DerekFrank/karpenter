@@ -17,6 +17,7 @@ limitations under the License.
 package disruption_test
 
 import (
+	"strconv"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -34,6 +35,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
+	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
 // These tests exercise Terminate-First Disruption for repair (F2 / RFC #3203): a capacity-constrained NodePool has no
@@ -63,10 +65,19 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			disruption.WithMethods(disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue))))
 	})
 
-	// INV-F2-1: a static NodePool (fixed replica count) has no room to grow, so repair terminates first — the command
-	// is delete-only (no pre-spun replacement).
-	It("should issue a delete-only command for a capacity-constrained (static) NodePool", func() {
-		nodePool := test.StaticNodePool(v1.NodePool{Spec: v1.NodePoolSpec{Replicas: lo.ToPtr(int64(1))}})
+	// staticNodePoolAtLimit builds a static NodePool whose node limit equals its replica count, so it is at its limit and
+	// cannot stage a replacement without bursting.
+	staticNodePoolAtLimit := func(replicas int64) *v1.NodePool {
+		return test.StaticNodePool(v1.NodePool{Spec: v1.NodePoolSpec{
+			Replicas: lo.ToPtr(replicas),
+			Limits:   v1.Limits{resources.Node: resource.MustParse(strconv.FormatInt(replicas, 10))},
+		}})
+	}
+
+	// INV-F2-1: a static NodePool at its node limit has no room to grow, so repair terminates first — the command is
+	// delete-only (no pre-spun replacement).
+	It("should issue a delete-only command for a static NodePool at its node limit", func() {
+		nodePool := staticNodePoolAtLimit(1)
 		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
 		}})
@@ -81,6 +92,47 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		Expect(cmds).To(HaveLen(1))
 		Expect(cmds[0].Decision()).To(Equal(disruption.TerminateFirstDecision))
 		Expect(cmds[0].Replacements).To(HaveLen(0))
+	})
+
+	// A static NodePool BELOW its node limit has room to stage a replacement, so repair replaces-first (a synthetic
+	// replacement from the template) rather than terminating first — even with the gate on.
+	It("should replace-first for a static NodePool below its node limit", func() {
+		nodePool := test.StaticNodePool(v1.NodePool{Spec: v1.NodePoolSpec{
+			Replicas: lo.ToPtr(int64(1)),
+			Limits:   v1.Limits{resources.Node: resource.MustParse("2")}, // room for one more node
+		}})
+		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
+		}})
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		markUnhealthy(node)
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+
+		cmds := queue.GetCommands()
+		Expect(cmds).To(HaveLen(1))
+		Expect(cmds[0].Decision()).To(Equal(disruption.ReplaceDecision))
+		Expect(cmds[0].Replacements).To(HaveLen(1))
+	})
+
+	// Gate off: a static NodePool at its limit is NOT terminate-first'd. It also can't pre-spin (at the limit), so it is
+	// Blocked (no command) rather than freed — the feature gate is honored for the static path.
+	It("does not terminate-first a static NodePool at its limit when TerminateFirstRepair is disabled", func() {
+		ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeRepair: lo.ToPtr(true), TerminateFirstRepair: lo.ToPtr(false)}}))
+		nodePool := staticNodePoolAtLimit(1)
+		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
+		}})
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		markUnhealthy(node)
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+
+		Expect(queue.GetCommands()).To(HaveLen(0))
 	})
 
 	// Terminate-first is behind the TerminateFirstRepair gate: with it off, a reserved candidate whose reservation is
@@ -170,7 +222,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 	// two eligible candidates repair still returns a single terminate-first command.
 	It("should still pace terminate-first (one command per pass)", func() {
 		const count = 10
-		nodePool := test.StaticNodePool(v1.NodePool{Spec: v1.NodePoolSpec{Replicas: lo.ToPtr(int64(count))}})
+		nodePool := staticNodePoolAtLimit(count) // at limit -> terminate-first
 		nodeClaims, nodes := test.NodeClaimsAndNodes(count, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
 		}})
