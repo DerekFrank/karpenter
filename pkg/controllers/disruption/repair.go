@@ -93,6 +93,8 @@ func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 
 // ComputeCommands orders eligible candidates by the repair score and returns one replace-then-terminate command for the
 // highest-scoring candidate whose NodePool has budget. Only one command per pass, mirroring drift.
+//
+//nolint:gocyclo
 func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
 	ranks := r.ranks
 	sort.SliceStable(candidates, func(i, j int) bool {
