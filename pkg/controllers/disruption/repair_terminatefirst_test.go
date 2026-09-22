@@ -298,5 +298,10 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		Expect(cmds).To(HaveLen(1))
 		Expect(cmds[0].Decision()).To(Equal(disruption.TerminateFirstDecision))
 		Expect(cmds[0].Replacements).To(HaveLen(0))
+		// The delete-only command must carry the pass-2 (credit-back) Results — that's what nominates the existing
+		// (freed) node for the reschedulable pod; dropping it or returning pass-1 Results would lose that nomination.
+		Expect(cmds[0].Results.NewNodeClaims).To(HaveLen(1))
+		Expect(cmds[0].Results.NewNodeClaims[0].Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeReserved)).To(BeTrue())
+		Expect(cmds[0].Results.NewNodeClaims[0].Requirements.Get(cloudprovider.ReservationIDLabel).Has(reservationID)).To(BeTrue())
 	})
 })
