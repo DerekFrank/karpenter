@@ -17,7 +17,6 @@ limitations under the License.
 package integration_test
 
 import (
-	"regexp"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -29,6 +28,7 @@ import (
 	kwokcloudprovider "sigs.k8s.io/karpenter/kwok/cloudprovider"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/test"
+	"sigs.k8s.io/karpenter/test/pkg/environment/common"
 )
 
 // These tests exercise node repair (voluntary disruption of unhealthy nodes) and the budgeted-breaker safeguard, using
@@ -70,7 +70,7 @@ var _ = Describe("Repair", Ordered, func() {
 				originalFeatureGates = e.Value
 			}
 		}
-		env.ExpectSettingsOverridden(corev1.EnvVar{Name: "FEATURE_GATES", Value: withNodeRepairGate(originalFeatureGates, true)})
+		env.ExpectSettingsOverridden(corev1.EnvVar{Name: "FEATURE_GATES", Value: common.WithFeatureGate(originalFeatureGates, "NodeRepair", true)})
 	})
 	AfterAll(func() {
 		env.ExpectSettingsOverridden(corev1.EnvVar{Name: "FEATURE_GATES", Value: originalFeatureGates})
@@ -134,10 +134,11 @@ var _ = Describe("Repair", Ordered, func() {
 		env.EventuallyExpectHealthyPodCount(selector, 5)
 		nodes := env.EventuallyExpectNodeCount("==", 5)
 
-		// Trip the breaker (2/5 unhealthy) -> frozen.
+		// Trip the breaker (2/5 unhealthy) -> frozen. Hold past the RepairPolicy TolerationDuration (30s) so this proves
+		// the breaker is what freezes repair, not the toleration window.
 		injectFault(nodes[0])
 		injectFault(nodes[1])
-		env.ConsistentlyExpectNoDisruptions(5, 30*time.Second)
+		env.ConsistentlyExpectNoDisruptions(5, 1*time.Minute)
 
 		// Heal one node -> 1/5 unhealthy is under the threshold -> the breaker resets and the remaining unhealthy node is repaired.
 		clearFault(nodes[0])
@@ -173,6 +174,30 @@ var _ = Describe("Repair", Ordered, func() {
 		env.EventuallyExpectNodeCount("==", 5)
 		env.EventuallyExpectHealthyPodCount(selector, 5)
 	})
+
+	It("does not repair a node carrying the do-not-repair annotation", func() {
+		// do-not-repair is the operator escape hatch. A faulted node under the breaker threshold would normally be
+		// repaired; the annotation must veto it so the node is never disrupted.
+		appLabels := map[string]string{"app": "repair-veto"}
+		dep := test.Deployment(test.DeploymentOptions{
+			Replicas: 5,
+			PodOptions: test.PodOptions{
+				ObjectMeta:          metav1.ObjectMeta{Labels: appLabels},
+				PodAntiRequirements: hostnameAntiAffinity(appLabels),
+			},
+		})
+		selector := labels.SelectorFromSet(appLabels)
+		env.ExpectCreated(nodeClass, nodePool, dep)
+		env.EventuallyExpectHealthyPodCount(selector, 5)
+		nodes := env.EventuallyExpectNodeCount("==", 5)
+
+		// Veto repair on the node that will be faulted (repair reads the registered node's annotations).
+		nodes[0].Annotations = lo.Assign(nodes[0].Annotations, map[string]string{v1.DoNotRepairAnnotationKey: "true"})
+		env.ExpectUpdated(nodes[0])
+		injectFault(nodes[0]) // 1/5 unhealthy (under the breaker) — would be repaired, but do-not-repair vetoes it.
+		env.ConsistentlyExpectNoDisruptions(5, 1*time.Minute)
+		env.ExpectExists(nodes[0])
+	})
 })
 
 // hostnameAntiAffinity forces each pod carrying the given labels onto its own node.
@@ -181,21 +206,4 @@ func hostnameAntiAffinity(matchLabels map[string]string) []corev1.PodAffinityTer
 		TopologyKey:   corev1.LabelHostname,
 		LabelSelector: &metav1.LabelSelector{MatchLabels: matchLabels},
 	}}
-}
-
-// withNodeRepairGate returns the FEATURE_GATES string with NodeRepair set to enabled, preserving all other gates.
-func withNodeRepairGate(gates string, enabled bool) string {
-	val := "NodeRepair=false"
-	if enabled {
-		val = "NodeRepair=true"
-	}
-	re := regexp.MustCompile(`NodeRepair=[a-zA-Z]+`)
-	switch {
-	case re.MatchString(gates):
-		return re.ReplaceAllString(gates, val)
-	case gates == "":
-		return val
-	default:
-		return gates + "," + val
-	}
 }
