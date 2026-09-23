@@ -135,6 +135,47 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		Expect(queue.GetCommands()).To(HaveLen(0))
 	})
 
+	// A static NodePool at its limit is only terminate-first'd if it's actually refillable: static provisioning refuses
+	// NotReady (or deleting) NodePools, so terminating first there would strand the workload. Repair must Block instead.
+	It("does not terminate-first a static NodePool at its limit when the NodePool is NotReady", func() {
+		nodePool := staticNodePoolAtLimit(1)
+		nodePool.StatusConditions().SetFalse(v1.ConditionTypeValidationSucceeded, "NotReady", "NotReady")
+		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
+		}})
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		markUnhealthy(node)
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+
+		Expect(queue.GetCommands()).To(HaveLen(0))
+	})
+
+	// Repair doesn't disrupt a static pool mid scale-down (mirrors StaticDrift): with more nodes running than the desired
+	// replica count, a staged replacement would just be deleted by deprovisioning, so repair issues no command.
+	It("does not disrupt a static NodePool that is scaling down", func() {
+		nodePool := test.StaticNodePool(v1.NodePool{Spec: v1.NodePoolSpec{
+			Replicas: lo.ToPtr(int64(1)),
+			Limits:   v1.Limits{resources.Node: resource.MustParse("3")}, // below limit, but over replicas
+		}})
+		nodeClaims, nodes := test.NodeClaimsAndNodes(2, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
+		}})
+		ExpectApplied(ctx, env.Client, nodePool)
+		for i := range nodes {
+			ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
+		}
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+		markUnhealthy(nodes[0]) // 2 running > 1 replica -> scaling down
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+
+		Expect(queue.GetCommands()).To(HaveLen(0))
+	})
+
 	// Terminate-first is behind the TerminateFirstRepair gate: with it off, a reserved candidate whose reservation is
 	// full is not terminate-first'd — repair falls back to its normal pre-spin, which can't stage a replacement here, so
 	// the node is Blocked (no command) rather than freed.

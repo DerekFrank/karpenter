@@ -142,12 +142,28 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 		// refill the freed slot; with the gate off there's nothing it can safely do this pass.
 		if candidate.OwnedByStaticNodePool() {
 			np := candidate.NodePool
+			active, _, pendingDisruption := r.cluster.NodePoolState.GetNodeCount(np.Name)
+
+			// Don't disrupt until scale-down is complete (mirrors StaticDrift): if the pool is already running more than
+			// its desired replicas, a staged replacement would be an extra node that the deprovisioning controller
+			// immediately deletes.
+			if int64(active+pendingDisruption) > lo.FromPtr(np.Spec.Replicas) {
+				continue
+			}
+
 			limit, ok := np.Spec.Limits[resources.Node]
 			nodeLimit := lo.Ternary(ok, limit.Value(), int64(math.MaxInt64))
-			if r.cluster.NodePoolState.ReserveNodeCount(np.Name, nodeLimit, 1) == 0 {
-				// At the node limit — no room to stage a replacement.
-				if !terminateFirstEnabled {
-					r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, "static NodePool is at its node limit and terminate-first repair is disabled")...)
+			// Read-only at-limit probe (GetNodeCount, not ReserveNodeCount): we must not hold a node-count reservation
+			// here — its only release path is provisioning.CreateNodeClaims, so a reservation would leak if the command
+			// fails before then. The below-limit replacement's slot is reserved/released by provisioning at create time.
+			if int64(active+pendingDisruption) >= nodeLimit {
+				// At the node limit — no room to stage a replacement, so it can only be freed by terminating first. Only
+				// do so when the pool is actually refillable: static provisioning refuses NotReady or deleting NodePools
+				// (see static/provisioning Reconcile), so terminating first there would strand the workload with no
+				// replacement. Otherwise there's nothing safe to do this pass.
+				refillable := np.StatusConditions().Root().IsTrue() && np.DeletionTimestamp.IsZero()
+				if !terminateFirstEnabled || !refillable {
+					r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, "static NodePool is at its node limit and cannot stage a replacement")...)
 					continue
 				}
 				return []Command{{
