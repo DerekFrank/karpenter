@@ -102,7 +102,6 @@ var _ = Describe("Repair", func() {
 	}
 
 	BeforeEach(func() {
-		// Enable the NodeRepair feature gate for the repair suite.
 		ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeRepair: lo.ToPtr(true)}}))
 		// Single default policy: BadNode/False, 30m toleration (the fake cloud provider default).
 		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
@@ -130,10 +129,8 @@ var _ = Describe("Repair", func() {
 		Expect(cmds[0].Decision()).To(Equal(disruption.ReplaceDecision))
 		Expect(cmds[0].Replacements).To(HaveLen(1))
 
-		// Before the replacement is healthy, the original is NOT terminated.
 		Expect(ExpectExists(ctx, env.Client, nodeClaim).DeletionTimestamp.IsZero()).To(BeTrue())
 
-		// Once the replacement comes up healthy, the original is terminated.
 		ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
 		ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
 		ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
