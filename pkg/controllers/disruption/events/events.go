@@ -30,8 +30,7 @@ import (
 
 // NodeRepairBlocked warns that node repair is being withheld from a node (e.g. the circuit breaker tripped because too
 // much of the NodePool is unhealthy). It is a Warning so it surfaces during one-off debugging of "why isn't this node
-// being repaired?"; it is NOT a monitoring signal — alerting/dashboards should be built on repair metrics, not on this
-// event (events are best-effort and deduplicated). Any monitoring guidance should point at a metric instead.
+// being repaired?"
 func NodeRepairBlocked(node *corev1.Node, nodeClaim *v1.NodeClaim, nodePool *v1.NodePool, msg string) []events.Event {
 	// One event per involved object (node, NodeClaim, NodePool) so each surfaces the block on its own timeline —
 	// not three identical events on the node.
