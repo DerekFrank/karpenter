@@ -236,6 +236,12 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 		// A candidate may carry an explicit drain bound (repair sets one). Stamp the absolute termination deadline HERE,
 		// at actual deletion time, so replace-then-terminate latency doesn't erode the grace window. The lifecycle
 		// controller no-ops if the annotation already exists, so this candidate-level bound wins over the NodeClaim's TGP.
+		// TODO(kubernetes-sigs/karpenter#3029): self-stamping an absolute deadline separately from the deletion timestamp
+		// is an interim mechanism with two known gaps to resolve once the termination flow has a formal contract:
+		// (1) the deadline is absolute, so termination-controller processing delay eats into the drain (TGP is really a
+		// minimum drain time); and (2) it is not atomic with the delete — a crash between this patch and the delete can
+		// leave a stale timestamp. The right fix is a deletion-anchored deadline (DeletionTimestamp + TGP) owned by the
+		// termination contract.
 		if tgp := cmd.Candidates[i].TerminationGracePeriod; tgp != nil {
 			nc := cmd.Candidates[i].NodeClaim
 			stored := nc.DeepCopy()
