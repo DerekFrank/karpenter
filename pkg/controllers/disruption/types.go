@@ -178,24 +178,23 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 	if queue.HasAny(node.ProviderID()) {
 		return nil, fmt.Errorf("candidate is already being disrupted")
 	}
-	if err = node.ValidateNodeDisruptable(clk); err != nil {
-		// Repair is voluntary but is NOT discretionary: a node carrying do-not-disrupt must still be repairable,
-		// since do-not-disrupt was never meant to strand a broken node (repair honors do-not-repair instead).
-		// So for the repair class we ignore the do-not-disrupt block here; all other block reasons still apply.
-		if disruptionClass == RepairDisruptionClass {
-			err = state.IgnoreNodeDoNotDisruptError(err)
+	err = node.ValidateNodeDisruptable(clk)
+	// Repair is voluntary but is NOT discretionary: a node carrying do-not-disrupt must still be repairable, since
+	// do-not-disrupt was never meant to strand a broken node (repair honors do-not-repair instead). So for the repair
+	// class we ignore the do-not-disrupt block; all other block reasons still apply. (Ignoring is a no-op on a nil err.)
+	if disruptionClass == RepairDisruptionClass {
+		err = state.IgnoreNodeDoNotDisruptError(err)
+	}
+	if err != nil {
+		// Only emit an event if the NodeClaim is not nil, ensuring that we only emit events for Karpenter-managed nodes
+		if node.NodeClaim != nil {
+			recorder.Publish(disruptionevents.Blocked(node.Node, node.NodeClaim, pretty.Sentence(err.Error()))...)
 		}
-		if err != nil {
-			// Only emit an event if the NodeClaim is not nil, ensuring that we only emit events for Karpenter-managed nodes
-			if node.NodeClaim != nil {
-				recorder.Publish(disruptionevents.Blocked(node.Node, node.NodeClaim, pretty.Sentence(err.Error()))...)
-			}
-			err = fmt.Errorf("validating node for disruption, %w", err)
-			if node.Node == nil || !node.Registered() {
-				return nil, serrors.Wrap(err, "NodeClaim", klog.KObj(node.NodeClaim))
-			}
-			return nil, serrors.Wrap(err, "Node", klog.KObj(node.Node))
+		err = fmt.Errorf("validating node for disruption, %w", err)
+		if node.Node == nil || !node.Registered() {
+			return nil, serrors.Wrap(err, "NodeClaim", klog.KObj(node.NodeClaim))
 		}
+		return nil, serrors.Wrap(err, "Node", klog.KObj(node.Node))
 	}
 	// We know that the node will have the label key because of the node.IsDisruptable check above
 	nodePoolName := node.Labels()[v1.NodePoolLabelKey]

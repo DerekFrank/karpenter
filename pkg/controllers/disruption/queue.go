@@ -277,11 +277,19 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 		// Repair records the eligible condition on the candidate; emit the per-condition/per-image unhealthy-disrupted
 		// metric here (at actual termination), not at command production, so an abandoned command doesn't over-count.
 		if cond := cmd.Candidates[i].RepairCondition; cond != "" {
+			// Termination mode reflects the drain bound repair actually applied (candidate.TerminationGracePeriod),
+			// not the NodeClaim's own Spec.TGP — a forceful (0) or bounded policy overrides it. nil means repair
+			// inherited the NodeClaim's mode.
+			mode := nodeclaimutils.DisruptionTerminationMode(cmd.Candidates[i].NodeClaim)
+			if tgp := cmd.Candidates[i].TerminationGracePeriod; tgp != nil {
+				mode = lo.Ternary(*tgp <= 0, metrics.TerminationModeForceful, metrics.TerminationModeEventual)
+			}
 			NodeClaimsUnhealthyDisruptedTotal.Inc(map[string]string{
-				conditionLabel:            pretty.ToSnakeCase(string(cond)),
-				metrics.NodePoolLabel:     cmd.Candidates[i].NodeClaim.Labels[v1.NodePoolLabelKey],
-				metrics.CapacityTypeLabel: cmd.Candidates[i].NodeClaim.Labels[v1.CapacityTypeLabelKey],
-				imageIDLabel:              cmd.Candidates[i].NodeClaim.Status.ImageID,
+				conditionLabel:               pretty.ToSnakeCase(string(cond)),
+				metrics.NodePoolLabel:        cmd.Candidates[i].NodeClaim.Labels[v1.NodePoolLabelKey],
+				metrics.CapacityTypeLabel:    cmd.Candidates[i].NodeClaim.Labels[v1.CapacityTypeLabelKey],
+				imageIDLabel:                 cmd.Candidates[i].NodeClaim.Status.ImageID,
+				metrics.TerminationModeLabel: mode,
 			})
 		}
 	})

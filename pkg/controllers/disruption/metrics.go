@@ -236,9 +236,9 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: metrics.NodeClaimSubsystem,
 			Name:      "unhealthy_disrupted_total",
-			Help:      "Number of unhealthy nodeclaims disrupted in total by node repair. Labeled by the condition the node was disrupted on, the owning nodepool, the capacity type, and the image ID.",
+			Help:      "Number of unhealthy nodeclaims disrupted in total by node repair. Labeled by the condition the node was disrupted on, the owning nodepool, the capacity type, the image ID, and the termination mode.",
 		},
-		[]opmetrics.Label{RepairCondition, metrics.NodePool, metrics.CapacityType, ImageID},
+		[]opmetrics.Label{RepairCondition, metrics.NodePool, metrics.CapacityType, ImageID, metrics.TerminationMode},
 		opmetrics.Alpha,
 	)
 )

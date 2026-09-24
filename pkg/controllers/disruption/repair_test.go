@@ -431,12 +431,14 @@ var _ = Describe("Repair", func() {
 		// HighPriority governs the action: its 5m TGP is stamped (not LowPriority's 15m)...
 		Expect(ExpectExists(ctx, env.Client, nodeClaim).Annotations).To(
 			HaveKeyWithValue(v1.NodeClaimTerminationTimestampAnnotationKey, env.Clock.Now().Add(5*time.Minute).Format(time.RFC3339)))
-		// ...and the metric is emitted once at termination, labeled by the HighPriority condition and the node's image.
+		// ...and the metric is emitted once at termination, labeled by the HighPriority condition, the node's image, and
+		// the termination mode derived from the applied bound (5m > 0 -> eventual; NOT the NodeClaim's nil Spec.TGP).
 		ExpectMetricCounterValue(disruption.NodeClaimsUnhealthyDisruptedTotal, 1, map[string]string{
 			disruption.RepairCondition.Name: "high_priority",
 			metrics.NodePoolLabel:           nodePool.Name,
 			metrics.CapacityTypeLabel:       v1.CapacityTypeOnDemand,
 			disruption.ImageID.Name:         "ami-test-1234",
+			metrics.TerminationModeLabel:    metrics.TerminationModeEventual,
 		})
 	})
 
