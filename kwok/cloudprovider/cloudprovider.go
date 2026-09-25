@@ -157,6 +157,9 @@ func (c CloudProvider) GetSupportedNodeClasses() []status.Object {
 	return []status.Object{&v1alpha1.KWOKNodeClass{}}
 }
 
+// KWOKUnhealthyCondition is injected by terminate-first repair e2e tests.
+const KWOKUnhealthyCondition corev1.NodeConditionType = "KWOKUnhealthy"
+
 func (c CloudProvider) RepairPolicies() []cloudprovider.RepairPolicy {
 	return []cloudprovider.RepairPolicy{
 		// Supported Kubelet Node Conditions
@@ -169,6 +172,11 @@ func (c CloudProvider) RepairPolicies() []cloudprovider.RepairPolicy {
 			ConditionType:      corev1.NodeReady,
 			ConditionStatus:    corev1.ConditionUnknown,
 			TolerationDuration: 10 * time.Minute,
+		},
+		{
+			ConditionType:      KWOKUnhealthyCondition,
+			ConditionStatus:    corev1.ConditionTrue,
+			TolerationDuration: 30 * time.Second,
 		},
 	}
 }
