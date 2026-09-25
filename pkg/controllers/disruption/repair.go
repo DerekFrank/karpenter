@@ -153,10 +153,15 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 
 			limit, ok := np.Spec.Limits[resources.Node]
 			nodeLimit := lo.Ternary(ok, limit.Value(), int64(math.MaxInt64))
-			// Read-only at-limit probe (GetNodeCount, not ReserveNodeCount): we must not hold a node-count reservation
-			// here — its only release path is provisioning.CreateNodeClaims, so a reservation would leak if the command
-			// fails before then. The below-limit replacement's slot is reserved/released by provisioning at create time.
-			if int64(active+pendingDisruption) >= nodeLimit {
+			// Decide headroom with the NodePool's atomic reservation accounting (mirrors StaticDrift). ReserveNodeCount
+			// subtracts active + deleting + pending-disruption + already-reserved counts, so it won't over-provision past
+			// limits.nodes even with deleting nodes present or in-flight commands racing — a plain node count ignores the
+			// deleting and reserved counts and can exceed the limit (e.g. replicas=10, limit=11, 10 active + 1 deleting:
+			// a naive count sees 10 and would stage a 12th NodeClaim). It reserves only when a slot is free: 0 => at the
+			// limit, and crucially nothing was reserved, so the delete-only path below leaks no reservation; >0 => below
+			// the limit, and the reserved slot is consumed by the replacement staged below (released by provisioning at
+			// CreateNodeClaims).
+			if r.cluster.NodePoolState.ReserveNodeCount(np.Name, nodeLimit, 1) == 0 {
 				// At the node limit — no room to stage a replacement, so it can only be freed by terminating first. Only
 				// do so when the pool is actually refillable: static provisioning refuses NotReady or deleting NodePools
 				// (see static/provisioning Reconcile), so terminating first there would strand the workload with no

@@ -117,6 +117,34 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		Expect(cmds[0].Replacements).To(HaveLen(1))
 	})
 
+	// Headroom must be judged with the NodePool's atomic reservation accounting, not a naive node count: outstanding
+	// reservations (an in-flight replacement) and deleting nodes count against limits.nodes. Here replicas=1, limit=2,
+	// one active node, and one slot already reserved — the pool is effectively at its limit, so repair must terminate
+	// first rather than stage a replacement that would push it past the limit.
+	It("does not stage a replacement past limits.nodes when a slot is already reserved", func() {
+		nodePool := test.StaticNodePool(v1.NodePool{Spec: v1.NodePoolSpec{
+			Replicas: lo.ToPtr(int64(1)),
+			Limits:   v1.Limits{resources.Node: resource.MustParse("2")},
+		}})
+		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
+		}})
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		// Simulate an outstanding reservation (an in-flight replacement from another command) consuming the only spare
+		// slot under the limit. A naive active-node count (1 < 2) would wrongly see headroom and replace-first.
+		Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(BeEquivalentTo(int64(1)))
+		markUnhealthy(node)
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+
+		cmds := queue.GetCommands()
+		Expect(cmds).To(HaveLen(1))
+		Expect(cmds[0].Decision()).To(Equal(disruption.TerminateFirstDecision))
+		Expect(cmds[0].Replacements).To(HaveLen(0))
+	})
+
 	// Gate off: a static NodePool at its limit is NOT terminate-first'd. It also can't pre-spin (at the limit), so it is
 	// Blocked (no command) rather than freed — the feature gate is honored for the static path.
 	It("does not terminate-first a static NodePool at its limit when TerminateFirstRepair is disabled", func() {
