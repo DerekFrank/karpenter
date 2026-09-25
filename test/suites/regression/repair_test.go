@@ -36,7 +36,7 @@ import (
 // that stock KWOK's node lifecycle does not manage, so an injected fault HOLDS while the node stays Ready=True — see
 // kwok/cloudprovider/cloudprovider.go and hack/kwok/stages/node-heartbeat-with-lease.yaml. Node repair is behind the
 // NodeRepair feature gate (off by default), enabled for this suite in BeforeAll and restored in AfterAll.
-var _ = Describe("Repair", Ordered, func() {
+var _ = Describe("Repair", Ordered, ContinueOnFailure, func() {
 	var originalFeatureGates string
 
 	// injectFault stamps the durable, KWOK-unmanaged repair-eligible condition on a node. The node-heartbeat-with-lease
@@ -63,6 +63,11 @@ var _ = Describe("Repair", Ordered, func() {
 	}
 
 	BeforeAll(func() {
+		// These specs drive repair via the KWOK-only KWOKUnhealthy condition, which other providers do not recognize;
+		// skip on non-KWOK providers rather than time out or pass vacuously.
+		if !env.IsDefaultNodeClassKWOK() {
+			Skip("node repair regression specs require the KWOK provider (they inject the KWOKUnhealthy condition)")
+		}
 		// Node repair is gated by the NodeRepair feature gate (default false). Flip it on without disturbing the other
 		// gates the controller was deployed with, and restart karpenter. Restored in AfterAll.
 		for _, e := range env.ExpectSettings() {
@@ -73,10 +78,13 @@ var _ = Describe("Repair", Ordered, func() {
 		env.ExpectSettingsOverridden(corev1.EnvVar{Name: "FEATURE_GATES", Value: common.WithFeatureGate(originalFeatureGates, "NodeRepair", true)})
 	})
 	AfterAll(func() {
+		if !env.IsDefaultNodeClassKWOK() {
+			return
+		}
 		env.ExpectSettingsOverridden(corev1.EnvVar{Name: "FEATURE_GATES", Value: originalFeatureGates})
 	})
 
-	It("repairs an isolated unhealthy node (replace-then-terminate)", func() {
+	It("repairs an isolated unhealthy node", func() {
 		appLabels := map[string]string{"app": "repair-isolated"}
 		dep := test.Deployment(test.DeploymentOptions{
 			Replicas: 5,
@@ -90,10 +98,37 @@ var _ = Describe("Repair", Ordered, func() {
 		env.EventuallyExpectHealthyPodCount(selector, 5)
 		nodes := env.EventuallyExpectNodeCount("==", 5)
 
-		// 1 of 5 unhealthy (20%) is at/under the breaker threshold (trips only when unhealthy > ceil(20%)=1), so repair proceeds.
+		// 1 of 5 unhealthy (20%) is at/under the breaker threshold (trips only when unhealthy > ceil(20%)=1), so repair
+		// proceeds. This asserts the fault is eventually resolved and the workload recovers; the replace-before-terminate
+		// ordering is proven separately below.
 		injectFault(nodes[0])
-		env.EventuallyExpectNotFound(nodes[0]) // original node is replaced
-		env.EventuallyExpectNodeCount("==", 5) // replacement brings the pool back
+		env.EventuallyExpectNotFound(nodes[0]) // unhealthy node removed
+		env.EventuallyExpectNodeCount("==", 5) // pool restored
+		env.EventuallyExpectHealthyPodCount(selector, 5)
+	})
+
+	It("repairs replace-first: a healthy replacement joins before the unhealthy node is removed", func() {
+		// Replace-then-terminate: repair brings up a replacement and only removes the original once the replacement is
+		// Initialized, so the pool transiently reaches 6 nodes. A delete-first implementation would drop to 4 first and
+		// never reach 6. A modest pod grace keeps the original terminating long enough to observe the overlap.
+		appLabels := map[string]string{"app": "repair-replace-first"}
+		dep := test.Deployment(test.DeploymentOptions{
+			Replicas: 5,
+			PodOptions: test.PodOptions{
+				ObjectMeta:                    metav1.ObjectMeta{Labels: appLabels},
+				PodAntiRequirements:           hostnameAntiAffinity(appLabels),
+				TerminationGracePeriodSeconds: lo.ToPtr(int64(30)),
+			},
+		})
+		selector := labels.SelectorFromSet(appLabels)
+		env.ExpectCreated(nodeClass, nodePool, dep)
+		env.EventuallyExpectHealthyPodCount(selector, 5)
+		nodes := env.EventuallyExpectNodeCount("==", 5)
+
+		injectFault(nodes[0])                  // 1 of 5 unhealthy (under the breaker threshold)
+		env.EventuallyExpectNodeCount("==", 6) // replacement is up while the original is still terminating (replace-first)
+		env.EventuallyExpectNotFound(nodes[0]) // original removed only after the replacement joined
+		env.EventuallyExpectNodeCount("==", 5)
 		env.EventuallyExpectHealthyPodCount(selector, 5)
 	})
 
@@ -147,11 +182,13 @@ var _ = Describe("Repair", Ordered, func() {
 		env.EventuallyExpectHealthyPodCount(selector, 5)
 	})
 
-	It("force-terminates a drain-blocked unhealthy node past the RepairPolicy termination grace period", func() {
-		// Every pod carries do-not-disrupt, so the faulted node's drain is blocked by an un-evictable pod. Node repair is
-		// non-discretionary (it ignores do-not-disrupt and PDBs; only the do-not-repair annotation vetoes it), so the node
-		// is force-terminated once the RepairPolicy TGP elapses. Use a 5-node pool and fault only one (20%, under the
-		// breaker threshold) so repair actually runs — a single-node pool would read 100% unhealthy and trip the breaker.
+	It("force-terminates a drain-blocked unhealthy node", func() {
+		// Node repair is non-discretionary: it ignores do-not-disrupt and PDBs (only the do-not-repair annotation vetoes
+		// it). Every pod carries do-not-disrupt with a large grace, so graceful eviction cannot complete — the node can
+		// only leave by a FORCE-termination once repair's drain bound (the RepairPolicy TGP) elapses. Fault only 1 of 5
+		// (under the breaker threshold) so repair runs; a single-node pool would read 100% unhealthy and trip the breaker.
+		// (This asserts the force behavior, not an exact TGP duration: on KWOK node removal is near-instant once the
+		// force-delete is issued, so the elapsed time isn't a reliable signal.)
 		appLabels := map[string]string{"app": "repair-drain"}
 		dep := test.Deployment(test.DeploymentOptions{
 			Replicas: 5,
@@ -160,7 +197,8 @@ var _ = Describe("Repair", Ordered, func() {
 					Labels:      appLabels,
 					Annotations: map[string]string{v1.DoNotDisruptAnnotationKey: "true"},
 				},
-				PodAntiRequirements: hostnameAntiAffinity(appLabels),
+				PodAntiRequirements:           hostnameAntiAffinity(appLabels),
+				TerminationGracePeriodSeconds: lo.ToPtr(int64(300)), // graceful eviction can't finish → removal must be a force
 			},
 		})
 		selector := labels.SelectorFromSet(appLabels)
@@ -169,8 +207,8 @@ var _ = Describe("Repair", Ordered, func() {
 		nodes := env.EventuallyExpectNodeCount("==", 5)
 
 		injectFault(nodes[0])
-		// Repair forces past the blocking do-not-disrupt pod once the policy TGP (45s) after the toleration (30s) elapses.
-		env.EventuallyExpectNotFound(nodes[0])
+		env.EventuallyExpectTaintedNodeCount("==", 1) // repair decided to terminate it despite the blocking pod
+		env.EventuallyExpectNotFound(nodes[0])        // force-terminated despite the un-evictable do-not-disrupt pod
 		env.EventuallyExpectNodeCount("==", 5)
 		env.EventuallyExpectHealthyPodCount(selector, 5)
 	})
