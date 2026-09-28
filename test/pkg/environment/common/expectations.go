@@ -327,6 +327,28 @@ func (env *Environment) ExpectSettings() (res []corev1.EnvVar) {
 	})
 }
 
+// WithFeatureGate returns the FEATURE_GATES value string with the named gate set to enabled, preserving every other gate
+// already present. Use it with ExpectSettings/ExpectSettingsOverridden to flip a single gate for a suite without
+// clobbering the gates the controller was deployed with.
+func WithFeatureGate(featureGates, gate string, enabled bool) string {
+	entry := fmt.Sprintf("%s=%t", gate, enabled)
+	if featureGates == "" {
+		return entry
+	}
+	parts := strings.Split(featureGates, ",")
+	found := false
+	for i, p := range parts {
+		if k, _, ok := strings.Cut(strings.TrimSpace(p), "="); ok && k == gate {
+			parts[i] = entry
+			found = true
+		}
+	}
+	if !found {
+		parts = append(parts, entry)
+	}
+	return strings.Join(parts, ",")
+}
+
 func (env *Environment) ExpectSettingsReplaced(vars ...corev1.EnvVar) {
 	GinkgoHelper()
 
