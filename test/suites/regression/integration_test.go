@@ -429,6 +429,14 @@ var _ = Describe("Integration", func() {
 			var dep *appsv1.Deployment
 			var numPods int
 			var unhealthyCondition corev1.NodeCondition
+			// kwok resets the conditions of a node that isn't Ready, so label the node into a no-op stage
+			// (hack/kwok/stages/node-unhealthy.yaml) before injecting the condition to keep it in place.
+			expectUnhealthy := func(node *corev1.Node, cond corev1.NodeCondition) {
+				GinkgoHelper()
+				node.Labels["kwok.x-k8s.io/stage"] = "unhealthy"
+				env.ExpectUpdated(node)
+				env.ExpectStatusUpdated(env.ReplaceNodeConditions(node, cond))
+			}
 
 			BeforeEach(func() {
 				unhealthyCondition = corev1.NodeCondition{
@@ -460,8 +468,7 @@ var _ = Describe("Integration", func() {
 				node := env.ExpectCreatedNodeCount("==", 1)[0]
 				env.EventuallyExpectInitializedNodeCount("==", 1)
 
-				node = env.ReplaceNodeConditions(node, unhealthyCondition)
-				env.ExpectStatusUpdated(node)
+				expectUnhealthy(node, unhealthyCondition)
 
 				env.EventuallyExpectNotFound(pod, node)
 				env.EventuallyExpectHealthyPodCount(selector, numPods)
@@ -478,7 +485,7 @@ var _ = Describe("Integration", func() {
 					LastTransitionTime: metav1.Time{Time: time.Now().Add(-31 * time.Hour)},
 				}),
 			)
-			It("should ignore disruption budgets", func() {
+			It("should respect disruption budgets", func() {
 				nodePool.Spec.Disruption.Budgets = []v1.Budget{
 					{
 						Nodes: "0",
@@ -489,8 +496,17 @@ var _ = Describe("Integration", func() {
 				node := env.ExpectCreatedNodeCount("==", 1)[0]
 				env.EventuallyExpectInitializedNodeCount("==", 1)
 
-				node = env.ReplaceNodeConditions(node, unhealthyCondition)
-				env.ExpectStatusUpdated(node)
+				expectUnhealthy(node, unhealthyCondition)
+
+				env.ConsistentlyExpectNoDisruptions(1, time.Minute)
+
+				// Lifting the budget releases the repair, so it was the budget holding it back
+				nodePool.Spec.Disruption.Budgets = []v1.Budget{
+					{
+						Nodes: "100%",
+					},
+				}
+				env.ExpectUpdated(nodePool)
 
 				env.EventuallyExpectNotFound(pod, node)
 				env.EventuallyExpectHealthyPodCount(selector, numPods)
@@ -504,8 +520,7 @@ var _ = Describe("Integration", func() {
 				node.Annotations[v1.DoNotDisruptAnnotationKey] = "true"
 				env.ExpectUpdated(node)
 
-				node = env.ReplaceNodeConditions(node, unhealthyCondition)
-				env.ExpectStatusUpdated(node)
+				expectUnhealthy(node, unhealthyCondition)
 
 				env.EventuallyExpectNotFound(pod, node)
 				env.EventuallyExpectHealthyPodCount(selector, numPods)
@@ -517,8 +532,7 @@ var _ = Describe("Integration", func() {
 				node := env.ExpectCreatedNodeCount("==", 1)[0]
 				env.EventuallyExpectInitializedNodeCount("==", 1)
 
-				node = env.ReplaceNodeConditions(node, unhealthyCondition)
-				env.ExpectStatusUpdated(node)
+				expectUnhealthy(node, unhealthyCondition)
 
 				env.EventuallyExpectNotFound(pod, node)
 				env.EventuallyExpectHealthyPodCount(selector, numPods)

@@ -80,13 +80,13 @@ JUNIT_REPORT := $(if $(ARTIFACT_DIR), --ginkgo.junit-report="$(ARTIFACT_DIR)/jun
 e2etests: ## Run the e2e suite against your local cluster
 	cd test && go test \
 		-count 1 \
-		-timeout 2h \
+		-timeout 3h \
 		-v \
 		./suites/$(shell echo $(TEST_SUITE) | tr A-Z a-z)/... \
 		$(JUNIT_REPORT) \
 		--ginkgo.focus="${FOCUS}" \
 		--ginkgo.skip="${SKIP}" \
-		--ginkgo.timeout=2h \
+		--ginkgo.timeout=3h \
 		--ginkgo.grace-period=15m \
 		--ginkgo.vv
 
