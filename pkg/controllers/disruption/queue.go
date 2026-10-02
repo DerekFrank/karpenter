@@ -342,6 +342,17 @@ func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, 
 	return markedCandidates, multierr.Combine(errs...)
 }
 
+// unmarkPendingDisruption returns static candidates that markDisrupted marked pendingdisruption to active when the
+// command is abandoned before they are marked for deletion. NodeClaim updates don't clear pendingdisruption, so without
+// this the candidates would keep counting as pending disruption instead of running.
+func (q *Queue) unmarkPendingDisruption(candidates []*Candidate) {
+	for _, c := range candidates {
+		if c.OwnedByStaticNodePool() {
+			q.cluster.NodePoolState.MarkNodeClaimActive(c.NodePool.Name, c.NodeClaim.Name)
+		}
+	}
+}
+
 // createReplacementNodeClaims creates replacement NodeClaims
 func (q *Queue) createReplacementNodeClaims(ctx context.Context, cmd *Command) error {
 	nodeClaimNames, err := q.provisioner.CreateNodeClaims(ctx, lo.Map(cmd.Replacements, func(r *Replacement, _ int) *pscheduling.NodeClaim { return r.NodeClaim }), provisioning.WithReason(strings.ToLower(string(cmd.Reason()))))
@@ -394,6 +405,7 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	// If we get a failure marking some nodes as disrupted, if we are launching replacements, we shouldn't continue
 	// with disrupting the candidates. If it's just a delete operation, we can proceed
 	if markDisruptedErr != nil && (len(cmd.Replacements) > 0 || len(markedCandidates) == 0) {
+		q.unmarkPendingDisruption(markedCandidates)
 		return serrors.Wrap(fmt.Errorf("marking disrupted, %w", markDisruptedErr), "command-id", cmd.ID)
 	}
 
@@ -405,6 +417,7 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	if err := q.createReplacementNodeClaims(ctx, cmd); err != nil {
 		// If we failed to launch the replacement, don't disrupt.  If this is some permanent failure,
 		// we don't want to disrupt workloads with no way to provision new nodes for them.
+		q.unmarkPendingDisruption(cmd.Candidates)
 		return serrors.Wrap(fmt.Errorf("launching replacement nodeclaim, %w", err), "command-id", cmd.ID)
 	}
 	// IMPORTANT

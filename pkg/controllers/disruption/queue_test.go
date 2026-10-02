@@ -120,6 +120,31 @@ var _ = Describe("Queue", func() {
 			node1 = ExpectNodeExists(ctx, env.Client, node1.Name)
 			Expect(node1.Spec.Taints).To(ContainElement(v1.DisruptedNoScheduleTaint))
 		})
+		It("should return static candidates to running when their replacements fail to launch", func() {
+			nodePool.Spec.Replicas = new(int64(1))
+			nodePool.Spec.Limits = nil
+			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
+			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+
+			// The replacement's NodePool doesn't exist, so creating it fails after the candidate is marked disrupted
+			nct := scheduling.NewNodeClaimTemplate(test.NodePool())
+			nct.InstanceTypeOptions = append([]*cloudprovider.InstanceType{}, cloudProvider.InstanceTypes...)
+			cmd := &disruption.Command{
+				Method:            disruption.NewStaticDrift(cluster, prov, cloudProvider),
+				CreationTimestamp: env.Clock.Now(),
+				ID:                uuid.New(),
+				Results:           scheduling.Results{},
+				Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
+				Replacements:      []*disruption.Replacement{{NodeClaim: &scheduling.NodeClaim{NodeClaimTemplate: *nct}}},
+			}
+			Expect(queue.StartCommand(ctx, cmd)).ToNot(Succeed())
+
+			running, deleting, pendingDisruption := cluster.NodePoolState.GetNodeCount(nodePool.Name)
+			Expect(running).To(Equal(1))
+			Expect(deleting).To(Equal(0))
+			Expect(pendingDisruption).To(Equal(0))
+		})
 		It("should not return an error when handling commands before the timeout", func() {
 			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})

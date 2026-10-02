@@ -2742,6 +2742,75 @@ var _ = Describe("NodePoolState Tracking", func() {
 				Expect(deleting).To(Equal(0))
 				Expect(pendingdisruption).To(Equal(2))
 			})
+			It("should keep a NodeClaim pending disruption when the NodeClaim is updated", func() {
+				cluster.NodePoolState.MarkNodeClaimPendingDisruption(nodePool.Name, nodeClaim.Name)
+
+				// The disruption queue patches the DisruptionReason condition right before marking the candidate, so the
+				// resulting NodeClaim update can be processed after the mark
+				nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeDisruptionReason, string(v1.DisruptionReasonDrifted), string(v1.DisruptionReasonDrifted))
+				ExpectApplied(ctx, env.Client, nodeClaim)
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+
+				running, deleting, pendingdisruption := cluster.NodePoolState.GetNodeCount(nodePool.Name)
+				Expect(running).To(Equal(0))
+				Expect(deleting).To(Equal(0))
+				Expect(pendingdisruption).To(Equal(1))
+
+				cluster.MarkForDeletion(nodeClaim.Status.ProviderID)
+				running, deleting, pendingdisruption = cluster.NodePoolState.GetNodeCount(nodePool.Name)
+				Expect(running).To(Equal(0))
+				Expect(deleting).To(Equal(1))
+				Expect(pendingdisruption).To(Equal(0))
+			})
+			It("should return a NodeClaim pending disruption to running when it is unmarked", func() {
+				cluster.NodePoolState.MarkNodeClaimPendingDisruption(nodePool.Name, nodeClaim.Name)
+				cluster.UnmarkForDeletion(nodeClaim.Status.ProviderID)
+
+				running, deleting, pendingdisruption := cluster.NodePoolState.GetNodeCount(nodePool.Name)
+				Expect(running).To(Equal(1))
+				Expect(deleting).To(Equal(0))
+				Expect(pendingdisruption).To(Equal(0))
+			})
+			It("should keep tracking a NodeClaim pending disruption when the NodePool's other NodeClaims are deleted", func() {
+				nodeClaim2 := test.NodeClaim(v1.NodeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:   "test-nodeclaim-2",
+						Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name},
+					},
+					Status: v1.NodeClaimStatus{ProviderID: test.RandomProviderID()},
+				})
+				ExpectApplied(ctx, env.Client, nodeClaim2)
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim2))
+				cluster.NodePoolState.MarkNodeClaimPendingDisruption(nodePool.Name, nodeClaim.Name)
+
+				ExpectDeleted(ctx, env.Client, nodeClaim2)
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim2))
+
+				running, deleting, pendingdisruption := cluster.NodePoolState.GetNodeCount(nodePool.Name)
+				Expect(running).To(Equal(0))
+				Expect(deleting).To(Equal(0))
+				Expect(pendingdisruption).To(Equal(1))
+			})
+		})
+
+		Context("Mark NodeClaims after cleanup", func() {
+			It("should not track a NodeClaim that is marked after it was cleaned up", func() {
+				ExpectApplied(ctx, env.Client, nodeClaim)
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+				ExpectDeleted(ctx, env.Client, nodeClaim)
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+
+				// Static deprovisioning marks the NodeClaim Deleting after deleting it, which can land after Cleanup
+				cluster.NodePoolState.MarkNodeClaimDeleting(nodePool.Name, nodeClaim.Name)
+				cluster.NodePoolState.MarkNodeClaimPendingDisruption(nodePool.Name, nodeClaim.Name)
+				cluster.NodePoolState.MarkNodeClaimActive(nodePool.Name, nodeClaim.Name)
+
+				running, deleting, pendingdisruption := cluster.NodePoolState.GetNodeCount(nodePool.Name)
+				Expect(running).To(Equal(0))
+				Expect(deleting).To(Equal(0))
+				Expect(pendingdisruption).To(Equal(0))
+				Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 1, 1)).To(Equal(int64(1)))
+			})
 		})
 
 		Context("DeleteNodeClaim", func() {
