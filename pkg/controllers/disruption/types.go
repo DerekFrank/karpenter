@@ -252,6 +252,8 @@ type Command struct {
 	PoolDisruptionCosts map[string]float64
 	// TerminateFirst marks a delete-only terminate-first command (RFC #3203); Decision() surfaces it as TerminateFirstDecision.
 	TerminateFirst bool
+	// markedForDeletion holds the providerIDs of the candidates this command marked for deletion
+	markedForDeletion []string
 }
 
 // Reason returns the disruption reason for this command.

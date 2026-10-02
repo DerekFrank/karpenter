@@ -26,6 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/watch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 )
@@ -112,6 +113,11 @@ func (c *CacheSyncingClient) DeleteAllOf(ctx context.Context, obj client.Object,
 		return err == nil && len(metaList.Items) == 0, ctx.Err()
 	})
 	return nil
+}
+
+// Watch makes CacheSyncingClient a client.WithWatch, so a test can wrap it with controller-runtime's interceptor
+func (c *CacheSyncingClient) Watch(ctx context.Context, obj client.ObjectList, opts ...client.ListOption) (watch.Interface, error) {
+	return c.Client.(client.WithWatch).Watch(ctx, obj, opts...)
 }
 
 func (c *CacheSyncingClient) Status() client.StatusWriter {
