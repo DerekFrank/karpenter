@@ -65,19 +65,23 @@ docs generator turns them into per-dimension help and value tables.
   a const, never a magic string; a value that exists only as a metric value should
   be a first-class `metrics.Value` var that its emission site references by `.Name`.
 
-## Well Known Annotations
+## Well Known Labels and Annotations
 
-Karpenter's annotations are documented in code as
-`wellknown.Annotation{Name, Example, UsedOn, Help, Values, Stage, InternalOnly}` in
-`pkg/apis/v1/labels.go`, so a docs generator can render a reference page from them
+Karpenter's labels and annotations are documented in code as
+`wellknown.Label{Name, Example, UsedOn, Help, Values, Stage, Selectable, InternalOnly}` /
+`wellknown.Annotation{Name, Example, UsedOn, Help, Values, Stage, InternalOnly}`
+in `pkg/apis/v1/labels.go`, so a docs generator can render a reference page from them
 mirroring https://kubernetes.io/docs/reference/labels-annotations-taints/.
 
-- Describe every new annotation with a `wellknown.Annotation`, and add it to
+- Describe every new label with a `wellknown.Label` and add it to `KarpenterLabels`.
+  Set `Selectable` when users can use it in NodePool requirements or pod scheduling
+  constraints; `WellKnownLabels` is derived from the `Selectable` labels.
+- Describe every new annotation with a `wellknown.Annotation` and add it to
   `KarpenterAnnotations`.
-- Set `InternalOnly` when only Karpenter should ever set the annotation. Internal
-  only annotations are always `docs.Alpha`.
-- Enumerate the annotation's well known values as `docs.Value`s. A value's
-  `Name` comes from a const, never a magic string.
+- Set `InternalOnly` when only Karpenter should ever set the key, and users don't
+  select on it. Internal only keys are always `docs.Alpha`.
+- Enumerate the key's well known values as `docs.Value`s. A value's `Name` comes
+  from a const, never a magic string.
 
 ## Feature Gates
 
