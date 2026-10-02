@@ -170,7 +170,7 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 		})
 		stateNodes := lo.Map(cmd.Candidates, func(c *Candidate, _ int) *state.StateNode { return c.StateNode })
 		multiErr := multierr.Combine(err, state.RequireNoScheduleTaint(ctx, q.kubeClient, false, stateNodes...))
-		multiErr = multierr.Combine(multiErr, state.ClearNodeClaimsCondition(ctx, q.kubeClient, q.clock, v1.ConditionTypeDisruptionReason, stateNodes...))
+		multiErr = multierr.Combine(multiErr, clearDisruptionReason(ctx, q.kubeClient, q.clock, q.cluster, stateNodes...))
 		// Log the error
 		log.FromContext(ctx).Error(multiErr, "failed terminating nodes while executing a disruption command")
 	} else {
@@ -304,8 +304,9 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 	return multierr.Combine(errs...)
 }
 
-// markDisrupted taints the node and adds the Disrupted condition to the NodeClaim for a candidate that is about to be disrupted
-// For static NodeClaims, we mark NodeClaims as pendingdisruption in statenodepool
+// markDisrupted taints the node and adds the Disrupted condition to the NodeClaim for a candidate that is about to be disrupted.
+// NodePoolState observes each patched NodeClaim of a static NodePool, so it counts the candidate as pending disruption
+// before the informer sees the patch.
 func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, error) {
 	errs := make([]error, len(cmd.Candidates))
 	workqueue.ParallelizeUntil(ctx, len(cmd.Candidates), len(cmd.Candidates), func(i int) {
@@ -326,6 +327,7 @@ func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, 
 			errs[i] = client.IgnoreNotFound(err)
 			return
 		}
+		q.cluster.NodePoolState.ObserveIfTracked(nodeClaim)
 	})
 	var markedCandidates []*Candidate
 	for i := range errs {
@@ -333,11 +335,6 @@ func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, 
 			continue
 		}
 		markedCandidates = append(markedCandidates, cmd.Candidates[i])
-
-		// Mark all StaticNodeClaims as pendingdisruption in nodepoolstate
-		if cmd.Candidates[i].OwnedByStaticNodePool() {
-			q.cluster.NodePoolState.MarkNodeClaimPendingDisruption(cmd.Candidates[i].NodePool.Name, cmd.Candidates[i].NodeClaim.Name)
-		}
 	}
 	return markedCandidates, multierr.Combine(errs...)
 }
@@ -413,7 +410,7 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	// If we MarkForDeletion before we create replacements, it's possible for the provisioner
 	// to recognize that it needs to launch capacity for terminating pods, causing us to launch
 	// capacity for these pods twice instead of just once
-	q.cluster.MarkForDeletion(lo.Map(cmd.Candidates, func(c *Candidate, _ int) string { return c.ProviderID() })...)
+	cmd.markedForDeletion = q.cluster.MarkForDeletion(lo.Map(cmd.Candidates, func(c *Candidate, _ int) string { return c.ProviderID() })...)
 
 	// Nominate each node for scheduling and emit pod nomination events
 	// We emit all nominations before we exit the disruption loop as
@@ -483,7 +480,8 @@ func (q *Queue) GetCommands() []*Command {
 // CompleteCommand fully clears the queue of all references of a hash/command
 func (q *Queue) CompleteCommand(cmd *Command) {
 	if !cmd.Succeeded {
-		q.cluster.UnmarkForDeletion(lo.Map(cmd.Candidates, func(c *Candidate, _ int) string { return c.ProviderID() })...)
+		// Only unmark the candidates this command marked. Another controller may have marked the rest, and still owns them.
+		q.cluster.UnmarkForDeletion(cmd.markedForDeletion...)
 	}
 	// Remove all candidates linked to the command
 	q.Lock()

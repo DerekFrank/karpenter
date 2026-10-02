@@ -113,6 +113,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 			// limit, so terminate-first applies.
 			nodePool.Spec.Limits = v1.Limits{resources.Node: resource.MustParse("1")}
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			cluster.UpdateNodePool(nodePool)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 			ExpectSingletonReconciled(ctx, staticDriftController)
@@ -129,6 +130,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 			// limit, so it replaces-first rather than terminating first even with the gate on.
 			nodePool.Spec.Limits = v1.Limits{resources.Node: resource.MustParse("2")}
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			cluster.UpdateNodePool(nodePool)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 			ExpectSingletonReconciled(ctx, staticDriftController)
@@ -142,6 +144,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 		It("replaces-first for a static NodePool when TerminateFirstDrift is disabled", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(false)}}))
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			cluster.UpdateNodePool(nodePool)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 			ExpectSingletonReconciled(ctx, staticDriftController)

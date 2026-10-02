@@ -192,6 +192,8 @@ func (p *Provisioner) CreateNodeClaims(ctx context.Context, nodeClaims []*schedu
 		// was successfully created, we've updated the active node count in Create already. If we failed, we should release
 		// the reservation and allow the provisioner to create new NodeClaims in a subsequent attempt.
 		// NOTE: Only applies to static NodePools since node limits are not supported for dynamic NodePools
+		// ORDERING: Create calls cluster.UpdateNodeClaim, which records the NodeClaim in NodePoolState, before this
+		// release. Releasing first would briefly count the slot as free and let another reservation take it.
 		if nodeClaims[i].IsStaticNodeClaim {
 			p.cluster.NodePoolState.ReleaseNodeCount(nodeClaims[i].NodePoolName, 1)
 		}
@@ -482,6 +484,8 @@ func (p *Provisioner) Create(ctx context.Context, n *scheduler.NodeClaim, opts .
 	if err := p.kubeClient.Get(ctx, types.NamespacedName{Name: n.NodePoolName}, latest); err != nil {
 		return "", fmt.Errorf("getting current resource usage, %w", err)
 	}
+	// Cluster state must know the NodePool is static before it sees the NodeClaim below, so that NodePoolState counts it
+	p.cluster.UpdateNodePool(latest)
 	if err := latest.Spec.Limits.ExceededBy(p.cluster.NodePoolResourcesFor(n.NodePoolName)); err != nil {
 		return "", err
 	}

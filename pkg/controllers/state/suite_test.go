@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/awslabs/operatorpkg/status"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -2472,8 +2473,13 @@ var _ = Describe("NodePoolState Tracking", func() {
 	var nodePool2 *v1.NodePool
 
 	BeforeEach(func() {
-		nodePool2 = test.NodePool(v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "nodepool2"}})
-		ExpectApplied(ctx, env.Client, nodePool2)
+		// NodePoolState only tracks the NodeClaims of static NodePools. A NodePool can't switch between static and
+		// dynamic, so the suite's dynamic NodePool is replaced rather than updated.
+		nodePool = test.StaticNodePool(v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "static"}, Spec: v1.NodePoolSpec{Replicas: new(int64(1))}})
+		nodePool2 = test.StaticNodePool(v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "nodepool2"}, Spec: v1.NodePoolSpec{Replicas: new(int64(1))}})
+		ExpectApplied(ctx, env.Client, nodePool, nodePool2)
+		ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
+		ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool2))
 
 		nodeClaim = test.NodeClaim(v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{
@@ -2728,14 +2734,14 @@ var _ = Describe("NodePoolState Tracking", func() {
 				Expect(deleting).To(Equal(0))
 				Expect(pendingdisruption).To(Equal(0))
 
-				cluster.NodePoolState.MarkNodeClaimPendingDisruption(nodePool.Name, nodeClaim.Name)
+				ExpectDisruptionReasonObserved(ctx, env.Client, nodeClaimController, nodeClaim)
 				running, deleting, pendingdisruption = cluster.NodePoolState.GetNodeCount(nodePool.Name)
 
 				Expect(running).To(Equal(1))
 				Expect(deleting).To(Equal(0))
 				Expect(pendingdisruption).To(Equal(1))
 
-				cluster.NodePoolState.MarkNodeClaimPendingDisruption(nodePool.Name, nodeClaim2.Name)
+				ExpectDisruptionReasonObserved(ctx, env.Client, nodeClaimController, nodeClaim2)
 				running, deleting, pendingdisruption = cluster.NodePoolState.GetNodeCount(nodePool.Name)
 
 				Expect(running).To(Equal(0))
@@ -2892,6 +2898,8 @@ var _ = Describe("NodePoolState Tracking", func() {
 
 			ExpectApplied(ctx, env.Client, nodeClaim)
 			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+			disrupted := nodeClaim.DeepCopy()
+			disrupted.StatusConditions().SetTrueWithReason(v1.ConditionTypeDisruptionReason, string(v1.DisruptionReasonDrifted), string(v1.DisruptionReasonDrifted))
 
 			var wg sync.WaitGroup
 			numOperations := 50
@@ -2906,7 +2914,7 @@ var _ = Describe("NodePoolState Tracking", func() {
 					case 0:
 						cluster.MarkForDeletion(nodeClaim.Status.ProviderID)
 					case 1:
-						cluster.NodePoolState.MarkNodeClaimPendingDisruption(nodePool.Name, nodeClaim.Name)
+						cluster.UpdateNodeClaim(disrupted)
 					case 2:
 						cluster.UnmarkForDeletion(nodeClaim.Status.ProviderID)
 					}
@@ -2919,6 +2927,392 @@ var _ = Describe("NodePoolState Tracking", func() {
 			running, deleting, pendingdisruption := cluster.NodePoolState.GetNodeCount(nodePool.Name)
 			Expect(running + deleting + pendingdisruption).To(Equal(1)) // Should have exactly one NodeClaim
 		})
+	})
+})
+
+var _ = Describe("NodePoolState Derived Accounting", func() {
+	var unlaunched *v1.NodeClaim
+
+	BeforeEach(func() {
+		nodePool = test.StaticNodePool(v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "static"}, Spec: v1.NodePoolSpec{Replicas: new(int64(1))}})
+		ExpectApplied(ctx, env.Client, nodePool)
+		ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
+		unlaunched = test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}}})
+		unlaunched.Status.ProviderID = ""
+		ExpectApplied(ctx, env.Client, unlaunched)
+		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+		ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 0)
+	})
+
+	Context("Launch", func() {
+		It("should keep the NodePool's reservation when a NodeClaim's providerID resolves", func() {
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(BeEquivalentTo(1))
+			// Launch the NodeClaim
+			unlaunched.Status.ProviderID = test.RandomProviderID()
+			ExpectApplied(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(BeEquivalentTo(0))
+		})
+	})
+
+	Context("Observed state", func() {
+		It("should count an unlaunched NodeClaim with a DeletionTimestamp as deleting", func() {
+			ExpectDeletionTimestampSet(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 1, 0)
+		})
+		It("should not add conditions to the NodeClaim it observes", func() {
+			// The informer hands cluster state the cache's own object, which other controllers read concurrently
+			observed := ExpectExists(ctx, env.Client, unlaunched)
+			observed.Status.Conditions = nil
+			cluster.UpdateNodeClaim(observed)
+			Expect(observed.Status.Conditions).To(BeEmpty())
+		})
+		It("should count an unlaunched NodeClaim that is InstanceTerminating as deleting", func() {
+			unlaunched.StatusConditions().SetTrue(v1.ConditionTypeInstanceTerminating)
+			ExpectApplied(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 1, 0)
+		})
+		It("should count a launched NodeClaim with a DeletionTimestamp as deleting after UnmarkForDeletion", func() {
+			// Launch the NodeClaim
+			unlaunched.Status.ProviderID = test.RandomProviderID()
+			ExpectApplied(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			cluster.MarkForDeletion(unlaunched.Status.ProviderID)
+			ExpectDeletionTimestampSet(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			cluster.UnmarkForDeletion(unlaunched.Status.ProviderID)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 1, 0)
+		})
+		It("should count a NodeClaim with the DisruptionReason condition as pending disruption until it is cleared", func() {
+			ExpectDisruptionReasonObserved(ctx, env.Client, nodeClaimController, unlaunched)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 1)
+
+			Expect(unlaunched.StatusConditions().Clear(v1.ConditionTypeDisruptionReason)).To(Succeed())
+			ExpectApplied(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 0)
+		})
+	})
+
+	Context("Observation order", func() {
+		var older *v1.NodeClaim
+
+		BeforeEach(func() {
+			older = ExpectExists(ctx, env.Client, unlaunched).DeepCopy()
+			ExpectDisruptionReasonObserved(ctx, env.Client, nodeClaimController, unlaunched)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 1)
+		})
+
+		It("should ignore a read older than one already observed", func() {
+			cluster.UpdateNodeClaim(older)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 1)
+		})
+		It("should apply a read of an already observed version without changing the counts", func() {
+			current := ExpectExists(ctx, env.Client, unlaunched)
+			cluster.UpdateNodeClaim(current)
+			cluster.UpdateNodeClaim(current)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 1)
+		})
+		It("should apply a read whose resourceVersion can't be compared", func() {
+			older.ResourceVersion = "not-a-resource-version"
+			cluster.UpdateNodeClaim(older)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 0)
+		})
+	})
+
+	Context("MarkNodeClaimForDeletion", func() {
+		It("should mark a NodeClaim that hasn't launched", func() {
+			Expect(cluster.MarkNodeClaimForDeletion(unlaunched.Name)).To(BeTrue())
+			Expect(cluster.NodePoolState.MarkedForDeletion(unlaunched.Name)).To(BeTrue())
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 1, 0)
+		})
+		It("should keep the mark when the NodeClaim's providerID resolves", func() {
+			Expect(cluster.MarkNodeClaimForDeletion(unlaunched.Name)).To(BeTrue())
+			// Launch the NodeClaim
+			unlaunched.Status.ProviderID = test.RandomProviderID()
+			ExpectApplied(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 1, 0)
+			Expect(ExpectStateNodeExistsForNodeClaim(cluster, unlaunched).MarkedForDeletion()).To(BeTrue())
+		})
+		It("should only report setting the mark to the caller that set it", func() {
+			Expect(cluster.MarkNodeClaimForDeletion(unlaunched.Name)).To(BeTrue())
+			Expect(cluster.MarkNodeClaimForDeletion(unlaunched.Name)).To(BeFalse())
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 1, 0)
+
+			cluster.UnmarkNodeClaimForDeletion(unlaunched.Name)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 0)
+			Expect(cluster.MarkNodeClaimForDeletion(unlaunched.Name)).To(BeTrue())
+		})
+		It("should return false for a NodeClaim the disruption queue marked by providerID", func() {
+			// Launch the NodeClaim
+			unlaunched.Status.ProviderID = test.RandomProviderID()
+			ExpectApplied(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			cluster.MarkForDeletion(unlaunched.Status.ProviderID)
+			Expect(cluster.MarkNodeClaimForDeletion(unlaunched.Name)).To(BeFalse())
+		})
+		It("should not mark a NodeClaim that cluster state hasn't observed", func() {
+			unobserved := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}}})
+			unobserved.Status.ProviderID = ""
+			Expect(cluster.MarkNodeClaimForDeletion(unobserved.Name)).To(BeFalse())
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 0)
+
+			// Marking it didn't create a record, so it is active once observed
+			ExpectApplied(ctx, env.Client, unobserved)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unobserved))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 2, 0, 0)
+		})
+		It("should not mark a NodeClaim after it is deleted", func() {
+			ExpectDeleted(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			Expect(cluster.MarkNodeClaimForDeletion(unlaunched.Name)).To(BeFalse())
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 0)
+		})
+		It("should be what the NodeClaim's StateNode reports", func() {
+			launched := test.NodeClaim(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}},
+				Status: v1.NodeClaimStatus{
+					ProviderID: test.RandomProviderID(),
+					Capacity:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+				},
+			})
+			ExpectApplied(ctx, env.Client, launched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(launched))
+			before := ExpectStateNodeExistsForNodeClaim(cluster, launched)
+			Expect(lo.ToPtr(cluster.NodePoolResourcesFor(nodePool.Name)[resources.Node]).Value()).To(BeEquivalentTo(1))
+
+			Expect(cluster.MarkNodeClaimForDeletion(launched.Name)).To(BeTrue())
+			Expect(ExpectStateNodeExistsForNodeClaim(cluster, launched).MarkedForDeletion()).To(BeTrue())
+			// A copy is a snapshot, so a copy taken before the mark doesn't see it
+			Expect(before.MarkedForDeletion()).To(BeFalse())
+			// A NodeClaim marked for deletion doesn't count toward its NodePool's resources
+			Expect(cluster.NodePoolResourcesFor(nodePool.Name)).To(BeEmpty())
+
+			cluster.UnmarkForDeletion(launched.Status.ProviderID)
+			Expect(cluster.NodePoolState.MarkedForDeletion(launched.Name)).To(BeFalse())
+			Expect(ExpectStateNodeExistsForNodeClaim(cluster, launched).MarkedForDeletion()).To(BeFalse())
+			Expect(lo.ToPtr(cluster.NodePoolResourcesFor(nodePool.Name)[resources.Node]).Value()).To(BeEquivalentTo(1))
+		})
+	})
+
+	Context("Write responses", func() {
+		It("should not bring back a NodeClaim whose write response arrives after it is deleted", func() {
+			// Launch the NodeClaim
+			unlaunched.Status.ProviderID = test.RandomProviderID()
+			ExpectApplied(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			late := ExpectExists(ctx, env.Client, unlaunched)
+			late.StatusConditions().SetTrueWithReason(v1.ConditionTypeDisruptionReason, string(v1.DisruptionReasonDrifted), string(v1.DisruptionReasonDrifted))
+			ExpectDeleted(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 0)
+
+			Expect(cluster.NodePoolState.ObserveIfTracked(late)).To(BeFalse())
+			ExpectNodeClaimNotInClusterState(cluster, unlaunched.Name)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 0)
+		})
+		It("should apply a write response to NodePoolState only", func() {
+			// Launch the NodeClaim
+			unlaunched.Status.ProviderID = test.RandomProviderID()
+			ExpectApplied(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			patched := ExpectExists(ctx, env.Client, unlaunched)
+			patched.StatusConditions().SetTrueWithReason(v1.ConditionTypeDisruptionReason, string(v1.DisruptionReasonDrifted), string(v1.DisruptionReasonDrifted))
+			ExpectApplied(ctx, env.Client, patched)
+			Expect(cluster.NodePoolState.ObserveIfTracked(patched)).To(BeTrue())
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 1)
+			// The StateNode only sees what the informer delivers
+			Expect(ExpectStateNodeExistsForNodeClaim(cluster, unlaunched).NodeClaim.StatusConditions(status.WithObservedOnly()).Get(v1.ConditionTypeDisruptionReason).IsTrue()).To(BeFalse())
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			Expect(ExpectStateNodeExistsForNodeClaim(cluster, unlaunched).NodeClaim.StatusConditions(status.WithObservedOnly()).Get(v1.ConditionTypeDisruptionReason).IsTrue()).To(BeTrue())
+		})
+		It("should not roll back the StateNode with a write response older than the informer's version", func() {
+			// Launch the NodeClaim
+			unlaunched.Status.ProviderID = test.RandomProviderID()
+			ExpectApplied(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			late := ExpectExists(ctx, env.Client, unlaunched)
+			late.StatusConditions().SetTrueWithReason(v1.ConditionTypeDisruptionReason, string(v1.DisruptionReasonDrifted), string(v1.DisruptionReasonDrifted))
+			ExpectApplied(ctx, env.Client, late)
+			// The informer delivers the deletion before the patch response arrives
+			ExpectDeletionTimestampSet(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			Expect(ExpectStateNodeExistsForNodeClaim(cluster, unlaunched).Deleted()).To(BeTrue())
+
+			Expect(cluster.NodePoolState.ObserveIfTracked(late)).To(BeTrue())
+			Expect(ExpectStateNodeExistsForNodeClaim(cluster, unlaunched).Deleted()).To(BeTrue())
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 1, 0)
+		})
+	})
+
+	Context("NodePools", func() {
+		It("should record a launched NodeClaim seen before its NodePool as soon as the NodePool is seen", func() {
+			unseen := test.StaticNodePool(v1.NodePool{Spec: v1.NodePoolSpec{Replicas: new(int64(2))}})
+			nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: unseen.Name}}})
+			marked, markedNode := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: unseen.Name}}})
+			ExpectApplied(ctx, env.Client, unseen, nodeClaim, node, marked, markedNode)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeController, nodeClaimController, []*corev1.Node{node, markedNode}, []*v1.NodeClaim{nodeClaim, marked})
+			Expect(cluster.MarkForDeletion(markedNode.Spec.ProviderID)).To(ConsistOf(markedNode.Spec.ProviderID))
+			Expect(cluster.NodePoolState.Tracked(nodeClaim.Name)).To(BeFalse())
+			ExpectStateNodePoolCount(cluster, unseen.Name, 0, 0, 0)
+
+			ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(unseen))
+			ExpectStateNodePoolCount(cluster, unseen.Name, 1, 1, 0)
+			Expect(cluster.NodePoolState.MarkedForDeletion(marked.Name)).To(BeTrue())
+		})
+		It("should record an unlaunched NodeClaim seen before its NodePool when the informer requeues it", func() {
+			unseen := test.StaticNodePool(v1.NodePool{Spec: v1.NodePoolSpec{Replicas: new(int64(1))}})
+			ExpectApplied(ctx, env.Client, unseen)
+			nodeClaim := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: unseen.Name}}})
+			nodeClaim.Status.ProviderID = ""
+			ExpectApplied(ctx, env.Client, nodeClaim)
+			result := ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+
+			// It has no StateNode, so seeing the NodePool doesn't record it
+			ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(unseen))
+			Expect(cluster.NodePoolState.Tracked(nodeClaim.Name)).To(BeFalse())
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+			ExpectStateNodePoolCount(cluster, unseen.Name, 1, 0, 0)
+		})
+		It("should keep observing a recorded NodeClaim after its NodePool is deleted", func() {
+			ExpectDeleted(ctx, env.Client, nodePool)
+			ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
+			ExpectDeletionTimestampSet(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 1, 0)
+
+			// A NodeClaim first seen after its NodePool is deleted isn't recorded
+			orphan := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}}})
+			orphan.Status.ProviderID = ""
+			ExpectApplied(ctx, env.Client, orphan)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(orphan))
+			Expect(cluster.NodePoolState.Tracked(orphan.Name)).To(BeFalse())
+		})
+		It("should forget a deleted NodeClaim after a while", func() {
+			ExpectDeleted(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			// A late update for the deleted NodeClaim doesn't add it back
+			cluster.UpdateNodeClaim(unlaunched)
+			ExpectNodeClaimNotInClusterState(cluster, unlaunched.Name)
+
+			// Deleted NodeClaims are only remembered long enough to drop late updates
+			env.Clock.Step(10 * time.Minute)
+			cluster.DeleteNodeClaim("another")
+			cluster.UpdateNodeClaim(unlaunched)
+			Expect(cluster.NodePoolState.Tracked(unlaunched.Name)).To(BeTrue())
+		})
+		It("should not be synced until it has seen every static NodePool", func() {
+			// Launch the NodeClaim, so it doesn't hold back the sync
+			unlaunched.Status.ProviderID = test.RandomProviderID()
+			ExpectApplied(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			Expect(cluster.Synced(ctx)).To(BeTrue())
+
+			cluster.SetSynced(false)
+			unseen := test.StaticNodePool(v1.NodePool{Spec: v1.NodePoolSpec{Replicas: new(int64(1))}})
+			ExpectApplied(ctx, env.Client, unseen)
+			Expect(cluster.Synced(ctx)).To(BeFalse())
+			ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(unseen))
+			Expect(cluster.Synced(ctx)).To(BeTrue())
+		})
+	})
+
+	Context("Mark before the NodeClaim is tracked", func() {
+		It("should carry a mark set on the Node's StateNode into the NodeClaim's record", func() {
+			nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+				v1.NodePoolLabelKey:            nodePool.Name,
+				corev1.LabelInstanceTypeStable: "m5.large",
+			}}})
+			ExpectApplied(ctx, env.Client, node)
+			ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
+			Expect(cluster.MarkForDeletion(node.Spec.ProviderID)).To(ConsistOf(node.Spec.ProviderID))
+
+			ExpectApplied(ctx, env.Client, nodeClaim)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+			Expect(cluster.NodePoolState.MarkedForDeletion(nodeClaim.Name)).To(BeTrue())
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 1, 0)
+
+			// The record now holds the mark, so unmarking it isn't undone when the StateNode is rebuilt
+			cluster.UnmarkForDeletion(node.Spec.ProviderID)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+			ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
+			Expect(ExpectStateNodeExists(cluster, node).MarkedForDeletion()).To(BeFalse())
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 2, 0, 0)
+		})
+	})
+
+	Context("Reservations", func() {
+		It("should keep the NodePool's reservation when its last NodeClaim is deleted", func() {
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(BeEquivalentTo(1))
+			ExpectDeleted(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 0)
+
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 1, 1)).To(BeEquivalentTo(0))
+			cluster.NodePoolState.ReleaseNodeCount(nodePool.Name, 1)
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 1, 1)).To(BeEquivalentTo(1))
+		})
+		It("should count pending disruption NodeClaims against the limit", func() {
+			ExpectDisruptionReasonObserved(ctx, env.Client, nodeClaimController, unlaunched)
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(BeEquivalentTo(1))
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(BeEquivalentTo(0))
+		})
+	})
+})
+
+var _ = Describe("Dynamic NodePool Deletion Marks", func() {
+	var nodeClaim *v1.NodeClaim
+	var node *corev1.Node
+
+	BeforeEach(func() {
+		nodeClaim, node = test.NodeClaimAndNode(v1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+				v1.NodePoolLabelKey:            nodePool.Name,
+				corev1.LabelInstanceTypeStable: "m5.large",
+			}},
+			Status: v1.NodeClaimStatus{Capacity: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}},
+		})
+		ExpectApplied(ctx, env.Client, nodeClaim, node)
+		ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
+		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
+	})
+
+	It("should not record a dynamic NodePool's NodeClaim", func() {
+		Expect(cluster.NodePoolState.Tracked(nodeClaim.Name)).To(BeFalse())
+		ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 0)
+		Expect(cluster.MarkNodeClaimForDeletion(nodeClaim.Name)).To(BeFalse())
+	})
+	It("should keep the mark on the StateNode, so copies taken before the mark don't see it", func() {
+		before := ExpectStateNodeExists(cluster, node)
+		Expect(cluster.MarkForDeletion(node.Spec.ProviderID)).To(ConsistOf(node.Spec.ProviderID))
+		Expect(cluster.NodePoolState.Tracked(nodeClaim.Name)).To(BeFalse())
+		Expect(before.MarkedForDeletion()).To(BeFalse())
+		Expect(ExpectStateNodeExists(cluster, node).MarkedForDeletion()).To(BeTrue())
+		Expect(cluster.NodePoolResourcesFor(nodePool.Name)).To(BeEmpty())
+
+		// The mark survives the StateNode being rebuilt
+		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
+		Expect(ExpectStateNodeExists(cluster, node).MarkedForDeletion()).To(BeTrue())
+
+		cluster.UnmarkForDeletion(node.Spec.ProviderID)
+		Expect(ExpectStateNodeExists(cluster, node).MarkedForDeletion()).To(BeFalse())
+		Expect(cluster.NodePoolResourcesFor(nodePool.Name)).ToNot(BeEmpty())
+	})
+	It("should only return the nodes that MarkForDeletion marked", func() {
+		Expect(cluster.MarkForDeletion(node.Spec.ProviderID)).To(ConsistOf(node.Spec.ProviderID))
+		Expect(cluster.MarkForDeletion(node.Spec.ProviderID, "unknown")).To(BeEmpty())
+	})
+	It("should ignore a write response for a dynamic NodePool's NodeClaim", func() {
+		patched := nodeClaim.DeepCopy()
+		patched.StatusConditions().SetTrueWithReason(v1.ConditionTypeDisruptionReason, string(v1.DisruptionReasonDrifted), string(v1.DisruptionReasonDrifted))
+		Expect(cluster.NodePoolState.ObserveIfTracked(patched)).To(BeFalse())
+		Expect(cluster.NodePoolState.Tracked(nodeClaim.Name)).To(BeFalse())
 	})
 })
 

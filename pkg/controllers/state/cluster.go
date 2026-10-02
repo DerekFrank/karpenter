@@ -46,6 +46,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
+	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
@@ -63,7 +64,12 @@ type Cluster struct {
 	nodeNameToProviderID      map[string]string               // node name -> provider id
 	nodeClaimNameToProviderID map[string]string               // node claim name -> provider id
 	nodePoolResources         map[string]corev1.ResourceList  // node pool name -> resource list
+	staticNodePools           sets.Set[string]                // names of the static node pools
 	daemonSetPods             sync.Map                        // daemonSet -> existing pod
+
+	// deletedNodeClaims holds the names of recently deleted NodeClaims, so a late update can't add them back
+	deletedNodeClaims          map[string]time.Time // node claim name -> time cluster state saw it deleted
+	lastDeletedNodeClaimsPrune time.Time
 
 	NodePoolState *NodePoolState
 
@@ -112,6 +118,8 @@ func NewCluster(clk clock.Clock, client client.Client, cloudProvider cloudprovid
 		nodeNameToProviderID:      map[string]string{},
 		nodeClaimNameToProviderID: map[string]string{},
 		nodePoolResources:         map[string]corev1.ResourceList{},
+		staticNodePools:           sets.New[string](),
+		deletedNodeClaims:         map[string]time.Time{},
 
 		NodePoolState: NewNodePoolState(),
 
@@ -187,6 +195,11 @@ func (c *Cluster) Synced(ctx context.Context) (synced bool) {
 		log.FromContext(ctx).Error(err, "failed checking cluster state sync")
 		return false
 	}
+	nodePools, err := nodepoolutils.ListManaged(ctx, c.kubeClient, c.cloudProvider, client.UnsafeDisableDeepCopy)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "failed checking cluster state sync")
+		return false
+	}
 	nodeList := &corev1.NodeList{}
 	// Because we get so many Nodes from this response, we are not DeepCopying the cached data here
 	// DO NOT MUTATE Nodes in this function as this will affect the underlying cached Node
@@ -207,6 +220,7 @@ func (c *Cluster) Synced(ctx context.Context) (synced bool) {
 		stateNodeClaimNames.Insert(name)
 	}
 	stateNodeNames := sets.New(lo.Keys(c.nodeNameToProviderID)...)
+	stateStaticNodePoolNames := c.staticNodePools.Clone()
 	c.mu.RUnlock()
 
 	nodeClaimNames := sets.New[string]()
@@ -217,11 +231,18 @@ func (c *Cluster) Synced(ctx context.Context) (synced bool) {
 	for _, node := range nodeList.Items {
 		nodeNames.Insert(node.Name)
 	}
+	// NodePoolState only records the NodeClaims of the static NodePools that cluster state has seen
+	staticNodePoolNames := sets.New[string]()
+	for _, nodePool := range nodePools {
+		if nodepoolutils.IsStatic(nodePool) {
+			staticNodePoolNames.Insert(nodePool.Name)
+		}
+	}
 	// The names tracked in-memory should at least have all the data that is in the api-server
 	// This doesn't ensure that the two states are exactly aligned (we could still not be tracking a node
 	// that exists in the cluster state but not in the apiserver) but it ensures that we have a state
 	// representation for every node/nodeClaim that exists on the apiserver
-	synced = stateNodeClaimNames.IsSuperset(nodeClaimNames) && stateNodeNames.IsSuperset(nodeNames)
+	synced = stateNodeClaimNames.IsSuperset(nodeClaimNames) && stateNodeNames.IsSuperset(nodeNames) && stateStaticNodePoolNames.IsSuperset(staticNodePoolNames)
 	if synced {
 		c.hasSynced.Store(true)
 	}
@@ -330,36 +351,95 @@ func (c *Cluster) UnmarkForDeletion(providerIDs ...string) {
 
 	for _, id := range providerIDs {
 		if n, ok := c.nodes[id]; ok {
-			oldNode := n.ShallowCopy()
-			n.markedForDeletion = false
-			c.updateNodePoolResources(oldNode, n)
-			if n.NodeClaim != nil && n.NodeClaim.DeletionTimestamp.IsZero() {
-				c.NodePoolState.MarkNodeClaimActive(n.NodeClaim.Labels[v1.NodePoolLabelKey], n.NodeClaim.Name)
-			}
+			c.setMark(nodeClaimName(n), n, false)
 		}
 	}
 }
 
-// MarkForDeletion marks the node as pending deletion in the internal cluster state
-func (c *Cluster) MarkForDeletion(providerIDs ...string) {
+// MarkForDeletion marks the node as pending deletion in the internal cluster state. It returns the providerIDs of the
+// nodes it marked, leaving out any that were already marked, so the caller can unmark only the nodes it marked.
+func (c *Cluster) MarkForDeletion(providerIDs ...string) []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for _, id := range providerIDs {
-		if n, ok := c.nodes[id]; ok {
-			oldNode := n.ShallowCopy()
-			n.markedForDeletion = true
-			c.updateNodePoolResources(oldNode, n)
-			if n.NodeClaim != nil {
-				c.NodePoolState.MarkNodeClaimDeleting(n.NodeClaim.Labels[v1.NodePoolLabelKey], n.NodeClaim.Name)
-			}
+	return lo.Filter(providerIDs, func(id string, _ int) bool {
+		n, ok := c.nodes[id]
+		return ok && c.setMark(nodeClaimName(n), n, true)
+	})
+}
+
+// MarkNodeClaimForDeletion marks a static NodePool's NodeClaim as pending deletion, whether or not it has launched. It
+// returns true only if this call set the mark, so a caller that must be the only one deleting the NodeClaim can skip it
+// otherwise. A NodeClaim without a NodePoolState record isn't marked.
+func (c *Cluster) MarkNodeClaimForDeletion(nodeClaimName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.NodePoolState.Tracked(nodeClaimName) && c.setMark(nodeClaimName, c.nodeForNodeClaim(nodeClaimName), true)
+}
+
+// UnmarkNodeClaimForDeletion removes the mark set by MarkNodeClaimForDeletion
+func (c *Cluster) UnmarkNodeClaimForDeletion(nodeClaimName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.setMark(nodeClaimName, c.nodeForNodeClaim(nodeClaimName), false)
+}
+
+// UpdateNodePool records whether the NodePool is static, so that cluster state records its NodeClaims in NodePoolState.
+// When a NodePool is first seen as static, the NodeClaims of its StateNodes are recorded too, since they may have been
+// seen before it. A NodeClaim that hasn't launched has no StateNode, so it is recorded on its next update: Synced waits
+// for every NodeClaim to launch.
+func (c *Cluster) UpdateNodePool(nodePool *v1.NodePool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !nodepoolutils.IsStatic(nodePool) {
+		c.staticNodePools.Delete(nodePool.Name)
+		return
+	}
+	if c.staticNodePools.Has(nodePool.Name) {
+		return
+	}
+	c.staticNodePools.Insert(nodePool.Name)
+	for _, n := range c.nodes {
+		if n.NodeClaim == nil || n.NodeClaim.Labels[v1.NodePoolLabelKey] != nodePool.Name {
+			continue
+		}
+		c.NodePoolState.Observe(n.NodeClaim)
+		if n.markedForDeletion {
+			c.NodePoolState.setMarkedForDeletion(n.NodeClaim.Name, true)
 		}
 	}
 }
 
+// DeleteNodePool forgets the NodePool. NodeClaims that NodePoolState already records stay recorded until they are deleted.
+func (c *Cluster) DeleteNodePool(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.staticNodePools.Delete(name)
+}
+
+// UpdateNodeClaim updates cluster state with the NodeClaim, adding it if it is new. A NodeClaim of a static NodePool is
+// also recorded in NodePoolState, whether or not it has launched, so its DeletionTimestamp is observed even though it
+// may have no StateNode. A NodeClaim seen before its NodePool is recorded once UpdateNodePool sees the NodePool.
 func (c *Cluster) UpdateNodeClaim(nodeClaim *v1.NodeClaim) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// NodeClaim names are generated and never reused, so a NodeClaim that cluster state has seen deleted is gone for
+	// good. This drops the provisioner's update after it creates a NodeClaim when the informer has already processed
+	// the NodeClaim's deletion, which would otherwise add back a NodeClaim that no longer exists.
+	if _, ok := c.deletedNodeClaims[nodeClaim.Name]; ok {
+		return
+	}
+
+	// A NodeClaim that is already recorded keeps being observed after its NodePool is deleted, so that its deletion is
+	// still counted
+	if c.NodePoolState.Tracked(nodeClaim.Name) || c.staticNodePools.Has(nodeClaim.Labels[v1.NodePoolLabelKey]) {
+		c.NodePoolState.Observe(nodeClaim)
+	}
 
 	// If the nodeclaim has a providerID, create a StateNode for it, and populate the data.
 	// We only need to do this for a nodeclaim with a providerID as nodeclaims without provider IDs haven't
@@ -368,13 +448,6 @@ func (c *Cluster) UpdateNodeClaim(nodeClaim *v1.NodeClaim) {
 		n := c.newStateFromNodeClaim(nodeClaim, c.nodes[nodeClaim.Status.ProviderID])
 		c.nodes[nodeClaim.Status.ProviderID] = n
 	}
-
-	// Update nodepool state with NodeClaim
-	markedForDel := false
-	if n, ok := c.nodes[nodeClaim.Status.ProviderID]; ok {
-		markedForDel = n.MarkedForDeletion()
-	}
-	c.NodePoolState.UpdateNodeClaim(nodeClaim, markedForDel)
 
 	// If the nodeclaim hasn't launched yet, we want to add it into cluster state to ensure
 	// that we're not racing with the internal cache for the cluster, assuming the node doesn't exist.
@@ -387,6 +460,10 @@ func (c *Cluster) DeleteNodeClaim(name string) {
 	defer c.mu.Unlock()
 
 	c.cleanupNodeClaim(name)
+	// The NodeClaim is gone, so drop its NodePoolState record. cleanupNodeClaim doesn't do this because it also runs
+	// when a NodeClaim's providerID changes, and that must keep the record and its deletion mark.
+	c.NodePoolState.Forget(name)
+	c.rememberDeletedNodeClaim(name)
 	ClusterStateNodesCount.Set(float64(len(c.nodes)), nil)
 }
 
@@ -660,6 +737,9 @@ func (c *Cluster) Reset() {
 	c.nodeClaimNameToProviderID = map[string]string{}
 	c.NodePoolState.Reset()
 	c.nodePoolResources = map[string]corev1.ResourceList{}
+	c.staticNodePools = sets.New[string]()
+	c.deletedNodeClaims = map[string]time.Time{}
+	c.lastDeletedNodeClaimsPrune = time.Time{}
 	c.bindings = map[types.NamespacedName]string{}
 	c.antiAffinityPods = sync.Map{}
 	c.daemonSetPods = sync.Map{}
@@ -730,8 +810,14 @@ func (c *Cluster) newStateFromNodeClaim(nodeClaim *v1.NodeClaim, oldNode *StateN
 		podLimits:         oldNode.podLimits,
 		hostPortUsage:     oldNode.hostPortUsage,
 		volumeUsage:       oldNode.volumeUsage,
-		markedForDeletion: oldNode.markedForDeletion,
+		// A NodeClaim's record and its StateNode are marked together, but either can be marked before the other
+		// exists, so the new StateNode is marked if either is. Unmarking clears both, so this never brings back a
+		// cleared mark.
+		markedForDeletion: oldNode.markedForDeletion || c.NodePoolState.MarkedForDeletion(nodeClaim.Name),
 		nominatedUntil:    oldNode.nominatedUntil,
+	}
+	if n.markedForDeletion {
+		c.NodePoolState.setMarkedForDeletion(nodeClaim.Name, true)
 	}
 	// Cleanup the old nodeClaim with its old providerID if its providerID changes
 	// This can happen since nodes don't get created with providerIDs. Rather, CCM picks up the
@@ -742,6 +828,60 @@ func (c *Cluster) newStateFromNodeClaim(nodeClaim *v1.NodeClaim, oldNode *StateN
 	c.updateNodePoolResources(oldNode, n)
 	c.triggerConsolidationOnChange(oldNode, n)
 	return n
+}
+
+// deletedNodeClaimTTL is how long cluster state remembers a deleted NodeClaim. It only needs to comfortably exceed the
+// time between the provisioner creating a NodeClaim and updating cluster state with it.
+const deletedNodeClaimTTL = 5 * time.Minute
+
+// rememberDeletedNodeClaim records that the NodeClaim was deleted, and forgets the NodeClaims deleted more than
+// deletedNodeClaimTTL ago. They are pruned at most once per deletedNodeClaimTTL, so each prune is amortized over the
+// deletions since the last one.
+func (c *Cluster) rememberDeletedNodeClaim(name string) {
+	now := c.clock.Now()
+	c.deletedNodeClaims[name] = now
+	if now.Sub(c.lastDeletedNodeClaimsPrune) < deletedNodeClaimTTL {
+		return
+	}
+	c.lastDeletedNodeClaimsPrune = now
+	for n, deleted := range c.deletedNodeClaims {
+		if now.Sub(deleted) > deletedNodeClaimTTL {
+			delete(c.deletedNodeClaims, n)
+		}
+	}
+}
+
+// setMark sets the deletion mark of a NodeClaim and its StateNode n, either of which may be missing, and returns
+// whether that changed the mark. The mark is compare-and-set on the NodeClaim's NodePoolState record if it has one,
+// and on the StateNode otherwise.
+func (c *Cluster) setMark(nodeClaimName string, n *StateNode, marked bool) bool {
+	changed := false
+	if c.NodePoolState.Tracked(nodeClaimName) {
+		changed = c.NodePoolState.setMarkedForDeletion(nodeClaimName, marked)
+	} else if n != nil {
+		changed = n.markedForDeletion != marked
+	}
+	if n != nil && n.markedForDeletion != marked {
+		oldNode := n.ShallowCopy()
+		n.markedForDeletion = marked
+		c.updateNodePoolResources(oldNode, n)
+	}
+	return changed
+}
+
+func nodeClaimName(n *StateNode) string {
+	if n.NodeClaim == nil {
+		return ""
+	}
+	return n.NodeClaim.Name
+}
+
+// nodeForNodeClaim returns the StateNode of the NodeClaim, or nil if it hasn't launched
+func (c *Cluster) nodeForNodeClaim(name string) *StateNode {
+	if n, ok := c.nodes[c.nodeClaimNameToProviderID[name]]; ok && nodeClaimName(n) == name {
+		return n
+	}
+	return nil
 }
 
 func (c *Cluster) cleanupNodeClaim(name string) {
@@ -760,9 +900,6 @@ func (c *Cluster) cleanupNodeClaim(name string) {
 	// yet. This ensures that if a nodeClaim is created and then deleted before it was able to launch that
 	// this is cleaned up.
 	delete(c.nodeClaimNameToProviderID, name)
-
-	// Delete the NodeClaim that is tracked in NodePoolState
-	c.NodePoolState.Cleanup(name)
 }
 
 func (c *Cluster) newStateFromNode(ctx context.Context, node *corev1.Node, oldNode *StateNode) (*StateNode, error) {

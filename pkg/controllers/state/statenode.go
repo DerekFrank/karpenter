@@ -608,9 +608,11 @@ func RequireNoScheduleTaint(ctx context.Context, kubeClient client.Client, addTa
 	return multierr.Combine(errs...)
 }
 
-// ClearNodeClaimsCondition will remove the conditionType from the NodeClaim status of the provided statenodes
-func ClearNodeClaimsCondition(ctx context.Context, kubeClient client.Client, clk clock.Clock, conditionType string, nodes ...*StateNode) error {
+// ClearNodeClaimsCondition will remove the conditionType from the NodeClaim status of the provided statenodes. It
+// returns the NodeClaims it patched, as returned by the API server, so the caller can update cluster state with them.
+func ClearNodeClaimsCondition(ctx context.Context, kubeClient client.Client, clk clock.Clock, conditionType string, nodes ...*StateNode) ([]*v1.NodeClaim, error) {
 	errs := make([]error, len(nodes))
+	patched := make([]*v1.NodeClaim, len(nodes))
 	workqueue.ParallelizeUntil(ctx, len(nodes), len(nodes), func(i int) {
 		if !nodes[i].Initialized() || nodes[i].NodeClaim == nil {
 			return
@@ -623,14 +625,16 @@ func ClearNodeClaimsCondition(ctx context.Context, kubeClient client.Client, clk
 			stored := nodeClaim.DeepCopy()
 			_ = nodeClaim.StatusConditions(status.WithClock(clk)).Clear(conditionType)
 			if !equality.Semantic.DeepEqual(stored, nodeClaim) {
-				return kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
+				if e := kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); e != nil {
+					return e
+				}
+				patched[i] = nodeClaim
 			}
 			return nil
 		}); err != nil {
 			errs[i] = client.IgnoreNotFound(err)
 			return
 		}
-
 	})
-	return multierr.Combine(errs...)
+	return lo.Compact(patched), multierr.Combine(errs...)
 }

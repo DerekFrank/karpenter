@@ -114,17 +114,23 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 	workqueue.ParallelizeUntil(ctx, len(candidates), len(candidates), func(i int) {
 		candidate := candidates[i]
 
+		// Mark the NodeClaim for deletion before deleting it, so it never counts as active once it is deleted. Otherwise
+		// a reconcile that runs before the informer sees the deletion would delete another NodeClaim to make up for it.
+		// The mark also claims the NodeClaim: skip it if another controller already marked it, or if cluster state
+		// hasn't observed it and so doesn't count it.
+		if !c.cluster.MarkNodeClaimForDeletion(candidate.Name) {
+			log.FromContext(ctx).WithValues("NodeClaim", klog.KObj(candidate)).V(1).Info("skipping nodeclaim that is already marked for deletion or not yet observed")
+			return
+		}
 		if err := retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
 			return c.kubeClient.Delete(ctx, candidate)
 		}); err != nil && client.IgnoreNotFound(err) != nil {
+			c.cluster.UnmarkNodeClaimForDeletion(candidate.Name)
 			scaleDownErrs[i] = err
 			return
 		}
 
 		log.FromContext(ctx).WithValues("NodeClaim", klog.KObj(candidate)).V(1).Info("deleting nodeclaim")
-
-		// Mark the NodeClaim as Deleting in StateNodePool
-		c.cluster.NodePoolState.MarkNodeClaimDeleting(np.Name, candidate.Name)
 	})
 
 	if scaleDownErr := multierr.Combine(scaleDownErrs...); scaleDownErr != nil {

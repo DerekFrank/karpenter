@@ -43,6 +43,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
+	staticdeprovisioning "sigs.k8s.io/karpenter/pkg/controllers/static/deprovisioning"
 	static "sigs.k8s.io/karpenter/pkg/controllers/static/provisioning"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
@@ -62,6 +63,22 @@ func (f *failingClient) Create(ctx context.Context, obj client.Object, opts ...c
 		return fmt.Errorf("simulated error creating nodeclaims")
 	}
 	return f.Client.Create(ctx, obj, opts...)
+}
+
+// afterCreateClient runs afterCreate after each successful NodeClaim Create, before the caller's code after Create runs
+type afterCreateClient struct {
+	client.Client
+	afterCreate func(*v1.NodeClaim)
+}
+
+func (a *afterCreateClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if err := a.Client.Create(ctx, obj, opts...); err != nil {
+		return err
+	}
+	if nodeClaim, ok := obj.(*v1.NodeClaim); ok && a.afterCreate != nil {
+		a.afterCreate(nodeClaim)
+	}
+	return nil
 }
 
 var (
@@ -125,6 +142,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			nodePool := test.StaticNodePool()
 			nodePool.Spec.Replicas = new(int64(1))
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 
 			// Create controller with failing client
 			failingController := static.NewController(&failingClient{Client: env.Client}, cluster, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, prov, env.Clock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client))
@@ -148,6 +166,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 				Name:  "test",
 			}
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 			Expect(result.RequeueAfter).To(BeZero())
@@ -162,6 +181,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			nodePool.Spec.Replicas = new(int64(1))
 			nodePool.StatusConditions().SetFalse(v1.ConditionTypeValidationSucceeded, "ValidationFailed", "Validation failed")
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 			Expect(result.RequeueAfter).To(BeZero())
@@ -175,6 +195,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			nodePool := test.StaticNodePool()
 			nodePool.Spec.Replicas = new(int64(1))
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 			ExpectDeletionTimestampSet(ctx, env.Client, nodePool)
 
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
@@ -189,6 +210,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			nodePool := test.StaticNodePool()
 			nodePool.Spec.Replicas = nil
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 			Expect(result.RequeueAfter).To(BeZero())
@@ -233,6 +255,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 				},
 			})
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, nodeClaim2, node1, node2)
+			cluster.UpdateNodePool(nodePool)
 
 			// Update cluster state to track the nodes
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeController, nodeClaimStateController, []*corev1.Node{node1, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2})
@@ -251,6 +274,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			nodePool := test.StaticNodePool()
 			nodePool.Spec.Replicas = new(int64(2))
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 			Expect(result.RequeueAfter).To(BeNumerically("~", time.Minute*1, time.Second))
@@ -287,6 +311,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 				},
 			})
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1)
+			cluster.UpdateNodePool(nodePool)
 
 			// 	// Update cluster state to track the nodes
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
@@ -335,7 +360,8 @@ var _ = Describe("Static Provisioning Controller", func() {
 				ProviderID: nodeClaim3.Status.ProviderID,
 			})
 
-			ExpectApplied(ctx, env.Client, nodeClaim1)
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1)
+			cluster.UpdateNodePool(nodePool)
 			ExpectApplied(ctx, env.Client, nodeClaim2, node2)
 			ExpectApplied(ctx, env.Client, nodeClaim3, node3)
 
@@ -376,6 +402,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 				},
 			})
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1)
+			cluster.UpdateNodePool(nodePool)
 
 			// 	// Update cluster state to track the nodes
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
@@ -399,6 +426,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			}
 
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 			Expect(result.RequeueAfter).To(BeNumerically("~", time.Minute*1, time.Second))
 
@@ -418,6 +446,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			// Size up the replicas to 15 with limit 10
 			nodePool.Spec.Replicas = new(int64(15))
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 
 			// Update the state with Created NodeClaims
 			for _, nodeClaim := range nodeClaims.Items {
@@ -442,6 +471,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			nodePool := test.StaticNodePool()
 			nodePool.Spec.Replicas = new(int64(0))
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 			Expect(result.RequeueAfter).To(BeNumerically("~", time.Minute*1, time.Second))
@@ -492,6 +522,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			})
 			nodePool.Spec.Template.Spec.Requirements = inputRequirements
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeController, nodeClaimStateController, []*corev1.Node{}, []*v1.NodeClaim{})
 
@@ -514,6 +545,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			numNodeClaims := 1000
 			nodePool.Spec.Replicas = new(int64(numNodeClaims))
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 
 			Eventually(func(g Gomega) int {
 				// TODO: remove Eventually when 1.31 is deprecated https://github.com/kubernetes/enhancements/issues/4420
@@ -531,6 +563,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			}
 			nodePool.Spec.Replicas = new(int64(5))
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 
 			// Run many reconciles in parallel
 			n := 50
@@ -558,6 +591,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			}
 			nodePool.Spec.Replicas = new(int64(5))
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 
 			// Run many reconciles in parallel
 			n := 50
@@ -584,6 +618,74 @@ var _ = Describe("Static Provisioning Controller", func() {
 			}, 10*time.Second)
 		})
 
+		It("should count the NodeClaims it creates before cluster state has seen the NodePool", func() {
+			nodePool := test.StaticNodePool()
+			nodePool.Spec.Replicas = new(int64(2))
+			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.SetSynced(true)
+
+			ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(2))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 2, 0, 0)
+		})
+		It("should not add back a NodeClaim whose deletion cluster state saw before the provisioner's update", func() {
+			nodePool := test.StaticNodePool()
+			nodePool.Spec.Replicas = new(int64(2))
+			existing, node := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+				v1.NodePoolLabelKey:        nodePool.Name,
+				v1.NodeInitializedLabelKey: "true",
+			}}})
+			ExpectApplied(ctx, env.Client, nodePool, existing, node)
+			cluster.UpdateNodePool(nodePool)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{existing})
+
+			// The created NodeClaim is deleted, and the informer processes the NotFound, before the provisioner updates
+			// cluster state with it
+			var created *v1.NodeClaim
+			hookClient := &afterCreateClient{Client: env.Client, afterCreate: func(nodeClaim *v1.NodeClaim) {
+				defer GinkgoRecover()
+				created = nodeClaim.DeepCopy()
+				ExpectDeleted(ctx, env.Client, created)
+				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(created))
+			}}
+			hookController := static.NewController(hookClient, cluster, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, prov, env.Clock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client))
+			ExpectObjectReconciled(ctx, env.Client, hookController, nodePool)
+			Expect(created).ToNot(BeNil())
+			ExpectNodeClaimNotInClusterState(cluster, created.Name)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 0)
+
+			// Scaling down to the one real NodeClaim mustn't delete it
+			nodePool.Spec.Replicas = new(int64(1))
+			ExpectApplied(ctx, env.Client, nodePool)
+			deprovisioner := staticdeprovisioning.NewController(env.Client, cluster, cloudProvider, env.Clock, events.NewRecorder(&record.FakeRecorder{}))
+			ExpectObjectReconciled(ctx, env.Client, deprovisioner, nodePool)
+			Expect(ExpectExists(ctx, env.Client, existing).DeletionTimestamp.IsZero()).To(BeTrue())
+		})
+		It("should not over provision after a restart until cluster state has seen the NodePool", func() {
+			nodePool := test.StaticNodePool()
+			nodePool.Spec.Replicas = new(int64(2))
+			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
+			ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+			nodeClaims := ExpectNodeClaims(ctx, env.Client)
+			Expect(nodeClaims).To(HaveLen(2))
+
+			// Restart: the NodeClaim informer sees the launched NodeClaims before the NodePool informer sees their NodePool
+			cluster.Reset()
+			for _, nodeClaim := range nodeClaims {
+				nodeClaim.Status.ProviderID = test.RandomProviderID()
+				ExpectApplied(ctx, env.Client, nodeClaim)
+				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim))
+			}
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 0)
+			ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(2))
+
+			cluster.UpdateNodePool(nodePool)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 2, 0, 0)
+			ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(2))
+		})
 	})
 	Context("Helper Functions", func() {
 		DescribeTable("should detect replica or status changes",

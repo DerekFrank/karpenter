@@ -1156,6 +1156,7 @@ var _ = Describe("Drift", func() {
 			drift := disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock)
 
 			ExpectApplied(ctx, env.Client, staticNp, nodeClaims[0], nodeClaims[1], nodes[0], nodes[1])
+			cluster.UpdateNodePool(staticNp)
 
 			// inform cluster state about nodes and nodeClaims
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{nodes[0], nodes[1]}, []*v1.NodeClaim{nodeClaims[0], nodeClaims[1]})
