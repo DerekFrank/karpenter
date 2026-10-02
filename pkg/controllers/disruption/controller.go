@@ -169,6 +169,10 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		}
 		return reconciler.Result{}, serrors.Wrap(fmt.Errorf("removing condition from nodeclaims, %w", err), "condition", v1.ConditionTypeDisruptionReason)
 	}
+	// NodePoolState counts these NodeClaims as pending disruption while the DisruptionReason condition is set, so
+	// clearing it above returns them to active. A command abandoned before the cache ever showed the condition can
+	// also leave a disrupt intent behind; no command owns these NodeClaims, so drop it too.
+	c.cluster.NodePoolState.ClearDisruptRequests(outdatedNodes...)
 
 	// Attempt different disruption methods. We'll only let one method perform an action
 	for _, m := range c.methods {

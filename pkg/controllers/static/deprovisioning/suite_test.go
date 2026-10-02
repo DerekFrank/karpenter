@@ -43,6 +43,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
+	"sigs.k8s.io/karpenter/pkg/utils/resources"
 	. "sigs.k8s.io/karpenter/pkg/utils/testing"
 )
 
@@ -68,6 +69,22 @@ func (f *failingClient) Delete(ctx context.Context, obj client.Object, opts ...c
 		return fmt.Errorf("simulated error deleting nodeclaims")
 	}
 	return f.Client.Delete(ctx, obj, opts...)
+}
+
+// deleteHookClient runs a hook after each successful NodeClaim Delete, before the deprovisioner's code after Delete runs
+type deleteHookClient struct {
+	client.Client
+	afterDelete func(*v1.NodeClaim)
+}
+
+func (d *deleteHookClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if err := d.Client.Delete(ctx, obj, opts...); err != nil {
+		return err
+	}
+	if nodeClaim, ok := obj.(*v1.NodeClaim); ok && d.afterDelete != nil {
+		d.afterDelete(nodeClaim)
+	}
+	return nil
 }
 
 func TestAPIs(t *testing.T) {
@@ -431,6 +448,119 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 				})
 				Expect(len(activeNodeClaims)).To(BeNumerically(">", 1)) // More than desired replicas (1)
 				// Verify StateNodePool Has been updated
+				ExpectStateNodePoolCount(cluster, nodePool.Name, 3, 0, 0)
+			})
+		})
+		Context("NodePoolState accounting", func() {
+			var nodePool *v1.NodePool
+			var launched []*v1.NodeClaim
+			var unlaunched *v1.NodeClaim
+			var hookClient *deleteHookClient
+			var hookController *static.Controller
+
+			BeforeEach(func() {
+				nodePool = test.StaticNodePool()
+				nodePool.Spec.Replicas = new(int64(2))
+				nodePool.Spec.Limits = v1.Limits{resources.Node: resource.MustParse("3")}
+				var nodes []*corev1.Node
+				launched, nodes = test.NodeClaimsAndNodes(2, v1.NodeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{
+							v1.NodePoolLabelKey:            nodePool.Name,
+							v1.NodeInitializedLabelKey:     "true",
+							corev1.LabelInstanceTypeStable: "stable.instance",
+						},
+					},
+					Status: v1.NodeClaimStatus{
+						Capacity: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("10"),
+							corev1.ResourceMemory: resource.MustParse("1000Mi"),
+						},
+					},
+				})
+				unlaunched = test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}}})
+				unlaunched.Status.ProviderID = ""
+				ExpectApplied(ctx, env.Client, nodePool, launched[0], launched[1], nodes[0], nodes[1])
+				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeController, nodeClaimStateController, nodes, launched)
+
+				hookClient = &deleteHookClient{Client: env.Client}
+				hookController = static.NewController(hookClient, cluster, cloudProvider, env.Clock, recorder)
+			})
+
+			It("should not leave a deleting NodeClaim behind when the NotFound is processed before Delete returns", func() {
+				ExpectApplied(ctx, env.Client, unlaunched)
+				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(unlaunched))
+				ExpectStateNodePoolCount(cluster, nodePool.Name, 3, 0, 0)
+
+				hookClient.afterDelete = func(nodeClaim *v1.NodeClaim) {
+					defer GinkgoRecover()
+					// The NodeClaim has no finalizer, so it is already gone and the informer Forgets it
+					ExpectNotFound(ctx, env.Client, nodeClaim)
+					ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim))
+				}
+				ExpectObjectReconciled(ctx, env.Client, hookController, nodePool)
+
+				ExpectNotFound(ctx, env.Client, unlaunched)
+				ExpectStateNodePoolCount(cluster, nodePool.Name, 2, 0, 0)
+				// The freed slot under limits.nodes can be reserved again
+				Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 3, 1)).To(BeEquivalentTo(1))
+			})
+			It("should count the NodeClaim as deleting before Delete is called", func() {
+				ExpectApplied(ctx, env.Client, unlaunched)
+				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(unlaunched))
+
+				nested := false
+				hookClient.afterDelete = func(*v1.NodeClaim) {
+					defer GinkgoRecover()
+					if nested {
+						return
+					}
+					nested = true
+					// A concurrent reconcile that runs before the informer sees the deletion must not delete another NodeClaim
+					ExpectStateNodePoolCount(cluster, nodePool.Name, 2, 1, 0)
+					ExpectObjectReconciled(ctx, env.Client, hookController, nodePool)
+				}
+				ExpectObjectReconciled(ctx, env.Client, hookController, nodePool)
+
+				ExpectNotFound(ctx, env.Client, unlaunched)
+				for _, nc := range launched {
+					Expect(ExpectExists(ctx, env.Client, nc).DeletionTimestamp.IsZero()).To(BeTrue())
+				}
+			})
+			It("should keep counting an unlaunched NodeClaim as deleting once the informer sees its DeletionTimestamp", func() {
+				unlaunched.Finalizers = []string{"karpenter.sh/test-finalizer"}
+				ExpectApplied(ctx, env.Client, unlaunched)
+				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(unlaunched))
+
+				ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+				Expect(ExpectExists(ctx, env.Client, unlaunched).DeletionTimestamp.IsZero()).To(BeFalse())
+				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(unlaunched))
+				ExpectStateNodePoolCount(cluster, nodePool.Name, 2, 1, 0)
+
+				// The next pass must not pick a launched NodeClaim to make up for the one already deleting
+				ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+				for _, nc := range launched {
+					Expect(ExpectExists(ctx, env.Client, nc).DeletionTimestamp.IsZero()).To(BeTrue())
+				}
+			})
+			It("should not count a NodeClaim that cluster state hasn't observed when deleting it", func() {
+				nodePool.Spec.Replicas = new(int64(1))
+				ExpectApplied(ctx, env.Client, nodePool, unlaunched)
+
+				// Unresolved NodeClaims are deleted first, so the unobserved one is picked. Its delete intent is dropped
+				// rather than creating accounting that only the informer could later remove.
+				ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+				ExpectNotFound(ctx, env.Client, unlaunched)
+				ExpectStateNodePoolCount(cluster, nodePool.Name, 2, 0, 0)
+			})
+			It("should stop counting the NodeClaim as deleting when Delete fails", func() {
+				failingController := static.NewController(&failingClient{Client: env.Client}, cluster, cloudProvider, env.Clock, recorder)
+				ExpectApplied(ctx, env.Client, unlaunched)
+				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(unlaunched))
+
+				_, err := failingController.Reconcile(ctx, nodePool)
+				Expect(err).To(HaveOccurred())
+				ExpectExists(ctx, env.Client, unlaunched)
 				ExpectStateNodePoolCount(cluster, nodePool.Name, 3, 0, 0)
 			})
 		})

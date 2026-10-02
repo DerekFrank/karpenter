@@ -333,8 +333,9 @@ func (c *Cluster) UnmarkForDeletion(providerIDs ...string) {
 			oldNode := n.ShallowCopy()
 			n.markedForDeletion = false
 			c.updateNodePoolResources(oldNode, n)
-			if n.NodeClaim != nil && n.NodeClaim.DeletionTimestamp.IsZero() {
-				c.NodePoolState.MarkNodeClaimActive(n.NodeClaim.Labels[v1.NodePoolLabelKey], n.NodeClaim.Name)
+			// NodePoolState still counts a NodeClaim with a DeletionTimestamp as deleting, since it observes that directly.
+			if n.NodeClaim != nil {
+				c.NodePoolState.SetMarkedForDeletion(n.NodeClaim.Name, false)
 			}
 		}
 	}
@@ -351,7 +352,7 @@ func (c *Cluster) MarkForDeletion(providerIDs ...string) {
 			n.markedForDeletion = true
 			c.updateNodePoolResources(oldNode, n)
 			if n.NodeClaim != nil {
-				c.NodePoolState.MarkNodeClaimDeleting(n.NodeClaim.Labels[v1.NodePoolLabelKey], n.NodeClaim.Name)
+				c.NodePoolState.SetMarkedForDeletion(n.NodeClaim.Name, true)
 			}
 		}
 	}
@@ -369,12 +370,9 @@ func (c *Cluster) UpdateNodeClaim(nodeClaim *v1.NodeClaim) {
 		c.nodes[nodeClaim.Status.ProviderID] = n
 	}
 
-	// Update nodepool state with NodeClaim
-	markedForDel := false
-	if n, ok := c.nodes[nodeClaim.Status.ProviderID]; ok {
-		markedForDel = n.MarkedForDeletion()
-	}
-	c.NodePoolState.UpdateNodeClaim(nodeClaim, markedForDel)
+	// Record the observed NodeClaim in NodePoolState. This runs for unlaunched NodeClaims too, so their
+	// DeletionTimestamp is observed even though they have no StateNode.
+	c.NodePoolState.Observe(nodeClaim)
 
 	// If the nodeclaim hasn't launched yet, we want to add it into cluster state to ensure
 	// that we're not racing with the internal cache for the cluster, assuming the node doesn't exist.
@@ -387,6 +385,9 @@ func (c *Cluster) DeleteNodeClaim(name string) {
 	defer c.mu.Unlock()
 
 	c.cleanupNodeClaim(name)
+	// The NodeClaim is gone, so drop its NodePoolState record. cleanupNodeClaim doesn't do this because it also runs
+	// when a NodeClaim's providerID changes, and that must keep the record and its intents.
+	c.NodePoolState.Forget(name)
 	ClusterStateNodesCount.Set(float64(len(c.nodes)), nil)
 }
 
@@ -760,9 +761,6 @@ func (c *Cluster) cleanupNodeClaim(name string) {
 	// yet. This ensures that if a nodeClaim is created and then deleted before it was able to launch that
 	// this is cleaned up.
 	delete(c.nodeClaimNameToProviderID, name)
-
-	// Delete the NodeClaim that is tracked in NodePoolState
-	c.NodePoolState.Cleanup(name)
 }
 
 func (c *Cluster) newStateFromNode(ctx context.Context, node *corev1.Node, oldNode *StateNode) (*StateNode, error) {
