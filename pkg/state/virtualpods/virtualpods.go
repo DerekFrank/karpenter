@@ -63,10 +63,14 @@ func (v *Cache) UpdateEntry(cb *autoscalingv1beta1.CapacityBuffer, spec corev1.P
 	v.capacityBufferToPods[client.ObjectKeyFromObject(cb)] = podCache
 }
 
-func (v *Cache) RemoveEntry(key types.NamespacedName) {
+// RemoveEntry drops the cached virtual pods for a buffer and reports whether an
+// entry was present
+func (v *Cache) RemoveEntry(key types.NamespacedName) bool {
 	v.mutex.Lock()
 	defer v.mutex.Unlock()
+	_, ok := v.capacityBufferToPods[key]
 	delete(v.capacityBufferToPods, key)
+	return ok
 }
 
 // hydrateCache performs the one-time lazy hydration of the cache. The caller

@@ -77,7 +77,7 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	if err := c.kubeClient.Get(ctx, req.NamespacedName, cb); err != nil {
 		if errors.IsNotFound(err) {
 			// The buffer was deleted; drop its virtual pods from the cache.
-			c.virtualPodCache.RemoveEntry(req.NamespacedName)
+			c.removeEntry(req.NamespacedName, types.UID(req.String()))
 		}
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
@@ -106,22 +106,36 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	// Refresh the virtual pod cache with the spec we already resolved above,
 	// avoiding a second lookup of the same PodTemplate/workload. On resolution
 	// failure (resolved == false) the buffer's ReadyForProvisioning condition is
-	// False, so UpdateEntry drops any stale entry for it.
-	if resolved {
-		c.virtualPodCache.UpdateEntry(cb, *podSpec)
-	} else {
-		c.virtualPodCache.RemoveEntry(client.ObjectKeyFromObject(cb))
+	// False, so drop any stale entry for it.
+	if !resolved {
+		c.removeEntry(client.ObjectKeyFromObject(cb), cb.UID)
+		return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
 	}
+	c.virtualPodCache.UpdateEntry(cb, *podSpec)
 
 	// Notify the provisioner so it can construct virtual pods and update the
 	// Provisioning condition in the next reconciliation. We trigger on every
 	// successful reconcile (not just status changes) so newly-applied buffers
 	// that already have accurate status still cause a provisioning pass.
-	if c.trigger != nil && resolved {
-		c.trigger.Trigger(cb.UID)
-	}
+	c.triggerProvisioner(cb.UID)
 
 	return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
+}
+
+// removeEntry drops a buffer's virtual pods from the cache. If the buffer had
+// cached pods, it triggers a provisioning pass: only that pass recomputes
+// cluster.bufferPodCounts, and without it emptiness keeps treating nodes as
+// hosting the removed pods until something unrelated triggers the provisioner.
+func (c *Controller) removeEntry(key types.NamespacedName, uid types.UID) {
+	if c.virtualPodCache.RemoveEntry(key) {
+		c.triggerProvisioner(uid)
+	}
+}
+
+func (c *Controller) triggerProvisioner(uid types.UID) {
+	if c.trigger != nil {
+		c.trigger.Trigger(uid)
+	}
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {

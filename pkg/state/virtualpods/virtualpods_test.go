@@ -168,14 +168,14 @@ var _ = Describe("VirtualPodCache", func() {
 			resolveAndUpdate(ctx, cache, cb)
 			Expect(cache.GetAll(ctx)).To(HaveLen(3))
 
-			cache.RemoveEntry(client.ObjectKeyFromObject(cb))
+			Expect(cache.RemoveEntry(client.ObjectKeyFromObject(cb))).To(BeTrue())
 			Expect(cache.GetAll(ctx)).To(BeEmpty())
 		})
 
 		It("should be a no-op for an unknown entry", func() {
 			cache := NewVirtualPodCache(fakeClient())
 			cache.warmed = true
-			cache.RemoveEntry(types.NamespacedName{Namespace: "default", Name: "does-not-exist"})
+			Expect(cache.RemoveEntry(types.NamespacedName{Namespace: "default", Name: "does-not-exist"})).To(BeFalse())
 			Expect(cache.GetAll(ctx)).To(BeEmpty())
 		})
 	})

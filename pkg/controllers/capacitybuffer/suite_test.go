@@ -563,6 +563,71 @@ var _ = Describe("CapacityBuffer Controller", func() {
 
 			Expect(trigger.calls).To(BeEmpty())
 		})
+
+		It("should trigger the provisioner when a cached buffer is deleted", func() {
+			trigger := &fakeTrigger{}
+			ctrl := NewController(env.Client, trigger, virtualpods.NewVirtualPodCache(env.Client))
+
+			pt := &v1.PodTemplate{
+				ObjectMeta: metav1.ObjectMeta{Name: "trig-del-template", Namespace: "default"},
+				Template: v1.PodTemplateSpec{
+					Spec: v1.PodSpec{Containers: []v1.Container{{Name: "c", Image: "p"}}},
+				},
+			}
+			cb := &autoscalingv1beta1.CapacityBuffer{
+				ObjectMeta: metav1.ObjectMeta{Name: "trig-del-buffer", Namespace: "default"},
+				Spec: autoscalingv1beta1.CapacityBufferSpec{
+					PodTemplateRef: &autoscalingv1beta1.LocalObjectRef{Name: "trig-del-template"},
+					Replicas:       lo.ToPtr(int32(2)),
+				},
+			}
+			ExpectApplied(ctx, env.Client, pt, cb)
+			ExpectReconcileSucceeded(ctx, ctrl, client.ObjectKeyFromObject(cb))
+			Expect(trigger.calls).To(HaveLen(1))
+
+			// The provisioner only recomputes cluster.bufferPodCounts on a
+			// provisioning pass. Deleting the buffer must trigger one, or nodes
+			// stay protected from emptiness by the deleted buffer's virtual pods.
+			ExpectDeleted(ctx, env.Client, cb)
+			ExpectReconcileSucceeded(ctx, ctrl, client.ObjectKeyFromObject(cb))
+			Expect(trigger.calls).To(HaveLen(2))
+
+			// A repeat reconcile for the already-evicted buffer has nothing to
+			// remove, so it shouldn't trigger again.
+			ExpectReconcileSucceeded(ctx, ctrl, client.ObjectKeyFromObject(cb))
+			Expect(trigger.calls).To(HaveLen(2))
+		})
+
+		It("should trigger the provisioner when resolution starts failing for a cached buffer", func() {
+			trigger := &fakeTrigger{}
+			ctrl := NewController(env.Client, trigger, virtualpods.NewVirtualPodCache(env.Client))
+
+			pt := &v1.PodTemplate{
+				ObjectMeta: metav1.ObjectMeta{Name: "trig-gone-template", Namespace: "default"},
+				Template: v1.PodTemplateSpec{
+					Spec: v1.PodSpec{Containers: []v1.Container{{Name: "c", Image: "p"}}},
+				},
+			}
+			cb := &autoscalingv1beta1.CapacityBuffer{
+				ObjectMeta: metav1.ObjectMeta{Name: "trig-gone-buffer", Namespace: "default"},
+				Spec: autoscalingv1beta1.CapacityBufferSpec{
+					PodTemplateRef: &autoscalingv1beta1.LocalObjectRef{Name: "trig-gone-template"},
+					Replicas:       lo.ToPtr(int32(2)),
+				},
+			}
+			ExpectApplied(ctx, env.Client, pt, cb)
+			ExpectReconcileSucceeded(ctx, ctrl, client.ObjectKeyFromObject(cb))
+			Expect(trigger.calls).To(HaveLen(1))
+
+			ExpectDeleted(ctx, env.Client, pt)
+			ExpectReconcileSucceeded(ctx, ctrl, client.ObjectKeyFromObject(cb))
+			cb = ExpectExists(ctx, env.Client, cb)
+			Expect(trigger.calls).To(Equal([]types.UID{cb.UID, cb.UID}))
+
+			// The entry is already gone, so later failing reconciles don't trigger.
+			ExpectReconcileSucceeded(ctx, ctrl, client.ObjectKeyFromObject(cb))
+			Expect(trigger.calls).To(HaveLen(2))
+		})
 	})
 
 	Context("Virtual pod cache", func() {
