@@ -95,6 +95,26 @@ type RepairPolicy struct {
 	Action RepairAction
 }
 
+type repairCondition struct {
+	conditionType   corev1.NodeConditionType
+	conditionStatus corev1.ConditionStatus
+}
+
+// RepairConditions is the set of node condition type/status pairs covered by a repair policy set, regardless of reason
+// or toleration. A node with any covered condition is unhealthy.
+type RepairConditions sets.Set[repairCondition]
+
+func NewRepairConditions(policies []RepairPolicy) RepairConditions {
+	return RepairConditions(sets.New(lo.Map(policies, func(p RepairPolicy, _ int) repairCondition {
+		return repairCondition{conditionType: p.ConditionType, conditionStatus: p.ConditionStatus}
+	})...))
+}
+
+// Covers returns true when the policy set covers the condition's type and status, regardless of reason or toleration.
+func (r RepairConditions) Covers(condition corev1.NodeCondition) bool {
+	return sets.Set[repairCondition](r).Has(repairCondition{conditionType: condition.Type, conditionStatus: condition.Status})
+}
+
 // CloudProvider interface is implemented by cloud providers to support provisioning.
 type CloudProvider interface {
 	// Create launches a NodeClaim with the given resource requests and requirements and returns a hydrated

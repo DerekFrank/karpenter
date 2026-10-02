@@ -44,6 +44,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
@@ -64,6 +65,9 @@ type Cluster struct {
 	nodeClaimNameToProviderID map[string]string               // node claim name -> provider id
 	nodePoolResources         map[string]corev1.ResourceList  // node pool name -> resource list
 	daemonSetPods             sync.Map                        // daemonSet -> existing pod
+
+	repairConditions cloudprovider.RepairConditions // built from the static RepairPolicies on first use
+	unhealthyNodes   sets.Set[string]               // provider ids of nodes with a condition in repairConditions
 
 	NodePoolState *NodePoolState
 
@@ -112,6 +116,7 @@ func NewCluster(clk clock.Clock, client client.Client, cloudProvider cloudprovid
 		nodeNameToProviderID:      map[string]string{},
 		nodeClaimNameToProviderID: map[string]string{},
 		nodePoolResources:         map[string]corev1.ResourceList{},
+		unhealthyNodes:            sets.New[string](),
 
 		NodePoolState: NewNodePoolState(),
 
@@ -274,6 +279,22 @@ func (c *Cluster) DeepCopyNodes() StateNodes {
 	})
 }
 
+// GetUnhealthyNodes returns a DeepCopy of the state nodes whose Node has a condition covered by the cloud provider's
+// repair policies, regardless of the policy's reason or toleration. The index is maintained from Node updates, so this
+// costs O(unhealthy nodes) rather than O(nodes).
+func (c *Cluster) GetUnhealthyNodes() StateNodes {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return lo.FilterMap(c.unhealthyNodes.UnsortedList(), func(providerID string, _ int) (*StateNode, bool) {
+		n, ok := c.nodes[providerID]
+		if !ok || n.Node == nil {
+			return nil, false
+		}
+		return n.DeepCopy(), true
+	})
+}
+
 // IsNodeNominated returns true if the given node was expected to have a pod bound to it during a recent scheduling
 // batch
 func (c *Cluster) IsNodeNominated(providerID string) bool {
@@ -411,6 +432,9 @@ func (c *Cluster) UpdateNode(ctx context.Context, node *corev1.Node) error {
 	n, err := c.newStateFromNode(ctx, node, c.nodes[node.Spec.ProviderID])
 	if err != nil {
 		return err
+	}
+	if options.FromContext(ctx).FeatureGates.NodeRepair {
+		c.updateNodeHealth(node.Spec.ProviderID, node)
 	}
 	c.nodes[node.Spec.ProviderID] = n
 	c.nodeNameToProviderID[node.Name] = node.Spec.ProviderID
@@ -660,6 +684,8 @@ func (c *Cluster) Reset() {
 	c.nodeClaimNameToProviderID = map[string]string{}
 	c.NodePoolState.Reset()
 	c.nodePoolResources = map[string]corev1.ResourceList{}
+	c.repairConditions = nil
+	c.unhealthyNodes = sets.New[string]()
 	c.bindings = map[types.NamespacedName]string{}
 	c.antiAffinityPods = sync.Map{}
 	c.daemonSetPods = sync.Map{}
@@ -800,6 +826,7 @@ func (c *Cluster) newStateFromNode(ctx context.Context, node *corev1.Node, oldNo
 
 func (c *Cluster) cleanupNode(name string) {
 	if id := c.nodeNameToProviderID[name]; id != "" {
+		c.unhealthyNodes.Delete(id)
 		if c.nodes[id].NodeClaim == nil {
 			c.updateNodePoolResources(c.nodes[id], nil)
 			delete(c.nodes, id)
@@ -810,6 +837,18 @@ func (c *Cluster) cleanupNode(name string) {
 		}
 		delete(c.nodeNameToProviderID, name)
 		c.MarkUnconsolidated()
+	}
+}
+
+// updateNodeHealth indexes the Node as unhealthy when one of its conditions is covered by a repair policy.
+func (c *Cluster) updateNodeHealth(providerID string, node *corev1.Node) {
+	if c.repairConditions == nil {
+		c.repairConditions = cloudprovider.NewRepairConditions(c.cloudProvider.RepairPolicies())
+	}
+	if lo.SomeBy(node.Status.Conditions, c.repairConditions.Covers) {
+		c.unhealthyNodes.Insert(providerID)
+	} else {
+		c.unhealthyNodes.Delete(providerID)
 	}
 }
 

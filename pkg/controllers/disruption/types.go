@@ -74,6 +74,13 @@ type Method interface {
 	ConsolidationType() string
 }
 
+// CandidateNodeSource is implemented by a Method whose eligible nodes are indexed in cluster state. The controller
+// builds that Method's candidates only from CandidateNodes, so a pass costs O(eligible nodes) rather than O(nodes).
+// NodePoolTotals computed from that subset would not describe the whole pool, so they are not passed to the Method.
+type CandidateNodeSource interface {
+	CandidateNodes() state.StateNodes
+}
+
 type CandidateFilter func(context.Context, *Candidate) bool
 
 // Candidate is a state.StateNode that we are considering for disruption along with extra information to be used in
