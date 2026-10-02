@@ -22,6 +22,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -540,4 +541,15 @@ var _ = Describe("Repair Policies", func() {
 		})
 	})
 
+	It("matches every covered condition type and status regardless of reason or toleration", func() {
+		matcher := lo.Must(NewRepairPolicyMatcher([]cloudprovider.RepairPolicy{
+			defaultFallback,
+			{ConditionType: corev1.NodeReady, ConditionStatus: corev1.ConditionUnknown, ReasonRegex: "^Lost$", TolerationDuration: time.Hour, Action: cloudprovider.ReplaceNode},
+		}, supportedActions))
+
+		Expect(matcher.Matches(corev1.NodeCondition{Type: "AcceleratorReady", Status: corev1.ConditionFalse})).To(BeTrue())
+		Expect(matcher.Matches(corev1.NodeCondition{Type: corev1.NodeReady, Status: corev1.ConditionUnknown, Reason: "Other"})).To(BeTrue())
+		Expect(matcher.Matches(corev1.NodeCondition{Type: corev1.NodeReady, Status: corev1.ConditionFalse})).To(BeFalse())
+		Expect(matcher.Matches(corev1.NodeCondition{Type: "AcceleratorReady", Status: corev1.ConditionTrue})).To(BeFalse())
+	})
 })

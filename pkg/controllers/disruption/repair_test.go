@@ -141,6 +141,7 @@ var _ = Describe("Repair", func() {
 
 	// newRepairController builds an isolated repair-only disruption controller. Repair caches RepairPolicies() at
 	// construction, so specs that override cloudProvider.RepairPolicy must call this again to pick up the new policies.
+	// Cluster state also caches them until Reset, so overrides must happen before any Node reaches cluster state.
 	newRepairController := func() {
 		repair = disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue))
 		repairController = disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
@@ -420,6 +421,23 @@ var _ = Describe("Repair", func() {
 
 		ExpectSingletonReconciled(ctx, repairController)
 		Expect(queue.GetCommands()).To(HaveLen(1))
+	})
+
+	// Repair only builds candidates from unhealthy nodes, so it never evaluates or publishes events for healthy ones.
+	It("should not publish disruption events for healthy nodes", func() {
+		initNode(nodeClaim, node)
+		markUnhealthy(node, "BadNode")
+		// A healthy node whose NodePool is missing would be blocked as a candidate if repair evaluated it.
+		orphanClaim, orphan := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: lo.Assign(labels(), map[string]string{v1.NodePoolLabelKey: "missing"})}})
+		initNode(orphanClaim, orphan)
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+
+		Expect(queue.GetCommands()).To(HaveLen(1))
+		Expect(lo.Filter(recorder.Events(), func(event karpenterevents.Event, _ int) bool {
+			return event.InvolvedObject.(metav1.Object).GetUID() == orphan.UID || event.InvolvedObject.(metav1.Object).GetUID() == orphanClaim.UID
+		})).To(BeEmpty())
 	})
 
 	// Ordering is prioritizable — a higher-priority fault repairs before a lower-priority one in the same pass.

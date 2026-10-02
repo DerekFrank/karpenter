@@ -51,6 +51,7 @@ type compiledPolicy struct {
 
 // RepairPolicyMatcher validates and evaluates provider repair policies.
 type RepairPolicyMatcher struct {
+	conditions     cloudprovider.RepairConditions
 	groups         map[policyKey][]compiledPolicy
 	fallbackPolicy compiledPolicy
 	ranks          map[int]int
@@ -115,6 +116,7 @@ func NewRepairPolicyMatcher(policies []cloudprovider.RepairPolicy, supportedActi
 		return nil, errs
 	}
 	return &RepairPolicyMatcher{
+		conditions:     cloudprovider.NewRepairConditions(policies),
 		groups:         groups,
 		fallbackPolicy: fallbackPolicy,
 		ranks:          denseRanks(policies),
@@ -226,8 +228,7 @@ func (p *RepairPolicyMatcher) Evaluate(node *corev1.Node, now time.Time) RepairR
 
 // Matches returns true when the condition is covered by the provider policy set, regardless of toleration.
 func (p *RepairPolicyMatcher) Matches(condition corev1.NodeCondition) bool {
-	_, ok := p.groups[policyKey{conditionType: condition.Type, conditionStatus: condition.Status}]
-	return ok
+	return p.conditions.Covers(condition)
 }
 
 func (r *RepairResult) mergePolicy(policy compiledPolicy, rank int, transitionTime, now time.Time) {

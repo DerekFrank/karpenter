@@ -37,6 +37,7 @@ import (
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
@@ -73,6 +74,12 @@ func NewRepair(c consolidation) *Repair {
 		policyMatcher:      policyMatcher,
 		decisionLogMonitor: pretty.NewChangeMonitor(),
 	}
+}
+
+// CandidateNodes limits repair to nodes with a condition covered by the provider policy set. ShouldDisrupt still
+// evaluates each against the policies, since the index ignores reason and toleration.
+func (r *Repair) CandidateNodes() state.StateNodes {
+	return r.cluster.GetUnhealthyNodes()
 }
 
 // ShouldDisrupt is a predicate that filters candidates to nodes that have an unhealthy condition matching a
