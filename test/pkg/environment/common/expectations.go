@@ -48,6 +48,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/portforward"
 	"k8s.io/client-go/transport"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1129,6 +1130,90 @@ func (env *Environment) ConsistentlyExpectNodeClaimCountNotExceed(duration time.
 		g.Expect(env.Client.List(env, nodeClaimList)).To(Succeed())
 		g.Expect(len(nodeClaimList.Items)).To(BeNumerically("<=", count))
 	}, duration).Should(Succeed())
+}
+
+// ExpectStaticDriftConverged watches the static NodePool's NodeClaims until none of the drifted NodeClaims are left
+// and the NodePool has exactly replicas NodeClaims, all within timeout. Throughout, the NodePool must never have more
+// than limit NodeClaims or Nodes. Unless allowReplacementDeletes is set, it also fails as soon as a NodeClaim other
+// than the drifted ones starts deleting: with replicas unchanged, that is static deprovisioning deleting a drift
+// replacement (#3250). midDrift, if set, runs in parallel once the watch has started.
+//
+//nolint:gocyclo
+func (env *Environment) ExpectStaticDriftConverged(nodePool *v1.NodePool, drifted []*v1.NodeClaim, replicas, limit int, timeout time.Duration, allowReplacementDeletes bool, midDrift func()) {
+	GinkgoHelper()
+	By(fmt.Sprintf("watching nodepool %s converge to %d replicas without exceeding %d nodes", nodePool.Name, replicas, limit))
+	watchClient := lo.Must(client.NewWithWatch(env.Config, client.Options{Scheme: env.Client.Scheme()}))
+	inPool := client.MatchingLabels{v1.NodePoolLabelKey: nodePool.Name}
+	driftedNames := sets.New(lo.Map(drifted, func(nc *v1.NodeClaim, _ int) string { return nc.Name })...)
+	live := map[string]*v1.NodeClaim{}
+	observe := func(nodeClaim *v1.NodeClaim, deleted bool) {
+		if !allowReplacementDeletes && !driftedNames.Has(nodeClaim.Name) && (deleted || !nodeClaim.DeletionTimestamp.IsZero()) {
+			Fail(fmt.Sprintf("nodeclaim %s, created during the drift, was deleted before the drift completed", nodeClaim.Name))
+		}
+		if deleted {
+			delete(live, nodeClaim.Name)
+		} else {
+			live[nodeClaim.Name] = nodeClaim
+		}
+		Expect(len(live)).To(BeNumerically("<=", limit), "nodepool %s has more nodeclaims than limits.nodes", nodePool.Name)
+	}
+	converged := func() bool {
+		return len(live) == replicas && lo.NoneBy(lo.Keys(live), driftedNames.Has)
+	}
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	started := false
+	for {
+		// List, then watch from the list's resourceVersion, so that no change is missed. If the watch ends, list again.
+		list := &v1.NodeClaimList{}
+		Expect(watchClient.List(env, list, inPool)).To(Succeed())
+		listed := sets.New[string]()
+		for i := range list.Items {
+			listed.Insert(list.Items[i].Name)
+			observe(&list.Items[i], false)
+		}
+		for name, nodeClaim := range live {
+			if !listed.Has(name) {
+				observe(nodeClaim, true)
+			}
+		}
+		if converged() {
+			return
+		}
+		if !started && midDrift != nil {
+			started = true
+			go func() {
+				defer GinkgoRecover()
+				midDrift()
+			}()
+		}
+		w := lo.Must(watchClient.Watch(env, &v1.NodeClaimList{}, inPool, &client.ListOptions{Raw: &metav1.ListOptions{ResourceVersion: list.ResourceVersion}}))
+	events:
+		for {
+			select {
+			case <-deadline:
+				w.Stop()
+				Fail(fmt.Sprintf("nodepool %s didn't converge within %s: %d nodeclaims, %d of them drifted", nodePool.Name, timeout, len(live), lo.CountBy(lo.Keys(live), driftedNames.Has)))
+			case <-ticker.C:
+				nodes := &corev1.NodeList{}
+				Expect(env.Client.List(env, nodes, inPool)).To(Succeed())
+				Expect(len(nodes.Items)).To(BeNumerically("<=", limit), "nodepool %s has more nodes than limits.nodes", nodePool.Name)
+			case event, ok := <-w.ResultChan():
+				if !ok || event.Type == watch.Error {
+					w.Stop()
+					break events
+				}
+				if nodeClaim, isNodeClaim := event.Object.(*v1.NodeClaim); isNodeClaim {
+					observe(nodeClaim, event.Type == watch.Deleted)
+				}
+				if converged() {
+					w.Stop()
+					return
+				}
+			}
+		}
+	}
 }
 
 func (env *Environment) EventuallyExpectEmpty(nodeClaims ...*v1.NodeClaim) {

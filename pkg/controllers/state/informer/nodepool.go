@@ -65,6 +65,7 @@ func (c *NodePoolController) Reconcile(ctx context.Context, req reconcile.Reques
 	if err := c.kubeClient.Get(ctx, req.NamespacedName, np); err != nil {
 		if errors.IsNotFound(err) {
 			// notify cluster state of the nodepool deletion
+			c.cluster.DeleteNodePool(req.Name)
 			c.clusterCost.DeleteNodePool(ctx, req.Name)
 			return reconcile.Result{}, nil
 		}
@@ -73,6 +74,7 @@ func (c *NodePoolController) Reconcile(ctx context.Context, req reconcile.Reques
 	if !nodepoolutils.IsManaged(np, c.cloudProvider) {
 		return reconcile.Result{}, nil
 	}
+	c.cluster.UpdateNodePool(np)
 
 	// Something changed in the NodePool so we should re-consider consolidation
 	c.cluster.MarkUnconsolidated()
