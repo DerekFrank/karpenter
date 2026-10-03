@@ -114,17 +114,18 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 	workqueue.ParallelizeUntil(ctx, len(candidates), len(candidates), func(i int) {
 		candidate := candidates[i]
 
+		// Count the NodeClaim as deleting before deleting it. The informer can process the NotFound, and Forget the
+		// NodeClaim, before Delete returns, so an intent set afterward would be left behind for a NodeClaim that's gone.
+		c.cluster.NodePoolState.RequestDelete(ctx, candidate.Name)
 		if err := retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
 			return c.kubeClient.Delete(ctx, candidate)
 		}); err != nil && client.IgnoreNotFound(err) != nil {
+			c.cluster.NodePoolState.ClearDeleteRequest(candidate.Name)
 			scaleDownErrs[i] = err
 			return
 		}
 
 		log.FromContext(ctx).WithValues("NodeClaim", klog.KObj(candidate)).V(1).Info("deleting nodeclaim")
-
-		// Mark the NodeClaim as Deleting in StateNodePool
-		c.cluster.NodePoolState.MarkNodeClaimDeleting(np.Name, candidate.Name)
 	})
 
 	if scaleDownErr := multierr.Combine(scaleDownErrs...); scaleDownErr != nil {

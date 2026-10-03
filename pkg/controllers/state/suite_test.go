@@ -2728,14 +2728,14 @@ var _ = Describe("NodePoolState Tracking", func() {
 				Expect(deleting).To(Equal(0))
 				Expect(pendingdisruption).To(Equal(0))
 
-				cluster.NodePoolState.MarkNodeClaimPendingDisruption(nodePool.Name, nodeClaim.Name)
+				cluster.NodePoolState.RequestDisrupt(ctx, nodeClaim.Name)
 				running, deleting, pendingdisruption = cluster.NodePoolState.GetNodeCount(nodePool.Name)
 
 				Expect(running).To(Equal(1))
 				Expect(deleting).To(Equal(0))
 				Expect(pendingdisruption).To(Equal(1))
 
-				cluster.NodePoolState.MarkNodeClaimPendingDisruption(nodePool.Name, nodeClaim2.Name)
+				cluster.NodePoolState.RequestDisrupt(ctx, nodeClaim2.Name)
 				running, deleting, pendingdisruption = cluster.NodePoolState.GetNodeCount(nodePool.Name)
 
 				Expect(running).To(Equal(0))
@@ -2906,7 +2906,7 @@ var _ = Describe("NodePoolState Tracking", func() {
 					case 0:
 						cluster.MarkForDeletion(nodeClaim.Status.ProviderID)
 					case 1:
-						cluster.NodePoolState.MarkNodeClaimPendingDisruption(nodePool.Name, nodeClaim.Name)
+						cluster.NodePoolState.RequestDisrupt(ctx, nodeClaim.Name)
 					case 2:
 						cluster.UnmarkForDeletion(nodeClaim.Status.ProviderID)
 					}
@@ -2918,6 +2918,118 @@ var _ = Describe("NodePoolState Tracking", func() {
 			// Final state should be consistent
 			running, deleting, pendingdisruption := cluster.NodePoolState.GetNodeCount(nodePool.Name)
 			Expect(running + deleting + pendingdisruption).To(Equal(1)) // Should have exactly one NodeClaim
+		})
+	})
+})
+
+var _ = Describe("NodePoolState Derived Accounting", func() {
+	var unlaunched *v1.NodeClaim
+
+	BeforeEach(func() {
+		unlaunched = test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}}})
+		unlaunched.Status.ProviderID = ""
+		ExpectApplied(ctx, env.Client, unlaunched)
+		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+		ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 0)
+	})
+
+	Context("Launch", func() {
+		launch := func() {
+			unlaunched.Status.ProviderID = test.RandomProviderID()
+			ExpectApplied(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+		}
+		It("should keep a delete request when the NodeClaim's providerID resolves", func() {
+			cluster.NodePoolState.RequestDelete(ctx, unlaunched.Name)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 1, 0)
+			launch()
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 1, 0)
+		})
+		It("should keep a disrupt request when the NodeClaim's providerID resolves", func() {
+			cluster.NodePoolState.RequestDisrupt(ctx, unlaunched.Name)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 1)
+			launch()
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 1)
+		})
+		It("should keep the NodePool's reservation when a NodeClaim's providerID resolves", func() {
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(BeEquivalentTo(1))
+			launch()
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(BeEquivalentTo(0))
+		})
+	})
+
+	Context("Observed state", func() {
+		It("should count an unlaunched NodeClaim with a DeletionTimestamp as deleting", func() {
+			ExpectDeletionTimestampSet(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 1, 0)
+		})
+		It("should count an unlaunched NodeClaim that is InstanceTerminating as deleting", func() {
+			unlaunched.StatusConditions().SetTrue(v1.ConditionTypeInstanceTerminating)
+			ExpectApplied(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 1, 0)
+		})
+		It("should count a launched NodeClaim with a DeletionTimestamp as deleting after UnmarkForDeletion", func() {
+			unlaunched.Status.ProviderID = test.RandomProviderID()
+			ExpectApplied(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			cluster.MarkForDeletion(unlaunched.Status.ProviderID)
+			ExpectDeletionTimestampSet(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			cluster.UnmarkForDeletion(unlaunched.Status.ProviderID)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 1, 0)
+		})
+		It("should count a NodeClaim with the DisruptionReason condition as pending disruption until it is cleared", func() {
+			unlaunched.StatusConditions().SetTrueWithReason(v1.ConditionTypeDisruptionReason, string(v1.DisruptionReasonDrifted), string(v1.DisruptionReasonDrifted))
+			ExpectApplied(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 1)
+
+			Expect(unlaunched.StatusConditions().Clear(v1.ConditionTypeDisruptionReason)).To(Succeed())
+			ExpectApplied(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 0)
+		})
+		It("should not let a stale read undo a disrupt request", func() {
+			stale := unlaunched.DeepCopy()
+			cluster.NodePoolState.RequestDisrupt(ctx, unlaunched.Name)
+			cluster.UpdateNodeClaim(stale)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 1)
+		})
+	})
+
+	Context("Unknown NodeClaims", func() {
+		It("should drop intents for NodeClaims that cluster state hasn't observed", func() {
+			cluster.NodePoolState.RequestDelete(ctx, "unknown")
+			cluster.NodePoolState.RequestDisrupt(ctx, "unknown")
+			cluster.NodePoolState.SetMarkedForDeletion("unknown", true)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 0)
+		})
+		It("should drop intents that arrive after the NodeClaim is deleted", func() {
+			ExpectDeleted(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			cluster.NodePoolState.RequestDelete(ctx, unlaunched.Name)
+			cluster.NodePoolState.RequestDisrupt(ctx, unlaunched.Name)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 0)
+		})
+	})
+
+	Context("Reservations", func() {
+		It("should keep the NodePool's reservation when its last NodeClaim is deleted", func() {
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(BeEquivalentTo(1))
+			ExpectDeleted(ctx, env.Client, unlaunched)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(unlaunched))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 0)
+
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 1, 1)).To(BeEquivalentTo(0))
+			cluster.NodePoolState.ReleaseNodeCount(nodePool.Name, 1)
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 1, 1)).To(BeEquivalentTo(1))
+		})
+		It("should count pending disruption NodeClaims against the limit", func() {
+			cluster.NodePoolState.RequestDisrupt(ctx, unlaunched.Name)
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(BeEquivalentTo(1))
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(BeEquivalentTo(0))
 		})
 	})
 })

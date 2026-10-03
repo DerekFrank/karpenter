@@ -305,7 +305,7 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 }
 
 // markDisrupted taints the node and adds the Disrupted condition to the NodeClaim for a candidate that is about to be disrupted
-// For static NodeClaims, we mark NodeClaims as pendingdisruption in statenodepool
+// For static NodeClaims, we also request pending disruption in NodePoolState
 func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, error) {
 	errs := make([]error, len(cmd.Candidates))
 	workqueue.ParallelizeUntil(ctx, len(cmd.Candidates), len(cmd.Candidates), func(i int) {
@@ -334,9 +334,9 @@ func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, 
 		}
 		markedCandidates = append(markedCandidates, cmd.Candidates[i])
 
-		// Mark all StaticNodeClaims as pendingdisruption in nodepoolstate
+		// Count static NodeClaims as pending disruption until the cache shows the DisruptionReason condition patched above
 		if cmd.Candidates[i].OwnedByStaticNodePool() {
-			q.cluster.NodePoolState.MarkNodeClaimPendingDisruption(cmd.Candidates[i].NodePool.Name, cmd.Candidates[i].NodeClaim.Name)
+			q.cluster.NodePoolState.RequestDisrupt(ctx, cmd.Candidates[i].NodeClaim.Name)
 		}
 	}
 	return markedCandidates, multierr.Combine(errs...)
