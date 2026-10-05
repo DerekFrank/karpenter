@@ -17,12 +17,16 @@ limitations under the License.
 package operator_test
 
 import (
+	"context"
+	"net/url"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	prometheusmodel "github.com/prometheus/client_model/go"
 	"github.com/samber/lo"
+	clientmetrics "k8s.io/client-go/tools/metrics"
 
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -41,5 +45,18 @@ var _ = Describe("Operator", func() {
 			_, ok := lo.Find(m.GetLabel(), func(l *prometheusmodel.LabelPair) bool { return lo.FromPtr(l.Name) == label })
 			Expect(ok).To(BeTrue())
 		}
+	})
+	It("should fire a metric for client-go rate limiter latency", func() {
+		clientmetrics.RateLimiterLatency.Observe(context.Background(), "PUT", url.URL{Path: "/apis/karpenter.sh/v1/nodeclaims/{name}/status"}, 2*time.Second)
+		m, found := FindMetricWithLabelValues("client_go_rate_limiter_duration_seconds", map[string]string{
+			"verb":        "UPDATE",
+			"group":       "karpenter.sh",
+			"version":     "v1",
+			"kind":        "nodeclaims",
+			"subresource": "status",
+		})
+		Expect(found).To(BeTrue())
+		Expect(m.GetHistogram().GetSampleCount()).To(BeNumerically("==", 1))
+		Expect(m.GetHistogram().GetSampleSum()).To(BeNumerically("==", 2))
 	})
 })
