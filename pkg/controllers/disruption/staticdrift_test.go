@@ -17,9 +17,13 @@ limitations under the License.
 package disruption_test
 
 import (
+	"context"
+	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/awslabs/operatorpkg/status"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -28,11 +32,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
+	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
+	staticdeprovisioning "sigs.k8s.io/karpenter/pkg/controllers/static/deprovisioning"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
@@ -106,6 +114,7 @@ var _ = Describe("StaticDrift", func() {
 			}
 
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 			for i := range numNodes {
 				nodeClaims[i].StatusConditions().SetTrue(v1.ConditionTypeDrifted)
 				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
@@ -165,6 +174,7 @@ var _ = Describe("StaticDrift", func() {
 			}
 
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 			for i := range numNodes {
 				nodeClaims[i].StatusConditions().SetTrue(v1.ConditionTypeDrifted)
 				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
@@ -242,6 +252,10 @@ var _ = Describe("StaticDrift", func() {
 			})
 
 			ExpectApplied(ctx, env.Client, nodePool1, nodePool2, nodePool3)
+			cluster.UpdateNodePool(nodePool3)
+			cluster.UpdateNodePool(nodePool1)
+			cluster.UpdateNodePool(nodePool2)
+			cluster.UpdateNodePool(nodePool3)
 
 			// Create 2 nodes for each NodePool
 			nodeClaims1, nodes1 := test.NodeClaimsAndNodes(2, v1.NodeClaim{
@@ -389,6 +403,7 @@ var _ = Describe("StaticDrift", func() {
 			})
 
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 			for i := range 5 {
 				nodeClaims[i].StatusConditions().SetTrue(v1.ConditionTypeDrifted)
 				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
@@ -429,6 +444,7 @@ var _ = Describe("StaticDrift", func() {
 			})
 
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 			for i := range 2 {
 				nodeClaims[i].StatusConditions().SetTrue(v1.ConditionTypeDrifted)
 				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
@@ -488,6 +504,7 @@ var _ = Describe("StaticDrift", func() {
 			})
 
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 			for i := range 5 {
 				nodeClaims[i].StatusConditions().SetTrue(v1.ConditionTypeDrifted)
 				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
@@ -546,6 +563,7 @@ var _ = Describe("StaticDrift", func() {
 			})
 
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 			for i := range 5 {
 				nodeClaims[i].StatusConditions().SetTrue(v1.ConditionTypeDrifted)
 				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
@@ -602,6 +620,7 @@ var _ = Describe("StaticDrift", func() {
 			})
 
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 			for i := 0; i < numNodes; i++ {
 				nodeClaims[i].StatusConditions().SetTrue(v1.ConditionTypeDrifted)
 				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
@@ -706,6 +725,10 @@ var _ = Describe("StaticDrift", func() {
 			})
 
 			ExpectApplied(ctx, env.Client, nodePool1, nodePool2, nodePool3)
+			cluster.UpdateNodePool(nodePool3)
+			cluster.UpdateNodePool(nodePool1)
+			cluster.UpdateNodePool(nodePool2)
+			cluster.UpdateNodePool(nodePool3)
 
 			// Create nodes for each NodePool
 			nodeClaims1, nodes1 := test.NodeClaimsAndNodes(2, v1.NodeClaim{
@@ -832,6 +855,7 @@ var _ = Describe("StaticDrift", func() {
 			nodePool.Spec.Replicas = new(int64(0))
 			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			cluster.UpdateNodePool(nodePool)
 
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -861,6 +885,7 @@ var _ = Describe("StaticDrift", func() {
 				},
 			})
 			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
 
 			for i, nc := range nodeClaims {
 				nc.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
@@ -882,6 +907,7 @@ var _ = Describe("StaticDrift", func() {
 			_ = nodeClaim.StatusConditions().Clear(v1.ConditionTypeDrifted)
 			nodePool.Spec.Replicas = new(int64(1))
 			ExpectApplied(ctx, env.Client, nodeClaim, node, nodePool)
+			cluster.UpdateNodePool(nodePool)
 
 			// inform cluster state about nodes and nodeclaims
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
@@ -898,6 +924,7 @@ var _ = Describe("StaticDrift", func() {
 			nodePool.Spec.Replicas = new(int64(1))
 			nodeClaim.StatusConditions().SetFalse(v1.ConditionTypeDrifted, "NotDrifted", "NotDrifted")
 			ExpectApplied(ctx, env.Client, nodeClaim, node, nodePool)
+			cluster.UpdateNodePool(nodePool)
 
 			// inform cluster state about nodes and nodeclaims
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
@@ -914,6 +941,7 @@ var _ = Describe("StaticDrift", func() {
 			nodePool.Spec.Replicas = new(int64(1))
 			node.Annotations = lo.Assign(node.Annotations, map[string]string{v1.DoNotDisruptAnnotationKey: "true"})
 			ExpectApplied(ctx, env.Client, nodeClaim, node, nodePool)
+			cluster.UpdateNodePool(nodePool)
 
 			// inform cluster state about nodes and nodeclaims
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
@@ -926,6 +954,295 @@ var _ = Describe("StaticDrift", func() {
 			// Should not drift any nodes
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(0))
+		})
+	})
+})
+
+var _ = Describe("StaticDrift NodePoolState accounting", func() {
+	const replicas = 10
+	var nodePool *v1.NodePool
+	var nodeClaims []*v1.NodeClaim
+	var nodes []*corev1.Node
+	var candidate *v1.NodeClaim
+	// Hooks a spec can set on the client that StartCommand runs through
+	var failCreate bool
+	var afterCreate, afterStatusPatch func(*v1.NodeClaim)
+	var hookQueue *disruption.Queue
+	var hookDisruptionController *disruption.Controller
+	var deprovisioner *staticdeprovisioning.Controller
+
+	BeforeEach(func() {
+		nodePool = test.StaticNodePool(v1.NodePool{
+			Spec: v1.NodePoolSpec{
+				Replicas: new(int64(replicas)),
+				Limits:   v1.Limits{resources.Node: resource.MustParse("12")},
+				Disruption: v1.Disruption{
+					Budgets: []v1.Budget{{Nodes: "100%"}},
+				},
+			},
+		})
+		nodeClaims, nodes = test.NodeClaimsAndNodes(replicas, v1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					v1.NodePoolLabelKey:            nodePool.Name,
+					corev1.LabelInstanceTypeStable: mostExpensiveInstance.Name,
+					v1.CapacityTypeLabelKey:        mostExpensiveOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+					corev1.LabelTopologyZone:       mostExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+				},
+			},
+			Status: v1.NodeClaimStatus{
+				Allocatable: map[corev1.ResourceName]resource.Quantity{
+					corev1.ResourceCPU:  resource.MustParse("32"),
+					corev1.ResourcePods: resource.MustParse("100"),
+				},
+			},
+		})
+		candidate = nodeClaims[0]
+		candidate.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
+		ExpectApplied(ctx, env.Client, nodePool)
+		cluster.UpdateNodePool(nodePool)
+		for i := range nodeClaims {
+			ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
+		}
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+		ExpectStateNodePoolCount(cluster, nodePool.Name, replicas, 0, 0)
+
+		// Run StartCommand through a client whose NodeClaim writes can be intercepted
+		failCreate, afterCreate, afterStatusPatch = false, nil, nil
+		hookClient := interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				nodeClaim, ok := obj.(*v1.NodeClaim)
+				if ok && failCreate {
+					return fmt.Errorf("simulated error creating nodeclaim")
+				}
+				if err := c.Create(ctx, obj, opts...); err != nil {
+					return err
+				}
+				if ok && afterCreate != nil {
+					afterCreate(nodeClaim)
+				}
+				return nil
+			},
+			// Status patches go through the env client's status writer, which waits for its cache to sync
+			SubResourcePatch: func(ctx context.Context, c client.Client, _ string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				if err := c.Status().Patch(ctx, obj, patch, opts...); err != nil {
+					return err
+				}
+				if nodeClaim, ok := obj.(*v1.NodeClaim); ok && afterStatusPatch != nil {
+					afterStatusPatch(nodeClaim)
+				}
+				return nil
+			},
+		})
+		hookProv := provisioning.NewProvisioner(hookClient, recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client))
+		hookQueue = disruption.NewQueue(hookClient, recorder, cluster, env.Clock, hookProv)
+		hookDisruptionController = disruption.NewController(ctx, env.Clock, hookClient, hookProv, cloudProvider, recorder, cluster, hookQueue, clusterCost,
+			disruption.WithMethods(disruption.NewStaticDrift(cluster, hookProv, cloudProvider, recorder)))
+		deprovisioner = staticdeprovisioning.NewController(env.Client, cluster, cloudProvider, env.Clock, recorder)
+	})
+
+	DescribeTable("should not let static deprovisioning delete the replacement while the candidate is pending disruption",
+		func(observeCandidate func(stale *v1.NodeClaim)) {
+			stale := ExpectExists(ctx, env.Client, candidate).DeepCopy()
+			Expect(stale.StatusConditions(status.WithObservedOnly()).Get(v1.ConditionTypeDisruptionReason).IsTrue()).To(BeFalse())
+			// The informer sees the candidate and the replacement, then static.deprovisioning reconciles, all before the
+			// queue marks the candidate for deletion
+			afterCreate = func(replacement *v1.NodeClaim) {
+				defer GinkgoRecover()
+				observeCandidate(stale)
+				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(replacement))
+				ExpectStateNodePoolCount(cluster, nodePool.Name, replicas, 0, 1)
+				ExpectObjectReconciled(ctx, env.Client, deprovisioner, nodePool)
+			}
+			ExpectSingletonReconciled(ctx, hookDisruptionController)
+
+			cmds := hookQueue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			// static.deprovisioning must not have deleted the replacement
+			ExpectExists(ctx, env.Client, &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: cmds[0].Replacements[0].Name}})
+			ExpectStateNodePoolCount(cluster, nodePool.Name, replicas, 1, 0)
+
+			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
+			ExpectObjectReconciled(ctx, env.Client, hookQueue, cmds[0].Candidates[0].NodeClaim)
+			Expect(cmds[0].Succeeded).To(BeTrue())
+			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, candidate)
+			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(candidate))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, replicas, 0, 0)
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(replicas))
+		},
+		// The queue records the DisruptionReason patch response, so the candidate is pending disruption whether or not
+		// the informer has seen the patch
+		Entry("before the informer sees the DisruptionReason patch", func(*v1.NodeClaim) {}),
+		Entry("after the informer sees the DisruptionReason patch", func(*v1.NodeClaim) {
+			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(candidate))
+		}),
+		// The informer's periodic requeue reads the cache before it has caught up to the status patch
+		Entry("after a stale read of the candidate", func(stale *v1.NodeClaim) { cluster.UpdateNodeClaim(stale) }),
+	)
+
+	Context("Self-healing", func() {
+		DescribeTable("should return the candidate to active when StartCommand fails to create the replacement",
+			func(informerSawCondition bool) {
+				failCreate = true
+				Expect(ExpectSingletonReconcileFailed(ctx, hookDisruptionController)).To(MatchError(ContainSubstring("simulated error creating nodeclaim")))
+				disrupted := ExpectExists(ctx, env.Client, candidate).DeepCopy()
+				Expect(disrupted.StatusConditions(status.WithObservedOnly()).Get(v1.ConditionTypeDisruptionReason).IsTrue()).To(BeTrue())
+				if informerSawCondition {
+					ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(candidate))
+				}
+				ExpectStateNodePoolCount(cluster, nodePool.Name, replicas-1, 0, 1)
+
+				// The next disruption loop's sweep clears the condition, since no command owns the candidate, and
+				// records the patch response, so the candidate is active again before the informer sees the patch
+				nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "0"}}
+				ExpectApplied(ctx, env.Client, nodePool)
+				cluster.UpdateNodePool(nodePool)
+				ExpectSingletonReconciled(ctx, disruptionController)
+				Expect(ExpectExists(ctx, env.Client, candidate).StatusConditions(status.WithObservedOnly()).Get(v1.ConditionTypeDisruptionReason).IsTrue()).To(BeFalse())
+				ExpectStateNodePoolCount(cluster, nodePool.Name, replicas, 0, 0)
+
+				// An informer that is still catching up delivers the version with the condition set, which is older
+				// than the sweep's patch response
+				cluster.UpdateNodeClaim(disrupted)
+				ExpectStateNodePoolCount(cluster, nodePool.Name, replicas, 0, 0)
+				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(candidate))
+				ExpectStateNodePoolCount(cluster, nodePool.Name, replicas, 0, 0)
+			},
+			Entry("after the informer saw the DisruptionReason condition", true),
+			Entry("before the informer saw the DisruptionReason condition", false),
+		)
+		It("should return the candidate to active when the command fails in the queue", func() {
+			ExpectSingletonReconciled(ctx, hookDisruptionController)
+			cmds := hookQueue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(candidate))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, replicas, 1, 0)
+
+			// Time the command out before the replacement initializes
+			env.Clock.Step(11 * time.Minute)
+			ExpectObjectReconciled(ctx, env.Client, hookQueue, candidate)
+			Expect(cmds[0].Succeeded).To(BeFalse())
+			Expect(hookQueue.HasAny(cmds[0].Candidates[0].ProviderID())).To(BeFalse())
+
+			// The queue cleared the condition, recorded the patch response and unmarked the candidate, so it is active
+			// without waiting for the informer or another disruption loop
+			ExpectStateNodePoolCount(cluster, nodePool.Name, replicas+1, 0, 0)
+			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(candidate))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, replicas+1, 0, 0)
+		})
+		It("should count a candidate as pending disruption after a restart, then return it to active", func() {
+			ExpectSingletonReconciled(ctx, hookDisruptionController)
+			cmds := hookQueue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			// Launch the replacement so cluster state can sync after the restart
+			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
+
+			// Restart: in-memory state and commands are gone, the DisruptionReason condition persists
+			cluster.Reset()
+			cluster.UpdateNodePool(nodePool)
+			*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov))
+			for _, n := range ExpectNodes(ctx, env.Client) {
+				ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(n))
+			}
+			for _, nc := range ExpectNodeClaims(ctx, env.Client) {
+				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nc))
+			}
+			ExpectStateNodePoolCount(cluster, nodePool.Name, replicas, 0, 1)
+
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "0"}}
+			ExpectApplied(ctx, env.Client, nodePool)
+			cluster.UpdateNodePool(nodePool)
+			ExpectSingletonReconciled(ctx, disruptionController)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, replicas+1, 0, 0)
+		})
+	})
+
+	Context("Mark ownership", func() {
+		It("should keep a mark it didn't set when the command fails in the queue", func() {
+			afterCreate = func(*v1.NodeClaim) {
+				defer GinkgoRecover()
+				// static.deprovisioning claims the candidate before the queue marks it
+				Expect(cluster.MarkNodeClaimForDeletion(candidate.Name)).To(BeTrue())
+			}
+			ExpectSingletonReconciled(ctx, hookDisruptionController)
+			cmds := hookQueue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+
+			// Time the command out before the replacement initializes
+			env.Clock.Step(11 * time.Minute)
+			ExpectObjectReconciled(ctx, env.Client, hookQueue, candidate)
+			Expect(cmds[0].Succeeded).To(BeFalse())
+
+			// static.deprovisioning still owns the candidate
+			Expect(cluster.NodePoolState.MarkedForDeletion(candidate.Name)).To(BeTrue())
+			Expect(ExpectStateNodeExistsForNodeClaim(cluster, candidate).MarkedForDeletion()).To(BeTrue())
+			Expect(cluster.MarkNodeClaimForDeletion(candidate.Name)).To(BeFalse())
+		})
+	})
+
+	Context("Late write responses", func() {
+		It("should not roll back the candidate's StateNode with its DisruptionReason patch response", func() {
+			afterStatusPatch = func(nodeClaim *v1.NodeClaim) {
+				defer GinkgoRecover()
+				if nodeClaim.Name != candidate.Name {
+					return
+				}
+				// The informer delivers a version newer than the patch response before the response is observed
+				newer := ExpectExists(ctx, env.Client, candidate)
+				newer.Labels["test/after-patch"] = "true"
+				ExpectApplied(ctx, env.Client, newer)
+				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(candidate))
+			}
+			ExpectSingletonReconciled(ctx, hookDisruptionController)
+			Expect(hookQueue.GetCommands()).To(HaveLen(1))
+			Expect(ExpectStateNodeExistsForNodeClaim(cluster, candidate).NodeClaim.Labels).To(HaveKey("test/after-patch"))
+		})
+		It("should not roll back the candidate's StateNode with its DisruptionReason clear response", func() {
+			ExpectSingletonReconciled(ctx, hookDisruptionController)
+			cmds := hookQueue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+
+			afterStatusPatch = func(nodeClaim *v1.NodeClaim) {
+				defer GinkgoRecover()
+				if nodeClaim.Name != candidate.Name {
+					return
+				}
+				// The informer delivers a version newer than the patch response before the response is observed
+				newer := ExpectExists(ctx, env.Client, candidate)
+				newer.Labels["test/after-patch"] = "true"
+				ExpectApplied(ctx, env.Client, newer)
+				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(candidate))
+			}
+			env.Clock.Step(11 * time.Minute)
+			ExpectObjectReconciled(ctx, env.Client, hookQueue, candidate)
+			Expect(cmds[0].Succeeded).To(BeFalse())
+			Expect(ExpectStateNodeExistsForNodeClaim(cluster, candidate).NodeClaim.Labels).To(HaveKey("test/after-patch"))
+		})
+		It("should not bring back a candidate whose DisruptionReason patch response arrives after it is forgotten", func() {
+			// The informer's NotFound for the candidate runs while the patch is in flight
+			afterStatusPatch = func(nodeClaim *v1.NodeClaim) {
+				if nodeClaim.Name == candidate.Name {
+					cluster.DeleteNodeClaim(candidate.Name)
+				}
+			}
+			ExpectSingletonReconciled(ctx, hookDisruptionController)
+			ExpectNodeClaimNotInClusterState(cluster, candidate.Name)
+		})
+		It("should not bring back a candidate whose DisruptionReason clear arrives after it is forgotten", func() {
+			ExpectSingletonReconciled(ctx, hookDisruptionController)
+			cmds := hookQueue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+
+			// The informer's NotFound for the candidate runs while the patch is in flight
+			afterStatusPatch = func(nodeClaim *v1.NodeClaim) {
+				if nodeClaim.Name == candidate.Name {
+					cluster.DeleteNodeClaim(candidate.Name)
+				}
+			}
+			env.Clock.Step(11 * time.Minute)
+			ExpectObjectReconciled(ctx, env.Client, hookQueue, candidate)
+			Expect(cmds[0].Succeeded).To(BeFalse())
+			ExpectNodeClaimNotInClusterState(cluster, candidate.Name)
 		})
 	})
 })

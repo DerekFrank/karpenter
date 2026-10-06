@@ -23,7 +23,6 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
@@ -80,16 +79,12 @@ func request(name string) reconcile.Request {
 }
 
 var _ = Describe("NodeClaim Cluster State GC", func() {
-	It("should heal the wedge caused by a seed landing after the informer's delete cleanup", func() {
-		// The informer observes the NotFound and cleans up first (a no-op against empty state),
-		// then the provisioner's seed lands and strands name -> "". Synced() is now stuck false
-		// until state.nodeclaimgc reconciles.
+	It("should heal the wedge caused by a seed for a NodeClaim whose deletion the informer never processed", func() {
+		// The NodeClaim is created and deleted while the informer is relisting, so the informer never sees it, then the
+		// provisioner's seed lands and strands name -> "". Synced() is now stuck false until state.nodeclaimgc
+		// reconciles. A seed landing after the informer processed the deletion is dropped by cluster state instead.
 		nodeClaim := test.NodeClaim()
 		nodeClaim.Status.ProviderID = ""
-
-		// Informer delete cleanup runs first against a NodeClaim that doesn't exist -> no-op.
-		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
-		// The provisioner's post-create seed lands afterwards, stranding the ghost entry.
 		cluster.UpdateNodeClaim(nodeClaim)
 		Expect(cluster.Synced(ctx)).To(BeFalse())
 

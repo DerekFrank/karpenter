@@ -178,7 +178,7 @@ func NewEnvironment(options ...option.Function[EnvironmentOptions]) *Environment
 			return []string{pod.Spec.NodeName}
 		}))
 		c = &CacheSyncingClient{
-			Client: lo.Must(client.New(environment.Config, client.Options{Scheme: scheme.Scheme, Cache: &client.CacheOptions{Reader: cache}})),
+			Client: lo.Must(client.NewWithWatch(environment.Config, client.Options{Scheme: scheme.Scheme, Cache: &client.CacheOptions{Reader: cache}})),
 		}
 		go func() {
 			lo.Must0(cache.Start(ctx))
@@ -187,7 +187,8 @@ func NewEnvironment(options ...option.Function[EnvironmentOptions]) *Environment
 			log.Fatalf("cache failed to sync")
 		}
 	} else {
-		c = lo.Must(client.New(environment.Config, client.Options{Scheme: scheme.Scheme}))
+		// A client.WithWatch, so a test can wrap it with controller-runtime's interceptor
+		c = lo.Must(client.NewWithWatch(environment.Config, client.Options{Scheme: scheme.Scheme}))
 	}
 	return &Environment{
 		Environment:         environment,

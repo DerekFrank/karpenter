@@ -49,6 +49,17 @@ import (
 
 var errCandidateDeleting = fmt.Errorf("candidate is deleting")
 
+// clearDisruptionReason removes the DisruptionReason condition from the nodes' NodeClaims. NodePoolState counts a
+// static NodePool's NodeClaim as pending disruption while the condition is set, so it also observes the patched
+// NodeClaims. They count as active again without waiting for the informer, even if it never saw the condition.
+func clearDisruptionReason(ctx context.Context, kubeClient client.Client, clk clock.Clock, cluster *state.Cluster, nodes ...*state.StateNode) error {
+	cleared, err := state.ClearNodeClaimsCondition(ctx, kubeClient, clk, v1.ConditionTypeDisruptionReason, nodes...)
+	for _, nodeClaim := range cleared {
+		cluster.NodePoolState.ObserveIfTracked(nodeClaim)
+	}
+	return err
+}
+
 // SimulationOptions configures disruption-specific scheduling behavior.
 type SimulationOptions struct {
 	// IncludeBlockedCandidatePods includes candidate pods even when they cannot currently be evicted.

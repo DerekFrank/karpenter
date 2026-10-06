@@ -1078,3 +1078,25 @@ func ExpectStateNodePoolCount(cluster *state.Cluster, npName string, r, d, pd in
 	Expect(deleting).To(Equal(d))
 	Expect(pendingdisruption).To(Equal(pd))
 }
+
+// ExpectDisruptionReasonObserved sets the DisruptionReason condition on the NodeClaim and has the NodeClaim state
+// controller observe it
+func ExpectDisruptionReasonObserved(ctx context.Context, c client.Client, nodeClaimStateController reconcile.Reconciler, nodeClaim *v1.NodeClaim) {
+	GinkgoHelper()
+	nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeDisruptionReason, string(v1.DisruptionReasonDrifted), string(v1.DisruptionReasonDrifted))
+	ExpectApplied(ctx, c, nodeClaim)
+	ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim))
+}
+
+// ExpectNodeClaimNotInClusterState expects cluster state to hold nothing for the NodeClaim: no NodePoolState record, no
+// NodeClaim and no StateNode for it
+func ExpectNodeClaimNotInClusterState(cluster *state.Cluster, nodeClaimName string) {
+	GinkgoHelper()
+	Expect(cluster.NodePoolState.Tracked(nodeClaimName)).To(BeFalse())
+	Expect(cluster.NodeClaimExists(nodeClaimName)).To(BeFalse())
+	for n := range cluster.Nodes() {
+		if n.NodeClaim != nil {
+			Expect(n.NodeClaim.Name).ToNot(Equal(nodeClaimName))
+		}
+	}
+}

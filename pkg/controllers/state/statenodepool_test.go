@@ -35,7 +35,7 @@ var _ = Describe("NodePoolState", func() {
 	var nodePool *v1.NodePool
 
 	BeforeEach(func() {
-		nodePool = test.NodePool(v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "nodepool-2"}})
+		nodePool = test.StaticNodePool(v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "nodepool-2"}, Spec: v1.NodePoolSpec{Replicas: new(int64(1))}})
 		nodeClaim = test.NodeClaim(v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels: map[string]string{
@@ -47,6 +47,7 @@ var _ = Describe("NodePoolState", func() {
 			},
 		})
 		ExpectApplied(ctx, env.Client, nodePool)
+		ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
 	})
 
 	Context("ReserveNodeCount", func() {
@@ -77,6 +78,13 @@ var _ = Describe("NodePoolState", func() {
 			// No more capacity available
 			granted = cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 1)
 			Expect(granted).To(Equal(int64(0)))
+		})
+
+		It("should return zero when the NodePool is already over its limit", func() {
+			ExpectApplied(ctx, env.Client, nodeClaim)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 0, 1)).To(Equal(int64(0)))
 		})
 
 		It("should account for running NodeClaims", func() {
