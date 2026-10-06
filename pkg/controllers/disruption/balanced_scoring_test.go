@@ -598,46 +598,66 @@ var _ = Describe("Balanced Scoring", func() {
 			Expect(sorted[2]).To(Equal(candB), "expected third candidate to be B (lowest ratio)")
 		})
 
-		It("should sort non-Balanced candidates by savings ratio descending", func() {
+		It("should sort non-Balanced candidates by disruption cost ascending", func() {
 			np := makeNodePool("default", v1.ConsolidationPolicyWhenEmptyOrUnderutilized)
 
-			// All same price, different disruption costs -> ratio = price/disruption
+			// Ratio order would be B > C > A; disruption cost order is A < C < B.
 			itA := makeInstanceType("type-a", 4.84)
 			itB := makeInstanceType("type-b", 4.84)
 			itC := makeInstanceType("type-c", 4.84)
 
 			candA := makeCandidate("node-a", np, itA, []*corev1.Pod{makePod("pa", "")})
-			candA.RescheduleDisruptionCost = 10.0 // ratio = 4.84/10 = 0.484
-			candB := makeCandidate("node-b", np, itB, nil)
-			// no pods: RescheduleDisruptionCost = 1.0 (base), ratio = 4.84/1 = 4.84
+			candA.RescheduleDisruptionCost = 10.0 // ratio = 0.484
+			candA.DisruptionCost = 1.0
+			candB := makeCandidate("node-b", np, itB, nil) // ratio = 4.84
+			candB.DisruptionCost = 30.0
 			candC := makeCandidate("node-c", np, itC, []*corev1.Pod{makePod("pc", "")})
-			candC.RescheduleDisruptionCost = 5.0 // ratio = 4.84/5 = 0.968
+			candC.RescheduleDisruptionCost = 5.0 // ratio = 0.968
+			candC.DisruptionCost = 20.0
 
 			c := consolidation{}
 			ctx := options.ToContext(context.Background(), &options.Options{})
-			sorted := c.sortCandidates(ctx, []*Candidate{candA, candB, candC})
+			sorted := c.sortCandidates(ctx, []*Candidate{candB, candC, candA})
 
-			// Expected order by ratio descending: B (4.84) > C (0.968) > A (0.484)
-			Expect(sorted[0]).To(Equal(candB))
-			Expect(sorted[1]).To(Equal(candC))
-			Expect(sorted[2]).To(Equal(candA))
+			Expect(sorted).To(Equal([]*Candidate{candA, candC, candB}))
 		})
 
-		It("should sort all candidates by savings ratio when any uses Balanced", func() {
+		It("should sort WhenEmpty candidates by disruption cost ascending", func() {
+			np := makeNodePool("default", v1.ConsolidationPolicyWhenEmpty)
+
+			// Empty nodes: ratio tracks price, so ratio order would be A > B.
+			candA := makeCandidate("node-a", np, makeInstanceType("expensive", 10.0), nil)
+			candA.DisruptionCost = 5.0
+			candB := makeCandidate("node-b", np, makeInstanceType("cheap", 1.0), nil)
+			candB.DisruptionCost = 1.0
+
+			c := consolidation{}
+			ctx := options.ToContext(context.Background(), &options.Options{})
+			sorted := c.sortCandidates(ctx, []*Candidate{candA, candB})
+
+			Expect(sorted).To(Equal([]*Candidate{candB, candA}))
+		})
+
+		It("should order each NodePool by its own policy when policies are mixed", func() {
 			balancedNP := makeNodePool("balanced", v1.ConsolidationPolicyBalanced)
 			defaultNP := makeNodePool("default", v1.ConsolidationPolicyWhenEmptyOrUnderutilized)
 
-			itExpensive := makeInstanceType("expensive", 10.0)
-			itCheap := makeInstanceType("cheap", 1.0)
-
-			candBalanced := makeCandidate("node-balanced", balancedNP, itExpensive, []*corev1.Pod{makePod("p1", "")})
-			candDefault := makeCandidate("node-default", defaultNP, itCheap, []*corev1.Pod{makePod("p2", "")})
+			// Balanced: ratio order is B1 (10/2) > B2 (1/2), against disruption cost.
+			candB1 := makeCandidate("node-b1", balancedNP, makeInstanceType("expensive", 10.0), []*corev1.Pod{makePod("pb1", "")})
+			candB1.DisruptionCost = 50.0
+			candB2 := makeCandidate("node-b2", balancedNP, makeInstanceType("cheap", 1.0), []*corev1.Pod{makePod("pb2", "")})
+			candB2.DisruptionCost = 1.0
+			// Default: disruption cost order is D1 < D2, against ratio.
+			candD1 := makeCandidate("node-d1", defaultNP, makeInstanceType("cheap", 1.0), []*corev1.Pod{makePod("pd1", "")})
+			candD1.DisruptionCost = 2.0
+			candD2 := makeCandidate("node-d2", defaultNP, makeInstanceType("expensive", 10.0), []*corev1.Pod{makePod("pd2", "")})
+			candD2.DisruptionCost = 40.0
 
 			c := consolidation{}
 			ctx := options.ToContext(context.Background(), &options.Options{})
-			sorted := c.sortCandidates(ctx, []*Candidate{candDefault, candBalanced})
+			sorted := c.sortCandidates(ctx, []*Candidate{candB2, candD2, candB1, candD1})
 
-			Expect(sorted[0]).To(Equal(candBalanced), "expected balanced candidate first (higher ratio)")
+			Expect(sorted).To(Equal([]*Candidate{candD1, candD2, candB1, candB2}))
 		})
 	})
 

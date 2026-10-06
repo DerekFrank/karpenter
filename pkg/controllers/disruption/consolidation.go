@@ -135,20 +135,22 @@ func (c *consolidation) ShouldDisrupt(ctx context.Context, cn *Candidate) bool {
 	return cn.NodeClaim.StatusConditions().Get(v1.ConditionTypeConsolidatable).IsTrue()
 }
 
-// sortCandidates sorts candidates by price/disruption ratio descending.
-// The binary search in multi-node consolidation tries the first N candidates
-// as a batch. Ratio sort means the batch contains the highest-value nodes,
-// so budget-limited cycles execute the most impactful moves first.
-//
-// This changes multi-node behavior for WhenEmptyOrUnderutilized, which
-// previously sorted by disruption cost ascending. The old sort found batches
-// that were easy to pack (low-disruption nodes fit together). The new sort
-// finds batches worth packing (high savings per unit disruption). The binary
-// search still converges because it shrinks the window until scheduling
-// succeeds.
+// sortCandidates orders candidates per their NodePool's consolidation policy.
+// Balanced candidates sort by price/disruption ratio descending, so the
+// highest-value moves are tried first. All other policies keep the original
+// disruption cost ascending order. When policies are mixed, non-Balanced
+// candidates come first; single-node and emptiness interweave by NodePool,
+// so only the within-pool order matters there.
 func (c *consolidation) sortCandidates(_ context.Context, candidates []*Candidate) []*Candidate {
 	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].SavingsRatio() > candidates[j].SavingsRatio()
+		bi, bj := candidates[i].NodePool.Spec.Disruption.ConsolidationPolicy.IsBalanced(), candidates[j].NodePool.Spec.Disruption.ConsolidationPolicy.IsBalanced()
+		if bi != bj {
+			return bj
+		}
+		if bi {
+			return candidates[i].SavingsRatio() > candidates[j].SavingsRatio()
+		}
+		return candidates[i].DisruptionCost < candidates[j].DisruptionCost
 	})
 	return candidates
 }
