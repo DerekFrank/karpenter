@@ -116,3 +116,5 @@ retract (
 	v0.34.4 // accidentally published incomplete patch release
 	v0.27.7 // accidentally published incomplete patch release
 )
+
+replace github.com/awslabs/operatorpkg => github.com/DerekFrank/operatorpkg v0.0.0-20261007234414-ddf619089b53
