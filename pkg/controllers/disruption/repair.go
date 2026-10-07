@@ -29,7 +29,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -55,27 +54,21 @@ const (
 // terminating workload-bearing nodes, orders candidates by rank + age/τ, and is vetoed by do-not-repair.
 type Repair struct {
 	consolidation
-	policyMatcher      *health.RepairPolicyMatcher
-	rebootHistory      *RebootHistory
-	decisionLogMonitor *pretty.ChangeMonitor
+	policyMatcher *health.RepairPolicyMatcher
+	rebootHistory *RebootHistory
 }
 
-// NewRepair validates and compiles the provider's complete repair policy set before constructing the method. It panics
-// when the provider defines no policies or the complete set is invalid.
+// NewRepair constructs the repair method around the matcher cluster state matches Nodes with. It panics when cluster
+// state has none, since health.NewRepairPolicyMatcher only returns nil when node repair is disabled.
 func NewRepair(c consolidation) *Repair {
-	policies := c.cloudProvider.RepairPolicies()
-	if len(policies) == 0 {
-		panic("node repair requires the cloud provider to define RepairPolicies, but it defines none")
-	}
-	policyMatcher, err := health.NewRepairPolicyMatcher(policies, sets.New(cloudprovider.ReplaceNode, cloudprovider.RebootNode))
-	if err != nil {
-		panic(fmt.Sprintf("node repair requires valid RepairPolicies: %v", err))
+	policyMatcher := c.cluster.RepairPolicyMatcher()
+	if policyMatcher == nil {
+		panic("node repair requires cluster state built with a repair policy matcher")
 	}
 	return &Repair{
-		consolidation:      c,
-		policyMatcher:      policyMatcher,
-		rebootHistory:      newRebootHistory(c.clock),
-		decisionLogMonitor: pretty.NewChangeMonitor(),
+		consolidation: c,
+		policyMatcher: policyMatcher,
+		rebootHistory: newRebootHistory(c.clock),
 	}
 }
 
@@ -95,8 +88,9 @@ func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 	if c.Annotations()[v1.DoNotRepairAnnotationKey] == "true" {
 		return false
 	}
-	now := r.clock.Now()
-	c.RepairPolicyResult = r.evaluate(ctx, c.Node, now)
+	// Cluster state matches the Node against the repair policies as it changes; only the toleration is resolved here.
+	c.RepairPolicyResult = c.GetRepairResult(r.clock.Now())
+	// Resolve rejects an empty Action, so this also skips healthy Nodes and those still within toleration.
 	if !r.rebootHistory.Resolve(c) {
 		return false
 	}
@@ -106,35 +100,6 @@ func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 		return false
 	}
 	return true
-}
-
-func (r *Repair) evaluate(ctx context.Context, node *corev1.Node, now time.Time) health.RepairResult {
-	result := r.policyMatcher.Evaluate(node, now)
-	if result.Action == "" {
-		return result
-	}
-	values := []any{
-		"condition", result.Condition,
-		"status", result.ConditionStatus,
-		"reason", result.Reason,
-		"reason-regex", result.ReasonRegex,
-		"fallback", result.Fallback,
-		"action", result.Action,
-		"eligible-at", result.SelectedEligibleAt,
-	}
-	if result.TerminationGracePeriod != nil {
-		values = append(values,
-			"termination-grace-period", *result.TerminationGracePeriod,
-			"termination-grace-period-condition", result.TerminationGracePeriodCondition,
-		)
-	}
-	if !r.decisionLogMonitor.HasChanged(string(node.UID), values) {
-		return result
-	}
-	log.FromContext(ctx).V(1).WithValues(append([]any{
-		"Node", klog.KObj(node),
-	}, values...)...).Info("evaluated repair policy")
-	return result
 }
 
 // ComputeCommands orders eligible candidates by the repair score and returns one command for the highest-scoring
