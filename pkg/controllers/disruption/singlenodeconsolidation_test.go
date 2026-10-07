@@ -101,7 +101,23 @@ var _ = Describe("SingleNodeConsolidation", func() {
 	})
 
 	Context("Candidate Shuffling", func() {
-		It("should sort candidates by savings ratio descending", func() {
+		It("should sort candidates by disruption cost", func() {
+			candidates, err := createCandidates(1.0, 3)
+			Expect(err).To(BeNil())
+
+			sortedCandidates := consolidation.SortCandidates(ctx, candidates)
+
+			// Verify candidates are sorted by disruption cost
+			Expect(sortedCandidates).To(HaveLen(9))
+			for i := 0; i < len(sortedCandidates)-1; i++ {
+				Expect(sortedCandidates[i].DisruptionCost).To(BeNumerically("<=", sortedCandidates[i+1].DisruptionCost))
+			}
+		})
+
+		It("should sort Balanced candidates by savings ratio descending", func() {
+			for _, np := range []*v1.NodePool{nodePool1, nodePool2, nodePool3} {
+				np.Spec.Disruption.ConsolidationPolicy = v1.ConsolidationPolicyBalanced
+			}
 			candidates, err := createCandidates(1.0, 3)
 			Expect(err).To(BeNil())
 
@@ -127,7 +143,68 @@ var _ = Describe("SingleNodeConsolidation", func() {
 			Expect(sortedCandidates[0].NodePool.Name).To(Equal(nodePool2.Name))
 		})
 
-		It("should sort candidates by savings ratio with different disruption costs", func() {
+		It("should interweave candidates from different nodepools", func() {
+			// Create candidates with different disruption costs
+			// We'll create 3 sets of candidates with costs 1.0, 2.0, and 3.0
+			// Use 1 node per nodepool to make the test more predictable
+			candidates1, err := createCandidates(1.0, 1)
+			Expect(err).To(BeNil())
+
+			candidates2, err := createCandidates(2.0, 1)
+			Expect(err).To(BeNil())
+
+			candidates3, err := createCandidates(3.0, 1)
+			Expect(err).To(BeNil())
+
+			// Combine all candidates
+			allCandidates := append(candidates3, append(candidates2, candidates1...)...)
+
+			// Sort candidates
+			sortedCandidates := consolidation.SortCandidates(ctx, allCandidates)
+
+			// Verify candidates are interweaved from different nodepools
+			// First we should have all candidates with disruption cost 1, then 2, then 3
+			// Within each cost group, we should have one from each nodepool
+			Expect(sortedCandidates).To(HaveLen(9))
+
+			// Check first three candidates (all with cost 1)
+			nodePoolsInFirstGroup := []string{
+				sortedCandidates[0].NodePool.Name,
+				sortedCandidates[1].NodePool.Name,
+				sortedCandidates[2].NodePool.Name,
+			}
+			Expect(nodePoolsInFirstGroup).To(ConsistOf(nodePool1.Name, nodePool2.Name, nodePool3.Name))
+			for i := range 3 {
+				Expect(sortedCandidates[i].DisruptionCost).To(Equal(1.0))
+			}
+
+			// Check next three candidates (all with cost 2)
+			nodePoolsInSecondGroup := []string{
+				sortedCandidates[3].NodePool.Name,
+				sortedCandidates[4].NodePool.Name,
+				sortedCandidates[5].NodePool.Name,
+			}
+			Expect(nodePoolsInSecondGroup).To(ConsistOf(nodePool1.Name, nodePool2.Name, nodePool3.Name))
+			for i := 3; i < 6; i++ {
+				Expect(sortedCandidates[i].DisruptionCost).To(Equal(2.0))
+			}
+
+			// Check last three candidates (all with cost 3)
+			nodePoolsInThirdGroup := []string{
+				sortedCandidates[6].NodePool.Name,
+				sortedCandidates[7].NodePool.Name,
+				sortedCandidates[8].NodePool.Name,
+			}
+			Expect(nodePoolsInThirdGroup).To(ConsistOf(nodePool1.Name, nodePool2.Name, nodePool3.Name))
+			for i := 6; i < 9; i++ {
+				Expect(sortedCandidates[i].DisruptionCost).To(Equal(3.0))
+			}
+		})
+
+		It("should interweave Balanced candidates by savings ratio", func() {
+			for _, np := range []*v1.NodePool{nodePool1, nodePool2, nodePool3} {
+				np.Spec.Disruption.ConsolidationPolicy = v1.ConsolidationPolicyBalanced
+			}
 			// Create candidates and assign different RescheduleDisruptionCost values
 			// to verify savings ratio ordering (price/RescheduleDisruptionCost descending)
 			candidates1, err := createCandidates(1.0, 1)

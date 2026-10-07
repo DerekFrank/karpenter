@@ -4426,7 +4426,54 @@ var _ = Describe("Consolidation", func() {
 				nc.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
 			}
 		})
-		It("should consolidate the node with best savings ratio first", func() {
+		It("should consider node lifetime remaining when calculating disruption cost", func() {
+			// create our RS so we can link a pod to it
+			rs := test.ReplicaSet()
+			ExpectApplied(ctx, env.Client, rs)
+
+			pods := test.Pods(3, test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion:         "apps/v1",
+							Kind:               "ReplicaSet",
+							Name:               rs.Name,
+							UID:                rs.UID,
+							Controller:         new(true),
+							BlockOwnerDeletion: new(true),
+						},
+					}}})
+
+			ExpectApplied(ctx, env.Client, rs, pods[0], pods[1], pods[2], nodePool)
+			ExpectApplied(ctx, env.Client, nodeClaims[0], nodes[0]) // ensure node1 is the oldest node
+			time.Sleep(2 * time.Second)                             // this sleep is unfortunate, but necessary.  The creation time is from etcd, and we can't mock it, so we
+			// need to sleep to force the second node to be created a bit after the first node.
+			ExpectApplied(ctx, env.Client, nodeClaims[1], nodes[1])
+
+			// two pods on node 1, one on node 2
+			ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
+			ExpectManualBinding(ctx, env.Client, pods[1], nodes[0])
+			ExpectManualBinding(ctx, env.Client, pods[2], nodes[1])
+
+			// inform cluster state about nodes and nodeclaims
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{nodes[0], nodes[1]}, []*v1.NodeClaim{nodeClaims[0], nodeClaims[1]})
+			env.Clock.SetTime(time.Now())
+			ExpectSingletonReconciled(ctx, disruptionController)
+
+			// Process the item so that the nodes can be deleted.
+			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaims[0])
+
+			// Cascade any deletion of the nodeclaim to the node
+			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[0])
+
+			// the second node has more pods, so it would normally not be picked for consolidation, except it very little
+			// lifetime remaining, so it should be deleted
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
+			Expect(ExpectNodes(ctx, env.Client)).To(HaveLen(1))
+			ExpectNotFound(ctx, env.Client, nodeClaims[0], nodes[0])
+		})
+		It("should consolidate the node with best savings ratio first for Balanced", func() {
+			nodePool.Spec.Disruption.ConsolidationPolicy = v1.ConsolidationPolicyBalanced
 			// create our RS so we can link a pod to it
 			rs := test.ReplicaSet()
 			ExpectApplied(ctx, env.Client, rs)
