@@ -49,3 +49,31 @@ var _ = Describe("WellKnownAnnotations", func() {
 		Expect(lo.FindDuplicatesBy(annotations, func(a wellknown.Annotation) string { return a.Name })).To(BeEmpty())
 	})
 })
+
+var _ = Describe("WellKnownLabels", func() {
+	labels := v1.KarpenterLabels
+
+	It("should document every label", func() {
+		for _, label := range labels {
+			Expect(label.Name).ToNot(BeEmpty())
+			Expect(label.Example).ToNot(BeEmpty(), label.Name)
+			Expect(label.Help).ToNot(BeEmpty(), label.Name)
+			Expect(label.UsedOn).ToNot(BeEmpty(), label.Name)
+			Expect(label.Stage).To(BeElementOf(docs.Alpha, docs.Beta, docs.GA), label.Name)
+		}
+	})
+	It("should document every label in WellKnownLabels", func() {
+		documented := lo.Map(labels, func(l wellknown.Label, _ int) string { return l.Name })
+		Expect(documented).To(ContainElements(v1.WellKnownLabels.UnsortedList()))
+	})
+	It("should mark every internal only label as alpha", func() {
+		for _, label := range labels {
+			if label.InternalOnly {
+				Expect(label.Stage).To(Equal(docs.Alpha), label.Name)
+			}
+		}
+	})
+	It("should not document a label twice", func() {
+		Expect(lo.FindDuplicatesBy(labels, func(l wellknown.Label) string { return l.Name })).To(BeEmpty())
+	})
+})
