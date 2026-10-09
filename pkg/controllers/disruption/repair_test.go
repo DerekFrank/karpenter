@@ -1038,6 +1038,33 @@ var _ = Describe("Repair", func() {
 		Expect(queue.GetCommands()).To(BeEmpty())
 	})
 
+	It("should block, not error, when the NodePool is already over its limits and the replacement is smaller", func() {
+		// The candidate alone exceeds the cpu limit, but a replacement fits the limit once the candidate is modeled
+		// as gone; launching it would still be refused because current usage already exceeds the limit.
+		nodePool.Spec.Limits = v1.Limits{corev1.ResourceCPU: resource.MustParse("8")}
+		ExpectApplied(ctx, env.Client, nodePool)
+		nodeClaim, node = test.NodeClaimAndNode(v1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{Labels: labels()},
+			Status: v1.NodeClaimStatus{
+				Capacity:    corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("32")},
+				Allocatable: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("32")},
+			},
+		})
+		initNode(nodeClaim, node)
+		bindReschedulablePod(node)
+		markUnhealthy(node, "BadNode")
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+
+		Expect(queue.GetCommands()).To(BeEmpty())
+		Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
+		Expect(lo.ContainsBy(recorder.Events(), func(e karpenterevents.Event) bool {
+			return e.Reason == karpenterevents.DisruptionBlocked && strings.Contains(e.Message, "nodepool is already over its limits")
+		})).To(BeTrue())
+		Expect(ExpectExists(ctx, env.Client, node).Spec.Taints).ToNot(ContainElement(v1.DisruptedNoScheduleTaint))
+	})
+
 	It("should release a static replacement reservation when command admission loses a race", func() {
 		nodePool = test.StaticNodePool(v1.NodePool{
 			Spec: v1.NodePoolSpec{

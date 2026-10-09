@@ -116,10 +116,25 @@ func (r *Repair) ComputeCommands(ctx context.Context, disruptionBudgetMapping ma
 	cmds, err := r.computeCommands(ctx, disruptionBudgetMapping, candidates...)
 	for _, cmd := range cmds {
 		for _, c := range cmd.Candidates {
-			log.FromContext(ctx).WithValues(append([]any{"Node", klog.KObj(c.Node)}, c.RepairPolicyResult.LogValues()...)...).Info("selected repair policy")
+			log.FromContext(ctx).WithValues(repairDecisionLogValues(c)...).Info("selected repair policy")
 		}
 	}
 	return cmds, err
+}
+
+// repairDecisionLogValues returns the selected policy plus the drain bound the candidate is actually disrupted with: the
+// stamped candidate bound (the policy bound capped by the NodeClaim's), else the NodeClaim's own bound. It's omitted when
+// the drain is unbounded.
+func repairDecisionLogValues(c *Candidate) []any {
+	values := append([]any{"Node", klog.KObj(c.Node)}, c.RepairPolicyResult.LogValues()...)
+	bound := c.TerminationGracePeriod
+	if bound == nil && c.NodeClaim.Spec.TerminationGracePeriod != nil {
+		bound = &c.NodeClaim.Spec.TerminationGracePeriod.Duration
+	}
+	if bound != nil {
+		values = append(values, "effective-termination-grace-period", *bound)
+	}
+	return values
 }
 
 //nolint:gocyclo // Static and dynamic replacement flows are intentionally kept inline.
