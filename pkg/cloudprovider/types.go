@@ -721,6 +721,35 @@ func IgnoreNodeClaimNotFoundError(err error) error {
 	return err
 }
 
+// NodeClaimDeletionDeferredError is returned by CloudProviders when they intentionally postpone terminating an instance
+// (for example, while its zone is shifted away from). Karpenter retries the delete later without treating it as a
+// failure or marking the instance as terminating.
+type NodeClaimDeletionDeferredError struct {
+	error
+}
+
+func NewNodeClaimDeletionDeferredError(err error) *NodeClaimDeletionDeferredError {
+	return &NodeClaimDeletionDeferredError{
+		error: err,
+	}
+}
+
+func (e *NodeClaimDeletionDeferredError) Error() string {
+	return fmt.Sprintf("nodeclaim deletion deferred, %s", e.error)
+}
+
+func (e *NodeClaimDeletionDeferredError) Unwrap() error {
+	return e.error
+}
+
+func IsNodeClaimDeletionDeferredError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var deferredErr *NodeClaimDeletionDeferredError
+	return errors.As(err, &deferredErr)
+}
+
 // NodeRebootNotImplementedError is returned by CloudProviders that do not support in-place reboot.
 // The reboot controller treats it as a terminal, non-retryable signal that reboot is unavailable
 // for this provider (so a reboot policy that requires it is rejected at startup validation).

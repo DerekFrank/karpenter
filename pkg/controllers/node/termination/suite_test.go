@@ -18,6 +18,7 @@ package termination_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -37,6 +38,7 @@ import (
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
@@ -166,6 +168,23 @@ var _ = Describe("Termination", func() {
 			ExpectNotRequeued(ExpectObjectReconciled(ctx, env.Client, terminationController, node))
 			ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
 			ExpectNotFound(ctx, env.Client, node, nodeClaim)
+		})
+		It("should requeue without marking the instance terminating when cloudProvider Delete is deferred", func() {
+			ExpectApplied(ctx, env.Client, node, nodeClaim)
+			Expect(env.Client.Delete(ctx, node)).To(Succeed())
+			node = ExpectNodeExists(ctx, env.Client, node.Name)
+
+			ExpectRequeued(ExpectObjectReconciled(ctx, env.Client, terminationController, node)) // Taint and Start Drain
+			env.Clock.Step(2 * termination.MinDrainTime)
+			cloudProvider.NextDeleteErr = cloudprovider.NewNodeClaimDeletionDeferredError(errors.New("zone is shifted away"))
+			ExpectRequeued(ExpectObjectReconciled(ctx, env.Client, terminationController, node)) // Drain, VolumeDetachment, deferred InstanceTermination
+			nc := ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nc.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue()).To(BeFalse())
+			ExpectNodeExists(ctx, env.Client, node.Name)
+
+			ExpectRequeued(ExpectObjectReconciled(ctx, env.Client, terminationController, node)) // InstanceTerminationInitiation
+			nc = ExpectExists(ctx, env.Client, nodeClaim)
+			Expect(nc.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue()).To(BeTrue())
 		})
 		It("should not race if deleting nodes in parallel", func() {
 			nodes := lo.Times(10, func(_ int) *corev1.Node {

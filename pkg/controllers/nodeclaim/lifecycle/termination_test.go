@@ -213,6 +213,24 @@ var _ = Describe("Termination", func() {
 		Expect(result.Requeue).To(BeFalse())
 		ExpectNotFound(ctx, env.Client, nodeClaim)
 	})
+	It("should requeue without error or InstanceTerminating when cloudProvider Delete is deferred", func() {
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(env.Client.Delete(ctx, nodeClaim)).To(Succeed())
+		cloudProvider.NextDeleteErr = cloudprovider.NewNodeClaimDeletionDeferredError(errors.New("zone is shifted away"))
+		result := ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+		Expect(result.RequeueAfter).To(BeEquivalentTo(5 * time.Second))
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue()).To(BeFalse())
+
+		// Once the deferral ends, termination proceeds as usual
+		result = ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+		Expect(result.RequeueAfter).To(BeEquivalentTo(5 * time.Second))
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue()).To(BeTrue())
+	})
 	It("should not remove the finalizer and terminate the NodeClaim if the cloudProvider instance is still around", func() {
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
 		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)

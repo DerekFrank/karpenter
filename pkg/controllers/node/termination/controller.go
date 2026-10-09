@@ -289,6 +289,10 @@ func (c *Controller) awaitInstanceTermination(
 		return reconcile.Result{}, nil
 	}
 	deleteErr := c.cloudProvider.Delete(ctx, nodeClaim)
+	if cloudprovider.IsNodeClaimDeletionDeferredError(deleteErr) {
+		log.FromContext(ctx).V(1).Info("instance termination deferred by cloud provider", "reason", deleteErr.Error())
+		return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
+	}
 	if cloudprovider.IgnoreNodeClaimNotFoundError(deleteErr) != nil {
 		return reconcile.Result{}, deleteErr
 	}
