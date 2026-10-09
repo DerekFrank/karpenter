@@ -281,25 +281,25 @@ func recordCandidateDisrupted(cmd *Command, candidate *Candidate) {
 	if cmd.ConsolidationType() != "" {
 		consolidationPolicy = pretty.ToSnakeCase(string(candidate.NodePool.Spec.Disruption.ConsolidationPolicy))
 	}
+	// Termination mode reflects the drain bound the candidate actually applies (candidate.TerminationGracePeriod),
+	// not the NodeClaim's own Spec.TGP — a forceful (0) or bounded repair policy overrides it. nil means the
+	// candidate inherits the NodeClaim's mode.
+	mode := nodeclaimutils.DisruptionTerminationMode(candidate.NodeClaim)
+	if tgp := candidate.TerminationGracePeriod; tgp != nil {
+		mode = lo.Ternary(*tgp <= 0, metrics.TerminationModeForceful, metrics.TerminationModeEventual)
+	}
 	labels := map[string]string{
 		metrics.ReasonLabel:              strings.ToLower(string(cmd.Reason())),
 		metrics.NodePoolLabel:            candidate.NodeClaim.Labels[v1.NodePoolLabelKey],
 		metrics.CapacityTypeLabel:        candidate.NodeClaim.Labels[v1.CapacityTypeLabelKey],
 		metrics.ConsolidationPolicyLabel: consolidationPolicy,
-		metrics.TerminationModeLabel:     nodeclaimutils.DisruptionTerminationMode(candidate.NodeClaim),
+		metrics.TerminationModeLabel:     mode,
 	}
 	metrics.NodeClaimsDisruptedTotal.Inc(labels)
 	metrics.PodsDisruptionInitiatedTotal.Add(float64(len(candidate.reschedulablePods)), labels)
 	// Repair records the policy result on the candidate; emit the per-condition/per-image unhealthy-disrupted metric
 	// when the disruption is carried out, not at command production, so an abandoned command doesn't over-count.
 	if condition := candidate.RepairPolicyResult.Condition; cmd.Reason() == v1.DisruptionReasonUnhealthy && condition != "" {
-		// Termination mode reflects the drain bound repair actually applied (candidate.TerminationGracePeriod),
-		// not the NodeClaim's own Spec.TGP — a forceful (0) or bounded policy overrides it. nil means repair
-		// inherited the NodeClaim's mode.
-		mode := nodeclaimutils.DisruptionTerminationMode(candidate.NodeClaim)
-		if tgp := candidate.TerminationGracePeriod; tgp != nil {
-			mode = lo.Ternary(*tgp <= 0, metrics.TerminationModeForceful, metrics.TerminationModeEventual)
-		}
 		NodeClaimsUnhealthyDisruptedTotal.Inc(map[string]string{
 			conditionLabel:               pretty.ToSnakeCase(string(condition)),
 			metrics.NodePoolLabel:        candidate.NodeClaim.Labels[v1.NodePoolLabelKey],
@@ -395,11 +395,9 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 		"command", cmd.String(),
 	}, cmd.LogValues()...)...).Info("disrupting node(s)")
 
-	// Reboot is already handed off to its controller, so only record metrics here.
+	// Reboot is already handed off to its controller, so only record the decision here. The NodeClaim is kept, so the
+	// per-NodeClaim and per-pod disruption metrics, which count terminations, don't apply.
 	if cmd.Decision() == RebootDecision {
-		for _, candidate := range cmd.Candidates {
-			recordCandidateDisrupted(cmd, candidate)
-		}
 		q.recordDecisionPerformed(cmd)
 		return nil
 	}

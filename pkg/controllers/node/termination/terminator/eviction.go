@@ -334,6 +334,9 @@ func (q *Queue) forceDelete(ctx context.Context, pod *corev1.Pod, nodeTerminatio
 	// pod semantics. The node's terminationGracePeriod may already have elapsed by the time we reconcile.
 	gracePeriodSeconds := lo.ToPtr(max(int64(lo.FromPtr(nodeTerminationTime).Sub(q.clock.Now()).Seconds()), 1))
 	q.recorder.Publish(terminatorevents.DisruptPodDelete(pod, gracePeriodSeconds, nodeTerminationTime))
+	// Only count the delete that starts the pod's termination. Past the deadline, Drain re-enqueues a still-terminating
+	// pod every pass until it's gone, and an evicted pod was already counted by evict.
+	alreadyTerminating := podutils.IsTerminating(pod)
 	if err := q.kubeClient.Delete(ctx, pod, &client.DeleteOptions{
 		GracePeriodSeconds: gracePeriodSeconds,
 		Preconditions: &metav1.Preconditions{
@@ -353,7 +356,9 @@ func (q *Queue) forceDelete(ctx context.Context, pod *corev1.Pod, nodeTerminatio
 		"delete.gracePeriodSeconds", lo.FromPtr(gracePeriodSeconds),
 		"nodeclaim.terminationTime", lo.FromPtr(nodeTerminationTime),
 	).V(1).Info("deleting pod")
-	PodsDrainedTotal.Inc(map[string]string{metrics.ReasonLabel: evictionReason(ctx, pod, q.kubeClient)})
+	if !alreadyTerminating {
+		PodsDrainedTotal.Inc(map[string]string{metrics.ReasonLabel: evictionReason(ctx, pod, q.kubeClient)})
+	}
 	q.complete(pod)
 	return reconcile.Result{}, nil
 }

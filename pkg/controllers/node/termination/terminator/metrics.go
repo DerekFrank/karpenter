@@ -27,9 +27,9 @@ import (
 const (
 	// CodeLabel for eviction request
 	CodeLabel = "code"
-	// ForcefulTerminationReason is the drain `reason` value emitted when a pod is
-	// force-deleted (the node's terminationGracePeriod elapsed) rather than
-	// drained under a disruption reason.
+	// ForcefulTerminationReason is the drain `reason` value emitted when the owning
+	// NodeClaim has no voluntary disruption reason (e.g. it was deleted directly),
+	// whether the pod was evicted or force-deleted.
 	ForcefulTerminationReason = "Forceful Termination"
 )
 

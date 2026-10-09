@@ -167,15 +167,15 @@ var (
 		Values: []opmetrics.Value{
 			{
 				Name: TerminationModeGraceful,
-				Help: "The NodeClaim has no terminationGracePeriod, so termination respects blocking pod PDBs and the do-not-disrupt annotation.",
+				Help: "Neither the NodeClaim's terminationGracePeriod nor the disruption (e.g. a repair policy) bounds the drain, so termination respects blocking pod PDBs and the do-not-disrupt annotation.",
 			},
 			{
 				Name: TerminationModeEventual,
-				Help: "The NodeClaim has a positive terminationGracePeriod, so termination is bounded by it and overrides blocking pod PDBs and the do-not-disrupt annotation.",
+				Help: "The drain is bounded by a positive terminationGracePeriod (the NodeClaim's or the disruption's), which overrides blocking pod PDBs and the do-not-disrupt annotation.",
 			},
 			{
 				Name: TerminationModeForceful,
-				Help: "The NodeClaim has a zero (non-positive) terminationGracePeriod, so it is terminated immediately.",
+				Help: "The drain is bounded by a zero (non-positive) terminationGracePeriod (the NodeClaim's or the disruption's), so it is terminated immediately.",
 			},
 		},
 	}
