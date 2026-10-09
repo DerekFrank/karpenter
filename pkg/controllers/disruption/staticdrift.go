@@ -18,9 +18,12 @@ package disruption
 
 import (
 	"context"
+	"fmt"
 	"math"
 
+	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/samber/lo"
+	"k8s.io/klog/v2"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -30,6 +33,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	pkgscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
 
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
@@ -85,6 +89,32 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 			int64(len(npCandidates)),
 		})
 
+		// Full reservations are checked before reserving limits.nodes so the delete-only path never takes a slot.
+		nct := scheduling.NewNodeClaimTemplate(np)
+		reserved, unreserved := lo.FilterReject(npCandidates, func(c *Candidate, _ int) bool { return c.capacityType == v1.CapacityTypeReserved })
+		if len(reserved) > 0 {
+			reservationsFull, err := staticReservationsFull(ctx, d.cloudprovider, np, nct)
+			if err != nil {
+				return []Command{}, err
+			}
+			if reservationsFull {
+				// Only a reserved candidate frees a slot the refill can use, so it goes first and is the only one that can
+				// terminate first; the rest can't be replaced either way.
+				for _, c := range append(reserved, unreserved...)[:maxDrifts] {
+					if options.FromContext(ctx).FeatureGates.TerminateFirstDrift && c.capacityType == v1.CapacityTypeReserved {
+						cmds = append(cmds, Command{
+							Candidates:          []*Candidate{c},
+							PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{c}),
+							TerminateFirst:      true,
+						})
+						continue
+					}
+					d.recorder.Publish(disruptionevents.Blocked(c.Node, c.NodeClaim, "static NodePool's capacity reservations are full and cannot stage a replacement")...)
+				}
+				continue
+			}
+		}
+
 		// Acquire limits from cluster state without bursting over. maxAllowedDrifts is how many candidates we can drift
 		// while staging a replacement for each without exceeding the NodePool's node limit; 0 means the pool is at its
 		// limit and can't stage any replacement.
@@ -117,7 +147,6 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 
 		// Select candidates up to maxAllowedDrifts
 		for _, c := range npCandidates[:maxAllowedDrifts] {
-			nct := scheduling.NewNodeClaimTemplate(np)
 			result := scheduling.Results{
 				NewNodeClaims: []*scheduling.NodeClaim{{NodeClaimTemplate: *nct}},
 			}
@@ -142,4 +171,19 @@ func (d *StaticDrift) Class() string {
 
 func (d *StaticDrift) ConsolidationType() string {
 	return ""
+}
+
+// staticReservationsFull reports whether a static NodePool's replacement can only land in full capacity reservations, so
+// pre-spinning it would fail to launch until a reserved node frees its slot. A static replacement is the bare NodePool
+// template, so this is an offering lookup rather than a scheduling simulation. GetInstanceTypes is NodeClass-scoped, so
+// offerings are filtered by the template's requirements.
+func staticReservationsFull(ctx context.Context, cloudProvider cloudprovider.CloudProvider, np *v1.NodePool, nct *scheduling.NodeClaimTemplate) (bool, error) {
+	its, err := cloudProvider.GetInstanceTypes(ctx, np)
+	if err != nil {
+		return false, serrors.Wrap(fmt.Errorf("getting instance types, %w", err), "NodePool", klog.KObj(np))
+	}
+	return !lo.SomeBy(its, func(it *cloudprovider.InstanceType) bool {
+		return nct.Requirements.IsCompatible(it.Requirements, pkgscheduling.AllowUndefinedWellKnownLabels) &&
+			len(it.Offerings.Compatible(nct.Requirements).Launchable()) > 0
+	}), nil
 }

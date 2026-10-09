@@ -151,6 +151,111 @@ var _ = Describe("TerminateFirstDrift", func() {
 			Expect(cmds[0].Decision()).To(Equal(disruption.ReplaceDecision))
 			Expect(cmds[0].Replacements).To(HaveLen(1))
 		})
+
+		// limits.nodes leaves headroom (limit 2 > replicas 1), but a reserved-only template can't launch a replacement
+		// while its reservation is full, so a reserved candidate terminates first instead.
+		Context("Capacity Reservations", func() {
+			var reservationID string
+
+			BeforeEach(func() {
+				reservationID = "r-" + mostExpensiveInstance.Name
+				mostExpensiveInstance.Requirements.Add(scheduling.NewRequirement(cloudprovider.ReservationIDLabel, corev1.NodeSelectorOpIn, reservationID))
+				mostExpensiveInstance.Requirements.Get(v1.CapacityTypeLabelKey).Insert(v1.CapacityTypeReserved)
+				nodePool.Spec.Limits = v1.Limits{resources.Node: resource.MustParse("2")}
+				nodePool.Spec.Template.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{
+					{Key: corev1.LabelInstanceTypeStable, Operator: corev1.NodeSelectorOpIn, Values: []string{mostExpensiveInstance.Name}},
+					{Key: v1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{v1.CapacityTypeReserved}},
+				}
+				nodeClaim.Labels[v1.CapacityTypeLabelKey] = v1.CapacityTypeReserved
+				nodeClaim.Labels[cloudprovider.ReservationIDLabel] = reservationID
+				node.Labels[v1.CapacityTypeLabelKey] = v1.CapacityTypeReserved
+				node.Labels[cloudprovider.ReservationIDLabel] = reservationID
+			})
+
+			withReservation := func(capacity int) {
+				mostExpensiveInstance.Offerings = append(mostExpensiveInstance.Offerings, &cloudprovider.Offering{
+					Price:               mostExpensiveOffering.Price / 1_000_000.0,
+					Available:           true,
+					ReservationCapacity: capacity,
+					Requirements: scheduling.NewLabelRequirements(map[string]string{
+						v1.CapacityTypeLabelKey:          v1.CapacityTypeReserved,
+						corev1.LabelTopologyZone:         mostExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+						cloudprovider.ReservationIDLabel: reservationID,
+					}),
+				})
+			}
+
+			It("issues a delete-only command when the reservation is full", func() {
+				ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacity: lo.ToPtr(true), TerminateFirstDrift: lo.ToPtr(true)}}))
+				withReservation(0)
+				ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+
+				ExpectSingletonReconciled(ctx, staticDriftController)
+
+				cmds := queue.GetCommands()
+				Expect(cmds).To(HaveLen(1))
+				Expect(cmds[0].Decision()).To(Equal(disruption.TerminateFirstDecision))
+				Expect(cmds[0].Replacements).To(HaveLen(0))
+				// The delete-only path must not hold the limits.nodes slot it never uses.
+				Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(BeEquivalentTo(int64(1)))
+			})
+
+			It("replaces-first when the reservation has capacity", func() {
+				ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacity: lo.ToPtr(true), TerminateFirstDrift: lo.ToPtr(true)}}))
+				withReservation(1)
+				ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+
+				ExpectSingletonReconciled(ctx, staticDriftController)
+
+				cmds := queue.GetCommands()
+				Expect(cmds).To(HaveLen(1))
+				Expect(cmds[0].Decision()).To(Equal(disruption.ReplaceDecision))
+				Expect(cmds[0].Replacements).To(HaveLen(1))
+			})
+
+			It("blocks when the reservation is full and TerminateFirstDrift is disabled", func() {
+				ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacity: lo.ToPtr(true), TerminateFirstDrift: lo.ToPtr(false)}}))
+				withReservation(0)
+				ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+
+				ExpectSingletonReconciled(ctx, staticDriftController)
+
+				Expect(queue.GetCommands()).To(HaveLen(0))
+				Expect(recorder.Calls(events.DisruptionBlocked)).To(BeNumerically(">", 0))
+				Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(BeEquivalentTo(int64(1)))
+			})
+
+			// A non-reserved candidate frees no reservation slot, so terminating it first wouldn't let the refill launch.
+			It("only terminates reserved candidates first when the reservation is full", func() {
+				ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacity: lo.ToPtr(true), TerminateFirstDrift: lo.ToPtr(true)}}))
+				withReservation(0)
+				nodePool.Spec.Replicas = lo.ToPtr(int64(2))
+				nodePool.Spec.Limits = v1.Limits{resources.Node: resource.MustParse("3")}
+				odNodeClaim, odNode := test.NodeClaimAndNode(v1.NodeClaim{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+						v1.NodePoolLabelKey:            nodePool.Name,
+						corev1.LabelInstanceTypeStable: mostExpensiveInstance.Name,
+						v1.CapacityTypeLabelKey:        v1.CapacityTypeOnDemand,
+						corev1.LabelTopologyZone:       mostExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+					}},
+					Status: v1.NodeClaimStatus{ProviderID: test.RandomProviderID()},
+				})
+				odNodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
+				ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, odNodeClaim, odNode)
+				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node, odNode}, []*v1.NodeClaim{nodeClaim, odNodeClaim})
+
+				ExpectSingletonReconciled(ctx, staticDriftController)
+
+				cmds := queue.GetCommands()
+				Expect(cmds).To(HaveLen(1))
+				Expect(cmds[0].Decision()).To(Equal(disruption.TerminateFirstDecision))
+				Expect(cmds[0].Candidates[0].NodeClaim.Name).To(Equal(nodeClaim.Name))
+				Expect(recorder.Calls(events.DisruptionBlocked)).To(BeNumerically(">", 0))
+			})
+		})
 	})
 
 	Context("Drift/Reserved", func() {
