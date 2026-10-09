@@ -5985,3 +5985,20 @@ func ExpectInstancesWithLabel(instanceTypes []*cloudprovider.InstanceType, label
 		}
 	}
 }
+
+var _ = Describe("Results", func() {
+	It("should describe non-pending pod scheduling errors in a stable order", func() {
+		podErrors := map[*corev1.Pod]error{}
+		for _, name := range []string{"f", "b", "e", "a", "g", "c", "d"} {
+			podErrors[test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"}})] = fmt.Errorf("error %s", name)
+		}
+		results := scheduling.Results{PodErrors: podErrors}
+		msg := results.NonPendingPodSchedulingErrors()
+		// Only the first five pods by name are listed, so map iteration order would otherwise change which ones appear.
+		Expect(msg).To(Equal("not all pods would schedule, default/a => error a default/b => error b default/c => error c " +
+			"default/d => error d default/e => error e  and 2 other(s)"))
+		for range 20 {
+			Expect(results.NonPendingPodSchedulingErrors()).To(Equal(msg))
+		}
+	})
+})

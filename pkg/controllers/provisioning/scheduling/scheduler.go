@@ -428,12 +428,20 @@ func (r Results) NonPendingPodSchedulingErrors() string {
 	if len(errs) == 0 {
 		return "No Pod Scheduling Errors"
 	}
+	// Sort the pods so the message, and which pods it names, is stable across passes.
+	pods := lo.Keys(errs)
+	sort.Slice(pods, func(i, j int) bool {
+		if pods[i].Namespace != pods[j].Namespace {
+			return pods[i].Namespace < pods[j].Namespace
+		}
+		return pods[i].Name < pods[j].Name
+	})
 	var msg bytes.Buffer
 	fmt.Fprintf(&msg, "not all pods would schedule, ")
 	const MaxErrors = 5
 	numErrors := 0
-	for k, err := range errs {
-		fmt.Fprintf(&msg, "%s/%s => %s ", k.Namespace, k.Name, err)
+	for _, k := range pods {
+		fmt.Fprintf(&msg, "%s/%s => %s ", k.Namespace, k.Name, errs[k])
 		numErrors++
 		if numErrors >= MaxErrors {
 			fmt.Fprintf(&msg, " and %d other(s)", len(errs)-MaxErrors)

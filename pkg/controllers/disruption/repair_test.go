@@ -20,9 +20,11 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/awslabs/operatorpkg/singleton"
+	"github.com/go-logr/logr/funcr"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -30,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -147,6 +150,23 @@ var _ = Describe("Repair", func() {
 		repair = disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue))
 		repairController = disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
 			disruption.WithMethods(repair))
+	}
+
+	// captureLogs returns a context whose logger records each log line, and a func that counts the recorded lines with
+	// the given message.
+	captureLogs := func() (context.Context, func(msg string) int) {
+		var mu sync.Mutex
+		var lines []string
+		logger := funcr.New(func(_, args string) {
+			mu.Lock()
+			defer mu.Unlock()
+			lines = append(lines, args)
+		}, funcr.Options{})
+		return log.IntoContext(ctx, logger), func(msg string) int {
+			mu.Lock()
+			defer mu.Unlock()
+			return lo.CountBy(lines, func(l string) bool { return strings.Contains(l, `"msg"="`+msg+`"`) })
+		}
 	}
 
 	BeforeEach(func() {
@@ -590,6 +610,32 @@ var _ = Describe("Repair", func() {
 		ExpectSingletonReconciled(ctx, repairController)
 
 		Expect(queue.GetCommands()).To(BeEmpty())
+		Expect(recorder.DetectedEvent(`no allowed disruptions remain for disruption reason Unhealthy in nodepool "` + nodePool.Name + `"`)).To(BeTrue())
+	})
+
+	It("should report a node waiting on a budget consumed by in-flight disruptions", func() {
+		nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "1"}}
+		ExpectApplied(ctx, env.Client, nodePool)
+		nodeClaims, nodes := test.NodeClaimsAndNodes(9, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
+		for i := range nodes {
+			initNode(nodeClaims[i], nodes[i])
+		}
+		initNode(nodeClaim, node)
+		// An in-flight disruption consumes the NodePool's only allowed disruption.
+		cluster.MarkForDeletion(nodeClaims[0].Status.ProviderID)
+		markUnhealthy(node, "BadNode")
+		env.Clock.Step(31 * time.Minute)
+
+		ExpectSingletonReconciled(ctx, repairController)
+
+		Expect(queue.GetCommands()).To(BeEmpty())
+		blocked := lo.Filter(recorder.Events(), func(e karpenterevents.Event, _ int) bool {
+			return e.Reason == karpenterevents.DisruptionBlocked &&
+				e.Message == `no allowed disruptions remain for disruption reason Unhealthy in nodepool "`+nodePool.Name+`"`
+		})
+		Expect(lo.Map(blocked, func(e karpenterevents.Event, _ int) string {
+			return string(e.InvolvedObject.(metav1.Object).GetUID())
+		})).To(ConsistOf(string(node.UID), string(nodeClaim.UID)))
 	})
 
 	It("should repair with the full policy decision once a blocking budget lifts", func() {
@@ -627,7 +673,9 @@ var _ = Describe("Repair", func() {
 		markUnhealthy(nodes[1], "BadNode")
 		markUnhealthy(nodes[2], "BadNode")
 
-		ExpectSingletonReconciled(ctx, repairController)
+		logCtx, logged := captureLogs()
+		ExpectSingletonReconciled(logCtx, repairController)
+		Expect(logged("halting repair, too many unhealthy nodes in nodepool")).To(Equal(1))
 
 		Expect(queue.GetCommands()).To(BeEmpty())
 		blockedEvents := lo.Filter(recorder.Events(), func(event karpenterevents.Event, _ int) bool {
@@ -640,6 +688,9 @@ var _ = Describe("Repair", func() {
 		for _, event := range blockedEvents {
 			Expect(event.Type).To(Equal(corev1.EventTypeWarning))
 		}
+		// The trip is logged once per interval rather than on every pass.
+		ExpectSingletonReconciled(logCtx, repairController)
+		Expect(logged("halting repair, too many unhealthy nodes in nodepool")).To(Equal(1))
 	})
 
 	It("should round the repair circuit-breaker threshold up for small NodePools", func() {
@@ -956,9 +1007,14 @@ var _ = Describe("Repair", func() {
 		markUnhealthy(node, "BadNode")
 		env.Clock.Step(31 * time.Minute)
 
-		ExpectSingletonReconciled(ctx, repairController)
+		logCtx, logged := captureLogs()
+		ExpectSingletonReconciled(logCtx, repairController)
 		Expect(queue.GetCommands()).To(HaveLen(0))
 		Expect(recorder.DetectedEvent("repair requires a termination grace period to bypass blocking pods")).To(BeTrue())
+		Expect(logged("repair blocked")).To(Equal(1))
+		// The block is logged once per interval rather than on every pass.
+		ExpectSingletonReconciled(logCtx, repairController)
+		Expect(logged("repair blocked")).To(Equal(1))
 	})
 
 	It("should size replacement capacity for a blocking pod when the drain is bounded", func() {

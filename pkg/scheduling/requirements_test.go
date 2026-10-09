@@ -570,6 +570,22 @@ var _ = Describe("Requirements", func() {
 			req := NewRequirements(NewRequirement("deployment", corev1.NodeSelectorOpExists))
 			Expect(unconstrained.Compatible(req).Error()).To(Equal(`label "deployment" does not have known values`))
 		})
+		It("should report multiple incompatible keys in a stable order", func() {
+			keys := []string{"e", "a", "d", "b", "c"}
+			existing := NewRequirements(lo.Map(keys, func(k string, _ int) *Requirement {
+				return NewRequirement(k, corev1.NodeSelectorOpIn, "x")
+			})...)
+			incoming := NewRequirements(lo.Map(keys, func(k string, _ int) *Requirement {
+				return NewRequirement(k, corev1.NodeSelectorOpIn, "y")
+			})...)
+			err := existing.Intersects(incoming)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(MatchRegexp(`^key a, .*; key b, .*; key c, .*; key d, .*; key e, .*$`))
+			// Map iteration is randomized per range, so repeated calls would disagree without the sort.
+			for range 20 {
+				Expect(existing.Intersects(incoming).Error()).To(Equal(err.Error()))
+			}
+		})
 	})
 	Context("NodeSelectorRequirements Conversion", func() {
 		It("should convert combinations of labels to expected NodeSelectorRequirements", func() {

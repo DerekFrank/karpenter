@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/awslabs/operatorpkg/status"
+	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -47,6 +48,9 @@ const (
 	// repairUnhealthyThreshold stops repair for a NodePool when a correlated failure makes more than this fraction of
 	// its nodes unhealthy. Disruption budgets continue to pace concurrent repairs below this safety threshold.
 	repairUnhealthyThreshold = "20%"
+	// repairBlockedLogInterval rate-limits the logs for a node, or a NodePool's circuit breaker, that stays blocked
+	// across disruption passes. Events still report every pass, subject to their own dedupe.
+	repairBlockedLogInterval = 15 * time.Minute
 )
 
 // Repair is a voluntary disruption method that remediates unhealthy nodes. It replaces the standalone node.health
@@ -56,6 +60,8 @@ type Repair struct {
 	consolidation
 	policyMatcher *health.RepairPolicyMatcher
 	rebootHistory *RebootHistory
+	// blockedLogs records the nodes and NodePools whose blocked repair was logged in the last repairBlockedLogInterval.
+	blockedLogs *cache.Cache
 }
 
 // NewRepair constructs the repair method around the matcher cluster state matches Nodes with. It panics when cluster
@@ -69,6 +75,7 @@ func NewRepair(c consolidation) *Repair {
 		consolidation: c,
 		policyMatcher: policyMatcher,
 		rebootHistory: newRebootHistory(c.clock),
+		blockedLogs:   cache.New(repairBlockedLogInterval, time.Minute),
 	}
 }
 
@@ -100,8 +107,7 @@ func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 		return false
 	}
 	if c.hasPodBlockers && c.RepairPolicyResult.TerminationGracePeriod == nil && c.NodeClaim.Spec.TerminationGracePeriod == nil {
-		r.recorder.Publish(disruptionevents.Blocked(c.Node, c.NodeClaim,
-			"repair requires a termination grace period to bypass blocking pods")...)
+		r.publishBlocked(ctx, c, "repair requires a termination grace period to bypass blocking pods")
 		return false
 	}
 	return true
@@ -146,6 +152,10 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 			continue
 		}
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
+			// The NodePool-level event only covers a budget that allows no disruptions; this one also covers a budget
+			// consumed by in-flight disruptions, so a waiting node says why.
+			r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim,
+				fmt.Sprintf("no allowed disruptions remain for disruption reason %s in nodepool %q", r.Reason(), candidate.NodePool.Name))...)
 			continue
 		}
 		// Repair admits nodes with blocking (PDB / do-not-disrupt) pods only on the promise of this drain bound, so it
@@ -188,7 +198,7 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 				// the workload with no replacement.
 				refillable := np.StatusConditions().Root().IsTrue() && np.DeletionTimestamp.IsZero()
 				if !terminateFirstEnabled || !refillable {
-					r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, "static NodePool is at its node limit and cannot stage a replacement")...)
+					r.publishBlocked(ctx, candidate, "static NodePool is at its node limit and cannot stage a replacement")
 					continue
 				}
 				return []Command{{
@@ -225,7 +235,7 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 			}}, nil
 		}
 		if !results.AllNonPendingPodsScheduled() {
-			r.recorder.Publish(disruptionevents.Blocked(candidate.Node, candidate.NodeClaim, pretty.Sentence(results.NonPendingPodSchedulingErrors()))...)
+			r.publishBlocked(ctx, candidate, pretty.Sentence(results.NonPendingPodSchedulingErrors()))
 			continue
 		}
 		return []Command{{
@@ -236,6 +246,16 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 		}}, nil
 	}
 	return []Command{}, nil
+}
+
+// publishBlocked reports that repair can't act on an eligible candidate. The event repeats on every pass (subject to the
+// recorder's dedupe); the log is rate-limited per node, so a repair that stays blocked is visible in logs without
+// logging every pass.
+func (r *Repair) publishBlocked(ctx context.Context, c *Candidate, msg string) {
+	r.recorder.Publish(disruptionevents.Blocked(c.Node, c.NodeClaim, msg)...)
+	if r.blockedLogs.Add("node/"+string(c.Node.UID), nil, cache.DefaultExpiration) == nil {
+		log.FromContext(ctx).WithValues("Node", klog.KObj(c.Node), "NodeClaim", klog.KObj(c.NodeClaim)).Info("repair blocked", "reason", msg)
+	}
 }
 
 // commitReboot hands the candidate to the reboot controller and returns false if it is already rebooting or deleting.
@@ -310,6 +330,10 @@ func (r *Repair) breakerTrippedPools(ctx context.Context) (map[string]bool, erro
 		threshold := lo.Must(intstr.GetScaledValueFromIntOrPercent(&thresholdValue, count, true))
 		if unhealthy[nodePool] > threshold {
 			tripped[nodePool] = true
+			if r.blockedLogs.Add("nodepool/"+nodePool, nil, cache.DefaultExpiration) == nil {
+				log.FromContext(ctx).WithValues("NodePool", klog.KRef("", nodePool)).Info("halting repair, too many unhealthy nodes in nodepool",
+					"unhealthy", unhealthy[nodePool], "nodes", count, "threshold", repairUnhealthyThreshold)
+			}
 		}
 	}
 	return tripped, nil

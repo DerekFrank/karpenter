@@ -25,7 +25,6 @@ import (
 
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/samber/lo"
-	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 
@@ -234,6 +233,19 @@ func (b badKeyError) Error() string {
 	return fmt.Sprintf("key %s, %s not in %s", b.key, b.incoming, b.existing)
 }
 
+// badKeyErrors lazily formats multiple bad key errors. They're collected in random map order, so they're sorted by key
+// when formatted to keep the message stable.
+type badKeyErrors []badKeyError
+
+func (b badKeyErrors) Error() string {
+	sorted := slices.SortedFunc(slices.Values(b), func(x, y badKeyError) int { return strings.Compare(x.key, y.key) })
+	return strings.Join(lo.Map(sorted, func(e badKeyError, _ int) string { return e.Error() }), "; ")
+}
+
+func (b badKeyErrors) Unwrap() []error {
+	return lo.Map(b, func(e badKeyError, _ int) error { return e })
+}
+
 // intersectKeys iterates over the keys present in both requirements sets in O(len(smallest))
 func (r Requirements) intersectKeys(rhs Requirements) iter.Seq[string] {
 	return func(yield func(string) bool) {
@@ -253,7 +265,8 @@ func (r Requirements) intersectKeys(rhs Requirements) iter.Seq[string] {
 }
 
 // Intersects returns errors if the requirements don't have overlapping values, undefined keys are allowed
-func (r Requirements) Intersects(requirements Requirements) (errs error) {
+func (r Requirements) Intersects(requirements Requirements) error {
+	var errs badKeyErrors
 	for key := range r.intersectKeys(requirements) {
 		existing := r.Get(key)
 		incoming := requirements.Get(key)
@@ -265,14 +278,21 @@ func (r Requirements) Intersects(requirements Requirements) (errs error) {
 					continue
 				}
 			}
-			errs = multierr.Append(errs, badKeyError{
+			errs = append(errs, badKeyError{
 				key:      key,
 				incoming: incoming,
 				existing: existing,
 			})
 		}
 	}
-	return errs
+	switch len(errs) {
+	case 0:
+		return nil
+	case 1:
+		return errs[0]
+	default:
+		return errs
+	}
 }
 
 func (r Requirements) HasMinValues() bool {
