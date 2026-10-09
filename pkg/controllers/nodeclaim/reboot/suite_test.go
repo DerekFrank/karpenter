@@ -464,8 +464,10 @@ var _ = Describe("Reboot Lifecycle", func() {
 			stale := ExpectExists(ctx, env.Client, nodeClaim).DeepCopy()
 			ExpectObjectReconciled(ctx, env.Client, rebootController, nodeClaim)
 
-			_, err := rebootController.Reconcile(ctx, stale)
-			Expect(err).To(HaveOccurred())
+			// The stale object's optimistic-locked write conflicts, which requeues quietly instead of erroring.
+			result, err := rebootController.Reconcile(ctx, stale)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result.Requeue).To(BeTrue()) //nolint:staticcheck
 			ExpectMetricCounterValue(reboot.RebootsTotal, 1, map[string]string{"result": "succeeded"})
 			ExpectMetricHistogramSampleCountValue("karpenter_nodes_reboot_recovery_duration_seconds", 1, map[string]string{})
 		})

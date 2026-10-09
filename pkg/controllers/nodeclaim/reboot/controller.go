@@ -31,6 +31,7 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
@@ -108,7 +109,16 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 
 func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
+	res, err := c.reconcileReboot(ctx, nodeClaim)
+	// Other controllers write the NodeClaim as its node rejoins (e.g. pod events and disruption conditions), so the
+	// optimistic-locked terminal writes routinely race them; retry against the latest object without an error.
+	if errors.IsConflict(err) {
+		return reconcile.Result{Requeue: true}, nil
+	}
+	return res, err
+}
 
+func (c *Controller) reconcileReboot(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
 	cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
 	// Only active reboots are reconciled here.
 	if cond == nil || !cond.IsTrue() {

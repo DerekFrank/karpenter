@@ -21,8 +21,10 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
@@ -138,6 +140,9 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 		return scheduling.Results{}, fmt.Errorf("scheduling pods, %w", err)
 	}
 	results = results.TruncateInstanceTypes(ctx, scheduling.MaxInstanceTypes)
+	if results, err = dropOverLimitNodeClaims(ctx, kubeClient, cluster, results); err != nil {
+		return scheduling.Results{}, err
+	}
 	deletingNodePodKeys := lo.SliceToMap(deletingNodePods, func(p *corev1.Pod) (client.ObjectKey, any) {
 		return client.ObjectKeyFromObject(p), nil
 	})
@@ -161,6 +166,38 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 			}
 		}
 	}
+	return results, nil
+}
+
+// dropOverLimitNodeClaims fails the pods of new NodeClaims whose NodePool's current usage already exceeds its limits,
+// and drops those NodeClaims, mirroring the check Provisioner.Create makes before launching. The scheduler models the
+// candidates as gone when it applies limits, so a replacement smaller than its candidate passes the simulation even
+// though its launch is refused, which would otherwise surface as a disruption reconcile error instead of a block.
+func dropOverLimitNodeClaims(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, results scheduling.Results) (scheduling.Results, error) {
+	limitErrs := map[string]error{}
+	var validNewNodeClaims []*scheduling.NodeClaim
+	for _, newNodeClaim := range results.NewNodeClaims {
+		limitErr, ok := limitErrs[newNodeClaim.NodePoolName]
+		if !ok {
+			nodePool := &v1.NodePool{}
+			if err := kubeClient.Get(ctx, types.NamespacedName{Name: newNodeClaim.NodePoolName}, nodePool); err != nil {
+				if !errors.IsNotFound(err) {
+					return scheduling.Results{}, fmt.Errorf("getting nodepool, %w", err)
+				}
+			} else {
+				limitErr = nodePool.Spec.Limits.ExceededBy(cluster.NodePoolResourcesFor(newNodeClaim.NodePoolName))
+			}
+			limitErrs[newNodeClaim.NodePoolName] = limitErr
+		}
+		if limitErr == nil {
+			validNewNodeClaims = append(validNewNodeClaims, newNodeClaim)
+			continue
+		}
+		for _, pod := range newNodeClaim.Pods {
+			results.PodErrors[pod] = serrors.Wrap(fmt.Errorf("nodepool is already over its limits, %w", limitErr), "NodePool", klog.KRef("", newNodeClaim.NodePoolName))
+		}
+	}
+	results.NewNodeClaims = validNewNodeClaims
 	return results, nil
 }
 
