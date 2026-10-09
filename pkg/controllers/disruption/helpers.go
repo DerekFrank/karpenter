@@ -397,6 +397,7 @@ func NodePoolStatsFromNodes(nodes []*state.StateNode, reason v1.DisruptionReason
 
 // BuildDisruptionBudgets prepares our disruption budget mapping. The disruption budget maps each disruption reason to the number of allowed disruptions.
 // We calculate allowed disruptions by taking the max disruptions allowed by disruption reason and subtracting the number of nodes that are NotReady and already being deleted by that disruption reason.
+// A nil recorder skips the budget-blocked events.
 func BuildDisruptionBudgetMapping(ctx context.Context, cluster *state.Cluster, clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, reason v1.DisruptionReason) (map[string]int, error) {
 	disruptionBudgetMapping := map[string]int{}
 	numNodes, disrupting := NodePoolStats(cluster, reason)
@@ -413,11 +414,18 @@ func BuildDisruptionBudgetMapping(ctx context.Context, cluster *state.Cluster, c
 		NodePoolNodesConsumingBudgets.Set(float64(disrupting[nodePool.Name]), map[string]string{
 			metrics.NodePoolLabel: nodePool.Name, metrics.ReasonLabel: strings.ToLower(string(reason)),
 		})
-		if numNodes[nodePool.Name] != 0 && allowedDisruptions == 0 {
+		if recorder != nil && numNodes[nodePool.Name] != 0 && allowedDisruptions == 0 {
 			recorder.Publish(disruptionevents.NodePoolBlockedForDisruptionReason(nodePool, reason))
 		}
 	}
 	return disruptionBudgetMapping, nil
+}
+
+// RecordDisruptionBudgets refreshes the budget gauges for a reason without publishing budget events, so the gauges
+// don't go stale while a disruption method has no candidates.
+func RecordDisruptionBudgets(ctx context.Context, cluster *state.Cluster, clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, reason v1.DisruptionReason) error {
+	_, err := BuildDisruptionBudgetMapping(ctx, cluster, clk, kubeClient, cloudProvider, nil, reason)
+	return err
 }
 
 // mapCandidates maps the list of proposed candidates with the current state

@@ -236,15 +236,13 @@ var _ = Describe("Repair", func() {
 			"decision":          string(disruption.RebootDecision),
 			metrics.ReasonLabel: strings.ToLower(string(v1.DisruptionReasonUnhealthy)),
 		})
-		ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
-			metrics.ReasonLabel:   strings.ToLower(string(v1.DisruptionReasonUnhealthy)),
-			metrics.NodePoolLabel: nodePool.Name,
-		})
-		ExpectMetricCounterValue(disruption.NodeClaimsUnhealthyDisruptedTotal, 1, map[string]string{
-			"condition":                  "bad_node",
-			metrics.NodePoolLabel:        nodePool.Name,
-			metrics.TerminationModeLabel: metrics.TerminationModeEventual,
-		})
+		// The NodeClaim is kept, so the termination-counting disruption metrics don't record the reboot.
+		_, found := FindMetricWithLabelValues("karpenter_nodeclaims_disrupted_total", map[string]string{metrics.NodePoolLabel: nodePool.Name})
+		Expect(found).To(BeFalse())
+		_, found = FindMetricWithLabelValues("karpenter_pods_disruption_initiated_total", map[string]string{metrics.NodePoolLabel: nodePool.Name})
+		Expect(found).To(BeFalse())
+		_, found = FindMetricWithLabelValues("karpenter_nodeclaims_unhealthy_disrupted_total", map[string]string{metrics.NodePoolLabel: nodePool.Name})
+		Expect(found).To(BeFalse())
 
 		// The next pass must not recommit the reboot or clear its DisruptionReason.
 		result = ExpectSingletonReconciled(ctx, repairController)
@@ -925,6 +923,17 @@ var _ = Describe("Repair", func() {
 			metrics.CapacityTypeLabel:       v1.CapacityTypeOnDemand,
 			disruption.ImageID.Name:         "ami-test-1234",
 			metrics.TerminationModeLabel:    metrics.TerminationModeEventual,
+		})
+		// The NodeClaim has no TGP of its own; every disruption metric reports the policy-bounded drain.
+		ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
+			metrics.ReasonLabel:          strings.ToLower(string(v1.DisruptionReasonUnhealthy)),
+			metrics.NodePoolLabel:        nodePool.Name,
+			metrics.TerminationModeLabel: metrics.TerminationModeEventual,
+		})
+		ExpectMetricCounterValue(metrics.PodsDisruptionInitiatedTotal, 0, map[string]string{
+			metrics.ReasonLabel:          strings.ToLower(string(v1.DisruptionReasonUnhealthy)),
+			metrics.NodePoolLabel:        nodePool.Name,
+			metrics.TerminationModeLabel: metrics.TerminationModeEventual,
 		})
 	})
 

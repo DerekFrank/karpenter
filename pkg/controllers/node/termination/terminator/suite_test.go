@@ -363,5 +363,24 @@ var _ = Describe("Eviction/Queue", func() {
 			pod = ExpectExists(ctx, env.Client, pod)
 			Expect(pod.DeletionTimestamp).ToNot(BeNil())
 		})
+		It("should count a pod drained once when it is force-deleted again on later passes", func() {
+			// A finalizer keeps the pod terminating, like a pod on a dead kubelet, so Drain keeps re-enqueueing it.
+			pod.Spec.TerminationGracePeriodSeconds = lo.ToPtr[int64](120)
+			pod.Finalizers = []string{"karpenter.sh/test-finalizer"}
+			ExpectApplied(ctx, env.Client, pod, node)
+			ExpectManualBinding(ctx, env.Client, pod, node)
+			DeferCleanup(func() {
+				ExpectFinalizersRemoved(ctx, env.Client, pod)
+			})
+
+			pastTerminationTime := env.Clock.Now().Add(-1 * time.Hour)
+			for range 3 {
+				queue.Add(&pastTerminationTime, pod)
+				ExpectObjectReconciled(ctx, env.Client, queue, pod)
+				Expect(queue.Has(pod)).To(BeFalse())
+			}
+			Expect(ExpectExists(ctx, env.Client, pod).DeletionTimestamp.IsZero()).To(BeFalse())
+			ExpectMetricCounterValue(terminator.PodsDrainedTotal, 1, map[string]string{metrics.ReasonLabel: ""})
+		})
 	})
 })

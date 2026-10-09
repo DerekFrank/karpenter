@@ -105,6 +105,24 @@ var _ = Describe("Emptiness", func() {
 				metrics.ReasonLabel: "empty",
 			})
 		})
+		It("should refresh budget metrics when there are no candidates", func() {
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "3"}}
+			pod := test.Pod()
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, pod)
+			ExpectManualBinding(ctx, env.Client, pod, node)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+
+			// Values left behind by an earlier pass that had candidates.
+			budgetLabels := map[string]string{metrics.NodePoolLabel: nodePool.Name, metrics.ReasonLabel: "empty"}
+			disruption.NodePoolAllowedDisruptions.Set(42, budgetLabels)
+			disruption.NodePoolNodesConsumingBudgets.Set(42, budgetLabels)
+
+			ExpectSingletonReconciled(ctx, disruptionController)
+			// Node has a pod, so Emptiness has no candidates.
+			ExpectMetricGaugeValue(disruption.EligibleNodes, 0, map[string]string{metrics.ReasonLabel: "empty"})
+			ExpectMetricGaugeValue(disruption.NodePoolAllowedDisruptions, 3, budgetLabels)
+			ExpectMetricGaugeValue(disruption.NodePoolNodesConsumingBudgets, 0, budgetLabels)
+		})
 	})
 	Context("Budgets", func() {
 		var numNodes = 10

@@ -206,6 +206,9 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 
 	// If there are no candidates, move to the next disruption
 	if len(candidates) == 0 {
+		if err := RecordDisruptionBudgets(ctx, c.cluster, c.clock, c.kubeClient, c.cloudProvider, disruption.Reason()); err != nil {
+			return false, fmt.Errorf("recording disruption budgets, %w", err)
+		}
 		return false, nil
 	}
 	// Pass precomputed NodePool totals to consolidation methods for balanced scoring
