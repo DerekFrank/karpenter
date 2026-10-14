@@ -192,6 +192,8 @@ var _ = AfterEach(func() {
 	disruption.NodepoolDecisionsPerformed.Reset()
 	disruption.TerminateFirstDecisionsTotal.Reset()
 	disruption.NodeClaimsUnhealthyDisruptedTotal.Reset()
+	disruption.ConsolidationSimulationDurationSeconds.Reset()
+	disruption.ConsolidationPassElapsedSeconds.Reset()
 })
 
 var _ = Describe("Simulate Scheduling", func() {

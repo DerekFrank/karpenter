@@ -21,10 +21,12 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	prometheusmodel "github.com/prometheus/client_model/go"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -212,7 +214,85 @@ var _ = Describe("SingleNodeConsolidation", func() {
 			Expect(consolidation.PreviouslyUnseenNodePools.Has(nodePool3.Name)).To(BeTrue())
 		})
 	})
+
+	Context("Simulation Metrics", func() {
+		var clk steppingClock
+		BeforeEach(func() {
+			// Every Now advances the clock, so each simulation takes a nonzero amount of time and the pass
+			// keeps elapsing across simulations.
+			clk = steppingClock{FakeClock: clocktesting.NewFakeClock(time.Now())}
+		})
+
+		It("should record the duration and pass elapsed time of each single-node simulation", func() {
+			candidates, err := createCandidates(1.0, 3)
+			Expect(err).To(BeNil())
+			// Only nodePool1's candidates are simulated.
+			budgetMapping := map[string]int{nodePool1.Name: 1, nodePool2.Name: 0, nodePool3.Name: 0}
+
+			_, err = disruption.NewSingleNodeConsolidation(disruption.MakeConsolidation(clk, cluster, env.Client, prov, cloudProvider, recorder, queue)).ComputeCommands(ctx, budgetMapping, candidates...)
+			Expect(err).To(BeNil())
+
+			labels := map[string]string{disruption.ConsolidationTypeLabel: disruption.SingleNodeConsolidationType.Name}
+			duration := expectHistogram("karpenter_voluntary_disruption_consolidation_simulation_duration_seconds", labels)
+			elapsed := expectHistogram("karpenter_voluntary_disruption_consolidation_pass_elapsed_seconds", labels)
+			Expect(lo.FromPtr(duration.SampleCount)).To(BeNumerically(">", 1))
+			Expect(elapsed.SampleCount).To(Equal(duration.SampleCount))
+			Expect(lo.FromPtr(duration.SampleSum)).To(BeNumerically(">", 0))
+			// Later simulations complete further into the pass than they took to run.
+			Expect(lo.FromPtr(elapsed.SampleSum)).To(BeNumerically(">", lo.FromPtr(duration.SampleSum)))
+		})
+
+		It("should not record a single-node simulation when the pass times out before simulating", func() {
+			disruption.SingleNodeConsolidationTimeoutDuration = -5 * time.Second
+			candidates, err := createCandidates(1.0, 1)
+			Expect(err).To(BeNil())
+			budgetMapping := map[string]int{nodePool1.Name: 1, nodePool2.Name: 1, nodePool3.Name: 1}
+
+			_, err = disruption.NewSingleNodeConsolidation(disruption.MakeConsolidation(clk, cluster, env.Client, prov, cloudProvider, recorder, queue)).ComputeCommands(ctx, budgetMapping, candidates...)
+			Expect(err).To(BeNil())
+
+			labels := map[string]string{disruption.ConsolidationTypeLabel: disruption.SingleNodeConsolidationType.Name}
+			_, found := FindMetricWithLabelValues("karpenter_voluntary_disruption_consolidation_simulation_duration_seconds", labels)
+			Expect(found).To(BeFalse())
+			_, found = FindMetricWithLabelValues("karpenter_voluntary_disruption_consolidation_pass_elapsed_seconds", labels)
+			Expect(found).To(BeFalse())
+		})
+
+		It("should record the duration and pass elapsed time of each multi-node simulation", func() {
+			candidates, err := createCandidates(1.0, 2)
+			Expect(err).To(BeNil())
+			budgetMapping := map[string]int{nodePool1.Name: 2, nodePool2.Name: 2, nodePool3.Name: 2}
+
+			_, err = disruption.NewMultiNodeConsolidation(disruption.MakeConsolidation(clk, cluster, env.Client, prov, cloudProvider, recorder, queue)).ComputeCommands(ctx, budgetMapping, candidates...)
+			Expect(err).To(BeNil())
+
+			labels := map[string]string{disruption.ConsolidationTypeLabel: disruption.MultiNodeConsolidationType.Name}
+			duration := expectHistogram("karpenter_voluntary_disruption_consolidation_simulation_duration_seconds", labels)
+			elapsed := expectHistogram("karpenter_voluntary_disruption_consolidation_pass_elapsed_seconds", labels)
+			Expect(lo.FromPtr(duration.SampleCount)).To(BeNumerically(">", 1))
+			Expect(elapsed.SampleCount).To(Equal(duration.SampleCount))
+			Expect(lo.FromPtr(duration.SampleSum)).To(BeNumerically(">", 0))
+			Expect(lo.FromPtr(elapsed.SampleSum)).To(BeNumerically(">", lo.FromPtr(duration.SampleSum)))
+		})
+	})
 })
+
+// steppingClock advances by a second every time Now is called.
+type steppingClock struct {
+	*clocktesting.FakeClock
+}
+
+func (s steppingClock) Now() time.Time {
+	s.Step(time.Second)
+	return s.FakeClock.Now()
+}
+
+func expectHistogram(name string, labels map[string]string) *prometheusmodel.Histogram {
+	GinkgoHelper()
+	metric, found := FindMetricWithLabelValues(name, labels)
+	Expect(found).To(BeTrue(), "Metric "+name+" should be available")
+	return metric.Histogram
+}
 
 func createCandidates(disruptionCost float64, nodesPerNodePool ...int) ([]*disruption.Candidate, error) {
 	// Default to 3 nodes per nodepool if not specified

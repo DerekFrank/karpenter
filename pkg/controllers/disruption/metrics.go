@@ -119,6 +119,12 @@ var (
 	}
 )
 
+// consolidationSimulationBuckets extends the default duration buckets past 600s, since a single-node
+// consolidation simulation isn't bounded by a timeout and can run for hours.
+func consolidationSimulationBuckets() []float64 {
+	return append(metrics.DurationBuckets(), 900, 1800, 3600, 7200, 14400)
+}
+
 func init() {
 	// Initialize the consolidation_type series that can time out to 0. Only the
 	// multi- and single-node algorithms run a bounded search that can hit a timeout;
@@ -195,6 +201,30 @@ var (
 		},
 		[]opmetrics.Label{ConsolidationType},
 		opmetrics.Beta,
+	)
+	ConsolidationSimulationDurationSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "consolidation_simulation_duration_seconds",
+			Help:      "Duration of a single consolidation scheduling simulation in seconds. Labeled by consolidation type.",
+			Buckets:   consolidationSimulationBuckets(),
+		},
+		[]opmetrics.Label{ConsolidationType},
+		opmetrics.Alpha,
+	)
+	ConsolidationPassElapsedSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "consolidation_pass_elapsed_seconds",
+			Help:      "Time elapsed since the start of a consolidation pass when one of its scheduling simulations completed, in seconds. Labeled by consolidation type.",
+			Buckets:   consolidationSimulationBuckets(),
+		},
+		[]opmetrics.Label{ConsolidationType},
+		opmetrics.Alpha,
 	)
 	FailedValidationsTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,

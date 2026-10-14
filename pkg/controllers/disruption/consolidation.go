@@ -153,6 +153,19 @@ func (c *consolidation) sortCandidates(_ context.Context, candidates []*Candidat
 	return candidates
 }
 
+// measuredComputeConsolidation wraps computeConsolidation, recording how long the simulation took and how far
+// into its consolidation pass, which started at passStart, it completed.
+func (c *consolidation) measuredComputeConsolidation(ctx context.Context, consolidationType string, passStart time.Time, candidates ...*Candidate) (Command, error) {
+	start := c.clock.Now()
+	defer func() {
+		end := c.clock.Now()
+		labels := map[string]string{ConsolidationTypeLabel: consolidationType}
+		ConsolidationSimulationDurationSeconds.Observe(end.Sub(start).Seconds(), labels)
+		ConsolidationPassElapsedSeconds.Observe(end.Sub(passStart).Seconds(), labels)
+	}()
+	return c.computeConsolidation(ctx, candidates...)
+}
+
 // computeConsolidation computes a consolidation action to take
 //
 // nolint:gocyclo

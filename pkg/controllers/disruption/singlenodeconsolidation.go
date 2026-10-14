@@ -57,7 +57,8 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 	candidates = s.SortCandidates(ctx, candidates)
 
 	// Set a timeout
-	timeout := s.clock.Now().Add(SingleNodeConsolidationTimeoutDuration)
+	passStart := s.clock.Now()
+	timeout := passStart.Add(SingleNodeConsolidationTimeoutDuration)
 	constrainedByBudgets := false
 
 	unseenNodePools := sets.New(lo.Map(candidates, func(c *Candidate, _ int) string { return c.NodePool.Name })...)
@@ -88,7 +89,7 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 		}
 
 		// compute a possible consolidation option
-		cmd, err := s.computeConsolidation(ctx, candidate)
+		cmd, err := s.measuredComputeConsolidation(ctx, s.ConsolidationType(), passStart, candidate)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "failed computing consolidation")
 			continue
