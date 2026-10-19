@@ -37,6 +37,9 @@ Karpenter is a multi-cloud project with implementations by the following cloud p
     - [Maintained by kubekanvas](https://github.com/kubekanvas/karpenter-provider-upcloud) (Alpha)
     - [Maintained by upcloud-tools (community)](https://github.com/upcloud-tools/karpenter-provider-upcloud) (Beta)
 
+## Support Policy
+Only the latest minor release and designated Long-Term Support (LTS) releases receive patches. See [SUPPORT.md](SUPPORT.md) for the support policy and the current LTS releases.
+
 ## Community, discussion, contribution, and support
 
 If you have any questions or want to get the latest project news, you can connect with us in the following ways:

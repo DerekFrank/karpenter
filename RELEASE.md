@@ -11,6 +11,7 @@ This repository is the home for both of the above components.
 ## Versioning Strategy
 
 The versioning strategy for this project is covered in detail in [the release type section of the compatibility documentation](https://karpenter.sh/docs/upgrading/compatibility/#release-types).
+See [SUPPORT.md](SUPPORT.md) for which releases are supported and which fixes are backported to them.
 
 ## Releasing a New Version
 
