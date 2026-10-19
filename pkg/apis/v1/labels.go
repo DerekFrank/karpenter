@@ -188,6 +188,131 @@ var KarpenterAnnotations = []wellknown.Annotation{
 	DisruptionCostAnnotation,
 }
 
+var (
+	NodePoolLabel = wellknown.Label{
+		Name:    NodePoolLabelKey,
+		Example: "default",
+		UsedOn:  []runtime.Object{&NodeClaim{}, &v1.Node{}},
+		Help: "Karpenter sets this to the name of the NodePool that launched the node; it can't be set in a " +
+			"NodePool's template. Select on it to target or avoid a NodePool. Karpenter doesn't provision for a " +
+			"pod that requires it not to exist, and doesn't consider nodes without it for disruption.",
+		Stage: docs.GA,
+	}
+	CapacityTypeLabel = wellknown.Label{
+		Name:    CapacityTypeLabelKey,
+		Example: CapacityTypeSpot,
+		UsedOn:  []runtime.Object{&NodeClaim{}, &v1.Node{}},
+		Help: "Karpenter sets this to the capacity type of the node's instance. Constrain it in NodePool " +
+			"requirements to choose which capacity types Karpenter may launch, or in pod scheduling constraints " +
+			"to choose where pods run.",
+		Values: []docs.Value{
+			{Name: CapacityTypeOnDemand, Help: "On-demand capacity."},
+			{Name: CapacityTypeSpot, Help: "Spot capacity, which can be reclaimed by the cloud provider."},
+			{Name: CapacityTypeReserved, Help: "Reserved capacity, backed by a capacity reservation."},
+		},
+		Stage: docs.GA,
+	}
+	NodeInitializedLabel = wellknown.Label{
+		Name:    NodeInitializedLabelKey,
+		Example: trueValue,
+		UsedOn:  []runtime.Object{&v1.Node{}},
+		Help: "Karpenter sets this once the node is Ready, its startup taints are removed, its expected extended " +
+			"resources are registered, and its requested DRA drivers have published their ResourceSlices. " +
+			"Uninitialized nodes are not considered for disruption.",
+		Values:       []docs.Value{{Name: trueValue, Help: "The node is initialized."}},
+		Stage:        docs.Alpha,
+		InternalOnly: true,
+	}
+	NodeRegisteredLabel = wellknown.Label{
+		Name:    NodeRegisteredLabelKey,
+		Example: trueValue,
+		UsedOn:  []runtime.Object{&v1.Node{}},
+		Help: "Karpenter sets this once the node has joined the cluster and Karpenter has synced the NodeClaim's " +
+			"labels, annotations, and taints onto it and removed the karpenter.sh/unregistered taint.",
+		Values:       []docs.Value{{Name: trueValue, Help: "The node is registered."}},
+		Stage:        docs.Alpha,
+		InternalOnly: true,
+	}
+	NodeDoNotSyncTaintsLabel = wellknown.Label{
+		Name:    NodeDoNotSyncTaintsLabelKey,
+		Example: trueValue,
+		UsedOn:  []runtime.Object{&v1.Node{}},
+		Help: "Set this on a node, typically from its bootstrap configuration, to take ownership of its taints. " +
+			"Karpenter still removes the karpenter.sh/unregistered taint.",
+		Values: []docs.Value{
+			{Name: trueValue, Help: "Karpenter does not sync the NodeClaim's taints and startup taints to the node."},
+		},
+		Stage: docs.Beta,
+	}
+	TopologyZoneLabel = wellknown.Label{
+		Name:    v1.LabelTopologyZone,
+		Example: "us-east-2a",
+		UsedOn:  []runtime.Object{&NodeClaim{}, &v1.Node{}},
+		Help:    "The zone of the node's instance, as defined by the cloud provider.",
+		Stage:   docs.GA,
+	}
+	TopologyRegionLabel = wellknown.Label{
+		Name:    v1.LabelTopologyRegion,
+		Example: "us-east-2",
+		UsedOn:  []runtime.Object{&NodeClaim{}, &v1.Node{}},
+		Help:    "The region of the node's instance, as defined by the cloud provider.",
+		Stage:   docs.GA,
+	}
+	InstanceTypeLabel = wellknown.Label{
+		Name:    v1.LabelInstanceTypeStable,
+		Example: "g4dn.8xlarge",
+		UsedOn:  []runtime.Object{&NodeClaim{}, &v1.Node{}},
+		Help:    "The instance type of the node, as defined by the cloud provider.",
+		Stage:   docs.GA,
+	}
+	ArchLabel = wellknown.Label{
+		Name:    v1.LabelArchStable,
+		Example: ArchitectureAmd64,
+		UsedOn:  []runtime.Object{&NodeClaim{}, &v1.Node{}},
+		Help:    "The CPU architecture of the node's instance, as a Go GOARCH value.",
+		Values: []docs.Value{
+			{Name: ArchitectureAmd64, Help: "x86-64 instances."},
+			{Name: ArchitectureArm64, Help: "Arm64 instances."},
+		},
+		Stage: docs.GA,
+	}
+	OSLabel = wellknown.Label{
+		Name:    v1.LabelOSStable,
+		Example: string(v1.Linux),
+		UsedOn:  []runtime.Object{&NodeClaim{}, &v1.Node{}},
+		Help:    "The operating system of the node's instance, as a Go GOOS value.",
+		Values: []docs.Value{
+			{Name: string(v1.Linux), Help: "Linux instances."},
+			{Name: string(v1.Windows), Help: "Windows instances."},
+		},
+		Stage: docs.GA,
+	}
+	WindowsBuildLabel = wellknown.Label{
+		Name:    v1.LabelWindowsBuild,
+		Example: "10.0.17763",
+		UsedOn:  []runtime.Object{&NodeClaim{}, &v1.Node{}},
+		Help: "The Windows build of the node's instance, as MajorVersion.MinorVersion.BuildNumber, e.g. " +
+			"`10.0.17763` for Windows Server 2019, `10.0.20348` for 2022, or `10.0.26100` for 2025.",
+		Stage: docs.GA,
+	}
+)
+
+// KarpenterLabels are the well known labels Karpenter reads or writes, including the Kubernetes labels it treats as
+// well known.
+var KarpenterLabels = []wellknown.Label{
+	NodePoolLabel,
+	CapacityTypeLabel,
+	NodeInitializedLabel,
+	NodeRegisteredLabel,
+	NodeDoNotSyncTaintsLabel,
+	TopologyZoneLabel,
+	TopologyRegionLabel,
+	InstanceTypeLabel,
+	ArchLabel,
+	OSLabel,
+	WindowsBuildLabel,
+}
+
 // Karpenter specific finalizers
 const (
 	TerminationFinalizer = apis.Group + "/termination"
