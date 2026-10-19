@@ -76,6 +76,9 @@ mirroring https://kubernetes.io/docs/reference/labels-annotations-taints/.
   only annotations are always `docs.Alpha`.
 - Enumerate the annotation's well known values as `docs.Value`s. A value's
   `Name` comes from a const, never a magic string.
+- Describe every taint Karpenter adds or removes with a `wellknown.Taint` in
+  `pkg/apis/v1/taints.go`, and add it to `KarpenterTaints`. Internal only taints
+  are always `docs.Alpha`.
 
 ## Feature Gates
 
