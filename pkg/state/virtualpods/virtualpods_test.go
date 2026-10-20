@@ -56,6 +56,19 @@ var _ = Describe("VirtualPodCache", func() {
 			Expect(cache.GetAll(ctx)).To(HaveLen(5))
 		})
 
+		It("should return copies, so callers can't modify the cached pods", func() {
+			web := test.ReadyBuffer("web", 2)
+			cache := NewVirtualPodCache(fakeClient(web, podTemplateFor(web)))
+			pods := cache.GetAll(ctx)
+			Expect(pods).To(HaveLen(2))
+			pods[0].Spec.TopologySpreadConstraints = []corev1.TopologySpreadConstraint{{TopologyKey: "zone"}}
+			pods[0].Labels = map[string]string{"mutated": "true"}
+
+			for _, p := range cache.GetAll(ctx) {
+				Expect(p.Spec.TopologySpreadConstraints).To(BeEmpty())
+				Expect(p.Labels).ToNot(HaveKey("mutated"))
+			}
+		})
 		It("should hydrate at most once", func() {
 			web := test.ReadyBuffer("web", 3)
 			cache := NewVirtualPodCache(fakeClient(web, podTemplateFor(web)))

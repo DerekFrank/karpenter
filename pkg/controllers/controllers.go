@@ -30,7 +30,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
+	"sigs.k8s.io/karpenter/pkg/state/workloads"
 
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 
 	autoscalingv1beta1 "sigs.k8s.io/karpenter/pkg/apis/autoscaling/v1beta1"
@@ -62,6 +65,7 @@ import (
 	nodepoolvalidation "sigs.k8s.io/karpenter/pkg/controllers/nodepool/validation"
 	"sigs.k8s.io/karpenter/pkg/controllers/pod/deletioncost"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
+	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	statenodeclaimgc "sigs.k8s.io/karpenter/pkg/controllers/state/nodeclaimgc"
@@ -113,12 +117,12 @@ func NewControllers(
 	overlayUndecoratedCloudProvider cloudprovider.CloudProvider,
 	cluster *state.Cluster,
 	instanceTypeStore *nodeoverlay.InstanceTypeStore,
-	predictionStore *prediction.Store,
 	opts ...option.Function[ControllerOptions],
 ) []controller.Controller {
 	o := option.Resolve(opts...)
 	deviceAllocationController := deviceallocation.NewController(kubeClient)
 	virtualPodCache := virtualpods.NewVirtualPodCache(kubeClient)
+	predictionStore := prediction.NewStore(workloads.NewReader(kubeClient))
 	p := provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, cluster, clock, deviceAllocationController, virtualPodCache, predictionStore)
 	evictionQueue := terminator.NewQueue(clock, kubeClient, recorder)
 	disruptionQueue := disruption.NewQueue(kubeClient, recorder, cluster, clock, p)
@@ -224,9 +228,41 @@ func NewControllers(
 			deletioncost.NewController(clock, kubeClient, cloudProvider, cluster, deletionCostQueue),
 		)
 	}
+	controllers = append(controllers, workloads.NewInformers(workloadObjects(ctx)...))
 	if o.enableVPAPrediction && options.FromContext(ctx).FeatureGates.PredictionEnabled {
 		controllers = append(controllers, informer.NewVPAController(kubeClient, predictionStore, cluster, recorder))
 	}
 
 	return controllers
+}
+
+// workloadObjects returns the kinds the enabled features read through workloads.Reader, so their informers sync before
+// any controller runs.
+func workloadObjects(ctx context.Context) []client.Object {
+	gates := options.FromContext(ctx).FeatureGates
+	defaultSpread := scheduling.HasDefaultTopologySpread(ctx)
+	// DaemonSet overhead is always computed
+	objects := []client.Object{&appsv1.DaemonSet{}}
+	// Predictions resolve pods through their ReplicaSet, default spread folds in its selector, and buffers read its
+	// template
+	if gates.PredictionEnabled || defaultSpread || gates.CapacityBuffer {
+		objects = append(objects, &appsv1.ReplicaSet{})
+	}
+	// Predictions resolve pods through their Job
+	if gates.PredictionEnabled {
+		objects = append(objects, &batchv1.Job{})
+	}
+	// Default spread folds in a StatefulSet's selector, and buffers read its template
+	if defaultSpread || gates.CapacityBuffer {
+		objects = append(objects, &appsv1.StatefulSet{})
+	}
+	// Default spread folds in a ReplicationController's selector and its Services' selectors
+	if defaultSpread {
+		objects = append(objects, &corev1.ReplicationController{}, &corev1.Service{})
+	}
+	// Buffers read a Deployment's or PodTemplate's template
+	if gates.CapacityBuffer {
+		objects = append(objects, &appsv1.Deployment{}, &corev1.PodTemplate{})
+	}
+	return objects
 }

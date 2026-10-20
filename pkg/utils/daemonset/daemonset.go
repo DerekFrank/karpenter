@@ -35,7 +35,8 @@ func PodForDaemonSet(daemonSet *appsv1.DaemonSet) *corev1.Pod {
 			Namespace:       daemonSet.Namespace,
 			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(daemonSet, appsv1.SchemeGroupVersion.WithKind("DaemonSet"))},
 		},
-		Spec: daemonSet.Spec.Template.Spec,
+		// Copied, since the DaemonSet may alias the informer cache and the requests are defaulted below
+		Spec: *daemonSet.Spec.Template.Spec.DeepCopy(),
 	}
 	// The API server performs defaulting to merge limits into requests for pods. However, this is not performed for higher
 	// level objects (e.g. deployments, daemonsets, etc). We should perform this defaulting ourselves when we create a fake

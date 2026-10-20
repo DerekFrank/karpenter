@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	karpopts "sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/state/workloads"
 )
 
 // The owner kinds whose selectors kube-scheduler's helper.DefaultSelector deduces a default topology spread selector
@@ -55,6 +56,7 @@ var (
 // belonging to only a handful of namespaces and workloads.
 type DefaultTopologySpreadInjector struct {
 	kubeClient client.Client
+	workloads  *workloads.Reader
 	// servicesByNamespace caches the Services in a namespace, keyed by namespace. A namespace with no Services caches
 	// an empty slice, so it isn't re-listed for every pod.
 	servicesByNamespace map[string][]corev1.Service
@@ -87,9 +89,16 @@ type selectorCacheKey struct {
 	labels string
 }
 
+// HasDefaultTopologySpread reports whether cluster-level default topology spread constraints are configured.
+func HasDefaultTopologySpread(ctx context.Context) bool {
+	cfg := karpopts.FromContext(ctx).SchedulerConfig
+	return cfg != nil && cfg.PodTopologySpread != nil && len(cfg.PodTopologySpread.DefaultConstraints) != 0
+}
+
 func NewDefaultTopologySpreadInjector(kubeClient client.Client) *DefaultTopologySpreadInjector {
 	return &DefaultTopologySpreadInjector{
 		kubeClient:             kubeClient,
+		workloads:              workloads.NewReader(kubeClient),
 		servicesByNamespace:    map[string][]corev1.Service{},
 		ownerContributionByUID: map[types.UID]*ownerContribution{},
 		selectorByPodShape:     map[selectorCacheKey]*metav1.LabelSelector{},
@@ -108,10 +117,10 @@ func NewDefaultTopologySpreadInjector(kubeClient client.Client) *DefaultTopology
 // NOTE: mutating the pods in place is safe because every pod reaching the scheduler is obtained from a cache-backed
 // List, which deep-copies. Callers passing pods from another source must copy them first.
 func (d *DefaultTopologySpreadInjector) Inject(ctx context.Context, pods []*corev1.Pod) {
-	cfg := karpopts.FromContext(ctx).SchedulerConfig
-	if cfg == nil || cfg.PodTopologySpread == nil || len(cfg.PodTopologySpread.DefaultConstraints) == 0 {
+	if !HasDefaultTopologySpread(ctx) {
 		return
 	}
+	cfg := karpopts.FromContext(ctx).SchedulerConfig
 	for _, p := range pods {
 		if len(p.Spec.TopologySpreadConstraints) != 0 {
 			continue
@@ -254,12 +263,11 @@ func (d *DefaultTopologySpreadInjector) resolveOwnerContribution(ctx context.Con
 		// Mirrors upstream, which returns the service-derived selector on a parse failure rather than erroring.
 		return nil, nil //nolint:nilerr
 	}
-	key := types.NamespacedName{Name: owner.Name, Namespace: namespace}
 	switch gv.WithKind(owner.Kind) {
 	case replicationControllerKind:
-		rc := &corev1.ReplicationController{}
-		if err := d.kubeClient.Get(ctx, key, rc, client.UnsafeDisableDeepCopy); err != nil {
-			return nil, fmt.Errorf("getting replicationcontroller, %w", err)
+		rc, err := found(d.workloads.ReplicationController(ctx, namespace, owner))
+		if err != nil {
+			return nil, err
 		}
 		// A ReplicationController's selector is an equality-only map, so it carries no expressions.
 		if len(rc.Spec.Selector) == 0 {
@@ -267,21 +275,30 @@ func (d *DefaultTopologySpreadInjector) resolveOwnerContribution(ctx context.Con
 		}
 		return &ownerContribution{matchLabels: maps.Clone(rc.Spec.Selector)}, nil
 	case replicaSetKind:
-		rs := &appsv1.ReplicaSet{}
-		if err := d.kubeClient.Get(ctx, key, rs, client.UnsafeDisableDeepCopy); err != nil {
-			return nil, fmt.Errorf("getting replicaset, %w", err)
+		rs, err := found(d.workloads.ReplicaSet(ctx, namespace, owner))
+		if err != nil {
+			return nil, err
 		}
 		return &ownerContribution{matchExpressions: requirementsFrom(rs.Spec.Selector)}, nil
 	case statefulSetKind:
-		ss := &appsv1.StatefulSet{}
-		if err := d.kubeClient.Get(ctx, key, ss, client.UnsafeDisableDeepCopy); err != nil {
-			return nil, fmt.Errorf("getting statefulset, %w", err)
+		ss, err := found(d.workloads.StatefulSet(ctx, namespace, owner))
+		if err != nil {
+			return nil, err
 		}
 		return &ownerContribution{matchExpressions: requirementsFrom(ss.Spec.Selector)}, nil
 	default:
 		// Not owned by a supported controller.
 		return nil, nil
 	}
+}
+
+// found turns a workloads.Reader read of an owner that doesn't exist into an error, since the pod's owner was deleted
+// while the pod lingers.
+func found[T any](obj T, ok bool, err error) (T, error) {
+	if err == nil && !ok {
+		err = fmt.Errorf("owner not found")
+	}
+	return obj, err
 }
 
 // requirementsFrom flattens a LabelSelector into the equivalent requirement list, turning each matchLabels entry into a

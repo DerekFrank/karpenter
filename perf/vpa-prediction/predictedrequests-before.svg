@@ -1,0 +1,1962 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1800" height="438" onload="init(evt)" viewBox="0 0 1800 438" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#f8f8f8" offset="5%" />
+		<stop stop-color="#e8e8e8" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+
+		// use GET parameters to restore a flamegraphs state.
+		var params = get_params();
+		if (params.x && params.y)
+			zoom(find_group(document.querySelector('[x="' + params.x + '"][y="' + params.y + '"]')));
+                if (params.s) search(params.s);
+	}
+
+	// event listeners
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom(true);
+			zoom(target);
+			if (!document.querySelector('.parent')) {
+				// we have basically done a clearzoom so clear the url
+				var params = get_params();
+				if (params.x) delete params.x;
+				if (params.y) delete params.y;
+				history.replaceState(null, null, parse_params(params));
+				unzoombtn.classList.add("hide");
+				return;
+			}
+
+			// set parameters for zoom state
+			var el = target.querySelector("rect");
+			if (el && el.attributes && el.attributes.y && el.attributes._orig_x) {
+				var params = get_params()
+				params.x = el.attributes._orig_x.value;
+				params.y = el.attributes.y.value;
+				history.replaceState(null, null, parse_params(params));
+			}
+		}
+		else if (e.target.id == "unzoom") clearzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+		else if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function get_params() {
+		var params = {};
+		var paramsarr = window.location.search.substr(1).split('&');
+		for (var i = 0; i < paramsarr.length; ++i) {
+			var tmp = paramsarr[i].split("=");
+			if (!tmp[0] || !tmp[1]) continue;
+			params[tmp[0]]  = decodeURIComponent(tmp[1]);
+		}
+		return params;
+	}
+	function parse_params(params) {
+		var uri = "?";
+		for (var key in params) {
+			uri += key + '=' + encodeURIComponent(params[key]) + '&';
+		}
+		if (uri.slice(-1) == "&")
+			uri = uri.substring(0, uri.length - 1);
+		if (uri == '?')
+			uri = window.location.href.split('?')[0];
+		return uri;
+	}
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		var sl = t.getSubStringLength(0, txt.length);
+		// check if only whitespace or if we can fit the entire string into width w
+		if (/^ *$/.test(txt) || sl < w)
+			return;
+
+		// this isn't perfect, but gives a good starting point
+		// and avoids calling getSubStringLength too often
+		var start = Math.floor((w/sl) * txt.length);
+		for (var x = start; x > 0; x = x-2) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom(dont_update_text) {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			if(!dont_update_text) update_text(el[i]);
+		}
+		search();
+	}
+	function clearzoom() {
+		unzoom();
+
+		// remove zoom state
+		var params = get_params();
+		if (params.x) delete params.x;
+		if (params.y) delete params.y;
+		history.replaceState(null, null, parse_params(params));
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+		var params = get_params();
+		delete params.s;
+		history.replaceState(null, null, parse_params(params));
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) search(term);
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (term) currentSearchTerm = term;
+		if (currentSearchTerm === null) return;
+
+		var re = new RegExp(currentSearchTerm, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+		var params = get_params();
+		params.s = currentSearchTerm;
+		history.replaceState(null, null, parse_params(params));
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1800.0" height="438.0" fill="url(#background)"  />
+<text id="title" x="900.00" y="24" >Store.PredictedRequests alone, 5000 pods, cold owner cache (main @ 605843ce) - red = owner resolution</text>
+<text id="details" x="10.00" y="421" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1690.00" y="24" >Search</text>
+<text id="ignorecase" x="1774.00" y="24" >ic</text>
+<text id="matched" x="1690.00" y="421" > </text>
+<g id="frames">
+<g >
+<title>runtime.mallocgcSmallScanHeader (7 samples, 1.47%)</title><rect x="1273.9" y="229" width="26.2" height="15.0" fill="rgb(119,119,237)" rx="2" ry="2" />
+<text  x="1276.95" y="239.5" >r..</text>
+</g>
+<g >
+<title>internal/runtime/maps.(*Iter).Next (1 samples, 0.21%)</title><rect x="1737.6" y="261" width="3.8" height="15.0" fill="rgb(110,110,230)" rx="2" ry="2" />
+<text  x="1740.65" y="271.5" ></text>
+</g>
+<g >
+<title>aeshashbody (2 samples, 0.42%)</title><rect x="1659.1" y="293" width="7.5" height="15.0" fill="rgb(134,134,250)" rx="2" ry="2" />
+<text  x="1662.12" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.heapSetTypeNoHeader (1 samples, 0.21%)</title><rect x="1535.7" y="245" width="3.8" height="15.0" fill="rgb(94,94,216)" rx="2" ry="2" />
+<text  x="1538.71" y="255.5" ></text>
+</g>
+<g >
+<title>internal/runtime/gc/scan.ScanSpanPacked (13 samples, 2.73%)</title><rect x="675.6" y="309" width="48.6" height="15.0" fill="rgb(133,133,249)" rx="2" ry="2" />
+<text  x="678.63" y="319.5" >inte..</text>
+</g>
+<g >
+<title>runtime.(*gcControllerState).enlistWorker (3 samples, 0.63%)</title><rect x="197.0" y="309" width="11.2" height="15.0" fill="rgb(127,127,244)" rx="2" ry="2" />
+<text  x="199.97" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.(*mcache).nextFree (1 samples, 0.21%)</title><rect x="1427.3" y="149" width="3.7" height="15.0" fill="rgb(100,100,222)" rx="2" ry="2" />
+<text  x="1430.27" y="159.5" ></text>
+</g>
+<g >
+<title>state/prediction.(*Store).Get (1 samples, 0.21%)</title><rect x="1307.6" y="325" width="3.7" height="15.0" fill="rgb(94,94,217)" rx="2" ry="2" />
+<text  x="1310.61" y="335.5" ></text>
+</g>
+<g >
+<title>runtime.wbBufFlush.func1 (1 samples, 0.21%)</title><rect x="1116.9" y="293" width="3.7" height="15.0" fill="rgb(119,119,237)" rx="2" ry="2" />
+<text  x="1119.89" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.sweepone (15 samples, 3.15%)</title><rect x="21.2" y="357" width="56.1" height="15.0" fill="rgb(85,85,209)" rx="2" ry="2" />
+<text  x="24.22" y="367.5" >runti..</text>
+</g>
+<g >
+<title>runtime.gcFlushBgCredit (5 samples, 1.05%)</title><rect x="911.2" y="309" width="18.7" height="15.0" fill="rgb(94,94,217)" rx="2" ry="2" />
+<text  x="914.22" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.systemstack (1 samples, 0.21%)</title><rect x="1539.5" y="149" width="3.7" height="15.0" fill="rgb(81,81,206)" rx="2" ry="2" />
+<text  x="1542.45" y="159.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.NewMap (3 samples, 0.63%)</title><rect x="1535.7" y="293" width="11.2" height="15.0" fill="rgb(122,122,240)" rx="2" ry="2" />
+<text  x="1538.71" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.alignDown (1 samples, 0.21%)</title><rect x="986.0" y="293" width="3.7" height="15.0" fill="rgb(92,92,215)" rx="2" ry="2" />
+<text  x="989.01" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.makeslice (7 samples, 1.47%)</title><rect x="1546.9" y="309" width="26.2" height="15.0" fill="rgb(126,126,244)" rx="2" ry="2" />
+<text  x="1549.93" y="319.5" >r..</text>
+</g>
+<g >
+<title>cr/cache.(*informerCache).Get (17 samples, 3.57%)</title><rect x="1397.4" y="293" width="63.5" height="15.0" fill="rgb(255,0,0)" rx="2" ry="2" />
+<text  x="1400.35" y="303.5" >cr/cac..</text>
+</g>
+<g >
+<title>runtime.trygetfull (26 samples, 5.46%)</title><rect x="814.0" y="293" width="97.2" height="15.0" fill="rgb(115,115,234)" rx="2" ry="2" />
+<text  x="816.99" y="303.5" >runtime.try..</text>
+</g>
+<g >
+<title>runtime.makemap (3 samples, 0.63%)</title><rect x="1535.7" y="309" width="11.2" height="15.0" fill="rgb(134,134,250)" rx="2" ry="2" />
+<text  x="1538.71" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.gcEndWork (2 samples, 0.42%)</title><rect x="81.1" y="357" width="7.4" height="15.0" fill="rgb(92,92,215)" rx="2" ry="2" />
+<text  x="84.05" y="367.5" ></text>
+</g>
+<g >
+<title>runtime.tryDeferToSpanScan (1 samples, 0.21%)</title><rect x="1116.9" y="261" width="3.7" height="15.0" fill="rgb(137,137,252)" rx="2" ry="2" />
+<text  x="1119.89" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.(*mspan).base (2 samples, 0.42%)</title><rect x="290.5" y="293" width="7.4" height="15.0" fill="rgb(103,103,224)" rx="2" ry="2" />
+<text  x="293.46" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.wbMove (2 samples, 0.42%)</title><rect x="1300.1" y="309" width="7.5" height="15.0" fill="rgb(132,132,248)" rx="2" ry="2" />
+<text  x="1303.13" y="319.5" ></text>
+</g>
+<g >
+<title>internal/chacha8rand.block (1 samples, 0.21%)</title><rect x="1685.3" y="245" width="3.7" height="15.0" fill="rgb(91,91,214)" rx="2" ry="2" />
+<text  x="1688.29" y="255.5" ></text>
+</g>
+<g >
+<title>runtime.(*gcWork).balance (2 samples, 0.42%)</title><rect x="208.2" y="309" width="7.5" height="15.0" fill="rgb(121,121,239)" rx="2" ry="2" />
+<text  x="211.19" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.(*mheap).alloc.func1 (3 samples, 0.63%)</title><rect x="1760.1" y="85" width="11.2" height="15.0" fill="rgb(136,136,252)" rx="2" ry="2" />
+<text  x="1763.08" y="95.5" ></text>
+</g>
+<g >
+<title>runtime.(*pallocBits).summarize (1 samples, 0.21%)</title><rect x="47.4" y="245" width="3.7" height="15.0" fill="rgb(133,133,249)" rx="2" ry="2" />
+<text  x="50.39" y="255.5" ></text>
+</g>
+<g >
+<title>runtime.scanObjectsSmall (2 samples, 0.42%)</title><rect x="380.2" y="293" width="7.5" height="15.0" fill="rgb(116,116,235)" rx="2" ry="2" />
+<text  x="383.21" y="303.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.(*groupReference).ctrls (1 samples, 0.21%)</title><rect x="1460.9" y="309" width="3.8" height="15.0" fill="rgb(100,100,222)" rx="2" ry="2" />
+<text  x="1463.92" y="319.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.(*table).uncheckedPutSlot (1 samples, 0.21%)</title><rect x="1483.4" y="261" width="3.7" height="15.0" fill="rgb(110,110,230)" rx="2" ry="2" />
+<text  x="1486.36" y="271.5" ></text>
+</g>
+<g >
+<title>internal/chacha8rand.(*State).Refill (1 samples, 0.21%)</title><rect x="1629.2" y="245" width="3.7" height="15.0" fill="rgb(101,101,223)" rx="2" ry="2" />
+<text  x="1632.20" y="255.5" ></text>
+</g>
+<g >
+<title>runtime.unlock2Wake (1 samples, 0.21%)</title><rect x="1161.8" y="293" width="3.7" height="15.0" fill="rgb(88,88,212)" rx="2" ry="2" />
+<text  x="1164.76" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.wbBufFlush (1 samples, 0.21%)</title><rect x="1483.4" y="197" width="3.7" height="15.0" fill="rgb(93,93,216)" rx="2" ry="2" />
+<text  x="1486.36" y="207.5" ></text>
+</g>
+<g >
+<title>runtime.tryDeferToSpanScan (7 samples, 1.47%)</title><rect x="1083.2" y="293" width="26.2" height="15.0" fill="rgb(137,137,252)" rx="2" ry="2" />
+<text  x="1086.24" y="303.5" >r..</text>
+</g>
+<g >
+<title>k8s.io/component-helpers/resource.AggregateContainerRequests (21 samples, 4.41%)</title><rect x="1704.0" y="309" width="78.5" height="15.0" fill="rgb(125,125,242)" rx="2" ry="2" />
+<text  x="1706.99" y="319.5" >k8s.io/co..</text>
+</g>
+<g >
+<title>runtime.(*mcache).refill (4 samples, 0.84%)</title><rect x="1756.3" y="165" width="15.0" height="15.0" fill="rgb(112,112,232)" rx="2" ry="2" />
+<text  x="1759.34" y="175.5" ></text>
+</g>
+<g >
+<title>runtime.spanClass.sizeclass (3 samples, 0.63%)</title><rect x="993.5" y="293" width="11.2" height="15.0" fill="rgb(103,103,224)" rx="2" ry="2" />
+<text  x="996.49" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.wbBufFlush.func1 (1 samples, 0.21%)</title><rect x="1483.4" y="165" width="3.7" height="15.0" fill="rgb(119,119,237)" rx="2" ry="2" />
+<text  x="1486.36" y="175.5" ></text>
+</g>
+<g >
+<title>runtime.(*gcControllerState).trigger (1 samples, 0.21%)</title><rect x="1292.6" y="197" width="3.8" height="15.0" fill="rgb(119,119,237)" rx="2" ry="2" />
+<text  x="1295.65" y="207.5" ></text>
+</g>
+<g >
+<title>runtime.futex (1 samples, 0.21%)</title><rect x="1158.0" y="245" width="3.8" height="15.0" fill="rgb(119,119,237)" rx="2" ry="2" />
+<text  x="1161.03" y="255.5" ></text>
+</g>
+<g >
+<title>runtime.mallocgcSmallScanNoHeader (1 samples, 0.21%)</title><rect x="1438.5" y="181" width="3.7" height="15.0" fill="rgb(94,94,216)" rx="2" ry="2" />
+<text  x="1441.49" y="191.5" ></text>
+</g>
+<g >
+<title>runtime.bgsweep (17 samples, 3.57%)</title><rect x="13.7" y="373" width="63.6" height="15.0" fill="rgb(123,123,240)" rx="2" ry="2" />
+<text  x="16.74" y="383.5" >runtim..</text>
+</g>
+<g >
+<title>apimachinery/apis/meta/v1.(*PartialObjectMetadata).DeepCopyInto (8 samples, 1.68%)</title><rect x="1419.8" y="245" width="29.9" height="15.0" fill="rgb(139,139,254)" rx="2" ry="2" />
+<text  x="1422.79" y="255.5" >ap..</text>
+</g>
+<g >
+<title>runtime.mapaccess2_faststr (1 samples, 0.21%)</title><rect x="1453.4" y="229" width="3.8" height="15.0" fill="rgb(119,119,238)" rx="2" ry="2" />
+<text  x="1456.45" y="239.5" ></text>
+</g>
+<g >
+<title>runtime.newarray (5 samples, 1.05%)</title><rect x="1756.3" y="229" width="18.7" height="15.0" fill="rgb(121,121,239)" rx="2" ry="2" />
+<text  x="1759.34" y="239.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.(*Iter).Init (2 samples, 0.42%)</title><rect x="1741.4" y="261" width="7.5" height="15.0" fill="rgb(136,136,251)" rx="2" ry="2" />
+<text  x="1744.39" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.mapIterNext (1 samples, 0.21%)</title><rect x="1618.0" y="309" width="3.7" height="15.0" fill="rgb(115,115,234)" rx="2" ry="2" />
+<text  x="1620.98" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.(*gcControllerState).findRunnableGCWorker (1 samples, 0.21%)</title><rect x="1128.1" y="309" width="3.7" height="15.0" fill="rgb(102,102,224)" rx="2" ry="2" />
+<text  x="1131.11" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.(*gcWork).tryGetObjFast (1 samples, 0.21%)</title><rect x="428.8" y="325" width="3.8" height="15.0" fill="rgb(132,132,248)" rx="2" ry="2" />
+<text  x="431.82" y="335.5" ></text>
+</g>
+<g >
+<title>runtime.gcDrain (184 samples, 38.66%)</title><rect x="432.6" y="325" width="688.0" height="15.0" fill="rgb(113,113,233)" rx="2" ry="2" />
+<text  x="435.56" y="335.5" >runtime.gcDrain</text>
+</g>
+<g >
+<title>runtime.(*mcache).nextFree (4 samples, 0.84%)</title><rect x="1756.3" y="181" width="15.0" height="15.0" fill="rgb(100,100,222)" rx="2" ry="2" />
+<text  x="1759.34" y="191.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.rand (2 samples, 0.42%)</title><rect x="1741.4" y="245" width="7.5" height="15.0" fill="rgb(126,126,243)" rx="2" ry="2" />
+<text  x="1744.39" y="255.5" ></text>
+</g>
+<g >
+<title>cr/client.(*client).Get (17 samples, 3.57%)</title><rect x="1397.4" y="309" width="63.5" height="15.0" fill="rgb(108,108,228)" rx="2" ry="2" />
+<text  x="1400.35" y="319.5" >cr/cli..</text>
+</g>
+<g >
+<title>k8s.io/component-helpers/resource.IsPodLevelRequestsSet (4 samples, 0.84%)</title><rect x="1666.6" y="325" width="15.0" height="15.0" fill="rgb(136,136,252)" rx="2" ry="2" />
+<text  x="1669.60" y="335.5" ></text>
+</g>
+<g >
+<title>apimachinery/apis/meta/v1.(*ManagedFieldsEntry).DeepCopyInto (1 samples, 0.21%)</title><rect x="1434.7" y="213" width="3.8" height="15.0" fill="rgb(88,88,211)" rx="2" ry="2" />
+<text  x="1437.75" y="223.5" ></text>
+</g>
+<g >
+<title>runtime.pageIndexOf (2 samples, 0.42%)</title><rect x="369.0" y="293" width="7.5" height="15.0" fill="rgb(117,117,236)" rx="2" ry="2" />
+<text  x="371.99" y="303.5" ></text>
+</g>
+<g >
+<title>k8s.io/component-helpers/resource.PodRequests (29 samples, 6.09%)</title><rect x="1681.6" y="325" width="108.4" height="15.0" fill="rgb(86,86,210)" rx="2" ry="2" />
+<text  x="1684.55" y="335.5" >k8s.io/compon..</text>
+</g>
+<g >
+<title>internal/runtime/maps.(*table).grow (2 samples, 0.42%)</title><rect x="1479.6" y="277" width="7.5" height="15.0" fill="rgb(103,103,224)" rx="2" ry="2" />
+<text  x="1482.62" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.makeslice (1 samples, 0.21%)</title><rect x="1438.5" y="213" width="3.7" height="15.0" fill="rgb(126,126,244)" rx="2" ry="2" />
+<text  x="1441.49" y="223.5" ></text>
+</g>
+<g >
+<title>runtime.(*mheap).allocSpan (3 samples, 0.63%)</title><rect x="1760.1" y="69" width="11.2" height="15.0" fill="rgb(114,114,233)" rx="2" ry="2" />
+<text  x="1763.08" y="79.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.(*Iter).Next (1 samples, 0.21%)</title><rect x="1210.4" y="293" width="3.7" height="15.0" fill="rgb(110,110,230)" rx="2" ry="2" />
+<text  x="1213.38" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.futexwakeup (1 samples, 0.21%)</title><rect x="1158.0" y="261" width="3.8" height="15.0" fill="rgb(97,97,219)" rx="2" ry="2" />
+<text  x="1161.03" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.profilealloc (1 samples, 0.21%)</title><rect x="1438.5" y="165" width="3.7" height="15.0" fill="rgb(117,117,236)" rx="2" ry="2" />
+<text  x="1441.49" y="175.5" ></text>
+</g>
+<g >
+<title>runtime.(*atomicHeadTailIndex).incTail (1 samples, 0.21%)</title><rect x="66.1" y="309" width="3.7" height="15.0" fill="rgb(83,83,207)" rx="2" ry="2" />
+<text  x="69.09" y="319.5" ></text>
+</g>
+<g >
+<title>testing.tRunner (167 samples, 35.08%)</title><rect x="1165.5" y="373" width="624.5" height="15.0" fill="rgb(101,101,223)" rx="2" ry="2" />
+<text  x="1168.50" y="383.5" >testing.tRunner</text>
+</g>
+<g >
+<title>runtime.(*mheap).alloc.func1 (2 samples, 0.42%)</title><rect x="1281.4" y="117" width="7.5" height="15.0" fill="rgb(136,136,252)" rx="2" ry="2" />
+<text  x="1284.43" y="127.5" ></text>
+</g>
+<g >
+<title>internal/chacha8rand.block (1 samples, 0.21%)</title><rect x="1778.8" y="261" width="3.7" height="15.0" fill="rgb(91,91,214)" rx="2" ry="2" />
+<text  x="1781.78" y="271.5" ></text>
+</g>
+<g >
+<title>internal/runtime/atomic.(*Uint32).CompareAndSwap (2 samples, 0.42%)</title><rect x="13.7" y="357" width="7.5" height="15.0" fill="rgb(121,121,239)" rx="2" ry="2" />
+<text  x="16.74" y="367.5" ></text>
+</g>
+<g >
+<title>runtime.scanObject (28 samples, 5.88%)</title><rect x="256.8" y="309" width="104.7" height="15.0" fill="rgb(122,122,240)" rx="2" ry="2" />
+<text  x="259.81" y="319.5" >runtime.scan..</text>
+</g>
+<g >
+<title>internal/runtime/maps.rand (1 samples, 0.21%)</title><rect x="1685.3" y="293" width="3.7" height="15.0" fill="rgb(126,126,243)" rx="2" ry="2" />
+<text  x="1688.29" y="303.5" ></text>
+</g>
+<g >
+<title>sync/atomic.(*Int32).Add (1 samples, 0.21%)</title><rect x="1412.3" y="245" width="3.8" height="15.0" fill="rgb(116,116,235)" rx="2" ry="2" />
+<text  x="1415.31" y="255.5" ></text>
+</g>
+<g >
+<title>runtime.(*spanSet).push (1 samples, 0.21%)</title><rect x="66.1" y="325" width="3.7" height="15.0" fill="rgb(136,136,252)" rx="2" ry="2" />
+<text  x="69.09" y="335.5" ></text>
+</g>
+<g >
+<title>runtime.(*gcBitsArena).tryAlloc (1 samples, 0.21%)</title><rect x="62.4" y="325" width="3.7" height="15.0" fill="rgb(134,134,250)" rx="2" ry="2" />
+<text  x="65.35" y="335.5" ></text>
+</g>
+<g >
+<title>runtime.mapIterNext (1 samples, 0.21%)</title><rect x="1737.6" y="277" width="3.8" height="15.0" fill="rgb(115,115,234)" rx="2" ry="2" />
+<text  x="1740.65" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.(*mcache).refill (1 samples, 0.21%)</title><rect x="1427.3" y="133" width="3.7" height="15.0" fill="rgb(112,112,232)" rx="2" ry="2" />
+<text  x="1430.27" y="143.5" ></text>
+</g>
+<g >
+<title>runtime.mapaccess1_faststr (3 samples, 0.63%)</title><rect x="1644.2" y="309" width="11.2" height="15.0" fill="rgb(127,127,244)" rx="2" ry="2" />
+<text  x="1647.16" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.mallocgc (5 samples, 1.05%)</title><rect x="1756.3" y="213" width="18.7" height="15.0" fill="rgb(124,124,241)" rx="2" ry="2" />
+<text  x="1759.34" y="223.5" ></text>
+</g>
+<g >
+<title>runtime.spanOfUnchecked (1 samples, 0.21%)</title><rect x="1109.4" y="309" width="3.8" height="15.0" fill="rgb(138,138,253)" rx="2" ry="2" />
+<text  x="1112.41" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.findObject (1 samples, 0.21%)</title><rect x="989.7" y="293" width="3.8" height="15.0" fill="rgb(93,93,216)" rx="2" ry="2" />
+<text  x="992.75" y="303.5" ></text>
+</g>
+<g >
+<title>k8s.io/client-go/tools/cache.(*cache).GetByKey (1 samples, 0.21%)</title><rect x="1453.4" y="261" width="3.8" height="15.0" fill="rgb(138,138,253)" rx="2" ry="2" />
+<text  x="1456.45" y="271.5" ></text>
+</g>
+<g >
+<title>k8s.io/component-helpers/resource.addResourceList (16 samples, 3.36%)</title><rect x="1715.2" y="293" width="59.8" height="15.0" fill="rgb(121,121,239)" rx="2" ry="2" />
+<text  x="1718.21" y="303.5" >k8s.io..</text>
+</g>
+<g >
+<title>runtime.scanSpan (16 samples, 3.36%)</title><rect x="361.5" y="309" width="59.8" height="15.0" fill="rgb(89,89,212)" rx="2" ry="2" />
+<text  x="364.51" y="319.5" >runtim..</text>
+</g>
+<g >
+<title>aeshashbody (1 samples, 0.21%)</title><rect x="1479.6" y="261" width="3.8" height="15.0" fill="rgb(134,134,250)" rx="2" ry="2" />
+<text  x="1482.62" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.mallocgc (2 samples, 0.42%)</title><rect x="1707.7" y="261" width="7.5" height="15.0" fill="rgb(124,124,241)" rx="2" ry="2" />
+<text  x="1710.73" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.mcall (12 samples, 2.52%)</title><rect x="1120.6" y="373" width="44.9" height="15.0" fill="rgb(90,90,213)" rx="2" ry="2" />
+<text  x="1123.63" y="383.5" >runt..</text>
+</g>
+<g >
+<title>runtime.(*sweepLocker).tryAcquire (2 samples, 0.42%)</title><rect x="69.8" y="341" width="7.5" height="15.0" fill="rgb(122,122,240)" rx="2" ry="2" />
+<text  x="72.83" y="351.5" ></text>
+</g>
+<g >
+<title>runtime.(*mheap).alloc (1 samples, 0.21%)</title><rect x="1558.2" y="197" width="3.7" height="15.0" fill="rgb(110,110,230)" rx="2" ry="2" />
+<text  x="1561.15" y="207.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.(*Iter).Init (3 samples, 0.63%)</title><rect x="1217.9" y="293" width="11.2" height="15.0" fill="rgb(136,136,251)" rx="2" ry="2" />
+<text  x="1220.86" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.(*gcWork).putObjFast (1 samples, 0.21%)</title><rect x="974.8" y="293" width="3.7" height="15.0" fill="rgb(131,131,248)" rx="2" ry="2" />
+<text  x="977.79" y="303.5" ></text>
+</g>
+<g >
+<title>internal/runtime/atomic.(*Uintptr).CompareAndSwap (1 samples, 0.21%)</title><rect x="1281.4" y="101" width="3.8" height="15.0" fill="rgb(112,112,232)" rx="2" ry="2" />
+<text  x="1284.43" y="111.5" ></text>
+</g>
+<g >
+<title>runtime.heapSetTypeNoHeader (1 samples, 0.21%)</title><rect x="1692.8" y="261" width="3.7" height="15.0" fill="rgb(94,94,216)" rx="2" ry="2" />
+<text  x="1695.77" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.(*mheap).initSpan (1 samples, 0.21%)</title><rect x="1539.5" y="101" width="3.7" height="15.0" fill="rgb(128,128,245)" rx="2" ry="2" />
+<text  x="1542.45" y="111.5" ></text>
+</g>
+<g >
+<title>runtime.mallocgcSmallScanNoHeader (1 samples, 0.21%)</title><rect x="1427.3" y="165" width="3.7" height="15.0" fill="rgb(94,94,216)" rx="2" ry="2" />
+<text  x="1430.27" y="175.5" ></text>
+</g>
+<g >
+<title>runtime.(*wbBuf).get2 (1 samples, 0.21%)</title><rect x="1483.4" y="213" width="3.7" height="15.0" fill="rgb(139,139,254)" rx="2" ry="2" />
+<text  x="1486.36" y="223.5" ></text>
+</g>
+<g >
+<title>runtime.mapIterStart (3 samples, 0.63%)</title><rect x="1741.4" y="277" width="11.2" height="15.0" fill="rgb(94,94,217)" rx="2" ry="2" />
+<text  x="1744.39" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.tryDeferToSpanScan (6 samples, 1.26%)</title><rect x="398.9" y="293" width="22.4" height="15.0" fill="rgb(137,137,252)" rx="2" ry="2" />
+<text  x="401.91" y="303.5" >r..</text>
+</g>
+<g >
+<title>runtime.runqsteal (2 samples, 0.42%)</title><rect x="1139.3" y="293" width="7.5" height="15.0" fill="rgb(107,107,227)" rx="2" ry="2" />
+<text  x="1142.33" y="303.5" ></text>
+</g>
+<g >
+<title>internal/runtime/gc/scan.scanSpanPackedAVX512 (10 samples, 2.10%)</title><rect x="686.8" y="277" width="37.4" height="15.0" fill="rgb(94,94,217)" rx="2" ry="2" />
+<text  x="689.85" y="287.5" >int..</text>
+</g>
+<g >
+<title>runtime.newobject (1 samples, 0.21%)</title><rect x="1427.3" y="197" width="3.7" height="15.0" fill="rgb(99,99,221)" rx="2" ry="2" />
+<text  x="1430.27" y="207.5" ></text>
+</g>
+<g >
+<title>cr/cache/internal.(*Informers).Get (3 samples, 0.63%)</title><rect x="1404.8" y="261" width="11.3" height="15.0" fill="rgb(84,84,208)" rx="2" ry="2" />
+<text  x="1407.83" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.signalM (5 samples, 1.05%)</title><rect x="728.0" y="277" width="18.7" height="15.0" fill="rgb(86,86,210)" rx="2" ry="2" />
+<text  x="730.98" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.(*mspan).base (1 samples, 0.21%)</title><rect x="380.2" y="277" width="3.7" height="15.0" fill="rgb(103,103,224)" rx="2" ry="2" />
+<text  x="383.21" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.systemstack (2 samples, 0.42%)</title><rect x="1281.4" y="133" width="7.5" height="15.0" fill="rgb(81,81,206)" rx="2" ry="2" />
+<text  x="1284.43" y="143.5" ></text>
+</g>
+<g >
+<title>runtime.(*gcControllerState).assignWaitingGCWorker (1 samples, 0.21%)</title><rect x="1128.1" y="293" width="3.7" height="15.0" fill="rgb(130,130,247)" rx="2" ry="2" />
+<text  x="1131.11" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.(*spanInlineMarkBits).tryAcquire (1 samples, 0.21%)</title><rect x="376.5" y="261" width="3.7" height="15.0" fill="rgb(115,115,234)" rx="2" ry="2" />
+<text  x="379.47" y="271.5" ></text>
+</g>
+<g >
+<title>internal/chacha8rand.block (1 samples, 0.21%)</title><rect x="1629.2" y="229" width="3.7" height="15.0" fill="rgb(91,91,214)" rx="2" ry="2" />
+<text  x="1632.20" y="239.5" ></text>
+</g>
+<g >
+<title>runtime.spanClass.sizeclass (3 samples, 0.63%)</title><rect x="387.7" y="293" width="11.2" height="15.0" fill="rgb(103,103,224)" rx="2" ry="2" />
+<text  x="390.69" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.systemstack (6 samples, 1.26%)</title><rect x="32.4" y="325" width="22.5" height="15.0" fill="rgb(81,81,206)" rx="2" ry="2" />
+<text  x="35.44" y="335.5" >r..</text>
+</g>
+<g >
+<title>cr/cache.(*informerCache).getInformerForKind (3 samples, 0.63%)</title><rect x="1404.8" y="277" width="11.3" height="15.0" fill="rgb(95,95,217)" rx="2" ry="2" />
+<text  x="1407.83" y="287.5" ></text>
+</g>
+<g >
+<title>aeshashbody (1 samples, 0.21%)</title><rect x="1408.6" y="197" width="3.7" height="15.0" fill="rgb(134,134,250)" rx="2" ry="2" />
+<text  x="1411.57" y="207.5" ></text>
+</g>
+<g >
+<title>runtime.(*spanScanOwnership).or (1 samples, 0.21%)</title><rect x="354.0" y="277" width="3.8" height="15.0" fill="rgb(101,101,222)" rx="2" ry="2" />
+<text  x="357.03" y="287.5" ></text>
+</g>
+<g >
+<title>k8s.io/component-helpers/resource.maxResourceList (1 samples, 0.21%)</title><rect x="1775.0" y="293" width="3.8" height="15.0" fill="rgb(136,136,251)" rx="2" ry="2" />
+<text  x="1778.04" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.(*lfstack).pop (25 samples, 5.25%)</title><rect x="817.7" y="277" width="93.5" height="15.0" fill="rgb(94,94,217)" rx="2" ry="2" />
+<text  x="820.73" y="287.5" >runtime.(*l..</text>
+</g>
+<g >
+<title>runtime.stealWork (4 samples, 0.84%)</title><rect x="1131.8" y="309" width="15.0" height="15.0" fill="rgb(138,138,253)" rx="2" ry="2" />
+<text  x="1134.85" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.findRunnable (7 samples, 1.47%)</title><rect x="1120.6" y="325" width="26.2" height="15.0" fill="rgb(96,96,219)" rx="2" ry="2" />
+<text  x="1123.63" y="335.5" >r..</text>
+</g>
+<g >
+<title>runtime.scanObject (30 samples, 6.30%)</title><rect x="929.9" y="309" width="112.2" height="15.0" fill="rgb(122,122,240)" rx="2" ry="2" />
+<text  x="932.92" y="319.5" >runtime.scanO..</text>
+</g>
+<g >
+<title>maps.Copy[go.shape.map[k8s.io/api/core/v1.ResourceName]apimachinery/api/resource.Quantity,go.shape.map[k8s.io/api/core/v1.ResourceName]apimachinery/api/resource.Quantity,go.shape.string,go.shape.struct (32 samples, 6.72%)</title><rect x="1187.9" y="325" width="119.7" height="15.0" fill="rgb(121,121,239)" rx="2" ry="2" />
+<text  x="1190.94" y="335.5" >maps.Copy[go.s..</text>
+</g>
+<g >
+<title>internal/runtime/maps.(*Iter).Next (7 samples, 1.47%)</title><rect x="1229.1" y="293" width="26.2" height="15.0" fill="rgb(110,110,230)" rx="2" ry="2" />
+<text  x="1232.08" y="303.5" >i..</text>
+</g>
+<g >
+<title>runtime.(*mcentral).cacheSpan (3 samples, 0.63%)</title><rect x="1281.4" y="181" width="11.2" height="15.0" fill="rgb(126,126,244)" rx="2" ry="2" />
+<text  x="1284.43" y="191.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.(*Iter).Next (1 samples, 0.21%)</title><rect x="1618.0" y="293" width="3.7" height="15.0" fill="rgb(110,110,230)" rx="2" ry="2" />
+<text  x="1620.98" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.bulkBarrierPreWrite (1 samples, 0.21%)</title><rect x="1303.9" y="293" width="3.7" height="15.0" fill="rgb(103,103,224)" rx="2" ry="2" />
+<text  x="1306.87" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.mapassign_faststr (3 samples, 0.63%)</title><rect x="1475.9" y="309" width="11.2" height="15.0" fill="rgb(120,120,238)" rx="2" ry="2" />
+<text  x="1478.88" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.typePointers.nextFast (2 samples, 0.42%)</title><rect x="421.3" y="309" width="7.5" height="15.0" fill="rgb(89,89,212)" rx="2" ry="2" />
+<text  x="424.34" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.mapIterStart (6 samples, 1.26%)</title><rect x="1621.7" y="309" width="22.5" height="15.0" fill="rgb(94,94,217)" rx="2" ry="2" />
+<text  x="1624.72" y="319.5" >r..</text>
+</g>
+<g >
+<title>runtime.unlock2 (1 samples, 0.21%)</title><rect x="1161.8" y="309" width="3.7" height="15.0" fill="rgb(127,127,244)" rx="2" ry="2" />
+<text  x="1164.76" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.typePointers.nextFast (1 samples, 0.21%)</title><rect x="1113.2" y="309" width="3.7" height="15.0" fill="rgb(89,89,212)" rx="2" ry="2" />
+<text  x="1116.15" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.(*mcentral).cacheSpan (1 samples, 0.21%)</title><rect x="1487.1" y="229" width="3.7" height="15.0" fill="rgb(126,126,244)" rx="2" ry="2" />
+<text  x="1490.10" y="239.5" ></text>
+</g>
+<g >
+<title>runtime.mallocgcSmallScanNoHeader (1 samples, 0.21%)</title><rect x="1539.5" y="245" width="3.7" height="15.0" fill="rgb(94,94,216)" rx="2" ry="2" />
+<text  x="1542.45" y="255.5" ></text>
+</g>
+<g >
+<title>runtime.(*gcWork).balance (17 samples, 3.57%)</title><rect x="746.7" y="309" width="63.6" height="15.0" fill="rgb(121,121,239)" rx="2" ry="2" />
+<text  x="749.68" y="319.5" >runtim..</text>
+</g>
+<g >
+<title>runtime.(*lfstack).pop (8 samples, 1.68%)</title><rect x="215.7" y="277" width="29.9" height="15.0" fill="rgb(94,94,217)" rx="2" ry="2" />
+<text  x="218.67" y="287.5" >ru..</text>
+</g>
+<g >
+<title>runtime.(*lfstack).empty (1 samples, 0.21%)</title><rect x="1128.1" y="277" width="3.7" height="15.0" fill="rgb(98,98,220)" rx="2" ry="2" />
+<text  x="1131.11" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.putempty (1 samples, 0.21%)</title><rect x="810.3" y="293" width="3.7" height="15.0" fill="rgb(121,121,239)" rx="2" ry="2" />
+<text  x="813.25" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.mapassign_faststr (10 samples, 2.10%)</title><rect x="1262.7" y="309" width="37.4" height="15.0" fill="rgb(120,120,238)" rx="2" ry="2" />
+<text  x="1265.73" y="319.5" >run..</text>
+</g>
+<g >
+<title>runtime.gcTrigger.test (1 samples, 0.21%)</title><rect x="1292.6" y="213" width="3.8" height="15.0" fill="rgb(81,81,206)" rx="2" ry="2" />
+<text  x="1295.65" y="223.5" ></text>
+</g>
+<g >
+<title>runtime.(*mcache).refill (1 samples, 0.21%)</title><rect x="1487.1" y="245" width="3.7" height="15.0" fill="rgb(112,112,232)" rx="2" ry="2" />
+<text  x="1490.10" y="255.5" ></text>
+</g>
+<g >
+<title>runtime.(*sweepLocked).sweep (4 samples, 0.84%)</title><rect x="54.9" y="341" width="14.9" height="15.0" fill="rgb(98,98,220)" rx="2" ry="2" />
+<text  x="57.87" y="351.5" ></text>
+</g>
+<g >
+<title>runtime.startm (1 samples, 0.21%)</title><rect x="1158.0" y="293" width="3.8" height="15.0" fill="rgb(98,98,220)" rx="2" ry="2" />
+<text  x="1161.03" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.getempty (11 samples, 2.31%)</title><rect x="746.7" y="277" width="41.1" height="15.0" fill="rgb(135,135,251)" rx="2" ry="2" />
+<text  x="749.68" y="287.5" >run..</text>
+</g>
+<g >
+<title>runtime.(*gcBitsArena).tryAlloc (1 samples, 0.21%)</title><rect x="1285.2" y="69" width="3.7" height="15.0" fill="rgb(134,134,250)" rx="2" ry="2" />
+<text  x="1288.17" y="79.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.(*Iter).Next (2 samples, 0.42%)</title><rect x="1632.9" y="293" width="7.5" height="15.0" fill="rgb(110,110,230)" rx="2" ry="2" />
+<text  x="1635.94" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.mapIterStart (13 samples, 2.73%)</title><rect x="1214.1" y="309" width="48.6" height="15.0" fill="rgb(94,94,217)" rx="2" ry="2" />
+<text  x="1217.12" y="319.5" >runt..</text>
+</g>
+<g >
+<title>runtime.(*mheap).alloc.func1 (1 samples, 0.21%)</title><rect x="1558.2" y="165" width="3.7" height="15.0" fill="rgb(136,136,252)" rx="2" ry="2" />
+<text  x="1561.15" y="175.5" ></text>
+</g>
+<g >
+<title>runtime.gcDrainMarkWorkerIdle (185 samples, 38.87%)</title><rect x="428.8" y="341" width="691.8" height="15.0" fill="rgb(96,96,218)" rx="2" ry="2" />
+<text  x="431.82" y="351.5" >runtime.gcDrainMarkWorkerIdle</text>
+</g>
+<g >
+<title>internal/runtime/gc/scan.ScanSpanPackedAVX512 (13 samples, 2.73%)</title><rect x="675.6" y="293" width="48.6" height="15.0" fill="rgb(102,102,223)" rx="2" ry="2" />
+<text  x="678.63" y="303.5" >inte..</text>
+</g>
+<g >
+<title>type:.hash.apimachinery/runtime/schema.GroupVersionKind (1 samples, 0.21%)</title><rect x="1408.6" y="213" width="3.7" height="15.0" fill="rgb(88,88,211)" rx="2" ry="2" />
+<text  x="1411.57" y="223.5" ></text>
+</g>
+<g >
+<title>runtime.(*wbBuf).get2 (1 samples, 0.21%)</title><rect x="1599.3" y="293" width="3.7" height="15.0" fill="rgb(139,139,254)" rx="2" ry="2" />
+<text  x="1602.29" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.(*lfstack).pop (10 samples, 2.10%)</title><rect x="750.4" y="261" width="37.4" height="15.0" fill="rgb(94,94,217)" rx="2" ry="2" />
+<text  x="753.42" y="271.5" >run..</text>
+</g>
+<g >
+<title>runtime.spanClass.sizeclass (1 samples, 0.21%)</title><rect x="1300.1" y="213" width="3.8" height="15.0" fill="rgb(103,103,224)" rx="2" ry="2" />
+<text  x="1303.13" y="223.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.(*Map).getWithoutKeySmallFastStr (3 samples, 0.63%)</title><rect x="1588.1" y="293" width="11.2" height="15.0" fill="rgb(132,132,249)" rx="2" ry="2" />
+<text  x="1591.07" y="303.5" ></text>
+</g>
+<g >
+<title>type:.hash.state/prediction.WorkloadReference (4 samples, 0.84%)</title><rect x="1326.3" y="293" width="15.0" height="15.0" fill="rgb(125,125,242)" rx="2" ry="2" />
+<text  x="1329.30" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.(*mheap).allocSpan (1 samples, 0.21%)</title><rect x="1539.5" y="117" width="3.7" height="15.0" fill="rgb(114,114,233)" rx="2" ry="2" />
+<text  x="1542.45" y="127.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.(*groupReference).key (1 samples, 0.21%)</title><rect x="1640.4" y="293" width="3.8" height="15.0" fill="rgb(89,89,212)" rx="2" ry="2" />
+<text  x="1643.42" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.mapaccess2_faststr (2 samples, 0.42%)</title><rect x="1468.4" y="309" width="7.5" height="15.0" fill="rgb(119,119,238)" rx="2" ry="2" />
+<text  x="1471.40" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.(*limiterEvent).start (1 samples, 0.21%)</title><rect x="10.0" y="373" width="3.7" height="15.0" fill="rgb(93,93,216)" rx="2" ry="2" />
+<text  x="13.00" y="383.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.typedmemmove (1 samples, 0.21%)</title><rect x="1483.4" y="245" width="3.7" height="15.0" fill="rgb(90,90,213)" rx="2" ry="2" />
+<text  x="1486.36" y="255.5" ></text>
+</g>
+<g >
+<title>runtime.wakep (1 samples, 0.21%)</title><rect x="1158.0" y="309" width="3.8" height="15.0" fill="rgb(94,94,216)" rx="2" ry="2" />
+<text  x="1161.03" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.(*mcentral).cacheSpan (1 samples, 0.21%)</title><rect x="1711.5" y="197" width="3.7" height="15.0" fill="rgb(126,126,244)" rx="2" ry="2" />
+<text  x="1714.47" y="207.5" ></text>
+</g>
+<g >
+<title>runtime.scanObjectSmall (1 samples, 0.21%)</title><rect x="376.5" y="293" width="3.7" height="15.0" fill="rgb(107,107,228)" rx="2" ry="2" />
+<text  x="379.47" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.concatstring3 (1 samples, 0.21%)</title><rect x="1449.7" y="245" width="3.7" height="15.0" fill="rgb(115,115,234)" rx="2" ry="2" />
+<text  x="1452.71" y="255.5" ></text>
+</g>
+<g >
+<title>runtime.(*mheap).freeSpan (6 samples, 1.26%)</title><rect x="32.4" y="341" width="22.5" height="15.0" fill="rgb(88,88,212)" rx="2" ry="2" />
+<text  x="35.44" y="351.5" >r..</text>
+</g>
+<g >
+<title>runtime.mallocgc (1 samples, 0.21%)</title><rect x="1438.5" y="197" width="3.7" height="15.0" fill="rgb(124,124,241)" rx="2" ry="2" />
+<text  x="1441.49" y="207.5" ></text>
+</g>
+<g >
+<title>internal/runtime/gc/scan.ScanSpanPacked (8 samples, 1.68%)</title><rect x="167.1" y="309" width="29.9" height="15.0" fill="rgb(133,133,249)" rx="2" ry="2" />
+<text  x="170.06" y="319.5" >in..</text>
+</g>
+<g >
+<title>runtime.typedmemmove (1 samples, 0.21%)</title><rect x="1457.2" y="229" width="3.7" height="15.0" fill="rgb(109,109,229)" rx="2" ry="2" />
+<text  x="1460.18" y="239.5" ></text>
+</g>
+<g >
+<title>apimachinery/apis/meta/v1.(*PartialObjectMetadata).DeepCopyObject (9 samples, 1.89%)</title><rect x="1416.1" y="261" width="33.6" height="15.0" fill="rgb(114,114,233)" rx="2" ry="2" />
+<text  x="1419.05" y="271.5" >ap..</text>
+</g>
+<g >
+<title>aeshashbody (1 samples, 0.21%)</title><rect x="1262.7" y="293" width="3.8" height="15.0" fill="rgb(134,134,250)" rx="2" ry="2" />
+<text  x="1265.73" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.mallocgc (3 samples, 0.63%)</title><rect x="1535.7" y="261" width="11.2" height="15.0" fill="rgb(124,124,241)" rx="2" ry="2" />
+<text  x="1538.71" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.mapassign_faststr (6 samples, 1.26%)</title><rect x="1752.6" y="277" width="22.4" height="15.0" fill="rgb(120,120,238)" rx="2" ry="2" />
+<text  x="1755.61" y="287.5" >r..</text>
+</g>
+<g >
+<title>runtime.tgkill (3 samples, 0.63%)</title><rect x="197.0" y="261" width="11.2" height="15.0" fill="rgb(133,133,249)" rx="2" ry="2" />
+<text  x="199.97" y="271.5" ></text>
+</g>
+<g >
+<title>internal/runtime/gc/scan.ScanSpanPackedAVX512 (8 samples, 1.68%)</title><rect x="167.1" y="293" width="29.9" height="15.0" fill="rgb(102,102,223)" rx="2" ry="2" />
+<text  x="170.06" y="303.5" >in..</text>
+</g>
+<g >
+<title>runtime.(*mcentral).grow (3 samples, 0.63%)</title><rect x="1760.1" y="133" width="11.2" height="15.0" fill="rgb(113,113,233)" rx="2" ry="2" />
+<text  x="1763.08" y="143.5" ></text>
+</g>
+<g >
+<title>runtime.(*mheap).freeSpanLocked (4 samples, 0.84%)</title><rect x="39.9" y="293" width="15.0" height="15.0" fill="rgb(103,103,224)" rx="2" ry="2" />
+<text  x="42.92" y="303.5" ></text>
+</g>
+<g >
+<title>countbody (1 samples, 0.21%)</title><rect x="1393.6" y="261" width="3.8" height="15.0" fill="rgb(90,90,213)" rx="2" ry="2" />
+<text  x="1396.61" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.(*mspan).init (3 samples, 0.63%)</title><rect x="1760.1" y="37" width="11.2" height="15.0" fill="rgb(90,90,213)" rx="2" ry="2" />
+<text  x="1763.08" y="47.5" ></text>
+</g>
+<g >
+<title>runtime.mProf_Malloc (1 samples, 0.21%)</title><rect x="1438.5" y="149" width="3.7" height="15.0" fill="rgb(81,81,206)" rx="2" ry="2" />
+<text  x="1441.49" y="159.5" ></text>
+</g>
+<g >
+<title>runtime.signalM (3 samples, 0.63%)</title><rect x="197.0" y="277" width="11.2" height="15.0" fill="rgb(86,86,210)" rx="2" ry="2" />
+<text  x="199.97" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.findObject (1 samples, 0.21%)</title><rect x="383.9" y="277" width="3.8" height="15.0" fill="rgb(93,93,216)" rx="2" ry="2" />
+<text  x="386.95" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.newobject (1 samples, 0.21%)</title><rect x="1487.1" y="309" width="3.7" height="15.0" fill="rgb(99,99,221)" rx="2" ry="2" />
+<text  x="1490.10" y="319.5" ></text>
+</g>
+<g >
+<title>aeshashbody (1 samples, 0.21%)</title><rect x="1333.8" y="261" width="3.7" height="15.0" fill="rgb(134,134,250)" rx="2" ry="2" />
+<text  x="1336.78" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.(*mcache).nextFree (4 samples, 0.84%)</title><rect x="1277.7" y="213" width="14.9" height="15.0" fill="rgb(100,100,222)" rx="2" ry="2" />
+<text  x="1280.69" y="223.5" ></text>
+</g>
+<g >
+<title>runtime.newobject (4 samples, 0.84%)</title><rect x="1689.0" y="293" width="15.0" height="15.0" fill="rgb(99,99,221)" rx="2" ry="2" />
+<text  x="1692.03" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.traceAcquire (1 samples, 0.21%)</title><rect x="1288.9" y="165" width="3.7" height="15.0" fill="rgb(89,89,212)" rx="2" ry="2" />
+<text  x="1291.91" y="175.5" ></text>
+</g>
+<g >
+<title>runtime.gcBgMarkWorker (279 samples, 58.61%)</title><rect x="77.3" y="373" width="1043.3" height="15.0" fill="rgb(116,116,235)" rx="2" ry="2" />
+<text  x="80.31" y="383.5" >runtime.gcBgMarkWorker</text>
+</g>
+<g >
+<title>runtime.mapassign_faststr (3 samples, 0.63%)</title><rect x="1655.4" y="309" width="11.2" height="15.0" fill="rgb(120,120,238)" rx="2" ry="2" />
+<text  x="1658.38" y="319.5" ></text>
+</g>
+<g >
+<title>internal/chacha8rand.(*State).Refill (1 samples, 0.21%)</title><rect x="1778.8" y="277" width="3.7" height="15.0" fill="rgb(101,101,223)" rx="2" ry="2" />
+<text  x="1781.78" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.newobject (1 samples, 0.21%)</title><rect x="1416.1" y="229" width="3.7" height="15.0" fill="rgb(99,99,221)" rx="2" ry="2" />
+<text  x="1419.05" y="239.5" ></text>
+</g>
+<g >
+<title>runtime.(*gcControllerState).markWorkerStop (1 samples, 0.21%)</title><rect x="77.3" y="357" width="3.8" height="15.0" fill="rgb(123,123,241)" rx="2" ry="2" />
+<text  x="80.31" y="367.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.newarray (7 samples, 1.47%)</title><rect x="1273.9" y="277" width="26.2" height="15.0" fill="rgb(102,102,223)" rx="2" ry="2" />
+<text  x="1276.95" y="287.5" >i..</text>
+</g>
+<g >
+<title>runtime.systemstack (3 samples, 0.63%)</title><rect x="1760.1" y="101" width="11.2" height="15.0" fill="rgb(81,81,206)" rx="2" ry="2" />
+<text  x="1763.08" y="111.5" ></text>
+</g>
+<g >
+<title>internal/chacha8rand.(*State).Refill (1 samples, 0.21%)</title><rect x="1685.3" y="261" width="3.7" height="15.0" fill="rgb(101,101,223)" rx="2" ry="2" />
+<text  x="1688.29" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.(*gcWork).tryGetObj (27 samples, 5.67%)</title><rect x="810.3" y="309" width="100.9" height="15.0" fill="rgb(98,98,220)" rx="2" ry="2" />
+<text  x="813.25" y="319.5" >runtime.(*gc..</text>
+</g>
+<g >
+<title>apimachinery/apis/meta/v1.(*OwnerReference).DeepCopyInto (2 samples, 0.42%)</title><rect x="1442.2" y="229" width="7.5" height="15.0" fill="rgb(93,93,216)" rx="2" ry="2" />
+<text  x="1445.23" y="239.5" ></text>
+</g>
+<g >
+<title>runtime.(*mcache).refill (3 samples, 0.63%)</title><rect x="1558.2" y="245" width="11.2" height="15.0" fill="rgb(112,112,232)" rx="2" ry="2" />
+<text  x="1561.15" y="255.5" ></text>
+</g>
+<g >
+<title>utils/resources.Merge (16 samples, 3.36%)</title><rect x="1606.8" y="325" width="59.8" height="15.0" fill="rgb(84,84,208)" rx="2" ry="2" />
+<text  x="1609.76" y="335.5" >utils/..</text>
+</g>
+<g >
+<title>runtime.findObject (3 samples, 0.63%)</title><rect x="301.7" y="293" width="11.2" height="15.0" fill="rgb(93,93,216)" rx="2" ry="2" />
+<text  x="304.68" y="303.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.(*Map).growToSmall (1 samples, 0.21%)</title><rect x="1266.5" y="293" width="3.7" height="15.0" fill="rgb(91,91,214)" rx="2" ry="2" />
+<text  x="1269.47" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.(*gcControllerState).enlistWorker (6 samples, 1.26%)</title><rect x="724.2" y="309" width="22.5" height="15.0" fill="rgb(127,127,244)" rx="2" ry="2" />
+<text  x="727.24" y="319.5" >r..</text>
+</g>
+<g >
+<title>runtime.mallocgc (1 samples, 0.21%)</title><rect x="1487.1" y="293" width="3.7" height="15.0" fill="rgb(124,124,241)" rx="2" ry="2" />
+<text  x="1490.10" y="303.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.NewEmptyMap (2 samples, 0.42%)</title><rect x="1782.5" y="293" width="7.5" height="15.0" fill="rgb(117,117,236)" rx="2" ry="2" />
+<text  x="1785.52" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.(*mcache).nextFree (1 samples, 0.21%)</title><rect x="1711.5" y="229" width="3.7" height="15.0" fill="rgb(100,100,222)" rx="2" ry="2" />
+<text  x="1714.47" y="239.5" ></text>
+</g>
+<g >
+<title>runtime.gcFlushBgCredit (3 samples, 0.63%)</title><rect x="245.6" y="309" width="11.2" height="15.0" fill="rgb(94,94,217)" rx="2" ry="2" />
+<text  x="248.59" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.(*mheap).allocSpan (1 samples, 0.21%)</title><rect x="1285.2" y="101" width="3.7" height="15.0" fill="rgb(114,114,233)" rx="2" ry="2" />
+<text  x="1288.17" y="111.5" ></text>
+</g>
+<g >
+<title>runtime.mallocgc (7 samples, 1.47%)</title><rect x="1273.9" y="245" width="26.2" height="15.0" fill="rgb(124,124,241)" rx="2" ry="2" />
+<text  x="1276.95" y="255.5" >r..</text>
+</g>
+<g >
+<title>runtime.newAllocBits (1 samples, 0.21%)</title><rect x="1285.2" y="85" width="3.7" height="15.0" fill="rgb(108,108,228)" rx="2" ry="2" />
+<text  x="1288.17" y="95.5" ></text>
+</g>
+<g >
+<title>apimachinery/runtime/schema.GroupVersion.String (1 samples, 0.21%)</title><rect x="1449.7" y="261" width="3.7" height="15.0" fill="rgb(130,130,246)" rx="2" ry="2" />
+<text  x="1452.71" y="271.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.(*groupReference).key (2 samples, 0.42%)</title><rect x="1255.3" y="293" width="7.4" height="15.0" fill="rgb(89,89,212)" rx="2" ry="2" />
+<text  x="1258.25" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.rand (1 samples, 0.21%)</title><rect x="1629.2" y="261" width="3.7" height="15.0" fill="rgb(85,85,209)" rx="2" ry="2" />
+<text  x="1632.20" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.(*mcache).refill (1 samples, 0.21%)</title><rect x="1711.5" y="213" width="3.7" height="15.0" fill="rgb(112,112,232)" rx="2" ry="2" />
+<text  x="1714.47" y="223.5" ></text>
+</g>
+<g >
+<title>runtime.(*pageAlloc).free (1 samples, 0.21%)</title><rect x="47.4" y="277" width="3.7" height="15.0" fill="rgb(131,131,247)" rx="2" ry="2" />
+<text  x="50.39" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.unlockWithRank (1 samples, 0.21%)</title><rect x="1161.8" y="325" width="3.7" height="15.0" fill="rgb(131,131,247)" rx="2" ry="2" />
+<text  x="1164.76" y="335.5" ></text>
+</g>
+<g >
+<title>runtime.rand (1 samples, 0.21%)</title><rect x="1778.8" y="293" width="3.7" height="15.0" fill="rgb(85,85,209)" rx="2" ry="2" />
+<text  x="1781.78" y="303.5" ></text>
+</g>
+<g >
+<title>aeshashbody (2 samples, 0.42%)</title><rect x="1647.9" y="277" width="7.5" height="15.0" fill="rgb(134,134,250)" rx="2" ry="2" />
+<text  x="1650.90" y="287.5" ></text>
+</g>
+<g >
+<title>state/prediction.(*Store).PredictedRequests (16 samples, 3.36%)</title><rect x="1606.8" y="341" width="59.8" height="15.0" fill="rgb(220,20,60)" rx="2" ry="2" />
+<text  x="1609.76" y="351.5" >state/..</text>
+</g>
+<g >
+<title>controllers/provisioning/scheduling_test.predictedRequests (167 samples, 35.08%)</title><rect x="1165.5" y="357" width="624.5" height="15.0" fill="rgb(126,126,243)" rx="2" ry="2" />
+<text  x="1168.50" y="367.5" >controllers/provisioning/scheduling_test.predictedRequests</text>
+</g>
+<g >
+<title>runtime.wbBufFlush (1 samples, 0.21%)</title><rect x="1116.9" y="309" width="3.7" height="15.0" fill="rgb(93,93,216)" rx="2" ry="2" />
+<text  x="1119.89" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.(*spanSet).push (2 samples, 0.42%)</title><rect x="1561.9" y="213" width="7.5" height="15.0" fill="rgb(136,136,252)" rx="2" ry="2" />
+<text  x="1564.89" y="223.5" ></text>
+</g>
+<g >
+<title>runtime.mallocgc (3 samples, 0.63%)</title><rect x="1692.8" y="277" width="11.2" height="15.0" fill="rgb(124,124,241)" rx="2" ry="2" />
+<text  x="1695.77" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.(*lfstack).push (6 samples, 1.26%)</title><rect x="787.8" y="261" width="22.5" height="15.0" fill="rgb(118,118,237)" rx="2" ry="2" />
+<text  x="790.82" y="271.5" >r..</text>
+</g>
+<g >
+<title>type:.hash.apimachinery/runtime/schema.GroupKind (1 samples, 0.21%)</title><rect x="1333.8" y="277" width="3.7" height="15.0" fill="rgb(139,139,254)" rx="2" ry="2" />
+<text  x="1336.78" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.notewakeup (1 samples, 0.21%)</title><rect x="1158.0" y="277" width="3.8" height="15.0" fill="rgb(111,111,231)" rx="2" ry="2" />
+<text  x="1161.03" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.systemstack (1 samples, 0.21%)</title><rect x="1483.4" y="181" width="3.7" height="15.0" fill="rgb(81,81,206)" rx="2" ry="2" />
+<text  x="1486.36" y="191.5" ></text>
+</g>
+<g >
+<title>runtime.(*pageAlloc).update (1 samples, 0.21%)</title><rect x="47.4" y="261" width="3.7" height="15.0" fill="rgb(127,127,244)" rx="2" ry="2" />
+<text  x="50.39" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.(*mheap).alloc (3 samples, 0.63%)</title><rect x="1760.1" y="117" width="11.2" height="15.0" fill="rgb(110,110,230)" rx="2" ry="2" />
+<text  x="1763.08" y="127.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.rand (1 samples, 0.21%)</title><rect x="1225.3" y="277" width="3.8" height="15.0" fill="rgb(126,126,243)" rx="2" ry="2" />
+<text  x="1228.34" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.handoff (17 samples, 3.57%)</title><rect x="746.7" y="293" width="63.6" height="15.0" fill="rgb(121,121,239)" rx="2" ry="2" />
+<text  x="749.68" y="303.5" >runtim..</text>
+</g>
+<g >
+<title>runtime.typePointers.next (1 samples, 0.21%)</title><rect x="357.8" y="293" width="3.7" height="15.0" fill="rgb(114,114,233)" rx="2" ry="2" />
+<text  x="360.77" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.runqgrab (2 samples, 0.42%)</title><rect x="1139.3" y="277" width="7.5" height="15.0" fill="rgb(116,116,235)" rx="2" ry="2" />
+<text  x="1142.33" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.newobject (3 samples, 0.63%)</title><rect x="1535.7" y="277" width="11.2" height="15.0" fill="rgb(99,99,221)" rx="2" ry="2" />
+<text  x="1538.71" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.(*lfstack).pop (1 samples, 0.21%)</title><rect x="211.9" y="261" width="3.8" height="15.0" fill="rgb(94,94,217)" rx="2" ry="2" />
+<text  x="214.93" y="271.5" ></text>
+</g>
+<g >
+<title>apimachinery/apis/meta/v1.GetControllerOfNoCopy (12 samples, 2.52%)</title><rect x="1348.7" y="309" width="44.9" height="15.0" fill="rgb(121,121,239)" rx="2" ry="2" />
+<text  x="1351.74" y="319.5" >apim..</text>
+</g>
+<g >
+<title>runtime.resetspinning (1 samples, 0.21%)</title><rect x="1158.0" y="325" width="3.8" height="15.0" fill="rgb(104,104,225)" rx="2" ry="2" />
+<text  x="1161.03" y="335.5" ></text>
+</g>
+<g >
+<title>runtime.mapIterNext (1 samples, 0.21%)</title><rect x="1210.4" y="309" width="3.7" height="15.0" fill="rgb(115,115,234)" rx="2" ry="2" />
+<text  x="1213.38" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.memclrNoHeapPointers (1 samples, 0.21%)</title><rect x="1296.4" y="213" width="3.7" height="15.0" fill="rgb(137,137,252)" rx="2" ry="2" />
+<text  x="1299.39" y="223.5" ></text>
+</g>
+<g >
+<title>runtime.nextFreeFast (1 samples, 0.21%)</title><rect x="1700.3" y="261" width="3.7" height="15.0" fill="rgb(106,106,227)" rx="2" ry="2" />
+<text  x="1703.25" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.mallocgcSmallScanHeader (5 samples, 1.05%)</title><rect x="1756.3" y="197" width="18.7" height="15.0" fill="rgb(119,119,237)" rx="2" ry="2" />
+<text  x="1759.34" y="207.5" ></text>
+</g>
+<g >
+<title>runtime.findObject (1 samples, 0.21%)</title><rect x="365.3" y="293" width="3.7" height="15.0" fill="rgb(93,93,216)" rx="2" ry="2" />
+<text  x="368.25" y="303.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.newGroups (5 samples, 1.05%)</title><rect x="1756.3" y="261" width="18.7" height="15.0" fill="rgb(130,130,246)" rx="2" ry="2" />
+<text  x="1759.34" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.tryDeferToSpanScan (7 samples, 1.47%)</title><rect x="331.6" y="293" width="26.2" height="15.0" fill="rgb(137,137,252)" rx="2" ry="2" />
+<text  x="334.60" y="303.5" >r..</text>
+</g>
+<g >
+<title>state/prediction.applyPredictions (29 samples, 6.09%)</title><rect x="1494.6" y="325" width="108.4" height="15.0" fill="rgb(122,122,240)" rx="2" ry="2" />
+<text  x="1497.58" y="335.5" >state/predict..</text>
+</g>
+<g >
+<title>runtime.(*mspan).writeHeapBitsSmall (1 samples, 0.21%)</title><rect x="1535.7" y="229" width="3.8" height="15.0" fill="rgb(95,95,217)" rx="2" ry="2" />
+<text  x="1538.71" y="239.5" ></text>
+</g>
+<g >
+<title>runtime.preemptM (5 samples, 1.05%)</title><rect x="728.0" y="293" width="18.7" height="15.0" fill="rgb(122,122,240)" rx="2" ry="2" />
+<text  x="730.98" y="303.5" ></text>
+</g>
+<g >
+<title>apimachinery/apis/meta/v1.(*PartialObjectMetadata).DeepCopy (1 samples, 0.21%)</title><rect x="1416.1" y="245" width="3.7" height="15.0" fill="rgb(137,137,253)" rx="2" ry="2" />
+<text  x="1419.05" y="255.5" ></text>
+</g>
+<g >
+<title>runtime.rand (1 samples, 0.21%)</title><rect x="1225.3" y="261" width="3.8" height="15.0" fill="rgb(85,85,209)" rx="2" ry="2" />
+<text  x="1228.34" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.mallocgcSmallScanNoHeader (1 samples, 0.21%)</title><rect x="1487.1" y="277" width="3.7" height="15.0" fill="rgb(94,94,216)" rx="2" ry="2" />
+<text  x="1490.10" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.concatstrings (1 samples, 0.21%)</title><rect x="1449.7" y="229" width="3.7" height="15.0" fill="rgb(99,99,220)" rx="2" ry="2" />
+<text  x="1452.71" y="239.5" ></text>
+</g>
+<g >
+<title>apimachinery/api/resource.(*Quantity).Add (2 samples, 0.42%)</title><rect x="1610.5" y="309" width="7.5" height="15.0" fill="rgb(121,121,239)" rx="2" ry="2" />
+<text  x="1613.50" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.(*mcentral).cacheSpan (3 samples, 0.63%)</title><rect x="1760.1" y="149" width="11.2" height="15.0" fill="rgb(126,126,244)" rx="2" ry="2" />
+<text  x="1763.08" y="159.5" ></text>
+</g>
+<g >
+<title>runtime.(*mspan).writeHeapBitsSmall (1 samples, 0.21%)</title><rect x="1786.3" y="229" width="3.7" height="15.0" fill="rgb(95,95,217)" rx="2" ry="2" />
+<text  x="1789.26" y="239.5" ></text>
+</g>
+<g >
+<title>runtime.extractHeapBitsSmall (1 samples, 0.21%)</title><rect x="1075.8" y="277" width="3.7" height="15.0" fill="rgb(102,102,223)" rx="2" ry="2" />
+<text  x="1078.76" y="287.5" ></text>
+</g>
+<g >
+<title>state/prediction.(*Store).resolveWorkload (41 samples, 8.61%)</title><rect x="1341.3" y="325" width="153.3" height="15.0" fill="rgb(255,0,0)" rx="2" ry="2" />
+<text  x="1344.26" y="335.5" >state/prediction.(*..</text>
+</g>
+<g >
+<title>runtime.gcDrainMarkWorkerDedicated (91 samples, 19.12%)</title><rect x="88.5" y="341" width="340.3" height="15.0" fill="rgb(81,81,206)" rx="2" ry="2" />
+<text  x="91.53" y="351.5" >runtime.gcDrainMarkWorkerDedicated</text>
+</g>
+<g >
+<title>runtime.(*mheap).alloc (1 samples, 0.21%)</title><rect x="1539.5" y="165" width="3.7" height="15.0" fill="rgb(110,110,230)" rx="2" ry="2" />
+<text  x="1542.45" y="175.5" ></text>
+</g>
+<g >
+<title>runtime.mapaccess2 (2 samples, 0.42%)</title><rect x="1404.8" y="229" width="7.5" height="15.0" fill="rgb(83,83,208)" rx="2" ry="2" />
+<text  x="1407.83" y="239.5" ></text>
+</g>
+<g >
+<title>internal/runtime/atomic.(*Uint32).CompareAndSwap (1 samples, 0.21%)</title><rect x="28.7" y="341" width="3.7" height="15.0" fill="rgb(121,121,239)" rx="2" ry="2" />
+<text  x="31.70" y="351.5" ></text>
+</g>
+<g >
+<title>runtime.wbBufFlush.func1 (1 samples, 0.21%)</title><rect x="1300.1" y="245" width="3.8" height="15.0" fill="rgb(119,119,237)" rx="2" ry="2" />
+<text  x="1303.13" y="255.5" ></text>
+</g>
+<g >
+<title>apimachinery/runtime/schema.ParseGroupVersion (1 samples, 0.21%)</title><rect x="1393.6" y="293" width="3.8" height="15.0" fill="rgb(127,127,244)" rx="2" ry="2" />
+<text  x="1396.61" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.systemstack (1 samples, 0.21%)</title><rect x="1300.1" y="261" width="3.8" height="15.0" fill="rgb(81,81,206)" rx="2" ry="2" />
+<text  x="1303.13" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.putfull (6 samples, 1.26%)</title><rect x="787.8" y="277" width="22.5" height="15.0" fill="rgb(122,122,240)" rx="2" ry="2" />
+<text  x="790.82" y="287.5" >r..</text>
+</g>
+<g >
+<title>runtime.mallocgcSmallScanNoHeader (4 samples, 0.84%)</title><rect x="1558.2" y="277" width="14.9" height="15.0" fill="rgb(94,94,216)" rx="2" ry="2" />
+<text  x="1561.15" y="287.5" ></text>
+</g>
+<g >
+<title>apimachinery/apis/meta/v1.(*ObjectMeta).GetOwnerReferences (4 samples, 0.84%)</title><rect x="1378.7" y="293" width="14.9" height="15.0" fill="rgb(121,121,239)" rx="2" ry="2" />
+<text  x="1381.66" y="303.5" ></text>
+</g>
+<g >
+<title>all (476 samples, 100%)</title><rect x="10.0" y="389" width="1780.0" height="15.0" fill="rgb(90,90,213)" rx="2" ry="2" />
+<text  x="13.00" y="399.5" ></text>
+</g>
+<g >
+<title>runtime.procyield (2 samples, 0.42%)</title><rect x="1150.5" y="309" width="7.5" height="15.0" fill="rgb(82,82,206)" rx="2" ry="2" />
+<text  x="1153.55" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.tryDeferToSpanScan (1 samples, 0.21%)</title><rect x="376.5" y="277" width="3.7" height="15.0" fill="rgb(137,137,252)" rx="2" ry="2" />
+<text  x="379.47" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.(*mcentral).cacheSpan (1 samples, 0.21%)</title><rect x="1539.5" y="197" width="3.7" height="15.0" fill="rgb(126,126,244)" rx="2" ry="2" />
+<text  x="1542.45" y="207.5" ></text>
+</g>
+<g >
+<title>runtime.scanSpan (18 samples, 3.78%)</title><rect x="1042.1" y="309" width="67.3" height="15.0" fill="rgb(89,89,212)" rx="2" ry="2" />
+<text  x="1045.10" y="319.5" >runtime..</text>
+</g>
+<g >
+<title>runtime.memequal (1 samples, 0.21%)</title><rect x="1595.5" y="277" width="3.8" height="15.0" fill="rgb(81,81,206)" rx="2" ry="2" />
+<text  x="1598.55" y="287.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.(*Iter).Next (1 samples, 0.21%)</title><rect x="1748.9" y="261" width="3.7" height="15.0" fill="rgb(110,110,230)" rx="2" ry="2" />
+<text  x="1751.87" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.memclrNoHeapPointers (1 samples, 0.21%)</title><rect x="1771.3" y="181" width="3.7" height="15.0" fill="rgb(137,137,252)" rx="2" ry="2" />
+<text  x="1774.30" y="191.5" ></text>
+</g>
+<g >
+<title>runtime.(*gcWork).tryGetObj (8 samples, 1.68%)</title><rect x="215.7" y="309" width="29.9" height="15.0" fill="rgb(98,98,220)" rx="2" ry="2" />
+<text  x="218.67" y="319.5" >ru..</text>
+</g>
+<g >
+<title>k8s.io/client-go/tools/cache.(*threadSafeMap).Get (1 samples, 0.21%)</title><rect x="1453.4" y="245" width="3.8" height="15.0" fill="rgb(80,80,205)" rx="2" ry="2" />
+<text  x="1456.45" y="255.5" ></text>
+</g>
+<g >
+<title>runtime.newobject (2 samples, 0.42%)</title><rect x="1707.7" y="277" width="7.5" height="15.0" fill="rgb(99,99,221)" rx="2" ry="2" />
+<text  x="1710.73" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.(*mcentral).grow (1 samples, 0.21%)</title><rect x="1558.2" y="213" width="3.7" height="15.0" fill="rgb(113,113,233)" rx="2" ry="2" />
+<text  x="1561.15" y="223.5" ></text>
+</g>
+<g >
+<title>runtime.(*mspan).init (1 samples, 0.21%)</title><rect x="1539.5" y="85" width="3.7" height="15.0" fill="rgb(90,90,213)" rx="2" ry="2" />
+<text  x="1542.45" y="95.5" ></text>
+</g>
+<g >
+<title>runtime.systemstack (1 samples, 0.21%)</title><rect x="1558.2" y="181" width="3.7" height="15.0" fill="rgb(81,81,206)" rx="2" ry="2" />
+<text  x="1561.15" y="191.5" ></text>
+</g>
+<g >
+<title>sync/atomic.(*Int32).Add (1 samples, 0.21%)</title><rect x="1603.0" y="325" width="3.8" height="15.0" fill="rgb(116,116,235)" rx="2" ry="2" />
+<text  x="1606.03" y="335.5" ></text>
+</g>
+<g >
+<title>runtime.gcDrain (91 samples, 19.12%)</title><rect x="88.5" y="325" width="340.3" height="15.0" fill="rgb(113,113,233)" rx="2" ry="2" />
+<text  x="91.53" y="335.5" >runtime.gcDrain</text>
+</g>
+<g >
+<title>runtime.wbBufFlush1 (1 samples, 0.21%)</title><rect x="1116.9" y="277" width="3.7" height="15.0" fill="rgb(133,133,249)" rx="2" ry="2" />
+<text  x="1119.89" y="287.5" ></text>
+</g>
+<g >
+<title>apimachinery/apis/meta/v1.(*FieldsV1).DeepCopy (1 samples, 0.21%)</title><rect x="1427.3" y="213" width="3.7" height="15.0" fill="rgb(118,118,237)" rx="2" ry="2" />
+<text  x="1430.27" y="223.5" ></text>
+</g>
+<g >
+<title>cr/cache/internal.(*CacheReader).Get (12 samples, 2.52%)</title><rect x="1416.1" y="277" width="44.8" height="15.0" fill="rgb(100,100,222)" rx="2" ry="2" />
+<text  x="1419.05" y="287.5" >cr/c..</text>
+</g>
+<g >
+<title>runtime.getempty (1 samples, 0.21%)</title><rect x="211.9" y="277" width="3.8" height="15.0" fill="rgb(135,135,251)" rx="2" ry="2" />
+<text  x="214.93" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.(*gcControllerState).addIdleMarkWorker (1 samples, 0.21%)</title><rect x="1124.4" y="309" width="3.7" height="15.0" fill="rgb(119,119,237)" rx="2" ry="2" />
+<text  x="1127.37" y="319.5" ></text>
+</g>
+<g >
+<title>internal/chacha8rand.(*State).Refill (2 samples, 0.42%)</title><rect x="1741.4" y="213" width="7.5" height="15.0" fill="rgb(101,101,223)" rx="2" ry="2" />
+<text  x="1744.39" y="223.5" ></text>
+</g>
+<g >
+<title>runtime.preemptM (3 samples, 0.63%)</title><rect x="197.0" y="293" width="11.2" height="15.0" fill="rgb(122,122,240)" rx="2" ry="2" />
+<text  x="199.97" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.memequal (1 samples, 0.21%)</title><rect x="1322.6" y="277" width="3.7" height="15.0" fill="rgb(81,81,206)" rx="2" ry="2" />
+<text  x="1325.56" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.(*lfstack).push (1 samples, 0.21%)</title><rect x="810.3" y="277" width="3.7" height="15.0" fill="rgb(118,118,237)" rx="2" ry="2" />
+<text  x="813.25" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.(*mcache).refill (1 samples, 0.21%)</title><rect x="1539.5" y="213" width="3.7" height="15.0" fill="rgb(112,112,232)" rx="2" ry="2" />
+<text  x="1542.45" y="223.5" ></text>
+</g>
+<g >
+<title>runtime.wbBufFlush1 (1 samples, 0.21%)</title><rect x="1483.4" y="149" width="3.7" height="15.0" fill="rgb(133,133,249)" rx="2" ry="2" />
+<text  x="1486.36" y="159.5" ></text>
+</g>
+<g >
+<title>runtime.(*mcache).nextFree (3 samples, 0.63%)</title><rect x="1558.2" y="261" width="11.2" height="15.0" fill="rgb(100,100,222)" rx="2" ry="2" />
+<text  x="1561.15" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.wbMove (1 samples, 0.21%)</title><rect x="1599.3" y="309" width="3.7" height="15.0" fill="rgb(132,132,248)" rx="2" ry="2" />
+<text  x="1602.29" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.(*sysMemStat).add (1 samples, 0.21%)</title><rect x="51.1" y="277" width="3.8" height="15.0" fill="rgb(117,117,236)" rx="2" ry="2" />
+<text  x="54.13" y="287.5" ></text>
+</g>
+<g >
+<title>type:.eq.state/prediction.WorkloadReference (1 samples, 0.21%)</title><rect x="1490.8" y="309" width="3.8" height="15.0" fill="rgb(102,102,223)" rx="2" ry="2" />
+<text  x="1493.84" y="319.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.(*groupReference).ctrls (1 samples, 0.21%)</title><rect x="1270.2" y="293" width="3.7" height="15.0" fill="rgb(100,100,222)" rx="2" ry="2" />
+<text  x="1273.21" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.memmove (1 samples, 0.21%)</title><rect x="1457.2" y="213" width="3.7" height="15.0" fill="rgb(113,113,232)" rx="2" ry="2" />
+<text  x="1460.18" y="223.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.(*Iter).Init (3 samples, 0.63%)</title><rect x="1621.7" y="293" width="11.2" height="15.0" fill="rgb(136,136,251)" rx="2" ry="2" />
+<text  x="1624.72" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.(*mspan).writeHeapBitsSmall (1 samples, 0.21%)</title><rect x="1692.8" y="245" width="3.7" height="15.0" fill="rgb(95,95,217)" rx="2" ry="2" />
+<text  x="1695.77" y="255.5" ></text>
+</g>
+<g >
+<title>runtime.systemstack (276 samples, 57.98%)</title><rect x="88.5" y="357" width="1032.1" height="15.0" fill="rgb(81,81,206)" rx="2" ry="2" />
+<text  x="91.53" y="367.5" >runtime.systemstack</text>
+</g>
+<g >
+<title>runtime.mallocgc (1 samples, 0.21%)</title><rect x="1786.3" y="261" width="3.7" height="15.0" fill="rgb(124,124,241)" rx="2" ry="2" />
+<text  x="1789.26" y="271.5" ></text>
+</g>
+<g >
+<title>reflect.typedmemmove (1 samples, 0.21%)</title><rect x="1457.2" y="245" width="3.7" height="15.0" fill="rgb(110,110,230)" rx="2" ry="2" />
+<text  x="1460.18" y="255.5" ></text>
+</g>
+<g >
+<title>runtime.spanClass.sizeclass (5 samples, 1.05%)</title><rect x="312.9" y="293" width="18.7" height="15.0" fill="rgb(103,103,224)" rx="2" ry="2" />
+<text  x="315.90" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.mapaccess2_faststr (7 samples, 1.47%)</title><rect x="1573.1" y="309" width="26.2" height="15.0" fill="rgb(119,119,238)" rx="2" ry="2" />
+<text  x="1576.11" y="319.5" >r..</text>
+</g>
+<g >
+<title>runtime.schedule (12 samples, 2.52%)</title><rect x="1120.6" y="341" width="44.9" height="15.0" fill="rgb(98,98,220)" rx="2" ry="2" />
+<text  x="1123.63" y="351.5" >runt..</text>
+</g>
+<g >
+<title>internal/runtime/maps.ctrlGroup.matchH2 (1 samples, 0.21%)</title><rect x="1464.7" y="309" width="3.7" height="15.0" fill="rgb(100,100,221)" rx="2" ry="2" />
+<text  x="1467.66" y="319.5" ></text>
+</g>
+<g >
+<title>internal/runtime/gc/scan.scanSpanPackedAVX512 (8 samples, 1.68%)</title><rect x="167.1" y="277" width="29.9" height="15.0" fill="rgb(94,94,217)" rx="2" ry="2" />
+<text  x="170.06" y="287.5" >in..</text>
+</g>
+<g >
+<title>state/prediction.(*Store).PredictedRequests.func1 (118 samples, 24.79%)</title><rect x="1165.5" y="341" width="441.3" height="15.0" fill="rgb(220,20,60)" rx="2" ry="2" />
+<text  x="1168.50" y="351.5" >state/prediction.(*Store).PredictedRequests.func1</text>
+</g>
+<g >
+<title>runtime.(*mcache).refill (4 samples, 0.84%)</title><rect x="1277.7" y="197" width="14.9" height="15.0" fill="rgb(112,112,232)" rx="2" ry="2" />
+<text  x="1280.69" y="207.5" ></text>
+</g>
+<g >
+<title>runtime.spanClass.sizeclass (1 samples, 0.21%)</title><rect x="1079.5" y="293" width="3.7" height="15.0" fill="rgb(103,103,224)" rx="2" ry="2" />
+<text  x="1082.50" y="303.5" ></text>
+</g>
+<g >
+<title>strings.Count (1 samples, 0.21%)</title><rect x="1393.6" y="277" width="3.8" height="15.0" fill="rgb(103,103,224)" rx="2" ry="2" />
+<text  x="1396.61" y="287.5" ></text>
+</g>
+<g >
+<title>internal/runtime/gc/scan.FilterNilAVX512 (3 samples, 0.63%)</title><rect x="675.6" y="277" width="11.2" height="15.0" fill="rgb(86,86,210)" rx="2" ry="2" />
+<text  x="678.63" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.scanObjectsSmall (2 samples, 0.42%)</title><rect x="1072.0" y="293" width="7.5" height="15.0" fill="rgb(116,116,235)" rx="2" ry="2" />
+<text  x="1075.02" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.(*mcentral).uncacheSpan (2 samples, 0.42%)</title><rect x="1561.9" y="229" width="7.5" height="15.0" fill="rgb(107,107,227)" rx="2" ry="2" />
+<text  x="1564.89" y="239.5" ></text>
+</g>
+<g >
+<title>runtime.wbBufFlush1 (1 samples, 0.21%)</title><rect x="1300.1" y="229" width="3.8" height="15.0" fill="rgb(133,133,249)" rx="2" ry="2" />
+<text  x="1303.13" y="239.5" ></text>
+</g>
+<g >
+<title>runtime.(*mcentral).grow (2 samples, 0.42%)</title><rect x="1281.4" y="165" width="7.5" height="15.0" fill="rgb(113,113,233)" rx="2" ry="2" />
+<text  x="1284.43" y="175.5" ></text>
+</g>
+<g >
+<title>cr/cache/internal.(*Informers).Peek (2 samples, 0.42%)</title><rect x="1404.8" y="245" width="7.5" height="15.0" fill="rgb(81,81,206)" rx="2" ry="2" />
+<text  x="1407.83" y="255.5" ></text>
+</g>
+<g >
+<title>runtime.(*sweepLocked).sweep.(*mheap).freeSpan.func2 (5 samples, 1.05%)</title><rect x="36.2" y="309" width="18.7" height="15.0" fill="rgb(99,99,220)" rx="2" ry="2" />
+<text  x="39.18" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.trygetfull (8 samples, 1.68%)</title><rect x="215.7" y="293" width="29.9" height="15.0" fill="rgb(115,115,234)" rx="2" ry="2" />
+<text  x="218.67" y="303.5" >ru..</text>
+</g>
+<g >
+<title>runtime.scanObjectSmall (1 samples, 0.21%)</title><rect x="1068.3" y="293" width="3.7" height="15.0" fill="rgb(107,107,228)" rx="2" ry="2" />
+<text  x="1071.28" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.mallocgc (1 samples, 0.21%)</title><rect x="1416.1" y="213" width="3.7" height="15.0" fill="rgb(124,124,241)" rx="2" ry="2" />
+<text  x="1419.05" y="223.5" ></text>
+</g>
+<g >
+<title>runtime.rand (1 samples, 0.21%)</title><rect x="1685.3" y="277" width="3.7" height="15.0" fill="rgb(85,85,209)" rx="2" ry="2" />
+<text  x="1688.29" y="287.5" ></text>
+</g>
+<g >
+<title>apimachinery/apis/meta/v1.(*ObjectMeta).DeepCopyInto (5 samples, 1.05%)</title><rect x="1423.5" y="229" width="18.7" height="15.0" fill="rgb(115,115,234)" rx="2" ry="2" />
+<text  x="1426.53" y="239.5" ></text>
+</g>
+<g >
+<title>runtime.(*mheap).initSpan (3 samples, 0.63%)</title><rect x="1760.1" y="53" width="11.2" height="15.0" fill="rgb(128,128,245)" rx="2" ry="2" />
+<text  x="1763.08" y="63.5" ></text>
+</g>
+<g >
+<title>runtime.newobject (1 samples, 0.21%)</title><rect x="1786.3" y="277" width="3.7" height="15.0" fill="rgb(99,99,221)" rx="2" ry="2" />
+<text  x="1789.26" y="287.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.(*Map).getWithoutKeySmallFastStr (2 samples, 0.42%)</title><rect x="1647.9" y="293" width="7.5" height="15.0" fill="rgb(132,132,249)" rx="2" ry="2" />
+<text  x="1650.90" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.newarray (7 samples, 1.47%)</title><rect x="1273.9" y="261" width="26.2" height="15.0" fill="rgb(121,121,239)" rx="2" ry="2" />
+<text  x="1276.95" y="271.5" >r..</text>
+</g>
+<g >
+<title>internal/runtime/maps.newarray (5 samples, 1.05%)</title><rect x="1756.3" y="245" width="18.7" height="15.0" fill="rgb(102,102,223)" rx="2" ry="2" />
+<text  x="1759.34" y="255.5" ></text>
+</g>
+<g >
+<title>runtime.tryDeferToSpanScan (1 samples, 0.21%)</title><rect x="1068.3" y="277" width="3.7" height="15.0" fill="rgb(137,137,252)" rx="2" ry="2" />
+<text  x="1071.28" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.lockWithRank (3 samples, 0.63%)</title><rect x="1146.8" y="325" width="11.2" height="15.0" fill="rgb(91,91,214)" rx="2" ry="2" />
+<text  x="1149.81" y="335.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.(*table).rehash (2 samples, 0.42%)</title><rect x="1479.6" y="293" width="7.5" height="15.0" fill="rgb(86,86,210)" rx="2" ry="2" />
+<text  x="1482.62" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.wbBufFlush (1 samples, 0.21%)</title><rect x="1300.1" y="277" width="3.8" height="15.0" fill="rgb(93,93,216)" rx="2" ry="2" />
+<text  x="1303.13" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.memclrNoHeapPointers (1 samples, 0.21%)</title><rect x="1569.4" y="261" width="3.7" height="15.0" fill="rgb(137,137,252)" rx="2" ry="2" />
+<text  x="1572.37" y="271.5" ></text>
+</g>
+<g >
+<title>apimachinery/apis/meta/v1.(*FieldsV1).DeepCopyInto (1 samples, 0.21%)</title><rect x="1431.0" y="213" width="3.7" height="15.0" fill="rgb(120,120,238)" rx="2" ry="2" />
+<text  x="1434.01" y="223.5" ></text>
+</g>
+<g >
+<title>runtime.greyobject (1 samples, 0.21%)</title><rect x="1057.1" y="293" width="3.7" height="15.0" fill="rgb(94,94,217)" rx="2" ry="2" />
+<text  x="1060.06" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.(*mspan).markBitsForIndex (1 samples, 0.21%)</title><rect x="982.3" y="293" width="3.7" height="15.0" fill="rgb(89,89,213)" rx="2" ry="2" />
+<text  x="985.27" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.pageIndexOf (2 samples, 0.42%)</title><rect x="1060.8" y="293" width="7.5" height="15.0" fill="rgb(117,117,236)" rx="2" ry="2" />
+<text  x="1063.80" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.mapaccess1 (6 samples, 1.26%)</title><rect x="1318.8" y="309" width="22.5" height="15.0" fill="rgb(91,91,214)" rx="2" ry="2" />
+<text  x="1321.82" y="319.5" >r..</text>
+</g>
+<g >
+<title>runtime.lock2 (1 samples, 0.21%)</title><rect x="1146.8" y="309" width="3.7" height="15.0" fill="rgb(87,87,210)" rx="2" ry="2" />
+<text  x="1149.81" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.mallocgcSmallScanNoHeader (1 samples, 0.21%)</title><rect x="1696.5" y="261" width="3.8" height="15.0" fill="rgb(94,94,216)" rx="2" ry="2" />
+<text  x="1699.51" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.procyieldAsm (2 samples, 0.42%)</title><rect x="1150.5" y="293" width="7.5" height="15.0" fill="rgb(121,121,239)" rx="2" ry="2" />
+<text  x="1153.55" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.alignDown (1 samples, 0.21%)</title><rect x="297.9" y="293" width="3.8" height="15.0" fill="rgb(92,92,215)" rx="2" ry="2" />
+<text  x="300.94" y="303.5" ></text>
+</g>
+<g >
+<title>reflect.Value.Set (1 samples, 0.21%)</title><rect x="1457.2" y="261" width="3.7" height="15.0" fill="rgb(81,81,206)" rx="2" ry="2" />
+<text  x="1460.18" y="271.5" ></text>
+</g>
+<g >
+<title>runtime.mapIterStart (1 samples, 0.21%)</title><rect x="1775.0" y="277" width="3.8" height="15.0" fill="rgb(94,94,217)" rx="2" ry="2" />
+<text  x="1778.04" y="287.5" ></text>
+</g>
+<g >
+<title>type:.hash.apimachinery/types.NamespacedName (1 samples, 0.21%)</title><rect x="1337.5" y="277" width="3.8" height="15.0" fill="rgb(120,120,238)" rx="2" ry="2" />
+<text  x="1340.52" y="287.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.NewEmptyMap (5 samples, 1.05%)</title><rect x="1685.3" y="309" width="18.7" height="15.0" fill="rgb(117,117,236)" rx="2" ry="2" />
+<text  x="1688.29" y="319.5" ></text>
+</g>
+<g >
+<title>internal/runtime/atomic.(*Uint32).Add (1 samples, 0.21%)</title><rect x="43.7" y="277" width="3.7" height="15.0" fill="rgb(136,136,251)" rx="2" ry="2" />
+<text  x="46.66" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.mallocgcSmallScanNoHeader (2 samples, 0.42%)</title><rect x="1707.7" y="245" width="7.5" height="15.0" fill="rgb(94,94,216)" rx="2" ry="2" />
+<text  x="1710.73" y="255.5" ></text>
+</g>
+<g >
+<title>runtime.(*mspan).base (1 samples, 0.21%)</title><rect x="978.5" y="293" width="3.8" height="15.0" fill="rgb(103,103,224)" rx="2" ry="2" />
+<text  x="981.53" y="303.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.NewEmptyMap (2 samples, 0.42%)</title><rect x="1707.7" y="293" width="7.5" height="15.0" fill="rgb(117,117,236)" rx="2" ry="2" />
+<text  x="1710.73" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.(*mheap).alloc.func1 (1 samples, 0.21%)</title><rect x="1539.5" y="133" width="3.7" height="15.0" fill="rgb(136,136,252)" rx="2" ry="2" />
+<text  x="1542.45" y="143.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.rand (1 samples, 0.21%)</title><rect x="1629.2" y="277" width="3.7" height="15.0" fill="rgb(126,126,243)" rx="2" ry="2" />
+<text  x="1632.20" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.(*gcControllerState).update (1 samples, 0.21%)</title><rect x="1427.3" y="117" width="3.7" height="15.0" fill="rgb(95,95,217)" rx="2" ry="2" />
+<text  x="1430.27" y="127.5" ></text>
+</g>
+<g >
+<title>internal/chacha8rand.(*State).Refill (1 samples, 0.21%)</title><rect x="1782.5" y="245" width="3.8" height="15.0" fill="rgb(101,101,223)" rx="2" ry="2" />
+<text  x="1785.52" y="255.5" ></text>
+</g>
+<g >
+<title>apimachinery/runtime/schema.FromAPIVersionAndKind (1 samples, 0.21%)</title><rect x="1393.6" y="309" width="3.8" height="15.0" fill="rgb(131,131,247)" rx="2" ry="2" />
+<text  x="1396.61" y="319.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.rand (1 samples, 0.21%)</title><rect x="1782.5" y="277" width="3.8" height="15.0" fill="rgb(126,126,243)" rx="2" ry="2" />
+<text  x="1785.52" y="287.5" ></text>
+</g>
+<g >
+<title>runtime.(*mcentral).grow (1 samples, 0.21%)</title><rect x="1539.5" y="181" width="3.7" height="15.0" fill="rgb(113,113,233)" rx="2" ry="2" />
+<text  x="1542.45" y="191.5" ></text>
+</g>
+<g >
+<title>runtime.(*mcache).nextFree (1 samples, 0.21%)</title><rect x="1487.1" y="261" width="3.7" height="15.0" fill="rgb(100,100,222)" rx="2" ry="2" />
+<text  x="1490.10" y="271.5" ></text>
+</g>
+<g >
+<title>state/prediction.(*Store).active (8 samples, 1.68%)</title><rect x="1311.3" y="325" width="30.0" height="15.0" fill="rgb(96,96,219)" rx="2" ry="2" />
+<text  x="1314.34" y="335.5" >st..</text>
+</g>
+<g >
+<title>runtime.(*mheap).allocSpan (1 samples, 0.21%)</title><rect x="1558.2" y="149" width="3.7" height="15.0" fill="rgb(114,114,233)" rx="2" ry="2" />
+<text  x="1561.15" y="159.5" ></text>
+</g>
+<g >
+<title>runtime.(*mcentral).cacheSpan (1 samples, 0.21%)</title><rect x="1558.2" y="229" width="3.7" height="15.0" fill="rgb(126,126,244)" rx="2" ry="2" />
+<text  x="1561.15" y="239.5" ></text>
+</g>
+<g >
+<title>runtime.(*mspan).base (1 samples, 0.21%)</title><rect x="1053.3" y="293" width="3.8" height="15.0" fill="rgb(103,103,224)" rx="2" ry="2" />
+<text  x="1056.32" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.tgkill (5 samples, 1.05%)</title><rect x="728.0" y="261" width="18.7" height="15.0" fill="rgb(133,133,249)" rx="2" ry="2" />
+<text  x="730.98" y="271.5" ></text>
+</g>
+<g >
+<title>internal/chacha8rand.block (1 samples, 0.21%)</title><rect x="1782.5" y="229" width="3.8" height="15.0" fill="rgb(91,91,214)" rx="2" ry="2" />
+<text  x="1785.52" y="239.5" ></text>
+</g>
+<g >
+<title>runtime.rand (2 samples, 0.42%)</title><rect x="1741.4" y="229" width="7.5" height="15.0" fill="rgb(85,85,209)" rx="2" ry="2" />
+<text  x="1744.39" y="239.5" ></text>
+</g>
+<g >
+<title>runtime.heapSetTypeNoHeader (1 samples, 0.21%)</title><rect x="1786.3" y="245" width="3.7" height="15.0" fill="rgb(94,94,216)" rx="2" ry="2" />
+<text  x="1789.26" y="255.5" ></text>
+</g>
+<g >
+<title>internal/chacha8rand.block (2 samples, 0.42%)</title><rect x="1741.4" y="197" width="7.5" height="15.0" fill="rgb(91,91,214)" rx="2" ry="2" />
+<text  x="1744.39" y="207.5" ></text>
+</g>
+<g >
+<title>utils/resources.RequestsForSpec (33 samples, 6.93%)</title><rect x="1666.6" y="341" width="123.4" height="15.0" fill="rgb(134,134,250)" rx="2" ry="2" />
+<text  x="1669.60" y="351.5" >utils/resources..</text>
+</g>
+<g >
+<title>runtime.park_m (12 samples, 2.52%)</title><rect x="1120.6" y="357" width="44.9" height="15.0" fill="rgb(114,114,233)" rx="2" ry="2" />
+<text  x="1123.63" y="367.5" >runt..</text>
+</g>
+<g >
+<title>runtime.(*mcache).nextFree (1 samples, 0.21%)</title><rect x="1539.5" y="229" width="3.7" height="15.0" fill="rgb(100,100,222)" rx="2" ry="2" />
+<text  x="1542.45" y="239.5" ></text>
+</g>
+<g >
+<title>runtime.(*mheap).alloc (2 samples, 0.42%)</title><rect x="1281.4" y="149" width="7.5" height="15.0" fill="rgb(110,110,230)" rx="2" ry="2" />
+<text  x="1284.43" y="159.5" ></text>
+</g>
+<g >
+<title>runtime.(*mspan).writeHeapBitsSmall (1 samples, 0.21%)</title><rect x="1416.1" y="181" width="3.7" height="15.0" fill="rgb(95,95,217)" rx="2" ry="2" />
+<text  x="1419.05" y="191.5" ></text>
+</g>
+<g >
+<title>runtime.typedmemmove (1 samples, 0.21%)</title><rect x="1483.4" y="229" width="3.7" height="15.0" fill="rgb(109,109,229)" rx="2" ry="2" />
+<text  x="1486.36" y="239.5" ></text>
+</g>
+<g >
+<title>runtime.(*wbBuf).get2 (1 samples, 0.21%)</title><rect x="1300.1" y="293" width="3.8" height="15.0" fill="rgb(139,139,254)" rx="2" ry="2" />
+<text  x="1303.13" y="303.5" ></text>
+</g>
+<g >
+<title>k8s.io/component-helpers/resource.reuseOrClearResourceList (2 samples, 0.42%)</title><rect x="1782.5" y="309" width="7.5" height="15.0" fill="rgb(104,104,225)" rx="2" ry="2" />
+<text  x="1785.52" y="319.5" ></text>
+</g>
+<g >
+<title>aeshashbody (1 samples, 0.21%)</title><rect x="1475.9" y="293" width="3.7" height="15.0" fill="rgb(134,134,250)" rx="2" ry="2" />
+<text  x="1478.88" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.nextFreeFast (1 samples, 0.21%)</title><rect x="1543.2" y="245" width="3.7" height="15.0" fill="rgb(106,106,227)" rx="2" ry="2" />
+<text  x="1546.19" y="255.5" ></text>
+</g>
+<g >
+<title>runtime.tryDeferToSpanScan (10 samples, 2.10%)</title><rect x="1004.7" y="293" width="37.4" height="15.0" fill="rgb(137,137,252)" rx="2" ry="2" />
+<text  x="1007.71" y="303.5" >run..</text>
+</g>
+<g >
+<title>runtime.rand (1 samples, 0.21%)</title><rect x="1782.5" y="261" width="3.8" height="15.0" fill="rgb(85,85,209)" rx="2" ry="2" />
+<text  x="1785.52" y="271.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.newGroups (7 samples, 1.47%)</title><rect x="1273.9" y="293" width="26.2" height="15.0" fill="rgb(130,130,246)" rx="2" ry="2" />
+<text  x="1276.95" y="303.5" >i..</text>
+</g>
+<g >
+<title>runtime.stkbucket (1 samples, 0.21%)</title><rect x="1438.5" y="133" width="3.7" height="15.0" fill="rgb(103,103,224)" rx="2" ry="2" />
+<text  x="1441.49" y="143.5" ></text>
+</g>
+<g >
+<title>internal/runtime/maps.ctrlGroup.matchH2 (1 samples, 0.21%)</title><rect x="1315.1" y="309" width="3.7" height="15.0" fill="rgb(100,100,221)" rx="2" ry="2" />
+<text  x="1318.08" y="319.5" ></text>
+</g>
+<g >
+<title>runtime.handoff (2 samples, 0.42%)</title><rect x="208.2" y="293" width="7.5" height="15.0" fill="rgb(121,121,239)" rx="2" ry="2" />
+<text  x="211.19" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.mallocgc (5 samples, 1.05%)</title><rect x="1554.4" y="293" width="18.7" height="15.0" fill="rgb(124,124,241)" rx="2" ry="2" />
+<text  x="1557.41" y="303.5" ></text>
+</g>
+<g >
+<title>runtime.heapSetTypeNoHeader (1 samples, 0.21%)</title><rect x="1416.1" y="197" width="3.7" height="15.0" fill="rgb(94,94,216)" rx="2" ry="2" />
+<text  x="1419.05" y="207.5" ></text>
+</g>
+<g >
+<title>runtime.mallocgc (1 samples, 0.21%)</title><rect x="1427.3" y="181" width="3.7" height="15.0" fill="rgb(124,124,241)" rx="2" ry="2" />
+<text  x="1430.27" y="191.5" ></text>
+</g>
+<g >
+<title>runtime.heapArenaOf (1 samples, 0.21%)</title><rect x="1483.4" y="133" width="3.7" height="15.0" fill="rgb(121,121,239)" rx="2" ry="2" />
+<text  x="1486.36" y="143.5" ></text>
+</g>
+<g >
+<title>type:.eq.state/prediction.WorkloadReference (1 samples, 0.21%)</title><rect x="1322.6" y="293" width="3.7" height="15.0" fill="rgb(102,102,223)" rx="2" ry="2" />
+<text  x="1325.56" y="303.5" ></text>
+</g>
+</g>
+</svg>

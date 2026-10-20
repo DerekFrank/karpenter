@@ -48,6 +48,7 @@ import (
 
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/state/prediction"
+	"sigs.k8s.io/karpenter/pkg/state/workloads"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -558,12 +559,13 @@ func instanceTypeList(names []string) string {
 }
 
 func (p *Provisioner) getDaemonSetPods(ctx context.Context) ([]*corev1.Pod, error) {
-	daemonSetList := &appsv1.DaemonSetList{}
-	if err := p.kubeClient.List(ctx, daemonSetList); err != nil {
+	// The DaemonSets alias the informer cache, so nothing below may modify them
+	daemonSets, err := workloads.NewReader(p.kubeClient).DaemonSets(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("listing daemonsets, %w", err)
 	}
 
-	return lo.Map(daemonSetList.Items, func(d appsv1.DaemonSet, _ int) *corev1.Pod {
+	return lo.Map(daemonSets, func(d appsv1.DaemonSet, _ int) *corev1.Pod {
 		pod := p.cluster.GetDaemonSetPod(&d)
 		if pod == nil {
 			pod = daemonset.PodForDaemonSet(&d)
@@ -578,7 +580,7 @@ func (p *Provisioner) getDaemonSetPods(ctx context.Context) ([]*corev1.Pod, erro
 			if pod.Spec.Affinity.NodeAffinity == nil {
 				pod.Spec.Affinity.NodeAffinity = &corev1.NodeAffinity{}
 			}
-			pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = d.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+			pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = d.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.DeepCopy()
 		}
 		return pod
 	}), nil

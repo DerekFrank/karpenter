@@ -90,9 +90,9 @@ func (v *Cache) hydrateCache(ctx context.Context) error {
 	return nil
 }
 
-// GetAll returns a snapshot of every cached virtual pod, hydrating the cache on
-// first use. The pod objects are NOT deep copied, for performance
-// Callers MUST treat the returned pods as read-only
+// GetAll returns a copy of every cached virtual pod, hydrating the cache on first use. The pods are copied like pods
+// listed from the cache, since scheduling mutates the pods it's given, e.g. injecting default topology spread and
+// relaxing preferences.
 func (v *Cache) GetAll(ctx context.Context) []*corev1.Pod {
 	v.mutex.Lock()
 	defer v.mutex.Unlock()
@@ -107,7 +107,9 @@ func (v *Cache) GetAll(ctx context.Context) []*corev1.Pod {
 	}
 	ans := make([]*corev1.Pod, 0)
 	for _, pods := range v.capacityBufferToPods {
-		ans = append(ans, pods...)
+		for _, p := range pods {
+			ans = append(ans, p.DeepCopy())
+		}
 	}
 	return ans
 }

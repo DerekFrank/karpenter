@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/state/prediction"
+	"sigs.k8s.io/karpenter/pkg/state/workloads"
 	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -382,7 +383,7 @@ var _ = Describe("Prediction", func() {
 	})
 
 	It("should wait for the prediction store to hydrate before disrupting when the PredictionEnabled feature gate is enabled", func() {
-		hydrationStore := prediction.NewStore(env.Client)
+		hydrationStore := prediction.NewStore(workloads.NewReader(env.Client))
 		hydrationProv := provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client), hydrationStore)
 
 		rs := test.ReplicaSet()
@@ -421,7 +422,7 @@ var _ = Describe("Prediction", func() {
 	})
 
 	It("should remove taints left by a previous disruption action while waiting for the prediction store to hydrate", func() {
-		hydrationStore := prediction.NewStore(env.Client)
+		hydrationStore := prediction.NewStore(workloads.NewReader(env.Client))
 		hydrationProv := provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client), hydrationStore)
 
 		node.Spec.Taints = append(node.Spec.Taints, v1.DisruptedNoScheduleTaint)

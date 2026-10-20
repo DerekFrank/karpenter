@@ -41,6 +41,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/state/prediction"
+	"sigs.k8s.io/karpenter/pkg/state/workloads"
 	"sigs.k8s.io/karpenter/pkg/test"
 	testcrds "sigs.k8s.io/karpenter/pkg/test/crds"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -72,7 +73,7 @@ var _ = AfterSuite(func() {
 })
 
 var _ = BeforeEach(func() {
-	store = prediction.NewStore(env.Client)
+	store = prediction.NewStore(workloads.NewReader(env.Client))
 	cluster = state.NewCluster(env.Clock, env.Client, fake.NewCloudProvider())
 	recorder = test.NewEventRecorder()
 	controller = informer.NewVPAController(env.Client, store, cluster, recorder)

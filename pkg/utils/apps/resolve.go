@@ -20,13 +20,12 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/samber/lo"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	autoscalingv1beta1 "sigs.k8s.io/karpenter/pkg/apis/autoscaling/v1beta1"
+	"sigs.k8s.io/karpenter/pkg/state/workloads"
 )
 
 // PodTemplateResult holds the resolved data from a PodTemplate lookup.
@@ -38,14 +37,14 @@ type PodTemplateResult struct {
 
 // ResolvePodTemplateRef fetches a PodTemplate by name and namespace.
 func ResolvePodTemplateRef(ctx context.Context, c client.Client, name, namespace string) (*PodTemplateResult, error) {
-	pt := &corev1.PodTemplate{}
-	if err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, pt); err != nil {
+	template, generation, err := workloads.NewReader(c).PodTemplate(ctx, namespace, name)
+	if err != nil {
 		return nil, err
 	}
 	return &PodTemplateResult{
-		PodTemplateSpec: pt.Template,
-		Name:            pt.Name,
-		Generation:      pt.Generation,
+		PodTemplateSpec: *template,
+		Name:            name,
+		Generation:      generation,
 	}, nil
 }
 
@@ -108,28 +107,20 @@ func ResolveScalableRef(ctx context.Context, c client.Client, ref *autoscalingv1
 	if group != "apps" {
 		return nil, fmt.Errorf("unsupported scalableRef API group %q", ref.APIGroup)
 	}
-	key := types.NamespacedName{Name: ref.Name, Namespace: namespace}
-
+	var kind schema.GroupKind
 	switch ref.Kind {
 	case autoscalingv1beta1.KindDeployment:
-		obj := &appsv1.Deployment{}
-		if err := c.Get(ctx, key, obj); err != nil {
-			return nil, err
-		}
-		return &ScalableRefResult{PodTemplateSpec: obj.Spec.Template, ScalableReplicas: lo.FromPtrOr(obj.Spec.Replicas, 1)}, nil
+		kind = workloads.DeploymentKind
 	case autoscalingv1beta1.KindStatefulSet:
-		obj := &appsv1.StatefulSet{}
-		if err := c.Get(ctx, key, obj); err != nil {
-			return nil, err
-		}
-		return &ScalableRefResult{PodTemplateSpec: obj.Spec.Template, ScalableReplicas: lo.FromPtrOr(obj.Spec.Replicas, 1)}, nil
+		kind = workloads.StatefulSetKind
 	case autoscalingv1beta1.KindReplicaSet:
-		obj := &appsv1.ReplicaSet{}
-		if err := c.Get(ctx, key, obj); err != nil {
-			return nil, err
-		}
-		return &ScalableRefResult{PodTemplateSpec: obj.Spec.Template, ScalableReplicas: lo.FromPtrOr(obj.Spec.Replicas, 1)}, nil
+		kind = workloads.ReplicaSetKind
 	default:
 		return nil, fmt.Errorf("unsupported kind %q", ref.Kind)
 	}
+	template, replicas, err := workloads.NewReader(c).ScalableTemplate(ctx, kind, namespace, ref.Name)
+	if err != nil {
+		return nil, err
+	}
+	return &ScalableRefResult{PodTemplateSpec: *template, ScalableReplicas: replicas}, nil
 }
