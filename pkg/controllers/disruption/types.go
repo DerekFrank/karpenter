@@ -256,6 +256,8 @@ type Command struct {
 	TerminateFirstReason TerminateFirstReason
 	// Reboot is already handed off to its controller, so the queue only records the decision.
 	Reboot bool
+	// markedForDeletion holds the providerIDs of the candidates this command marked for deletion
+	markedForDeletion []string
 }
 
 // Reason returns the disruption reason for this command.

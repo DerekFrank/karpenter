@@ -17,6 +17,7 @@ limitations under the License.
 package integration_test
 
 import (
+	"strconv"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -27,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/test"
@@ -325,6 +327,60 @@ var _ = Describe("StaticCapacity", func() {
 
 			// Should create a replacement node and then remove the drifted one 2 at a time
 			env.ConsistentlyExpectDisruptionsUntilNoneLeft(10, 2, 5*time.Minute)
+		})
+	})
+
+	Context("Drift races", func() {
+		const replicas, limit = 20, 24
+		var nodeClaims []*v1.NodeClaim
+		BeforeEach(func() {
+			nodePool.Spec.Replicas = new(int64(replicas))
+			nodePool.Spec.Limits = v1.Limits{corev1.ResourceName("nodes"): resource.MustParse(strconv.Itoa(limit))}
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "100%"}}
+			if env.IsDefaultNodeClassKWOK() {
+				nodePool.Spec.Template.Spec.Requirements = append(nodePool.Spec.Template.Spec.Requirements, v1.NodeSelectorRequirementWithMinValues{
+					Key:      corev1.LabelInstanceTypeStable,
+					Operator: corev1.NodeSelectorOpIn,
+					Values: []string{
+						"c-16x-amd64-linux",
+						"c-16x-arm64-linux",
+					},
+				})
+			}
+			env.ExpectCreated(nodeClass, nodePool)
+			env.EventuallyExpectInitializedNodeCount("==", replicas)
+			nodeClaims = env.EventuallyExpectCreatedNodeClaimCount("==", replicas)
+			env.EventuallyExpectNodeClaimsReady(nodeClaims...)
+		})
+
+		// #3250: while a drift replacement launches, its candidate must keep counting as pending disruption, or static
+		// deprovisioning sees one NodeClaim too many and deletes the replacement
+		It("should not delete drift replacements when limits.nodes is close to replicas", func() {
+			nodePool.Spec.Template.Annotations = map[string]string{"drift-trigger": "test-value"}
+			env.ExpectUpdated(nodePool)
+			env.ExpectStaticDriftConverged(nodePool, nodeClaims, replicas, limit, 15*time.Minute, false, nil)
+		})
+
+		// After a restart, cluster state must count candidates and replacements correctly from what it observes, rather
+		// than from in-memory state the restart lost
+		It("should converge without exceeding limits.nodes when the controller restarts mid-drift", func() {
+			nodePool.Spec.Template.Annotations = map[string]string{"drift-trigger": "test-value"}
+			env.ExpectUpdated(nodePool)
+			// Replacements may be deleted once the restarted controller abandons the commands that launched them
+			env.ExpectStaticDriftConverged(nodePool, nodeClaims, replicas, limit, 15*time.Minute, true, func() {
+				for range 3 {
+					Eventually(func(g Gomega) {
+						list := &v1.NodeClaimList{}
+						g.Expect(env.Client.List(env, list, client.MatchingLabels{v1.NodePoolLabelKey: nodePool.Name})).To(Succeed())
+						g.Expect(len(list.Items)).To(BeNumerically(">", replicas))
+					}).WithTimeout(5 * time.Minute).WithPolling(200 * time.Millisecond).Should(Succeed())
+					leader := env.ExpectActiveKarpenterPod()
+					env.ExpectDeleted(leader)
+					Eventually(func(g Gomega) {
+						g.Expect(env.ExpectActiveKarpenterPodName()).ToNot(Equal(leader.Name))
+					}).WithTimeout(5 * time.Minute).Should(Succeed())
+				}
+			})
 		})
 	})
 

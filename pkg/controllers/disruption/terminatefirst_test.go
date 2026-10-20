@@ -131,6 +131,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 			// limit, so terminate-first applies.
 			nodePool.Spec.Limits = v1.Limits{resources.Node: resource.MustParse("1")}
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			cluster.UpdateNodePool(nodePool)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 			ExpectSingletonReconciled(ctx, staticDriftController)
@@ -147,6 +148,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 			nodePool.Spec.Limits = v1.Limits{resources.Node: resource.MustParse("1")}
 			nodePool.StatusConditions().SetFalse(v1.ConditionTypeValidationSucceeded, "NotReady", "NotReady")
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			cluster.UpdateNodePool(nodePool)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 			ExpectSingletonReconciled(ctx, staticDriftController)
@@ -161,6 +163,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 			// limit, so it replaces-first rather than terminating first even with the gate on.
 			nodePool.Spec.Limits = v1.Limits{resources.Node: resource.MustParse("2")}
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			cluster.UpdateNodePool(nodePool)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 			ExpectSingletonReconciled(ctx, staticDriftController)
@@ -174,6 +177,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 		It("replaces-first for a static NodePool when TerminateFirstDrift is disabled", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(false)}}))
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			cluster.UpdateNodePool(nodePool)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 			ExpectSingletonReconciled(ctx, staticDriftController)
@@ -221,6 +225,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 				ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacity: lo.ToPtr(true), TerminateFirstDrift: lo.ToPtr(true)}}))
 				withReservation(0)
 				ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+				cluster.UpdateNodePool(nodePool)
 				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 				ExpectSingletonReconciled(ctx, staticDriftController)
@@ -254,6 +259,8 @@ var _ = Describe("TerminateFirstDrift", func() {
 				})
 				healthyNodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
 				ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, healthyPool, healthyNodeClaim, healthyNode)
+				cluster.UpdateNodePool(nodePool)
+				cluster.UpdateNodePool(healthyPool)
 				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController,
 					[]*corev1.Node{node, healthyNode}, []*v1.NodeClaim{nodeClaim, healthyNodeClaim})
 				erroring := &instanceTypesErrorCloudProvider{CloudProvider: cloudProvider, nodePools: []string{nodePool.Name}}
@@ -277,6 +284,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 				withReservation(0)
 				nodePool.Spec.Template.Spec.Requirements[1].Values = []string{v1.CapacityTypeReserved, v1.CapacityTypeOnDemand}
 				ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+				cluster.UpdateNodePool(nodePool)
 				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 				ExpectSingletonReconciled(ctx, staticDriftController)
@@ -302,6 +310,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 					}),
 				})
 				ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+				cluster.UpdateNodePool(nodePool)
 				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 				ExpectSingletonReconciled(ctx, staticDriftController)
@@ -336,6 +345,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 					nodeClaims, nodes = append(nodeClaims, nc), append(nodes, n)
 				}
 				ExpectApplied(ctx, env.Client, nodePool)
+				cluster.UpdateNodePool(nodePool)
 				for i := range nodes {
 					ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
 				}
@@ -357,6 +367,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 				nodeClaim.Labels[v1.CapacityTypeLabelKey] = v1.CapacityTypeOnDemand
 				node.Labels[v1.CapacityTypeLabelKey] = v1.CapacityTypeOnDemand
 				ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+				cluster.UpdateNodePool(nodePool)
 				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 				ExpectSingletonReconciled(ctx, staticDriftController)
@@ -371,6 +382,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 				nodeClaim.Labels[cloudprovider.ReservationIDLabel] = "r-canceled"
 				node.Labels[cloudprovider.ReservationIDLabel] = "r-canceled"
 				ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+				cluster.UpdateNodePool(nodePool)
 				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 				ExpectSingletonReconciled(ctx, staticDriftController)
@@ -383,6 +395,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 				ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacity: lo.ToPtr(true), TerminateFirstDrift: lo.ToPtr(true)}}))
 				withReservation(1)
 				ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+				cluster.UpdateNodePool(nodePool)
 				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 				ExpectSingletonReconciled(ctx, staticDriftController)
@@ -397,6 +410,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 				ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacity: lo.ToPtr(true), TerminateFirstDrift: lo.ToPtr(false)}}))
 				withReservation(0)
 				ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+				cluster.UpdateNodePool(nodePool)
 				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 				ExpectSingletonReconciled(ctx, staticDriftController)
@@ -424,6 +438,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 				})
 				odNodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
 				ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, odNodeClaim, odNode)
+				cluster.UpdateNodePool(nodePool)
 				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node, odNode}, []*v1.NodeClaim{nodeClaim, odNodeClaim})
 
 				ExpectSingletonReconciled(ctx, staticDriftController)
@@ -494,6 +509,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
 			setupReservedOffering(0, true, v1.CapacityTypeReserved) // full but healthy (row 1), reserved-only pool
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			cluster.UpdateNodePool(nodePool)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			bindReschedulablePod(node)
 			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
@@ -517,6 +533,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
 			setupReservedOffering(0, true, v1.CapacityTypeReserved) // full but healthy, reserved-only pool
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			cluster.UpdateNodePool(nodePool)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			// Two reschedulable pods that can't co-locate need two nodes, but crediting the candidate's reservation frees
 			// only one slot. Pass 2 runs strict, so the surplus pod fails and we must NOT terminate-first — a fallback
@@ -533,6 +550,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
 			setupReservedOffering(0, false, v1.CapacityTypeReserved) // full AND unavailable (row 2): expiring / ICE'd / incompatible
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			cluster.UpdateNodePool(nodePool)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			bindReschedulablePod(node)
 			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
@@ -549,6 +567,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(false), ReservedCapacity: lo.ToPtr(true)}}))
 			setupReservedOffering(0, true, v1.CapacityTypeReserved) // full but healthy (row 1), reserved-only pool
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			cluster.UpdateNodePool(nodePool)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			bindReschedulablePod(node)
 			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
@@ -567,6 +586,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
 			setupReservedOffering(0, true, v1.CapacityTypeReserved, v1.CapacityTypeOnDemand) // full but healthy, on-demand fallback allowed
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			cluster.UpdateNodePool(nodePool)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			bindReschedulablePod(node)
 			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
@@ -583,6 +603,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: lo.ToPtr(true), ReservedCapacity: lo.ToPtr(true)}}))
 			setupReservedOffering(5, true, v1.CapacityTypeReserved) // spare reservation capacity -> can grow in place
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			cluster.UpdateNodePool(nodePool)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			bindReschedulablePod(node)
 			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
@@ -615,6 +636,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 			setupReservedOffering(0, true, v1.CapacityTypeReserved) // full but healthy (Available=true, cap=0)
 			od := setupODFallbackNodePool()
 			ExpectApplied(ctx, env.Client, nodePool, od, nodeClaim, node)
+			cluster.UpdateNodePool(nodePool)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			bindReschedulablePod(node)
 			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
@@ -634,6 +656,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 			setupReservedOffering(0, false, v1.CapacityTypeReserved) // full AND unavailable (Available=false)
 			od := setupODFallbackNodePool()
 			ExpectApplied(ctx, env.Client, nodePool, od, nodeClaim, node)
+			cluster.UpdateNodePool(nodePool)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			bindReschedulablePod(node)
 			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
