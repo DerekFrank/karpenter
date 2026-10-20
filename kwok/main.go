@@ -50,7 +50,6 @@ func main() {
 			overlayUndecoratedCloudProvider,
 			clusterState,
 			op.InstanceTypeStore,
-			op.PredictionStore,
 			controllers.WithVPAPrediction(),
 		)...).Start(ctx)
 }

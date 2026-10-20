@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"maps"
 
+	"github.com/awslabs/operatorpkg/serrors"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	karpopts "sigs.k8s.io/karpenter/pkg/operator/options"
 )
 
@@ -55,6 +57,7 @@ var (
 // belonging to only a handful of namespaces and workloads.
 type DefaultTopologySpreadInjector struct {
 	kubeClient client.Client
+	cluster    *state.Cluster
 	// servicesByNamespace caches the Services in a namespace, keyed by namespace. A namespace with no Services caches
 	// an empty slice, so it isn't re-listed for every pod.
 	servicesByNamespace map[string][]corev1.Service
@@ -87,9 +90,16 @@ type selectorCacheKey struct {
 	labels string
 }
 
-func NewDefaultTopologySpreadInjector(kubeClient client.Client) *DefaultTopologySpreadInjector {
+// HasDefaultTopologySpread reports whether cluster-level default topology spread constraints are configured.
+func HasDefaultTopologySpread(ctx context.Context) bool {
+	cfg := karpopts.FromContext(ctx).SchedulerConfig
+	return cfg != nil && cfg.PodTopologySpread != nil && len(cfg.PodTopologySpread.DefaultConstraints) != 0
+}
+
+func NewDefaultTopologySpreadInjector(kubeClient client.Client, cluster *state.Cluster) *DefaultTopologySpreadInjector {
 	return &DefaultTopologySpreadInjector{
 		kubeClient:             kubeClient,
+		cluster:                cluster,
 		servicesByNamespace:    map[string][]corev1.Service{},
 		ownerContributionByUID: map[types.UID]*ownerContribution{},
 		selectorByPodShape:     map[selectorCacheKey]*metav1.LabelSelector{},
@@ -108,10 +118,10 @@ func NewDefaultTopologySpreadInjector(kubeClient client.Client) *DefaultTopology
 // NOTE: mutating the pods in place is safe because every pod reaching the scheduler is obtained from a cache-backed
 // List, which deep-copies. Callers passing pods from another source must copy them first.
 func (d *DefaultTopologySpreadInjector) Inject(ctx context.Context, pods []*corev1.Pod) {
-	cfg := karpopts.FromContext(ctx).SchedulerConfig
-	if cfg == nil || cfg.PodTopologySpread == nil || len(cfg.PodTopologySpread.DefaultConstraints) == 0 {
+	if !HasDefaultTopologySpread(ctx) {
 		return
 	}
+	cfg := karpopts.FromContext(ctx).SchedulerConfig
 	for _, p := range pods {
 		if len(p.Spec.TopologySpreadConstraints) != 0 {
 			continue
@@ -267,11 +277,11 @@ func (d *DefaultTopologySpreadInjector) resolveOwnerContribution(ctx context.Con
 		}
 		return &ownerContribution{matchLabels: maps.Clone(rc.Spec.Selector)}, nil
 	case replicaSetKind:
-		rs := &appsv1.ReplicaSet{}
-		if err := d.kubeClient.Get(ctx, key, rs, client.UnsafeDisableDeepCopy); err != nil {
-			return nil, fmt.Errorf("getting replicaset, %w", err)
+		selector, ok := d.cluster.ReplicaSetSelector(namespace, owner)
+		if !ok {
+			return nil, serrors.Wrap(fmt.Errorf("replicaset not found in cluster state"), "ReplicaSet", klog.KRef(namespace, owner.Name))
 		}
-		return &ownerContribution{matchExpressions: requirementsFrom(rs.Spec.Selector)}, nil
+		return &ownerContribution{matchExpressions: requirementsFrom(selector)}, nil
 	case statefulSetKind:
 		ss := &appsv1.StatefulSet{}
 		if err := d.kubeClient.Get(ctx, key, ss, client.UnsafeDisableDeepCopy); err != nil {
