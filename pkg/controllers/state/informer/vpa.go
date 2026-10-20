@@ -140,7 +140,7 @@ func (c *VPAController) Name() string {
 }
 
 func (c *VPAController) Register(ctx context.Context, m manager.Manager) error {
-	if err := c.store.RegisterTargetKinds(ctx, m.GetCache(), prediction.SupportedTargets.UnsortedList()...); err != nil {
+	if err := c.store.RegisterTargetKinds(prediction.SupportedTargets.UnsortedList()...); err != nil {
 		return err
 	}
 	return controllerruntime.NewControllerManagedBy(m).

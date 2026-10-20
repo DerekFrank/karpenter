@@ -344,7 +344,7 @@ func (p *Provisioner) NewScheduler(
 	// synthesis, ScheduleAnyway relaxation, and consolidation - flows through the existing per-pod path with no new
 	// logic. The injected constraints exist only on these scheduling-time copies and are never written back to the API
 	// server.
-	scheduler.NewDefaultTopologySpreadInjector(p.kubeClient).Inject(ctx, pods)
+	scheduler.NewDefaultTopologySpreadInjector(p.kubeClient, p.cluster).Inject(ctx, pods)
 
 	// Calculate cluster topology, if a context error occurs, it is wrapped and returned
 	topology, err := scheduler.NewTopology(ctx, p.kubeClient, p.cluster, stateNodes, nodePools, instanceTypes, pods, opts...)

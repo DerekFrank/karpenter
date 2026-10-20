@@ -72,7 +72,7 @@ var _ = AfterSuite(func() {
 })
 
 var _ = BeforeEach(func() {
-	store = prediction.NewStore(env.Client)
+	store = prediction.NewStore(cluster)
 	cluster = state.NewCluster(env.Clock, env.Client, fake.NewCloudProvider())
 	recorder = test.NewEventRecorder()
 	controller = informer.NewVPAController(env.Client, store, cluster, recorder)

@@ -62,6 +62,7 @@ import (
 	nodepoolvalidation "sigs.k8s.io/karpenter/pkg/controllers/nodepool/validation"
 	"sigs.k8s.io/karpenter/pkg/controllers/pod/deletioncost"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
+	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	statenodeclaimgc "sigs.k8s.io/karpenter/pkg/controllers/state/nodeclaimgc"
@@ -113,12 +114,12 @@ func NewControllers(
 	overlayUndecoratedCloudProvider cloudprovider.CloudProvider,
 	cluster *state.Cluster,
 	instanceTypeStore *nodeoverlay.InstanceTypeStore,
-	predictionStore *prediction.Store,
 	opts ...option.Function[ControllerOptions],
 ) []controller.Controller {
 	o := option.Resolve(opts...)
 	deviceAllocationController := deviceallocation.NewController(kubeClient)
 	virtualPodCache := virtualpods.NewVirtualPodCache(kubeClient)
+	predictionStore := prediction.NewStore(cluster)
 	p := provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, cluster, clock, deviceAllocationController, virtualPodCache, predictionStore)
 	evictionQueue := terminator.NewQueue(clock, kubeClient, recorder)
 	disruptionQueue := disruption.NewQueue(kubeClient, recorder, cluster, clock, p)
@@ -223,6 +224,14 @@ func NewControllers(
 			deletionCostQueue,
 			deletioncost.NewController(clock, kubeClient, cloudProvider, cluster, deletionCostQueue),
 		)
+	}
+	// Predictions resolve pods through their ReplicaSet and Job, and default topology spread folds in ReplicaSet
+	// selectors, so scheduling reads both from cluster state.
+	if options.FromContext(ctx).FeatureGates.PredictionEnabled || scheduling.HasDefaultTopologySpread(ctx) {
+		controllers = append(controllers, informer.NewReplicaSetController(kubeClient, cluster))
+	}
+	if options.FromContext(ctx).FeatureGates.PredictionEnabled {
+		controllers = append(controllers, informer.NewJobController(kubeClient, cluster))
 	}
 	if o.enableVPAPrediction && options.FromContext(ctx).FeatureGates.PredictionEnabled {
 		controllers = append(controllers, informer.NewVPAController(kubeClient, predictionStore, cluster, recorder))
