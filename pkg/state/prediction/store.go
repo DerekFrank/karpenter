@@ -26,20 +26,13 @@ import (
 
 	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/samber/lo"
-	appsv1 "k8s.io/api/apps/v1"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/klog/v2"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
@@ -82,8 +75,6 @@ type workloadEntry struct {
 // then lexicographically smallest name) to determine which prediction is active.
 type Store struct {
 	sync.RWMutex
-	// kubeClient resolves a pod's owners to the workload its prediction is stored under
-	kubeClient    client.Client
 	hydrationCh   chan struct{}
 	hydrationOnce sync.Once
 	// byWorkload indexes all contending predictions by the workload they apply to.
@@ -92,11 +83,26 @@ type Store struct {
 	// bySource maps the prediction source identity to its WorkloadReference, for deletion cleanup.
 	bySource    map[types.NamespacedName]WorkloadReference
 	targetKinds sets.Set[schema.GroupKind]
+	owners      Owners
 }
 
-func NewStore(kubeClient client.Client) *Store {
+// Owners resolves a pod's ReplicaSet or Job to the controller of it, as cluster state tracks them.
+type Owners interface {
+	ControllerOf(namespace string, ref *metav1.OwnerReference) (*metav1.OwnerReference, bool)
+}
+
+// parentKinds maps each kind that pods can be controlled by to the kind that controls it in turn, which a pod's
+// prediction is stored under when that kind is targeted.
+var parentKinds = map[schema.GroupKind]schema.GroupKind{
+	{Group: "apps", Kind: "ReplicaSet"}: {Group: "apps", Kind: "Deployment"},
+	{Group: "batch", Kind: "Job"}:       {Group: "batch", Kind: "CronJob"},
+}
+
+// NewStore returns a store that resolves pods' owners through owners, which may be nil to resolve each pod to its own
+// controller.
+func NewStore(owners Owners) *Store {
 	return &Store{
-		kubeClient:  kubeClient,
+		owners:      owners,
 		hydrationCh: make(chan struct{}),
 		byWorkload:  make(map[WorkloadReference][]workloadEntry),
 		bySource:    make(map[types.NamespacedName]WorkloadReference),
@@ -104,26 +110,13 @@ func NewStore(kubeClient client.Client) *Store {
 	}
 }
 
-func (s *Store) RegisterTargetKinds(ctx context.Context, informers cache.Informers, kinds ...schema.GroupKind) error {
+// RegisterTargetKinds records the workload kinds a prediction source targets.
+func (s *Store) RegisterTargetKinds(kinds ...schema.GroupKind) error {
 	for _, kind := range kinds {
 		if !SupportedTargets.Has(kind) {
 			return serrors.Wrap(fmt.Errorf("unsupported prediction target kind"), "kind", kind.Kind)
 		}
 		s.targetKinds.Insert(kind)
-		var owner schema.GroupVersionKind
-		switch kind {
-		case schema.GroupKind{Group: "apps", Kind: "Deployment"}:
-			owner = appsv1.SchemeGroupVersion.WithKind("ReplicaSet")
-		case schema.GroupKind{Group: "batch", Kind: "CronJob"}:
-			owner = batchv1.SchemeGroupVersion.WithKind("Job")
-		default:
-			continue
-		}
-		obj := &metav1.PartialObjectMetadata{}
-		obj.SetGroupVersionKind(owner)
-		if _, err := informers.GetInformer(ctx, obj); err != nil {
-			return serrors.Wrap(fmt.Errorf("registering owner informer, %w", err), "kind", owner.Kind)
-		}
 	}
 	return nil
 }
@@ -260,23 +253,24 @@ func stronger(a, b workloadEntry) bool {
 
 var podCountOne = resource.MustParse("1")
 
-// OwnerResolutions is only valid for a single scheduling run, since owners come and go, e.g. a new ReplicaSet on every
-// rollout.
-type OwnerResolutions map[types.UID]WorkloadReference
-
 // PredictedRequests returns the total resource requests of the pods with predictions applied. For each container with
 // a prediction, it replaces current requests with the predicted value. Containers without a prediction, and pods
-// whose workload has no prediction, keep their current requests. cachedOwnerResolutions may be nil.
-func (s *Store) PredictedRequests(ctx context.Context, cachedOwnerResolutions OwnerResolutions, pods ...*corev1.Pod) corev1.ResourceList {
-	if s.Len() == 0 {
+// whose workload has no prediction, keep their current requests. A nil store applies no predictions.
+func (s *Store) PredictedRequests(pods ...*corev1.Pod) corev1.ResourceList {
+	if s == nil {
+		return resources.RequestsForPods(pods...)
+	}
+	s.RLock()
+	defer s.RUnlock()
+	if len(s.byWorkload) == 0 {
 		return resources.RequestsForPods(pods...)
 	}
 	return resources.Merge(lo.Map(pods, func(pod *corev1.Pod, _ int) corev1.ResourceList {
-		workload, ok := s.resolveWorkload(ctx, pod, cachedOwnerResolutions)
+		workload, ok := s.resolveWorkload(pod)
 		if !ok {
 			return resources.RequestsForPods(pod)
 		}
-		pred, ok := s.Get(workload)
+		pred, ok := s.active(workload)
 		if !ok {
 			return resources.RequestsForPods(pod)
 		}
@@ -291,74 +285,24 @@ func (s *Store) PredictedRequests(ctx context.Context, cachedOwnerResolutions Ow
 	})...)
 }
 
-// resolveWorkload resolves a pod to the workload its prediction is stored under, which is always one of
-// SupportedTargets. Keep the two in sync.
-//
-//nolint:gocyclo
-func (s *Store) resolveWorkload(ctx context.Context, pod *corev1.Pod, cachedOwnerResolutions OwnerResolutions) (WorkloadReference, bool) {
+// resolveWorkload resolves a pod to the workload its prediction is stored under: the Deployment or CronJob controlling
+// its ReplicaSet or Job when that kind is targeted, otherwise its own controller. The caller must hold the lock.
+func (s *Store) resolveWorkload(pod *corev1.Pod) (WorkloadReference, bool) {
 	ref := metav1.GetControllerOfNoCopy(pod)
 	if ref == nil {
 		return WorkloadReference{}, false
 	}
-	if workload, ok := cachedOwnerResolutions[ref.UID]; ok {
-		return workload, workload != WorkloadReference{}
-	}
-	var workloadRef *metav1.OwnerReference
-	switch ref.Kind {
-	case "ReplicaSet":
-		if !s.targetKinds.Has(schema.GroupKind{Group: "apps", Kind: "Deployment"}) {
-			workloadRef = ref
-			break
-		}
-		rs := &metav1.PartialObjectMetadata{}
-		rs.SetGroupVersionKind(schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "ReplicaSet"})
-		if err := s.kubeClient.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: ref.Name}, rs); err != nil {
-			if !apierrors.IsNotFound(err) {
-				log.FromContext(ctx).WithValues("Pod", klog.KObj(pod), "ReplicaSet", klog.KRef(pod.Namespace, ref.Name)).V(1).Info("failed resolving pod owner, skipping prediction", "error", err)
-			}
-			break
-		}
-		workloadRef = ref
-		if owner := metav1.GetControllerOfNoCopy(rs); owner != nil && owner.Kind == "Deployment" {
-			workloadRef = owner
-		}
-	case "StatefulSet", "DaemonSet", "ReplicationController":
-		workloadRef = ref
-	case "Job":
-		if !s.targetKinds.Has(schema.GroupKind{Group: "batch", Kind: "CronJob"}) {
-			workloadRef = ref
-			break
-		}
-		job := &metav1.PartialObjectMetadata{}
-		job.SetGroupVersionKind(schema.GroupVersionKind{Group: "batch", Version: "v1", Kind: "Job"})
-		if err := s.kubeClient.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: ref.Name}, job); err != nil {
-			if !apierrors.IsNotFound(err) {
-				log.FromContext(ctx).WithValues("Pod", klog.KObj(pod), "Job", klog.KRef(pod.Namespace, ref.Name)).V(1).Info("failed resolving pod owner, skipping prediction", "error", err)
-			}
-			break
-		}
-		workloadRef = ref
-		if owner := metav1.GetControllerOfNoCopy(job); owner != nil && owner.Kind == "CronJob" {
-			workloadRef = owner
+	if parent, ok := parentKinds[groupKind(ref)]; ok && s.targetKinds.Has(parent) && s.owners != nil {
+		if owner, ok := s.owners.ControllerOf(pod.Namespace, ref); ok && groupKind(owner) == parent {
+			ref = owner
 		}
 	}
-	var workload WorkloadReference
-	if workloadRef != nil {
-		workload = WorkloadReference{
-			GroupKind:      schema.FromAPIVersionAndKind(workloadRef.APIVersion, workloadRef.Kind).GroupKind(),
-			NamespacedName: types.NamespacedName{Namespace: pod.Namespace, Name: workloadRef.Name},
-		}
-	}
-	if !s.targetKinds.Has(workload.GroupKind) {
-		if cachedOwnerResolutions != nil {
-			cachedOwnerResolutions[ref.UID] = WorkloadReference{}
-		}
-		return WorkloadReference{}, false
-	}
-	if cachedOwnerResolutions != nil {
-		cachedOwnerResolutions[ref.UID] = workload
-	}
-	return workload, true
+	workload := WorkloadReference{GroupKind: groupKind(ref), NamespacedName: types.NamespacedName{Namespace: pod.Namespace, Name: ref.Name}}
+	return workload, s.targetKinds.Has(workload.GroupKind)
+}
+
+func groupKind(ref *metav1.OwnerReference) schema.GroupKind {
+	return schema.FromAPIVersionAndKind(ref.APIVersion, ref.Kind).GroupKind()
 }
 
 func applyPredictions(containers []corev1.Container, pred *Prediction) []corev1.Container {

@@ -24,10 +24,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/cache/informertest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/karpenter/pkg/state/prediction"
@@ -39,10 +37,8 @@ var _ = Describe("PredictedRequests", func() {
 	var store *prediction.Store
 
 	BeforeEach(func() {
-		store = prediction.NewStore(env.Client)
-		metaScheme := runtime.NewScheme()
-		Expect(metav1.AddMetaToScheme(metaScheme)).To(Succeed())
-		Expect(store.RegisterTargetKinds(ctx, &informertest.FakeInformers{Scheme: metaScheme}, prediction.SupportedTargets.UnsortedList()...)).To(Succeed())
+		store = prediction.NewStore(cluster)
+		Expect(store.RegisterTargetKinds(prediction.SupportedTargets.UnsortedList()...)).To(Succeed())
 	})
 
 	It("should return currentRequests when pod has no owner", func() {
@@ -54,7 +50,7 @@ var _ = Describe("PredictedRequests", func() {
 				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("50m")},
 			},
 		})
-		result := store.PredictedRequests(ctx, nil, pod)
+		result := store.PredictedRequests(pod)
 		Expect(result.Cpu().Cmp(resource.MustParse("50m"))).To(Equal(0))
 	})
 
@@ -70,6 +66,7 @@ var _ = Describe("PredictedRequests", func() {
 			APIVersion: "apps/v1", Kind: "Deployment", Name: dep.Name, UID: dep.UID, Controller: lo.ToPtr(true),
 		}}
 		ExpectApplied(ctx, env.Client, rs)
+		cluster.UpdateReplicaSet(rs)
 
 		pod := test.UnschedulablePod(test.PodOptions{
 			ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
@@ -79,7 +76,7 @@ var _ = Describe("PredictedRequests", func() {
 				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
 			},
 		})
-		result := store.PredictedRequests(ctx, nil, pod)
+		result := store.PredictedRequests(pod)
 		Expect(result.Cpu().Cmp(resource.MustParse("100m"))).To(Equal(0))
 	})
 
@@ -92,6 +89,7 @@ var _ = Describe("PredictedRequests", func() {
 			APIVersion: "apps/v1", Kind: "Deployment", Name: dep.Name, UID: dep.UID, Controller: lo.ToPtr(true),
 		}}
 		ExpectApplied(ctx, env.Client, rs)
+		cluster.UpdateReplicaSet(rs)
 
 		pod := test.UnschedulablePod(test.PodOptions{
 			ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
@@ -119,13 +117,13 @@ var _ = Describe("PredictedRequests", func() {
 			}},
 			env.Clock.Now(),
 		)
-		result := store.PredictedRequests(ctx, nil, pod)
+		result := store.PredictedRequests(pod)
 		Expect(result.Cpu().Cmp(resource.MustParse("600m"))).To(Equal(0))
 		Expect(result.Memory().Cmp(resource.MustParse("256Mi"))).To(Equal(0))
 		Expect(result.Pods().Cmp(resource.MustParse("1"))).To(Equal(0))
 	})
 
-	It("should resolve pods sharing an owner from the cached owner resolution", func() {
+	It("should stop resolving a pod to its deployment once its replicaset is orphaned or deleted", func() {
 		dep := test.Deployment()
 		ExpectApplied(ctx, env.Client, dep)
 
@@ -134,31 +132,40 @@ var _ = Describe("PredictedRequests", func() {
 			APIVersion: "apps/v1", Kind: "Deployment", Name: dep.Name, UID: dep.UID, Controller: lo.ToPtr(true),
 		}}
 		ExpectApplied(ctx, env.Client, rs)
+		cluster.UpdateReplicaSet(rs)
 
-		pods := test.UnschedulablePods(test.PodOptions{
+		pod := test.UnschedulablePod(test.PodOptions{
 			ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rs.Name, UID: rs.UID, Controller: lo.ToPtr(true),
 			}}},
 			ResourceRequirements: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
 			},
-		}, 2)
-		pods[1].Spec.Containers[0].Name = pods[0].Spec.Containers[0].Name
+		})
 		store.Set(
 			types.NamespacedName{Namespace: "default", Name: "vpa-web"},
 			prediction.WorkloadReference{GroupKind: schema.GroupKind{Group: "apps", Kind: "Deployment"}, NamespacedName: client.ObjectKeyFromObject(dep)},
 			&prediction.Prediction{Containers: map[string]corev1.ResourceList{
-				pods[0].Spec.Containers[0].Name: {corev1.ResourceCPU: resource.MustParse("500m")},
+				pod.Spec.Containers[0].Name: {corev1.ResourceCPU: resource.MustParse("500m")},
 			}},
 			env.Clock.Now(),
 		)
-		cachedOwnerResolutions := prediction.OwnerResolutions{}
-		result := store.PredictedRequests(ctx, cachedOwnerResolutions, pods[0])
+		result := store.PredictedRequests(pod)
 		Expect(result.Cpu().Cmp(resource.MustParse("500m"))).To(Equal(0))
 
-		ExpectDeleted(ctx, env.Client, rs)
-		result = store.PredictedRequests(ctx, cachedOwnerResolutions, pods[1])
+		orphaned := rs.DeepCopy()
+		orphaned.OwnerReferences = nil
+		cluster.UpdateReplicaSet(orphaned)
+		result = store.PredictedRequests(pod)
+		Expect(result.Cpu().Cmp(resource.MustParse("100m"))).To(Equal(0))
+
+		cluster.UpdateReplicaSet(rs)
+		result = store.PredictedRequests(pod)
 		Expect(result.Cpu().Cmp(resource.MustParse("500m"))).To(Equal(0))
+
+		cluster.DeleteReplicaSet(client.ObjectKeyFromObject(rs))
+		result = store.PredictedRequests(pod)
+		Expect(result.Cpu().Cmp(resource.MustParse("100m"))).To(Equal(0))
 	})
 
 	It("should match a prediction by workload name regardless of the workload's UID", func() {
@@ -181,7 +188,7 @@ var _ = Describe("PredictedRequests", func() {
 			}},
 			env.Clock.Now(),
 		)
-		result := store.PredictedRequests(ctx, nil, pod)
+		result := store.PredictedRequests(pod)
 		Expect(result.Cpu().Cmp(resource.MustParse("750m"))).To(Equal(0))
 	})
 
@@ -206,7 +213,7 @@ var _ = Describe("PredictedRequests", func() {
 			}},
 			env.Clock.Now(),
 		)
-		result := store.PredictedRequests(ctx, nil, pod)
+		result := store.PredictedRequests(pod)
 		Expect(result.Memory().Cmp(resource.MustParse("1Gi"))).To(Equal(0))
 	})
 
@@ -231,7 +238,7 @@ var _ = Describe("PredictedRequests", func() {
 			}},
 			env.Clock.Now(),
 		)
-		result := store.PredictedRequests(ctx, nil, pod)
+		result := store.PredictedRequests(pod)
 		Expect(result.Cpu().Cmp(resource.MustParse("250m"))).To(Equal(0))
 	})
 
@@ -249,6 +256,7 @@ var _ = Describe("PredictedRequests", func() {
 			}}},
 		}
 		ExpectApplied(ctx, env.Client, job)
+		cluster.UpdateJob(job)
 
 		pod := test.UnschedulablePod(test.PodOptions{
 			ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
@@ -267,7 +275,7 @@ var _ = Describe("PredictedRequests", func() {
 			}},
 			env.Clock.Now(),
 		)
-		result := store.PredictedRequests(ctx, nil, pod)
+		result := store.PredictedRequests(pod)
 		Expect(result.Cpu().Cmp(resource.MustParse("2"))).To(Equal(0))
 	})
 
@@ -280,6 +288,7 @@ var _ = Describe("PredictedRequests", func() {
 			}}},
 		}
 		ExpectApplied(ctx, env.Client, job)
+		cluster.UpdateJob(job)
 
 		pod := test.UnschedulablePod(test.PodOptions{
 			ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
@@ -298,13 +307,13 @@ var _ = Describe("PredictedRequests", func() {
 			}},
 			env.Clock.Now(),
 		)
-		result := store.PredictedRequests(ctx, nil, pod)
+		result := store.PredictedRequests(pod)
 		Expect(result.Memory().Cmp(resource.MustParse("4Gi"))).To(Equal(0))
 	})
 
 	It("should resolve a job's pod to the job without looking it up when cronjobs aren't targeted", func() {
-		jobStore := prediction.NewStore(env.Client)
-		Expect(jobStore.RegisterTargetKinds(ctx, &informertest.FakeInformers{}, schema.GroupKind{Group: "batch", Kind: "Job"})).To(Succeed())
+		jobStore := prediction.NewStore(cluster)
+		Expect(jobStore.RegisterTargetKinds(schema.GroupKind{Group: "batch", Kind: "Job"})).To(Succeed())
 
 		pod := test.UnschedulablePod(test.PodOptions{
 			ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
@@ -322,15 +331,13 @@ var _ = Describe("PredictedRequests", func() {
 			}},
 			env.Clock.Now(),
 		)
-		result := jobStore.PredictedRequests(ctx, nil, pod)
+		result := jobStore.PredictedRequests(pod)
 		Expect(result.Memory().Cmp(resource.MustParse("4Gi"))).To(Equal(0))
 	})
 
 	It("should keep current requests for a pod whose workload kind isn't targeted", func() {
-		deploymentStore := prediction.NewStore(env.Client)
-		metaScheme := runtime.NewScheme()
-		Expect(metav1.AddMetaToScheme(metaScheme)).To(Succeed())
-		Expect(deploymentStore.RegisterTargetKinds(ctx, &informertest.FakeInformers{Scheme: metaScheme}, schema.GroupKind{Group: "apps", Kind: "Deployment"})).To(Succeed())
+		deploymentStore := prediction.NewStore(cluster)
+		Expect(deploymentStore.RegisterTargetKinds(schema.GroupKind{Group: "apps", Kind: "Deployment"})).To(Succeed())
 
 		pod := test.UnschedulablePod(test.PodOptions{
 			ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
@@ -348,13 +355,13 @@ var _ = Describe("PredictedRequests", func() {
 			}},
 			env.Clock.Now(),
 		)
-		result := deploymentStore.PredictedRequests(ctx, nil, pod)
+		result := deploymentStore.PredictedRequests(pod)
 		Expect(result.Memory().Cmp(resource.MustParse("1Gi"))).To(Equal(0))
 	})
 
 	It("should resolve a replicaset's pod to the replicaset without looking it up when deployments aren't targeted", func() {
-		rsStore := prediction.NewStore(env.Client)
-		Expect(rsStore.RegisterTargetKinds(ctx, &informertest.FakeInformers{}, schema.GroupKind{Group: "apps", Kind: "ReplicaSet"})).To(Succeed())
+		rsStore := prediction.NewStore(cluster)
+		Expect(rsStore.RegisterTargetKinds(schema.GroupKind{Group: "apps", Kind: "ReplicaSet"})).To(Succeed())
 
 		pod := test.UnschedulablePod(test.PodOptions{
 			ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
@@ -372,13 +379,14 @@ var _ = Describe("PredictedRequests", func() {
 			}},
 			env.Clock.Now(),
 		)
-		result := rsStore.PredictedRequests(ctx, nil, pod)
+		result := rsStore.PredictedRequests(pod)
 		Expect(result.Cpu().Cmp(resource.MustParse("500m"))).To(Equal(0))
 	})
 
 	It("should resolve pod to standalone replicaset with no deployment owner", func() {
 		rs := test.ReplicaSet()
 		ExpectApplied(ctx, env.Client, rs)
+		cluster.UpdateReplicaSet(rs)
 
 		pod := test.UnschedulablePod(test.PodOptions{
 			ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
@@ -397,15 +405,20 @@ var _ = Describe("PredictedRequests", func() {
 			}},
 			env.Clock.Now(),
 		)
-		result := store.PredictedRequests(ctx, nil, pod)
+		result := store.PredictedRequests(pod)
 		Expect(result.Cpu().Cmp(resource.MustParse("300m"))).To(Equal(0))
 	})
 
-	It("should return currentRequests when ReplicaSet owner is not found and keep them for the run", func() {
+	It("should resolve a pod to its replicaset until the replicaset's deployment is known", func() {
+		dep := test.Deployment()
 		rs := test.ReplicaSet()
+		rs.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: "apps/v1", Kind: "Deployment", Name: dep.Name, UID: "dep-uid", Controller: lo.ToPtr(true),
+		}}
+		rs.UID = "rs-uid"
 		pod := test.UnschedulablePod(test.PodOptions{
 			ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rs.Name, UID: "rs-uid", Controller: lo.ToPtr(true),
+				APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rs.Name, UID: rs.UID, Controller: lo.ToPtr(true),
 			}}},
 			ResourceRequirements: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")},
@@ -413,19 +426,18 @@ var _ = Describe("PredictedRequests", func() {
 		})
 		store.Set(
 			types.NamespacedName{Namespace: "default", Name: "vpa-web"},
-			prediction.WorkloadReference{GroupKind: schema.GroupKind{Group: "apps", Kind: "ReplicaSet"}, NamespacedName: client.ObjectKeyFromObject(rs)},
+			prediction.WorkloadReference{GroupKind: schema.GroupKind{Group: "apps", Kind: "Deployment"}, NamespacedName: client.ObjectKeyFromObject(dep)},
 			&prediction.Prediction{Containers: map[string]corev1.ResourceList{
 				pod.Spec.Containers[0].Name: {corev1.ResourceCPU: resource.MustParse("500m")},
 			}},
 			env.Clock.Now(),
 		)
-		cachedOwnerResolutions := prediction.OwnerResolutions{}
-		result := store.PredictedRequests(ctx, cachedOwnerResolutions, pod)
+		result := store.PredictedRequests(pod)
 		Expect(result.Cpu().Cmp(resource.MustParse("100m"))).To(Equal(0))
 
-		ExpectApplied(ctx, env.Client, rs)
-		result = store.PredictedRequests(ctx, cachedOwnerResolutions, pod)
-		Expect(result.Cpu().Cmp(resource.MustParse("100m"))).To(Equal(0))
+		cluster.UpdateReplicaSet(rs)
+		result = store.PredictedRequests(pod)
+		Expect(result.Cpu().Cmp(resource.MustParse("500m"))).To(Equal(0))
 	})
 
 	It("should apply predictions per-container and sum them for multi-container pods", func() {
@@ -437,6 +449,7 @@ var _ = Describe("PredictedRequests", func() {
 			APIVersion: "apps/v1", Kind: "Deployment", Name: dep.Name, UID: dep.UID, Controller: lo.ToPtr(true),
 		}}
 		ExpectApplied(ctx, env.Client, rs)
+		cluster.UpdateReplicaSet(rs)
 
 		pod := test.UnschedulablePod(test.PodOptions{
 			ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
@@ -472,7 +485,7 @@ var _ = Describe("PredictedRequests", func() {
 			}},
 			env.Clock.Now(),
 		)
-		result := store.PredictedRequests(ctx, nil, pod)
+		result := store.PredictedRequests(pod)
 		// containerSum: main keeps 500m + sidecar gets 200m = 700m
 		// initMax: db-migrate = 2000m
 		// max(700m, 2000m) + overhead(100m) = 2100m
@@ -489,6 +502,7 @@ var _ = Describe("PredictedRequests", func() {
 			APIVersion: "apps/v1", Kind: "Deployment", Name: dep.Name, UID: dep.UID, Controller: lo.ToPtr(true),
 		}}
 		ExpectApplied(ctx, env.Client, rs)
+		cluster.UpdateReplicaSet(rs)
 
 		pod := test.UnschedulablePod(test.PodOptions{
 			ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
@@ -510,7 +524,7 @@ var _ = Describe("PredictedRequests", func() {
 			}},
 			env.Clock.Now(),
 		)
-		result := store.PredictedRequests(ctx, nil, pod)
+		result := store.PredictedRequests(pod)
 		Expect(result.Cpu().Cmp(resource.MustParse("200m"))).To(Equal(0))
 		Expect(result.Memory().Cmp(resource.MustParse("128Mi"))).To(Equal(0))
 	})

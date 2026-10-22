@@ -27,7 +27,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/cache/informertest"
 )
 
 func TestPrediction(t *testing.T) {
@@ -49,7 +48,7 @@ var _ = Describe("Store", func() {
 	})
 
 	It("should reject registering a kind it can't resolve pods to", func() {
-		Expect(store.RegisterTargetKinds(context.Background(), &informertest.FakeInformers{}, schema.GroupKind{Group: "argoproj.io", Kind: "Rollout"})).To(MatchError(ContainSubstring("unsupported prediction target kind")))
+		Expect(store.RegisterTargetKinds(schema.GroupKind{Group: "argoproj.io", Kind: "Rollout"})).To(MatchError(ContainSubstring("unsupported prediction target kind")))
 	})
 
 	It("should keep targets with the same kind and name in different groups apart", func() {

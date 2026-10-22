@@ -66,6 +66,10 @@ type Cluster struct {
 	nodeClaimNameToProviderID map[string]string               // node claim name -> provider id
 	nodePoolResources         map[string]corev1.ResourceList  // node pool name -> resource list
 	daemonSetPods             sync.Map                        // daemonSet -> existing pod
+	replicaSets               sync.Map                        // replicaSet namespaced name -> *workload
+	jobs                      sync.Map                        // job namespaced name -> *workload
+	trackReplicaSets          atomic.Bool
+	trackJobs                 atomic.Bool
 
 	repairPolicyMatcher *health.RepairPolicyMatcher // nil when node repair is disabled
 
@@ -240,6 +244,14 @@ func (c *Cluster) Synced(ctx context.Context) (synced bool) {
 	// that exists in the cluster state but not in the apiserver) but it ensures that we have a state
 	// representation for every node/nodeClaim that exists on the apiserver
 	synced = stateNodeClaimNames.IsSuperset(nodeClaimNames) && stateNodeNames.IsSuperset(nodeNames)
+	if synced {
+		workloadsSynced, err := c.workloadsSynced(ctx)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "failed checking cluster state sync")
+			return false
+		}
+		synced = workloadsSynced
+	}
 	if synced {
 		c.hasSynced.Store(true)
 	}
@@ -686,6 +698,8 @@ func (c *Cluster) Reset() {
 	c.bindings = map[types.NamespacedName]string{}
 	c.antiAffinityPods = sync.Map{}
 	c.daemonSetPods = sync.Map{}
+	c.replicaSets = sync.Map{}
+	c.jobs = sync.Map{}
 	c.podAcks = sync.Map{}
 	c.podsSchedulingAttempted = sync.Map{}
 	c.podsSchedulableTimes = sync.Map{}

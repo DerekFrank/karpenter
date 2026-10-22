@@ -33,6 +33,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
+	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -2964,11 +2965,20 @@ var _ = Describe("Topology", func() {
 
 	Context("DefaultConstraints", func() {
 		var replicaSet *appsv1.ReplicaSet
+		// expectReplicaSetsTracked records the ReplicaSets in cluster state through the ReplicaSet informer, which is where
+		// default spread reads their selectors from.
+		expectReplicaSetsTracked := func(replicaSets ...*appsv1.ReplicaSet) {
+			GinkgoHelper()
+			for _, rs := range replicaSets {
+				ExpectReconcileSucceeded(ctx, informer.NewReplicaSetController(env.Client, cluster), client.ObjectKeyFromObject(rs))
+			}
+		}
 		BeforeEach(func() {
 			// kube-scheduler forbids a labelSelector on defaultConstraints and deduces one per pod from the Services and
 			// the rc/rs/ss that select it, so these tests give the pods a real owner to deduce from.
 			replicaSet = test.ReplicaSet(test.ReplicaSetOptions{Selector: labels})
 			ExpectApplied(ctx, env.Client, replicaSet)
+			expectReplicaSetsTracked(replicaSet)
 		})
 		// Restore default options so a configured default doesn't leak into subsequent tests.
 		AfterEach(func() {
@@ -3193,6 +3203,7 @@ var _ = Describe("Topology", func() {
 			otherLabels := map[string]string{"test": "other"}
 			otherReplicaSet := test.ReplicaSet(test.ReplicaSetOptions{Selector: otherLabels})
 			ExpectApplied(ctx, env.Client, nodePool, otherReplicaSet)
+			expectReplicaSetsTracked(otherReplicaSet)
 			pods := append(
 				ownedPods(3),
 				test.UnschedulablePods(test.PodOptions{ObjectMeta: metav1.ObjectMeta{
@@ -3220,6 +3231,7 @@ var _ = Describe("Topology", func() {
 			oldRS := test.ReplicaSet(test.ReplicaSetOptions{Selector: oldLabels})
 			newRS := test.ReplicaSet(test.ReplicaSetOptions{Selector: newLabels})
 			ExpectApplied(ctx, env.Client, nodePool, oldRS, newRS)
+			expectReplicaSetsTracked(oldRS, newRS)
 			pods := append(
 				test.UnschedulablePods(test.PodOptions{ObjectMeta: metav1.ObjectMeta{
 					Labels: oldLabels, OwnerReferences: []metav1.OwnerReference{ownerReferenceFor(oldRS)},
