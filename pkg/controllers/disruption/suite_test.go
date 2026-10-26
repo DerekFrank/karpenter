@@ -2400,7 +2400,7 @@ func ExpectTaintedNodeCount(ctx context.Context, c client.Client, numTainted int
 func ExpectNewNodeClaimsDeleted(ctx context.Context, c client.Client, wg *sync.WaitGroup, numNewNodeClaims int) {
 	GinkgoHelper()
 	existingNodeClaims := ExpectNodeClaims(ctx, c)
-	existingNodeClaimNames := sets.NewString(lo.Map(existingNodeClaims, func(nc *v1.NodeClaim, _ int) string {
+	existingNodeClaimNames := sets.New[string](lo.Map(existingNodeClaims, func(nc *v1.NodeClaim, _ int) string {
 		return nc.Name
 	})...)
 
