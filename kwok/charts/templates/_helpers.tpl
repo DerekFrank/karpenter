@@ -76,15 +76,6 @@ Karpenter image to use
 {{- end }}
 
 
-{{/* Get PodDisruptionBudget API Version */}}
-{{- define "karpenter.pdb.apiVersion" -}}
-{{- if and (.Capabilities.APIVersions.Has "policy/v1") (semverCompare ">= 1.21-0" .Capabilities.KubeVersion.Version) -}}
-{{- print "policy/v1" -}}
-{{- else -}}
-{{- print "policy/v1beta1" -}}
-{{- end -}}
-{{- end -}}
-
 {{/*
 Patch the label selector on an object
 This template will add a labelSelector using matchLabels to the object referenced at _target if there is no labelSelector specified.
