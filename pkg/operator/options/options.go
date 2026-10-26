@@ -175,7 +175,6 @@ var KarpenterFeatureGates = []FeatureGate{
 
 // Options contains all CLI flags / env vars for karpenter-core. It adheres to the options.Injectable interface.
 type Options struct {
-	ServiceName                      string
 	MetricsPort                      int
 	HealthProbePort                  int
 	KubeClientQPS                    int
@@ -222,7 +221,6 @@ func (fs *FlagSet) BoolVarWithEnv(p *bool, name string, envVar string, val bool,
 }
 
 func (o *Options) AddFlags(fs *FlagSet) {
-	fs.StringVar(&o.ServiceName, "karpenter-service", env.WithDefaultString("KARPENTER_SERVICE", ""), "The Karpenter Service name for the dynamic webhook certificate")
 	fs.IntVar(&o.MetricsPort, "metrics-port", env.WithDefaultInt("METRICS_PORT", 8080), "The port the metric endpoint binds to for operating metrics about the controller itself")
 	fs.IntVar(&o.HealthProbePort, "health-probe-port", env.WithDefaultInt("HEALTH_PROBE_PORT", 8081), "The port the health probe endpoint binds to for reporting controller health")
 	fs.IntVar(&o.KubeClientQPS, "kube-client-qps", env.WithDefaultInt("KUBE_CLIENT_QPS", 200), "The smoothed rate of qps to kube-apiserver")

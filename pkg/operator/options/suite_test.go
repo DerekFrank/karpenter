@@ -47,7 +47,6 @@ func TestOptions(t *testing.T) {
 
 var _ = Describe("Options", func() {
 	var environmentVariables = []string{
-		"KARPENTER_SERVICE",
 		"METRICS_PORT",
 		"HEALTH_PROBE_PORT",
 		"KUBE_CLIENT_QPS",
@@ -104,7 +103,6 @@ var _ = Describe("Options", func() {
 			err := opts.Parse(fs)
 			Expect(err).To(BeNil())
 			expectOptionsMatch(opts, test.Options(test.OptionsFields{
-				ServiceName:                      new(""),
 				MetricsPort:                      new(8080),
 				HealthProbePort:                  new(8081),
 				KubeClientQPS:                    new(200),
@@ -141,7 +139,6 @@ var _ = Describe("Options", func() {
 			os.Setenv("LOG_ERROR_OUTPUT_PATHS", "stderr")
 			err := opts.Parse(
 				fs,
-				"--karpenter-service", "cli",
 				"--metrics-port", "0",
 				"--health-probe-port", "0",
 				"--kube-client-qps", "0",
@@ -165,7 +162,6 @@ var _ = Describe("Options", func() {
 			)
 			Expect(err).To(BeNil())
 			expectOptionsMatch(opts, test.Options(test.OptionsFields{
-				ServiceName:                      new("cli"),
 				MetricsPort:                      new(0),
 				HealthProbePort:                  new(0),
 				KubeClientQPS:                    new(0),
@@ -206,7 +202,6 @@ var _ = Describe("Options", func() {
 		})
 
 		It("should use environment variables when CLI flags aren't set", func() {
-			os.Setenv("KARPENTER_SERVICE", "env")
 			os.Setenv("METRICS_PORT", "0")
 			os.Setenv("HEALTH_PROBE_PORT", "0")
 			os.Setenv("KUBE_CLIENT_QPS", "0")
@@ -234,7 +229,6 @@ var _ = Describe("Options", func() {
 			err := opts.Parse(fs)
 			Expect(err).To(BeNil())
 			expectOptionsMatch(opts, test.Options(test.OptionsFields{
-				ServiceName:                      new("env"),
 				MetricsPort:                      new(0),
 				HealthProbePort:                  new(0),
 				KubeClientQPS:                    new(0),
@@ -296,7 +290,6 @@ var _ = Describe("Options", func() {
 			opts.AddFlags(fs)
 			err := opts.Parse(
 				fs,
-				"--karpenter-service", "cli",
 				"--log-output-paths", "/etc/k8s/test",
 				"--log-error-output-paths", "/etc/k8s/testerror",
 				"--preference-policy", "Respect",
@@ -304,7 +297,6 @@ var _ = Describe("Options", func() {
 			)
 			Expect(err).To(BeNil())
 			expectOptionsMatch(opts, test.Options(test.OptionsFields{
-				ServiceName:                      new("cli"),
 				MetricsPort:                      new(0),
 				HealthProbePort:                  new(0),
 				KubeClientQPS:                    new(0),
@@ -577,7 +569,6 @@ func expectOptionsMatch(optsA, optsB *options.Options) {
 	}
 	Expect(optsA).ToNot(BeNil())
 	Expect(optsB).ToNot(BeNil())
-	Expect(optsA.ServiceName).To(Equal(optsB.ServiceName))
 	Expect(optsA.MetricsPort).To(Equal(optsB.MetricsPort))
 	Expect(optsA.HealthProbePort).To(Equal(optsB.HealthProbePort))
 	Expect(optsA.KubeClientQPS).To(Equal(optsB.KubeClientQPS))
