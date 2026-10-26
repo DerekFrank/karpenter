@@ -28,7 +28,6 @@ import (
 
 type OptionsFields struct {
 	// Vendor Neutral
-	ServiceName                      *string
 	MetricsPort                      *int
 	HealthProbePort                  *int
 	KubeClientQPS                    *int
@@ -76,7 +75,6 @@ func Options(overrides ...OptionsFields) *options.Options {
 	}
 
 	return &options.Options{
-		ServiceName:                      lo.FromPtrOr(opts.ServiceName, ""),
 		MetricsPort:                      lo.FromPtrOr(opts.MetricsPort, 8080),
 		HealthProbePort:                  lo.FromPtrOr(opts.HealthProbePort, 8081),
 		KubeClientQPS:                    lo.FromPtrOr(opts.KubeClientQPS, 200),
