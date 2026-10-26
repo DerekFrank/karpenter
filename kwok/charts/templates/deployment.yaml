@@ -72,8 +72,6 @@ spec:
           image: {{ include "karpenter.controller.image" . }}
           imagePullPolicy: {{ .Values.imagePullPolicy }}
           env:
-            - name: KUBERNETES_MIN_VERSION
-              value: "1.19.0-0"
             - name: KARPENTER_SERVICE
               value: {{ include "karpenter.fullname" . }}
           {{- with .Values.logLevel }}
