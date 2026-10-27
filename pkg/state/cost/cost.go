@@ -41,6 +41,10 @@ import (
 // on NodeClaim objects for cost tracking to function properly.
 var NecessaryLabels = []string{corev1.LabelInstanceTypeStable, v1.CapacityTypeLabelKey, corev1.LabelTopologyZone, v1.NodePoolLabelKey}
 
+func init() {
+	metrics.RegisterNodePoolMetric(CostTrackingErrorsTotal)
+}
+
 var (
 	CostTrackingErrorsTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,

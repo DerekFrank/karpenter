@@ -28,6 +28,12 @@ import (
 
 const dayDuration = time.Hour * 24
 
+func init() {
+	metrics.RegisterNodePoolMetric(DurationSeconds)
+	metrics.RegisterNodePoolMetric(NodesDrainedTotal)
+	metrics.RegisterNodePoolMetric(NodeLifetimeDurationSeconds)
+}
+
 var (
 	DurationSeconds = opmetrics.NewPrometheusSummary(
 		crmetrics.Registry,

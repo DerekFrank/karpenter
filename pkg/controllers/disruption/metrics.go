@@ -17,10 +17,14 @@ limitations under the License.
 package disruption
 
 import (
+	"strings"
+
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/samber/lo"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 )
 
@@ -119,12 +123,80 @@ var (
 	}
 )
 
+// seededMethods are the disruption methods whose series are seeded. Each method fixes the reason and
+// consolidation_type it reports, so its series are listed per method rather than as a product of the two dimensions.
+var seededMethods = []Method{&Repair{}, &Emptiness{}, &StaticDrift{}, &Drift{}, &MultiNodeConsolidation{}, &SingleNodeConsolidation{}}
+
+// seededDecisions are the decisions a recorded command can carry; no-op commands are never recorded.
+var seededDecisions = lo.Reject(DecisionDim.Values, func(v opmetrics.Value, _ int) bool { return v.Name == string(NoOpDecision) })
+
+// methodSeries returns, for each seeded method, base merged with the method's reason and consolidation type.
+func methodSeries(base map[string]string) []map[string]string {
+	return lo.Map(seededMethods, func(m Method, _ int) map[string]string {
+		return lo.Assign(base, map[string]string{
+			metrics.ReasonLabel:    strings.ToLower(string(m.Reason())),
+			ConsolidationTypeLabel: m.ConsolidationType(),
+		})
+	})
+}
+
+// methodDecisionSeries returns methodSeries(base) crossed with every seeded decision.
+func methodDecisionSeries(base map[string]string) []map[string]string {
+	return lo.FlatMap(methodSeries(base), func(labels map[string]string, _ int) []map[string]string {
+		return metrics.Combinations(labels, opmetrics.Label{Name: decisionLabel, Values: seededDecisions})
+	})
+}
+
+// NodeClaimsUnhealthyDisruptedTotal is sparse along image_id and condition, whose values aren't known ahead of time,
+// so it isn't seeded.
 func init() {
-	// Initialize the consolidation_type series that can time out to 0. Only the
-	// multi- and single-node algorithms run a bounded search that can hit a timeout;
-	// empty-node consolidation does not, so it is not pre-initialized here.
+	metrics.Seed(EvaluationDurationSeconds, methodSeries(nil)...)
+	metrics.Seed(DecisionsPerformedTotal, methodDecisionSeries(nil)...)
+	metrics.Seed(DisruptionQueueFailuresTotal, methodDecisionSeries(nil)...)
+	metrics.Seed(FailedValidationsTotal, metrics.Combinations(nil, ConsolidationType)...)
+	// Only the multi- and single-node algorithms run a bounded search that can hit a timeout.
 	for _, ct := range []opmetrics.Value{MultiNodeConsolidationType, SingleNodeConsolidationType} {
-		ConsolidationTimeoutsTotal.Add(0, map[string]string{ConsolidationTypeLabel: ct.Name})
+		metrics.Seed(ConsolidationTimeoutsTotal, map[string]string{ConsolidationTypeLabel: ct.Name})
+	}
+
+	metrics.RegisterNodePoolSeries(NodepoolDecisionsPerformed, func(nodePool *v1.NodePool) []map[string]string {
+		return methodDecisionSeries(map[string]string{metrics.NodePoolLabel: nodePool.Name})
+	})
+	metrics.RegisterNodePoolSeries(TerminateFirstDecisionsTotal, func(nodePool *v1.NodePool) []map[string]string {
+		reasons := lo.Uniq(lo.Map(seededMethods, func(m Method, _ int) string { return strings.ToLower(string(m.Reason())) }))
+		return lo.FlatMap(reasons, func(reason string, _ int) []map[string]string {
+			return metrics.Combinations(map[string]string{metrics.NodePoolLabel: nodePool.Name, metrics.ReasonLabel: reason}, TerminateFirstReasonDim)
+		})
+	})
+	// Balanced consolidation counts moves under every policy but only scores them under the Balanced policy.
+	metrics.RegisterNodePoolSeries(ConsolidationMovesTotal, func(nodePool *v1.NodePool) []map[string]string {
+		return metrics.Combinations(map[string]string{
+			metrics.NodePoolLabel: nodePool.Name,
+			policyLabel:           string(nodePool.Spec.Disruption.ConsolidationPolicy),
+		}, ApprovalDim)
+	})
+	metrics.RegisterNodePoolSeries(ConsolidationScoreHistogram, func(nodePool *v1.NodePool) []map[string]string {
+		if nodePool.Spec.Disruption.ConsolidationPolicy != v1.ConsolidationPolicyBalanced {
+			return nil
+		}
+		return metrics.Combinations(map[string]string{
+			metrics.NodePoolLabel: nodePool.Name,
+			policyLabel:           string(nodePool.Spec.Disruption.ConsolidationPolicy),
+		}, ApprovalDim)
+	})
+	// The voluntary-disruption series of the NodeClaim/Pod disruption counters; pkg/metrics registers the
+	// involuntary ones. Only consolidation reports a consolidation policy, see recordCandidateDisrupted.
+	for _, m := range []opmetrics.CounterMetric{metrics.NodeClaimsDisruptedTotal, metrics.PodsDisruptionInitiatedTotal} {
+		metrics.RegisterNodePoolSeries(m, func(nodePool *v1.NodePool) []map[string]string {
+			return lo.FlatMap(seededMethods, func(method Method, _ int) []map[string]string {
+				return metrics.Combinations(map[string]string{
+					metrics.NodePoolLabel:            nodePool.Name,
+					metrics.ReasonLabel:              strings.ToLower(string(method.Reason())),
+					metrics.ConsolidationPolicyLabel: lo.Ternary(method.ConsolidationType() != "", metrics.ConsolidationPolicyValue(nodePool), ""),
+					metrics.TerminationModeLabel:     metrics.TerminationModeValue(nodePool.Spec.Template.Spec.TerminationGracePeriod),
+				}, metrics.CapacityType)
+			})
+		})
 	}
 }
 

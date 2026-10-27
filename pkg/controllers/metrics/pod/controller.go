@@ -83,6 +83,15 @@ var (
 	}
 )
 
+// The per-pod gauges are labeled with the pod's name and only exist while the pod is in the measured state, so they
+// aren't seeded.
+func init() {
+	metrics.Seed(PodStartupDurationSeconds, nil)
+	metrics.Seed(PodBoundDurationSeconds, metrics.Combinations(nil, podDynamicResourcesLabel)...)
+	metrics.Seed(PodProvisioningBoundDurationSeconds, metrics.Combinations(nil, podDynamicResourcesLabel)...)
+	metrics.Seed(PodProvisioningStartupDurationSeconds, nil)
+}
+
 var (
 	PodState = opmetrics.NewPrometheusGauge(
 		crmetrics.Registry,

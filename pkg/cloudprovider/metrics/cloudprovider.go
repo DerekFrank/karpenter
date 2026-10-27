@@ -83,6 +83,7 @@ var (
 // decorator implements CloudProvider
 var _ cloudprovider.CloudProvider = (*decorator)(nil)
 
+// MethodDuration and ErrorsTotal are sparse along controller, whose values aren't enumerated, so they aren't seeded.
 var MethodDuration = opmetrics.NewPrometheusHistogram(
 	crmetrics.Registry,
 	prometheus.HistogramOpts{

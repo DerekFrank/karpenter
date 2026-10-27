@@ -164,4 +164,55 @@ var _ = Describe("Metrics", func() {
 			Expect(found).To(BeFalse())
 		}
 	})
+	DescribeTable(
+		"should seed the nodepool's zero-valued series only when it is managed",
+		func(isNodePoolManaged bool) {
+			if !isNodePoolManaged {
+				nodePool.Spec.Template.Spec.NodeClassRef = &v1.NodeClassReference{
+					Group: "karpenter.test.sh",
+					Kind:  "UnmanagedNodeClass",
+					Name:  "default",
+				}
+			}
+			ExpectApplied(ctx, env.Client, nodePool)
+			ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
+
+			m, found := FindMetricWithLabelValues("karpenter_nodeclaims_created_total", map[string]string{
+				metrics.NodePoolLabel:         nodePool.Name,
+				metrics.ReasonLabel:           metrics.ProvisionedReason,
+				metrics.MinValuesRelaxedLabel: "false",
+			})
+			Expect(found).To(Equal(isNodePoolManaged))
+			if isNodePoolManaged {
+				Expect(m.GetCounter().GetValue()).To(BeZero())
+			}
+			_, found = FindMetricWithLabelValues("karpenter_nodeclaims_disrupted_total", map[string]string{
+				metrics.NodePoolLabel:            nodePool.Name,
+				metrics.ReasonLabel:              metrics.ExpiredReason,
+				metrics.CapacityTypeLabel:        v1.CapacityTypeSpot,
+				metrics.ConsolidationPolicyLabel: "",
+				metrics.TerminationModeLabel:     metrics.TerminationModeGraceful,
+			})
+			Expect(found).To(Equal(isNodePoolManaged))
+		},
+		Entry("should seed for a managed nodepool", true),
+		Entry("should not seed for an unmanaged nodepool", false),
+	)
+	It("should delete the nodepool's series, including ones that recorded events, when it is deleted", func() {
+		ExpectApplied(ctx, env.Client, nodePool)
+		ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
+		labels := map[string]string{
+			metrics.NodePoolLabel:         nodePool.Name,
+			metrics.ReasonLabel:           metrics.ProvisionedReason,
+			metrics.MinValuesRelaxedLabel: "true",
+		}
+		metrics.NodeClaimsCreatedTotal.Inc(labels)
+
+		ExpectDeleted(ctx, env.Client, nodePool)
+		ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
+		for _, name := range []string{"karpenter_nodeclaims_created_total", "karpenter_nodeclaims_disrupted_total", "karpenter_nodepools_cost_tracker_errors_total"} {
+			_, found := FindMetricWithLabelValues(name, map[string]string{metrics.NodePoolLabel: nodePool.Name})
+			Expect(found).To(BeFalse())
+		}
+	})
 })

@@ -273,7 +273,7 @@ func recordCandidateDisrupted(cmd *Command, candidate *Candidate) {
 	// Drift also flows through this queue, so only report a policy for consolidation.
 	consolidationPolicy := ""
 	if cmd.ConsolidationType() != "" {
-		consolidationPolicy = pretty.ToSnakeCase(string(candidate.NodePool.Spec.Disruption.ConsolidationPolicy))
+		consolidationPolicy = metrics.ConsolidationPolicyValue(candidate.NodePool)
 	}
 	labels := map[string]string{
 		metrics.ReasonLabel:              strings.ToLower(string(cmd.Reason())),

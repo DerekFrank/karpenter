@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
+	"github.com/samber/lo"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
@@ -51,9 +52,9 @@ var (
 // disruption metrics and the NodeClaim/Pod disruption counters.
 var disruptionReasonValues = []opmetrics.Value{reasonUnderutilized, reasonEmpty, reasonDrifted, reasonUnhealthy}
 
-// nodeClaimDisruptedReasonValues is the union of every reason a NodeClaim is
-// disrupted: the voluntary-disruption reasons plus the involuntary paths.
-var nodeClaimDisruptedReasonValues = []opmetrics.Value{
+// involuntaryDisruptionReasonValues are the reasons a NodeClaim is disrupted
+// outside the disruption controller.
+var involuntaryDisruptionReasonValues = []opmetrics.Value{
 	reasonUnhealthy,
 	reasonExpired,
 	reasonGarbageCollected,
@@ -61,10 +62,11 @@ var nodeClaimDisruptedReasonValues = []opmetrics.Value{
 	reasonNodeClassNotReady,
 	reasonRegistrationTimeout,
 	reasonLaunchTimeout,
-	reasonUnderutilized,
-	reasonEmpty,
-	reasonDrifted,
 }
+
+// nodeClaimDisruptedReasonValues is the union of every reason a NodeClaim is
+// disrupted: the voluntary-disruption reasons plus the involuntary paths.
+var nodeClaimDisruptedReasonValues = append(lo.Clone(involuntaryDisruptionReasonValues), reasonUnderutilized, reasonEmpty, reasonDrifted)
 
 // Metric dimensions and their values are described with opmetrics.Label /
 // opmetrics.Value (from operatorpkg, so Karpenter and operatorpkg share one type).

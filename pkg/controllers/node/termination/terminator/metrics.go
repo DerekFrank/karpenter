@@ -51,6 +51,8 @@ var DrainReason = opmetrics.Label{
 	Help: "Why the pod was drained: the owning NodeClaim's disruption reason, or forceful termination.",
 }
 
+// PodsEvictionRequestsTotal and PodsDrainedTotal are sparse along code and reason, whose values aren't enumerated, so
+// they aren't seeded.
 var PodsEvictionRequestsTotal = opmetrics.NewPrometheusCounter(
 	crmetrics.Registry,
 	prometheus.CounterOpts{

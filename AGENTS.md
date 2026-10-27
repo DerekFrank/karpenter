@@ -65,6 +65,38 @@ docs generator turns them into per-dimension help and value tables.
   a const, never a magic string; a value that exists only as a metric value should
   be a first-class `metrics.Value` var that its emission site references by `.Name`.
 
+## Metric Series
+
+Metrics are non-sparse: every series a metric can emit exists, at zero, from the
+moment its label values are known, so `increase()`/`rate()` return 0 rather than
+nothing before the first event
+([Prometheus guidance](https://prometheus.io/docs/practices/instrumentation/#avoid-missing-metrics)).
+The helpers live in `pkg/metrics/seed.go`.
+
+- Seed every new counter, histogram, and summary. Never seed by recording a
+  value (`Add(0)`, `Observe(0)`); use `metrics.Seed`, which creates the series
+  without a sample.
+- Seed label values known at compile time from `init()` next to the
+  declaration: `metrics.Seed(m, metrics.Combinations(nil, labels...)...)`.
+- Register a metric labeled by `nodepool` with `metrics.RegisterNodePoolMetric`
+  (or `RegisterNodePoolSeries` for custom label sets) from `init()`. Its series
+  are seeded for every managed NodePool and deleted with the NodePool. Don't
+  seed `nodepool` series any other way.
+- Seed exactly the label values the emission site produces. `Combinations` is
+  only for dimensions that vary independently. When one value determines
+  another (a disruption method fixes `reason` and `consolidation_type`, and
+  drift emits `consolidation_type=""`), list the label sets explicitly and
+  derive them from the same inputs the emitter uses.
+- Pin dimensions the NodePool determines (e.g. `consolidation_policy`,
+  `termination_mode`) to that NodePool's value instead of expanding over every
+  `Value`. Share the value function with the emitter (e.g.
+  `metrics.TerminationModeValue`) so the two can't drift.
+- A metric with a dimension whose values can't be known ahead of time (zone,
+  pod, controller, scheduling ID, image ID, response code) stays sparse. Say so
+  in a comment on its declaration or seeding `init()`. Gauges that are set
+  every reconcile, or that only exist while their object or condition does,
+  aren't seeded.
+
 ## Well Known Annotations
 
 Karpenter's annotations are documented in code as
