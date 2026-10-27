@@ -24,6 +24,11 @@ import (
 	"sigs.k8s.io/karpenter/pkg/metrics"
 )
 
+func init() {
+	metrics.RegisterNodePoolMetric(InstanceTerminationDurationSeconds)
+	metrics.RegisterNodePoolMetric(NodeClaimTerminationDurationSeconds)
+}
+
 var InstanceTerminationDurationSeconds = opmetrics.NewPrometheusHistogram(
 	crmetrics.Registry,
 	prometheus.HistogramOpts{

@@ -39,6 +39,8 @@ var SchedulingID = opmetrics.Label{
 	Help: "A unique identifier for a scheduling simulation run.",
 }
 
+// These metrics are sparse along controller, scheduling_id, and zone, whose values aren't known ahead of time, so they
+// aren't seeded.
 var (
 	DurationSeconds = opmetrics.NewPrometheusHistogram(
 		crmetrics.Registry,

@@ -108,6 +108,7 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	if err := c.kubeClient.Get(ctx, req.NamespacedName, nodePool); err != nil {
 		if errors.IsNotFound(err) {
 			c.metricStore.Delete(req.String())
+			metrics.DeleteNodePool(req.Name)
 		}
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
@@ -115,6 +116,7 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return reconcile.Result{}, nil
 	}
 	c.metricStore.Update(req.String(), c.buildMetrics(nodePool))
+	metrics.SeedNodePool(nodePool)
 	// periodically update our metrics per nodepool even if nothing has changed
 	return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
 }

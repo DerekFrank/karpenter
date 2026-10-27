@@ -28,6 +28,10 @@ const (
 	stateSubsystem = "cluster_state"
 )
 
+func init() {
+	metrics.Seed(PodSchedulingDecisionSeconds, nil)
+}
+
 var (
 	ClusterStateNodesCount = opmetrics.NewPrometheusGauge(
 		crmetrics.Registry,

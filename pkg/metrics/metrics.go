@@ -20,6 +20,8 @@ import (
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
 const (
@@ -123,3 +125,21 @@ var (
 		opmetrics.GA,
 	)
 )
+
+// NodeClaimsTerminatedTotal, NodesCreatedTotal, and NodesTerminatedTotal are sparse along zone, whose values aren't
+// known ahead of time, so they aren't seeded.
+func init() {
+	RegisterNodePoolMetric(NodeClaimsCreatedTotal, NodeClaimCreatedReason, MinValuesRelaxed)
+	// The disruption controller registers the voluntary-disruption series of these counters. The involuntary paths
+	// don't report a consolidation policy.
+	involuntaryReason := opmetrics.Label{Name: ReasonLabel, Values: involuntaryDisruptionReasonValues}
+	for _, m := range []opmetrics.CounterMetric{NodeClaimsDisruptedTotal, PodsDisruptionInitiatedTotal} {
+		RegisterNodePoolSeries(m, func(nodePool *v1.NodePool) []map[string]string {
+			return Combinations(map[string]string{
+				NodePoolLabel:            nodePool.Name,
+				ConsolidationPolicyLabel: "",
+				TerminationModeLabel:     TerminationModeValue(nodePool.Spec.Template.Spec.TerminationGracePeriod),
+			}, involuntaryReason, CapacityType)
+		})
+	}
+}

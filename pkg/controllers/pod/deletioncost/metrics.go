@@ -58,6 +58,12 @@ var Result = opmetrics.Label{
 	Values: []opmetrics.Value{ResultUpdated, ResultSkippedUnchanged, ResultSkippedNotFound, ResultSkippedConflict, ResultError},
 }
 
+// nodesWithPendingAnnotationWrites is Reset every cycle and only set for NodePools with pending writes, so it isn't
+// seeded.
+func init() {
+	metrics.Seed(podAnnotationWritesTotal, metrics.Combinations(nil, Result)...)
+}
+
 var (
 	nodesWithPendingAnnotationWrites = opmetrics.NewPrometheusGauge(
 		crmetrics.Registry,

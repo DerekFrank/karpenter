@@ -48,13 +48,10 @@ func IsManaged(nodeClaim *v1.NodeClaim, cp cloudprovider.CloudProvider) bool {
 // DisruptionTerminationMode returns the termination_mode metric label value for a
 // disrupted NodeClaim, derived from its terminationGracePeriod.
 func DisruptionTerminationMode(nodeClaim *v1.NodeClaim) string {
-	if nodeClaim == nil || nodeClaim.Spec.TerminationGracePeriod == nil {
+	if nodeClaim == nil {
 		return metrics.TerminationModeGraceful
 	}
-	if nodeClaim.Spec.TerminationGracePeriod.Duration <= 0 {
-		return metrics.TerminationModeForceful
-	}
-	return metrics.TerminationModeEventual
+	return metrics.TerminationModeValue(nodeClaim.Spec.TerminationGracePeriod)
 }
 
 // PatchTerminationTimestampAnnotation sets the termination timestamp annotation using optimistic locking.

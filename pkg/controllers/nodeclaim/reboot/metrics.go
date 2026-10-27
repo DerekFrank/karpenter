@@ -46,6 +46,12 @@ var Result = opmetrics.Label{
 	},
 }
 
+func init() {
+	metrics.Seed(RebootsTotal, metrics.Combinations(nil, Result)...)
+	metrics.Seed(RebootDurationSeconds, metrics.Combinations(nil, Result)...)
+	metrics.Seed(RebootRecoveryDurationSeconds, nil)
+}
+
 // Buckets span fast VM reboots through the observation window.
 var rebootDurationBuckets = prometheus.ExponentialBuckets(10, 2, 8) // 10,20,40,80,160,320,640,1280s
 
