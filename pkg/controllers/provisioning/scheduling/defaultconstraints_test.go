@@ -19,6 +19,7 @@ package scheduling_test
 import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -54,10 +55,22 @@ var _ = Describe("DefaultTopologySpreadInjector", func() {
 		ctx = options.ToContext(ctx, test.Options())
 	})
 
+	// newInjector returns an injector reading cluster state that tracks every ReplicaSet in the api-server, as the
+	// ReplicaSet informer would.
+	newInjector := func() *scheduling.DefaultTopologySpreadInjector {
+		GinkgoHelper()
+		replicaSets := &appsv1.ReplicaSetList{}
+		Expect(env.Client.List(ctx, replicaSets)).To(Succeed())
+		for i := range replicaSets.Items {
+			cluster.UpdateReplicaSet(&replicaSets.Items[i])
+		}
+		return scheduling.NewDefaultTopologySpreadInjector(env.Client, cluster)
+	}
+
 	// inject runs the injector over the pod and returns the selector it deduced, or nil if the pod wasn't defaulted.
 	inject := func(pod *corev1.Pod) *metav1.LabelSelector {
 		GinkgoHelper()
-		scheduling.NewDefaultTopologySpreadInjector(env.Client).Inject(ctx, []*corev1.Pod{pod})
+		newInjector().Inject(ctx, []*corev1.Pod{pod})
 		if len(pod.Spec.TopologySpreadConstraints) == 0 {
 			return nil
 		}
@@ -306,7 +319,7 @@ var _ = Describe("DefaultTopologySpreadInjector", func() {
 			frontend := ownedPod(map[string]string{"app": "web", "tier": "frontend"}, owner)
 			plain := ownedPod(map[string]string{"app": "web"}, owner)
 			// Inject both in a single pass, so they share one injector and therefore one cache.
-			scheduling.NewDefaultTopologySpreadInjector(env.Client).Inject(ctx, []*corev1.Pod{frontend, plain})
+			newInjector().Inject(ctx, []*corev1.Pod{frontend, plain})
 
 			Expect(frontend.Spec.TopologySpreadConstraints[0].LabelSelector.MatchLabels).To(Equal(map[string]string{"tier": "frontend"}))
 			Expect(plain.Spec.TopologySpreadConstraints[0].LabelSelector.MatchLabels).To(BeEmpty())
@@ -320,7 +333,7 @@ var _ = Describe("DefaultTopologySpreadInjector", func() {
 			selected := ownedPod(map[string]string{"app": "web"})
 			other := ownedPod(map[string]string{"app": "web"})
 			other.Namespace = namespace.Name
-			scheduling.NewDefaultTopologySpreadInjector(env.Client).Inject(ctx, []*corev1.Pod{selected, other})
+			newInjector().Inject(ctx, []*corev1.Pod{selected, other})
 
 			Expect(selected.Spec.TopologySpreadConstraints).To(HaveLen(1))
 			Expect(other.Spec.TopologySpreadConstraints).To(BeEmpty())
@@ -345,7 +358,7 @@ var _ = Describe("DefaultTopologySpreadInjector", func() {
 				},
 				TopologySpreadConstraints: own,
 			})
-			scheduling.NewDefaultTopologySpreadInjector(env.Client).Inject(ctx, []*corev1.Pod{pod})
+			newInjector().Inject(ctx, []*corev1.Pod{pod})
 			Expect(pod.Spec.TopologySpreadConstraints).To(Equal(own))
 		})
 		It("should be a no-op when no defaults are configured", func() {
@@ -365,7 +378,7 @@ var _ = Describe("DefaultTopologySpreadInjector", func() {
 				ownedPod(map[string]string{"app": "web"}, owner),
 				ownedPod(map[string]string{"app": "web"}, owner),
 			}
-			scheduling.NewDefaultTopologySpreadInjector(env.Client).Inject(ctx, pods)
+			newInjector().Inject(ctx, pods)
 			for _, p := range pods {
 				Expect(p.Spec.TopologySpreadConstraints).To(HaveLen(1))
 			}
@@ -393,7 +406,7 @@ var _ = Describe("DefaultTopologySpreadInjector", func() {
 			replicaSet := test.ReplicaSet(test.ReplicaSetOptions{Selector: map[string]string{"app": "web"}})
 			ExpectApplied(ctx, env.Client, replicaSet)
 			pod := ownedPod(map[string]string{"app": "web"}, controllerRef("apps/v1", "ReplicaSet", replicaSet.Name, replicaSet.UID))
-			scheduling.NewDefaultTopologySpreadInjector(env.Client).Inject(ctx, []*corev1.Pod{pod})
+			newInjector().Inject(ctx, []*corev1.Pod{pod})
 			Expect(pod.Spec.TopologySpreadConstraints).To(HaveLen(1))
 			tsc := pod.Spec.TopologySpreadConstraints[0]
 			Expect(tsc.MaxSkew).To(BeEquivalentTo(4))
@@ -410,7 +423,7 @@ var _ = Describe("DefaultTopologySpreadInjector", func() {
 			web := ownedPod(map[string]string{"app": "web"}, controllerRef("apps/v1", "ReplicaSet", webRS.Name, webRS.UID))
 			api := ownedPod(map[string]string{"app": "api"}, controllerRef("apps/v1", "ReplicaSet", apiRS.Name, apiRS.UID))
 			undefaulted := ownedPod(map[string]string{"app": "orphan"})
-			scheduling.NewDefaultTopologySpreadInjector(env.Client).Inject(ctx, []*corev1.Pod{web, api, undefaulted})
+			newInjector().Inject(ctx, []*corev1.Pod{web, api, undefaulted})
 			Expect(web.Spec.TopologySpreadConstraints[0].LabelSelector.MatchExpressions).To(ConsistOf(
 				metav1.LabelSelectorRequirement{Key: "app", Operator: metav1.LabelSelectorOpIn, Values: []string{"web"}},
 			))

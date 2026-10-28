@@ -220,7 +220,6 @@ func NewScheduler(
 		allocator:                 allocator,
 		instanceTypes:             instanceTypes,
 		cachedResourceClaims:      map[types.NamespacedName]*resourcev1.ResourceClaim{},
-		cachedOwnerResolutions:    prediction.OwnerResolutions{},
 		deletingPodUIDs:           deletingPodUIDs,
 		predictionStore:           predictionStore,
 	}
@@ -291,10 +290,9 @@ type Scheduler struct {
 	// instanceTypes is the per-NodePool instance type set, used to resolve template devices for existing nodes.
 	instanceTypes map[string][]*cloudprovider.InstanceType
 	// cachedResourceClaims memoizes ResourceClaim lookups for the duration of a single scheduling loop.
-	cachedResourceClaims   map[types.NamespacedName]*resourcev1.ResourceClaim
-	cachedOwnerResolutions prediction.OwnerResolutions
-	deletingPodUIDs        sets.Set[types.UID] // pods being rescheduled off their nodes, the only ones predictions apply to
-	predictionStore        *prediction.Store
+	cachedResourceClaims map[types.NamespacedName]*resourcev1.ResourceClaim
+	deletingPodUIDs      sets.Set[types.UID] // pods being rescheduled off their nodes, the only ones predictions apply to
+	predictionStore      *prediction.Store
 }
 
 // DRAError indicates a pod will not be attempted to be scheduled because it has Dynamic Resource Allocation requirements
@@ -604,10 +602,10 @@ func (s *Scheduler) updateCachedPodData(ctx context.Context, p *corev1.Pod) {
 		strictRequirements = scheduling.NewStrictPodRequirements(p)
 	}
 	var requests corev1.ResourceList
-	if s.predictionStore == nil || !s.deletingPodUIDs.Has(p.UID) {
-		requests = resources.RequestsForPods(p)
+	if s.deletingPodUIDs.Has(p.UID) {
+		requests = s.predictionStore.PredictedRequests(p)
 	} else {
-		requests = s.predictionStore.PredictedRequests(ctx, s.cachedOwnerResolutions, p)
+		requests = resources.RequestsForPods(p)
 	}
 	data := &PodData{
 		Requests:                 requests,
@@ -1030,11 +1028,7 @@ func buildDaemonOverheadGroups(ctx context.Context, store *prediction.Store, nod
 			} else {
 				var overhead corev1.ResourceList
 				if len(compatible) > 0 {
-					if store == nil {
-						overhead = resources.RequestsForPods(compatible...)
-					} else {
-						overhead = store.PredictedRequests(ctx, nil, compatible...)
-					}
+					overhead = store.PredictedRequests(compatible...)
 				}
 				hostPortUsage := scheduling.NewHostPortUsage()
 				for _, p := range compatible {
