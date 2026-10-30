@@ -71,6 +71,7 @@ type FeatureGates struct {
 	TerminateFirstRepair      bool
 	PodDeletionCostManagement bool
 	PredictionEnabled         bool
+	ReadAfterWriteOverlay     bool
 }
 
 // FeatureGate is the source-of-truth description of a feature gate. Declaring gates as FeatureGates keeps each gate's
@@ -157,6 +158,13 @@ var (
 			"predicted by a registered prediction source, and waits for that source to hydrate before scheduling. " +
 			"Requires a registered prediction source.",
 	}
+	ReadAfterWriteOverlayFeatureGate = FeatureGate{
+		Name:    "ReadAfterWriteOverlay",
+		Default: false,
+		Stage:   docs.Alpha,
+		Help: "Karpenter's reads of NodeClaims, NodePools, Nodes and Pods from its cache include its own writes as " +
+			"soon as they return, rather than once the informer delivers them, without waiting for the informer.",
+	}
 )
 
 // KarpenterFeatureGates are the feature gates Karpenter supports, in the order --feature-gates lists them.
@@ -171,6 +179,7 @@ var KarpenterFeatureGates = []FeatureGate{
 	TerminateFirstRepairFeatureGate,
 	PodDeletionCostManagementFeatureGate,
 	PredictionEnabledFeatureGate,
+	ReadAfterWriteOverlayFeatureGate,
 }
 
 // Options contains all CLI flags / env vars for karpenter-core. It adheres to the options.Injectable interface.
@@ -298,6 +307,7 @@ func DefaultFeatureGates() FeatureGates {
 		TerminateFirstRepair:      TerminateFirstRepairFeatureGate.Default,
 		PodDeletionCostManagement: PodDeletionCostManagementFeatureGate.Default,
 		PredictionEnabled:         PredictionEnabledFeatureGate.Default,
+		ReadAfterWriteOverlay:     ReadAfterWriteOverlayFeatureGate.Default,
 	}
 }
 
@@ -340,6 +350,9 @@ func ParseFeatureGates(gateStr string) (FeatureGates, error) {
 	}
 	if val, ok := gateMap[PredictionEnabledFeatureGate.Name]; ok {
 		gates.PredictionEnabled = val
+	}
+	if val, ok := gateMap[ReadAfterWriteOverlayFeatureGate.Name]; ok {
+		gates.ReadAfterWriteOverlay = val
 	}
 
 	return gates, nil

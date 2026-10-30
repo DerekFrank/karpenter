@@ -116,3 +116,5 @@ retract (
 	v0.34.4 // accidentally published incomplete patch release
 	v0.27.7 // accidentally published incomplete patch release
 )
+
+replace sigs.k8s.io/controller-runtime => github.com/DerekFrank/controller-runtime v0.0.0-20261030164852-391f2d7d0ce6
