@@ -89,6 +89,12 @@ in `pkg/operator/options/options.go`; the `--feature-gates` default, its help te
   add its field to `FeatureGates`.
 - Reference a gate by its var (e.g. `NodeRepairFeatureGate.Name`), never a string literal.
 
+## Field Indexes
+
+Every lookup of objects by a value derived from the object is a field index.
+Read `pkg/state/index/AGENTS.md` before adding a map or a List-and-filter loop
+for a lookup.
+
 ## Issue and PR Guidelines
 
 - Never create an issue.

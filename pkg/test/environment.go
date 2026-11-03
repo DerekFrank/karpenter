@@ -24,9 +24,6 @@ import (
 
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/samber/lo"
-	"go.uber.org/multierr"
-	corev1 "k8s.io/api/core/v1"
-	storagev1 "k8s.io/api/storage/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/client-go/kubernetes"
@@ -37,7 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
-	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/state/index"
 	"sigs.k8s.io/karpenter/pkg/utils/env"
 )
 
@@ -84,57 +81,31 @@ func WithConfigOptions(options ...func(*rest.Config)) option.Function[Environmen
 
 func NodeProviderIDFieldIndexer(ctx context.Context) func(cache.Cache) error {
 	return func(c cache.Cache) error {
-		return c.IndexField(ctx, &corev1.Node{}, "spec.providerID", func(obj client.Object) []string {
-			return []string{obj.(*corev1.Node).Spec.ProviderID}
-		})
+		return index.NodeProviderID(ctx, c)
 	}
 }
 
 func NodeClaimProviderIDFieldIndexer(ctx context.Context) func(cache.Cache) error {
 	return func(c cache.Cache) error {
-		return c.IndexField(ctx, &v1.NodeClaim{}, "status.providerID", func(obj client.Object) []string {
-			return []string{obj.(*v1.NodeClaim).Status.ProviderID}
-		})
+		return index.NodeClaimProviderID(ctx, c)
 	}
 }
 
 func NodeClaimNodeClassRefFieldIndexer(ctx context.Context) func(cache.Cache) error {
 	return func(c cache.Cache) error {
-		var err error
-		err = multierr.Append(err, c.IndexField(ctx, &v1.NodeClaim{}, "spec.nodeClassRef.group", func(obj client.Object) []string {
-			return []string{obj.(*v1.NodeClaim).Spec.NodeClassRef.Group}
-		}))
-		err = multierr.Append(err, c.IndexField(ctx, &v1.NodeClaim{}, "spec.nodeClassRef.kind", func(obj client.Object) []string {
-			return []string{obj.(*v1.NodeClaim).Spec.NodeClassRef.Kind}
-		}))
-		err = multierr.Append(err, c.IndexField(ctx, &v1.NodeClaim{}, "spec.nodeClassRef.name", func(obj client.Object) []string {
-			return []string{obj.(*v1.NodeClaim).Spec.NodeClassRef.Name}
-		}))
-		return err
+		return index.NodeClaimNodeClassRef(ctx, c)
 	}
 }
 
 func NodePoolNodeClassRefFieldIndexer(ctx context.Context) func(cache.Cache) error {
 	return func(c cache.Cache) error {
-		var err error
-		err = multierr.Append(err, c.IndexField(ctx, &v1.NodePool{}, "spec.template.spec.nodeClassRef.group", func(obj client.Object) []string {
-			return []string{obj.(*v1.NodePool).Spec.Template.Spec.NodeClassRef.Group}
-		}))
-		err = multierr.Append(err, c.IndexField(ctx, &v1.NodePool{}, "spec.template.spec.nodeClassRef.kind", func(obj client.Object) []string {
-			return []string{obj.(*v1.NodePool).Spec.Template.Spec.NodeClassRef.Kind}
-		}))
-		err = multierr.Append(err, c.IndexField(ctx, &v1.NodePool{}, "spec.template.spec.nodeClassRef.name", func(obj client.Object) []string {
-			return []string{obj.(*v1.NodePool).Spec.Template.Spec.NodeClassRef.Name}
-		}))
-		return err
+		return index.NodePoolNodeClassRef(ctx, c)
 	}
 }
 
 func VolumeAttachmentFieldIndexer(ctx context.Context) func(cache.Cache) error {
 	return func(c cache.Cache) error {
-		return c.IndexField(ctx, &storagev1.VolumeAttachment{}, "spec.nodeName", func(obj client.Object) []string {
-			return []string{obj.(*storagev1.VolumeAttachment).Spec.NodeName}
-		})
+		return index.VolumeAttachmentNodeName(ctx, c)
 	}
 }
 
@@ -173,10 +144,7 @@ func NewEnvironment(options ...option.Function[EnvironmentOptions]) *Environment
 		for _, index := range opts.fieldIndexers {
 			lo.Must0(index(cache))
 		}
-		lo.Must0(cache.IndexField(ctx, &corev1.Pod{}, "spec.nodeName", func(o client.Object) []string {
-			pod := o.(*corev1.Pod)
-			return []string{pod.Spec.NodeName}
-		}))
+		lo.Must0(index.PodNodeName(ctx, cache))
 		c = &CacheSyncingClient{
 			Client: lo.Must(client.New(environment.Config, client.Options{Scheme: scheme.Scheme, Cache: &client.CacheOptions{Reader: cache}})),
 		}

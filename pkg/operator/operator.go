@@ -18,7 +18,6 @@ package operator
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/pprof"
@@ -34,9 +33,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/samber/lo"
 	coordinationv1 "k8s.io/api/coordination/v1"
-	corev1 "k8s.io/api/core/v1"
-	storagev1 "k8s.io/api/storage/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -63,6 +59,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/operator/logging"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/state/index"
 	"sigs.k8s.io/karpenter/pkg/state/prediction"
 	"sigs.k8s.io/karpenter/pkg/utils/env"
 )
@@ -261,7 +258,7 @@ func NewOperator(o ...option.Function[Options]) (context.Context, *Operator) {
 	mgr, err := ctrl.NewManager(config, mgrOpts)
 	mgr = lo.Must(mgr, err, "failed to setup manager")
 
-	setupIndexers(ctx, mgr)
+	index.Setup(ctx, mgr.GetFieldIndexer())
 
 	lo.Must0(mgr.AddReadyzCheck("manager", func(req *http.Request) error {
 		return lo.Ternary(mgr.GetCache().WaitForCacheSync(req.Context()), nil, fmt.Errorf("failed to sync caches"))
@@ -307,49 +304,4 @@ func (o *Operator) Start(ctx context.Context) {
 		lo.Must0(o.Manager.Start(ctx))
 	})
 	wg.Wait()
-}
-
-func setupIndexers(ctx context.Context, mgr manager.Manager) {
-	lo.Must0(mgr.GetFieldIndexer().IndexField(ctx, &corev1.Pod{}, "spec.nodeName", func(o client.Object) []string {
-		return []string{o.(*corev1.Pod).Spec.NodeName}
-	}), "failed to setup pod indexer")
-	lo.Must0(mgr.GetFieldIndexer().IndexField(ctx, &corev1.Node{}, "spec.providerID", func(o client.Object) []string {
-		return []string{o.(*corev1.Node).Spec.ProviderID}
-	}), "failed to setup node provider id indexer")
-	lo.Must0(mgr.GetFieldIndexer().IndexField(ctx, &storagev1.VolumeAttachment{}, "spec.nodeName", func(o client.Object) []string {
-		return []string{o.(*storagev1.VolumeAttachment).Spec.NodeName}
-	}), "failed to setup volumeattachment indexer")
-
-	// If the CRD does not exist, we should fail open when setting up indexers. This ensures controllers that aren't reliant on those CRDs may continue to function
-	handleCRDIndexerError := func(err error, msg string) {
-		noKindMatchError := &meta.NoKindMatchError{}
-		if errors.As(err, &noKindMatchError) {
-			log.FromContext(ctx).Error(err, msg)
-		} else if err != nil {
-			// lo.Must0 also does a panic
-			panic(fmt.Sprintf("%s, %s", err, msg))
-		}
-	}
-	handleCRDIndexerError(mgr.GetFieldIndexer().IndexField(ctx, &v1.NodeClaim{}, "status.providerID", func(o client.Object) []string {
-		return []string{o.(*v1.NodeClaim).Status.ProviderID}
-	}), "failed to setup nodeclaim provider id indexer")
-	handleCRDIndexerError(mgr.GetFieldIndexer().IndexField(ctx, &v1.NodeClaim{}, "spec.nodeClassRef.group", func(o client.Object) []string {
-		return []string{o.(*v1.NodeClaim).Spec.NodeClassRef.Group}
-	}), "failed to setup nodeclaim nodeclassref apiversion indexer")
-	handleCRDIndexerError(mgr.GetFieldIndexer().IndexField(ctx, &v1.NodeClaim{}, "spec.nodeClassRef.kind", func(o client.Object) []string {
-		return []string{o.(*v1.NodeClaim).Spec.NodeClassRef.Kind}
-	}), "failed to setup nodeclaim nodeclassref kind indexer")
-	handleCRDIndexerError(mgr.GetFieldIndexer().IndexField(ctx, &v1.NodeClaim{}, "spec.nodeClassRef.name", func(o client.Object) []string {
-		return []string{o.(*v1.NodeClaim).Spec.NodeClassRef.Name}
-	}), "failed to setup nodeclaim nodeclassref name indexer")
-
-	handleCRDIndexerError(mgr.GetFieldIndexer().IndexField(ctx, &v1.NodePool{}, "spec.template.spec.nodeClassRef.group", func(o client.Object) []string {
-		return []string{o.(*v1.NodePool).Spec.Template.Spec.NodeClassRef.Group}
-	}), "failed to setup nodepool nodeclassref apiversion indexer")
-	handleCRDIndexerError(mgr.GetFieldIndexer().IndexField(ctx, &v1.NodePool{}, "spec.template.spec.nodeClassRef.kind", func(o client.Object) []string {
-		return []string{o.(*v1.NodePool).Spec.Template.Spec.NodeClassRef.Kind}
-	}), "failed to setup nodepool nodeclassref kind indexer")
-	handleCRDIndexerError(mgr.GetFieldIndexer().IndexField(ctx, &v1.NodePool{}, "spec.template.spec.nodeClassRef.name", func(o client.Object) []string {
-		return []string{o.(*v1.NodePool).Spec.Template.Spec.NodeClassRef.Name}
-	}), "failed to setup nodepool nodeclassref name indexer")
 }
