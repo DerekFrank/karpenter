@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"slices"
 	"sync"
 	"testing"
 
@@ -122,6 +123,7 @@ func (h *heldInformers) enqueue(obj client.Object, deleted bool) {
 	defer h.mu.Unlock()
 	h.queue = append(h.queue, func() {
 		key := client.ObjectKeyFromObject(obj)
+		h.mu.Lock()
 		old, existed := h.view[key]
 		switch {
 		case deleted:
@@ -129,7 +131,9 @@ func (h *heldInformers) enqueue(obj client.Object, deleted bool) {
 		default:
 			h.view[key] = obj
 		}
-		for _, handler := range h.handlers {
+		handlers := slices.Clone(h.handlers)
+		h.mu.Unlock()
+		for _, handler := range handlers {
 			switch {
 			case deleted:
 				handler.OnDelete(obj)
@@ -144,11 +148,12 @@ func (h *heldInformers) enqueue(obj client.Object, deleted bool) {
 
 func (h *heldInformers) release() {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	for _, deliver := range h.queue {
+	queue := h.queue
+	h.queue = nil
+	h.mu.Unlock()
+	for _, deliver := range queue {
 		deliver()
 	}
-	h.queue = nil
 }
 
 func (h *heldInformers) get(key client.ObjectKey, into client.Object) error {
@@ -460,6 +465,40 @@ var _ = Describe("Overlay", func() {
 		list := &v1.NodeClaimList{}
 		Expect(overlayClient.List(ctx, list, client.MatchingLabels{v1.NodePoolLabelKey: nodeClaim.Labels[v1.NodePoolLabelKey]})).To(Succeed())
 		Expect(list.Items).To(ConsistOf(HaveField("Name", nodeClaim.Name)))
+	})
+	It("should call write handlers with its writes, the objects its deletes remove, and relist ghosts", func() {
+		type write struct {
+			name    string
+			deleted bool
+		}
+		var writes []write
+		remove := lo.Must(overlayClient.AddWriteHandler(&v1.NodeClaim{}, func(obj client.Object, deleted bool) {
+			writes = append(writes, write{name: obj.GetName(), deleted: deleted})
+		}))
+		patchNodeClaim(overlayClient, nodeClaim)
+		Expect(writes).To(Equal([]write{{name: nodeClaim.Name}}))
+
+		removed := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: nodeClaim.Labels}})
+		Expect(overlayClient.Create(ctx, removed)).To(Succeed())
+		Expect(overlayClient.Delete(ctx, removed)).To(Succeed())
+		Expect(writes[1:]).To(Equal([]write{{name: removed.Name}, {name: removed.Name, deleted: true}}))
+
+		ghost := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: nodeClaim.Labels}})
+		Expect(overlayClient.Create(ctx, ghost)).To(Succeed())
+		Expect(env.Client.Delete(ctx, ghost)).To(Succeed())
+		informers.mu.Lock()
+		informers.queue = nil
+		informers.mu.Unlock()
+		stored := nodeClaim.DeepCopy()
+		nodeClaim.Labels["delivered"] = "true"
+		Expect(env.Client.Patch(ctx, nodeClaim, client.MergeFrom(stored))).To(Succeed())
+		informers.enqueue(nodeClaim, false)
+		informers.release()
+		Expect(writes[3:]).To(Equal([]write{{name: ghost.Name}, {name: ghost.Name, deleted: true}}))
+
+		remove()
+		patchNodeClaim(overlayClient, nodeClaim)
+		Expect(writes).To(HaveLen(5))
 	})
 	It("should not hold a write response the informer has already delivered", func() {
 		stored := nodeClaim.DeepCopy()
