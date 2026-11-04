@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"iter"
 	"maps"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,10 +33,8 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
@@ -47,25 +46,42 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/state/store"
+	disruptionutils "sigs.k8s.io/karpenter/pkg/utils/disruption"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
-// Cluster maintains cluster state that is often needed but expensive to compute.
+// Cluster maintains cluster state that is often needed but expensive to compute. It keeps each node, the pods bound
+// to it and the NodePools' usage as fields in state stores, which follow the Node, NodeClaim and Pod events that the
+// cluster state informers apply.
 type Cluster struct {
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
 	clock         clock.Clock
 	hasSynced     atomic.Bool
 
-	mu                        sync.RWMutex
-	nodes                     map[string]*StateNode           // provider id -> cached node
-	bindings                  map[types.NamespacedName]string // pod namespaced named -> node name
-	nodeNameToProviderID      map[string]string               // node name -> provider id
-	nodeClaimNameToProviderID map[string]string               // node claim name -> provider id
-	nodePoolResources         map[string]corev1.ResourceList  // node pool name -> resource list
-	daemonSetPods             sync.Map                        // daemonSet -> existing pod
+	// nodes is a join: each Node and its NodeClaim, by providerID, read together with the intent kept about them.
+	nodes *store.Store[string, nodeFields]
+	// pods keeps the fields derived about each node from its pods, by node name, as StateNode.Derived. They can lag
+	// nodes.
+	pods *store.Store[string, podFields]
+	// nodeClaimNames finds a NodeClaim's providerID by name.
+	nodeClaimNames *store.Store[string, nodeClaimFields]
+	// nodePoolResources keeps the capacity derived about each NodePool from its nodes, by NodePool name.
+	nodePoolResources *store.Store[string, corev1.ResourceList]
+	nodeCount         atomic.Int64
+
+	nodeClaimsByProviderID *store.Contributor[string, *v1.NodeClaim, nodeFields, *v1.NodeClaim]
+	nodeClaimsByName       *store.Contributor[string, *v1.NodeClaim, nodeClaimFields, string]
+	nodesByProviderID      *store.Contributor[string, *corev1.Node, nodeFields, nodeContribution]
+	nodesByName            *store.Contributor[string, *corev1.Node, podFields, *corev1.Node]
+	podsByNodeName         *store.Contributor[string, *corev1.Pod, podFields, podContribution]
+
+	// daemonSetPods keeps the newest pod derived about each DaemonSet from its pods, by DaemonSet.
+	daemonSetPods   *store.Store[types.NamespacedName, daemonSetFields]
+	podsByDaemonSet *store.Contributor[types.NamespacedName, *corev1.Pod, daemonSetFields, *corev1.Pod]
 
 	repairPolicyMatcher *health.RepairPolicyMatcher // nil when node repair is disabled
 
@@ -88,7 +104,6 @@ type Cluster struct {
 	unsyncedTimeMu      sync.Mutex
 	unsyncedStartTime   time.Time
 	lastUnsyncedLogTime time.Time
-	antiAffinityPods    sync.Map // pod namespaced name -> *corev1.Pod of pods that have required anti affinities
 
 	// bufferPodCounts tracks how many virtual CapacityBuffer pods the provisioner's
 	// scheduling simulation placed on each node (keyed by providerID). This is
@@ -105,6 +120,76 @@ type Cluster struct {
 	bufferPodCounts   map[string]int
 }
 
+// nodeFields are the fields kept for each node, keyed by its providerID, or by its name for an unmanaged Node without
+// one. The Node and its NodeClaim each contribute themselves, which joins them.
+type nodeFields struct {
+	Node      *corev1.Node
+	NodeClaim *v1.NodeClaim
+	// CSIDrivers are the drivers of the Node's CSINode, read when the Node last changed.
+	CSIDrivers          []storagev1.CSINodeDriver
+	RepairPolicyMatches []health.RepairPolicyMatch
+	// MarkedForDeletion and NominatedUntil are set by the disruption and provisioning controllers.
+	MarkedForDeletion bool
+	NominatedUntil    metav1.Time
+}
+
+type nodeContribution struct {
+	node       *corev1.Node
+	csiDrivers []storagev1.CSINodeDriver
+	matches    []health.RepairPolicyMatch
+}
+
+// podFields are the fields kept for each node from the pods bound to it, keyed by the node's name. They exist as soon
+// as a pod binds to the node, whether or not cluster state has seen the Node yet.
+type podFields struct {
+	Node              *corev1.Node
+	Pods              int
+	Requests          corev1.ResourceList
+	Limits            corev1.ResourceList
+	DaemonSetRequests corev1.ResourceList
+	DaemonSetLimits   corev1.ResourceList
+	// DisruptionCost sums the eviction costs of the non-DaemonSet pods with a positive cost.
+	DisruptionCost float64
+	HostPorts      *scheduling.HostPortUsage
+	// Volumes are the pods' volumes, read from their PVCs when each pod last changed.
+	Volumes          *scheduling.VolumeUsage
+	AntiAffinityPods map[types.NamespacedName]*corev1.Pod
+}
+
+type podContribution struct {
+	pod            *corev1.Pod
+	requests       corev1.ResourceList
+	limits         corev1.ResourceList
+	daemonSet      bool
+	disruptionCost float64
+	hostPorts      []scheduling.HostPort
+	volumes        scheduling.Volumes
+	antiAffinity   bool
+}
+
+// equal reports whether applyPod folds the two contributions the same way.
+//
+//nolint:gocyclo
+func (p podContribution) equal(o podContribution) bool {
+	if (p.pod == nil) != (o.pod == nil) || (p.pod != nil && client.ObjectKeyFromObject(p.pod) != client.ObjectKeyFromObject(o.pod)) {
+		return false
+	}
+	return p.daemonSet == o.daemonSet && p.antiAffinity == o.antiAffinity && p.disruptionCost == o.disruptionCost &&
+		resourcesEqual(p.requests, o.requests) && resourcesEqual(p.limits, o.limits) &&
+		slices.EqualFunc(p.hostPorts, o.hostPorts, func(a, b scheduling.HostPort) bool {
+			return a.Port == b.Port && a.Protocol == b.Protocol && a.IP.Equal(b.IP)
+		}) &&
+		maps.EqualFunc(p.volumes, o.volumes, func(a, b sets.Set[string]) bool { return a.Equal(b) })
+}
+
+func resourcesEqual(a, b corev1.ResourceList) bool {
+	return maps.EqualFunc(a, b, func(x, y resource.Quantity) bool { return x.Cmp(y) == 0 })
+}
+
+type nodeClaimFields struct {
+	ProviderID string
+}
+
 type ClusterOptions struct {
 	repairPolicyMatcher *health.RepairPolicyMatcher
 }
@@ -119,28 +204,244 @@ func WithRepairPolicyMatcher(matcher *health.RepairPolicyMatcher) option.Functio
 
 func NewCluster(clk clock.Clock, client client.Client, cloudProvider cloudprovider.CloudProvider, opts ...option.Function[ClusterOptions]) *Cluster {
 	o := option.Resolve(opts...)
-	return &Cluster{
-		repairPolicyMatcher:       o.repairPolicyMatcher,
-		clock:                     clk,
-		kubeClient:                client,
-		cloudProvider:             cloudProvider,
-		nodes:                     map[string]*StateNode{},
-		bindings:                  map[types.NamespacedName]string{},
-		daemonSetPods:             sync.Map{},
-		nodeNameToProviderID:      map[string]string{},
-		nodeClaimNameToProviderID: map[string]string{},
-		nodePoolResources:         map[string]corev1.ResourceList{},
-
-		NodePoolState: NewNodePoolState(clk),
-
-		bufferPodCounts: map[string]int{},
-
-		podAcks:                         sync.Map{},
-		podsSchedulableTimes:            sync.Map{},
-		podsSchedulingAttempted:         sync.Map{},
-		podHealthyNodePoolScheduledTime: sync.Map{},
-		podToNodeClaim:                  sync.Map{},
+	c := &Cluster{
+		repairPolicyMatcher: o.repairPolicyMatcher,
+		clock:               clk,
+		kubeClient:          client,
+		cloudProvider:       cloudProvider,
+		bufferPodCounts:     map[string]int{},
 	}
+	c.newStores()
+	return c
+}
+
+//nolint:gocyclo
+func (c *Cluster) newStores() {
+	c.nodes = store.New[string, nodeFields]()
+	c.pods = store.New[string, podFields]()
+	c.nodeClaimNames = store.New[string, nodeClaimFields]()
+	c.nodePoolResources = store.New[string, corev1.ResourceList]()
+	c.nodeCount.Store(0)
+	c.NodePoolState = NewNodePoolState(c.clock)
+	c.daemonSetPods = store.New[types.NamespacedName, daemonSetFields]()
+	c.podsByDaemonSet = store.Contribute(c.daemonSetPods, nil, nil, &corev1.PodList{}, daemonSetKey,
+		func(_ context.Context, pod *corev1.Pod) (*corev1.Pod, error) { return pod, nil },
+		func(f daemonSetFields, _, next *corev1.Pod) daemonSetFields {
+			// Keep the newest pod, as a sample of the DaemonSet's current template. A pod going away leaves the
+			// sample in place until a newer one arrives or the DaemonSet goes.
+			if next != nil && (f.Pod == nil || next.UID == f.Pod.UID || next.CreationTimestamp.After(f.Pod.CreationTimestamp.Time)) {
+				f.Pod = next
+			}
+			return f
+		})
+
+	c.nodeClaimsByProviderID = store.Contribute(c.nodes, nil, nil, &v1.NodeClaimList{},
+		func(nodeClaim *v1.NodeClaim) string { return nodeClaim.Status.ProviderID },
+		func(_ context.Context, nodeClaim *v1.NodeClaim) (*v1.NodeClaim, error) { return nodeClaim, nil },
+		func(f nodeFields, _, next *v1.NodeClaim) nodeFields { f.NodeClaim = next; return f })
+	c.nodeClaimsByName = store.Contribute(c.nodeClaimNames, nil, nil, &v1.NodeClaimList{},
+		func(nodeClaim *v1.NodeClaim) string { return nodeClaim.Name },
+		func(_ context.Context, nodeClaim *v1.NodeClaim) (string, error) {
+			return nodeClaim.Status.ProviderID, nil
+		},
+		func(f nodeClaimFields, _, next string) nodeClaimFields { f.ProviderID = next; return f })
+	c.nodesByProviderID = store.Contribute(c.nodes, nil, nil, &corev1.NodeList{}, nodeKey, c.nodeContribution,
+		func(f nodeFields, _, next nodeContribution) nodeFields {
+			f.Node, f.CSIDrivers, f.RepairPolicyMatches = next.node, next.csiDrivers, next.matches
+			return f
+		})
+	c.nodesByName = store.Contribute(c.pods, nil, nil, &corev1.NodeList{},
+		func(node *corev1.Node) string { return lo.Ternary(nodeKey(node) == "", "", node.Name) },
+		func(_ context.Context, node *corev1.Node) (*corev1.Node, error) { return node, nil },
+		func(f podFields, _, next *corev1.Node) podFields { f.Node = next; return f })
+	c.podsByNodeName = store.Contribute(c.pods, nil, nil, &corev1.PodList{},
+		func(pod *corev1.Pod) string { return lo.Ternary(podutils.IsTerminal(pod), "", pod.Spec.NodeName) },
+		c.podContribution, applyPod).CompareWith(podContribution.equal)
+
+	store.Derive(c.nodes, c.nodePoolResources,
+		func(_ string, f nodeFields) string {
+			if f.Node == nil && f.NodeClaim == nil {
+				return ""
+			}
+			return (&StateNode{Node: f.Node, NodeClaim: f.NodeClaim}).Labels()[v1.NodePoolLabelKey]
+		},
+		func(_ string, f nodeFields) corev1.ResourceList {
+			n := &StateNode{Node: f.Node, NodeClaim: f.NodeClaim, markedForDeletion: f.MarkedForDeletion}
+			if n.MarkedForDeletion() {
+				return nil
+			}
+			return lo.Assign(n.Capacity(), corev1.ResourceList{resources.Node: resource.MustParse("1")})
+		},
+		func(total corev1.ResourceList, prev, next corev1.ResourceList) corev1.ResourceList {
+			sum := resources.Merge(total, next)
+			resources.SubtractFrom(sum, prev)
+			sum = lo.OmitBy(sum, func(_ corev1.ResourceName, q resource.Quantity) bool { return q.IsZero() })
+			return lo.Ternary(len(sum) == 0, nil, sum)
+		})
+	c.nodes.Subscribe(func(_ string, old, new nodeFields) {
+		existed, exists := old.Node != nil || old.NodeClaim != nil, new.Node != nil || new.NodeClaim != nil
+		if existed != exists {
+			ClusterStateNodesCount.Set(float64(c.nodeCount.Add(int64(lo.Ternary(exists, 1, -1)))), nil)
+		}
+		before := &StateNode{Node: old.Node, NodeClaim: old.NodeClaim, markedForDeletion: old.MarkedForDeletion}
+		after := &StateNode{Node: new.Node, NodeClaim: new.NodeClaim, markedForDeletion: new.MarkedForDeletion}
+		if existed != exists || (exists && (before.Initialized() != after.Initialized() || before.MarkedForDeletion() != after.MarkedForDeletion())) {
+			c.MarkUnconsolidated()
+		}
+	})
+	c.pods.Subscribe(func(_ string, old, new podFields) {
+		if old.Pods != new.Pods {
+			c.MarkUnconsolidated()
+		}
+	})
+}
+
+// nodeKey returns the key a Node is kept under: its providerID, or its name for an unmanaged Node without one. A
+// managed Node is kept once it has a providerID and either its instance type label or has initialized.
+func nodeKey(node *corev1.Node) string {
+	managed := node.Labels[v1.NodePoolLabelKey] != ""
+	if node.Spec.ProviderID == "" {
+		return lo.Ternary(managed, "", node.Name)
+	}
+	if managed && node.Labels[corev1.LabelInstanceTypeStable] == "" && node.Labels[v1.NodeInitializedLabelKey] == "" {
+		return ""
+	}
+	return node.Spec.ProviderID
+}
+
+func (c *Cluster) nodeContribution(ctx context.Context, node *corev1.Node) (nodeContribution, error) {
+	if node.Spec.ProviderID == "" {
+		node = node.DeepCopy()
+		node.Spec.ProviderID = node.Name
+	}
+	contribution := nodeContribution{node: node}
+	if c.repairPolicyMatcher != nil {
+		contribution.matches = c.repairPolicyMatcher.Match(node)
+	}
+	var csiNode storagev1.CSINode
+	if err := c.kubeClient.Get(ctx, client.ObjectKey{Name: node.Name}, &csiNode); err != nil {
+		return contribution, client.IgnoreNotFound(serrors.Wrap(fmt.Errorf("getting CSINode to determine volume limit, %w", err), "CSINode", klog.KRef("", node.Name)))
+	}
+	contribution.csiDrivers = csiNode.Spec.Drivers
+	return contribution, nil
+}
+
+func (c *Cluster) podContribution(ctx context.Context, pod *corev1.Pod) (podContribution, error) {
+	volumes, err := scheduling.GetVolumes(ctx, c.kubeClient, pod)
+	if err != nil {
+		return podContribution{}, fmt.Errorf("tracking volume usage, %w", err)
+	}
+	// The same as RequestsForPods and LimitsForPods, from one Ceiling.
+	ceiling := resources.Ceiling(pod)
+	requests, limits := resources.Merge(ceiling.Requests), resources.Merge(ceiling.Limits)
+	requests[corev1.ResourcePods] = *resource.NewQuantity(1, resource.DecimalExponent)
+	limits[corev1.ResourcePods] = *resource.NewQuantity(1, resource.DecimalExponent)
+	contribution := podContribution{
+		// The fields need only the pod's key, except for a pod with required anti-affinity, which they hold. The pod may
+		// be a List's item that shares the cache's memory, so hold a copy.
+		pod:          &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: pod.Name, Namespace: pod.Namespace}},
+		requests:     requests,
+		limits:       limits,
+		daemonSet:    podutils.IsOwnedByDaemonSet(pod),
+		hostPorts:    scheduling.GetHostPorts(pod),
+		volumes:      volumes,
+		antiAffinity: podutils.HasRequiredPodAntiAffinity(pod),
+	}
+	if contribution.antiAffinity {
+		contribution.pod = pod.DeepCopy()
+	}
+	if !contribution.daemonSet {
+		contribution.disruptionCost = max(0, disruptionutils.EvictionCost(ctx, pod))
+	}
+	return contribution, nil
+}
+
+//nolint:gocyclo
+func applyPod(f podFields, prev, next podContribution) podFields {
+	if prev.pod != nil {
+		key := client.ObjectKeyFromObject(prev.pod)
+		f.Pods--
+		f.Requests = resources.Subtract(f.Requests, prev.requests)
+		f.Limits = resources.Subtract(f.Limits, prev.limits)
+		if prev.daemonSet {
+			f.DaemonSetRequests = resources.Subtract(f.DaemonSetRequests, prev.requests)
+			f.DaemonSetLimits = resources.Subtract(f.DaemonSetLimits, prev.limits)
+		}
+		f.DisruptionCost -= prev.disruptionCost
+		if len(prev.hostPorts) > 0 {
+			f.HostPorts = f.HostPorts.DeepCopy()
+			f.HostPorts.DeletePod(key)
+		}
+		if len(prev.volumes) > 0 {
+			f.Volumes = f.Volumes.DeepCopy()
+			f.Volumes.DeletePod(key)
+		}
+		if prev.antiAffinity {
+			f.AntiAffinityPods = maps.Clone(f.AntiAffinityPods)
+			delete(f.AntiAffinityPods, key)
+		}
+	}
+	if next.pod != nil {
+		f.Pods++
+		f.Requests = resources.Merge(f.Requests, next.requests)
+		f.Limits = resources.Merge(f.Limits, next.limits)
+		if next.daemonSet {
+			f.DaemonSetRequests = resources.Merge(f.DaemonSetRequests, next.requests)
+			f.DaemonSetLimits = resources.Merge(f.DaemonSetLimits, next.limits)
+		}
+		f.DisruptionCost += next.disruptionCost
+		if len(next.hostPorts) > 0 {
+			f.HostPorts = lo.TernaryF(f.HostPorts == nil, scheduling.NewHostPortUsage, f.HostPorts.DeepCopy)
+			f.HostPorts.Add(next.pod, next.hostPorts)
+		}
+		if len(next.volumes) > 0 {
+			f.Volumes = lo.TernaryF(f.Volumes == nil, scheduling.NewVolumeUsage, f.Volumes.DeepCopy)
+			f.Volumes.Add(next.pod, next.volumes)
+		}
+		if next.antiAffinity {
+			f.AntiAffinityPods = lo.Assign(f.AntiAffinityPods, map[types.NamespacedName]*corev1.Pod{client.ObjectKeyFromObject(next.pod): next.pod})
+		}
+	}
+	if f.Pods == 0 {
+		return podFields{Node: f.Node}
+	}
+	return f
+}
+
+// stateNode builds the StateNode for a node's fields, joined with the fields of the pods bound to it. A StateNode
+// shares the Node and NodeClaim with cluster state, so they must not be modified. copyUsage copies the host port and
+// volume usage, which the scheduler adds simulated pods to.
+func (c *Cluster) stateNode(f nodeFields, copyUsage bool) *StateNode {
+	n := &StateNode{
+		Node:                f.Node,
+		NodeClaim:           f.NodeClaim,
+		markedForDeletion:   f.MarkedForDeletion,
+		nominatedUntil:      f.NominatedUntil,
+		repairPolicyMatches: f.RepairPolicyMatches,
+	}
+	var pods podFields
+	if f.Node != nil {
+		pods, _ = c.pods.Get(f.Node.Name)
+	}
+	n.Derived.PodRequests, n.Derived.PodLimits = pods.Requests, pods.Limits
+	n.Derived.DaemonSetRequests, n.Derived.DaemonSetLimits = pods.DaemonSetRequests, pods.DaemonSetLimits
+	n.Derived.DisruptionCost = pods.DisruptionCost
+	n.Derived.HostPorts = lo.TernaryF(pods.HostPorts == nil, scheduling.NewHostPortUsage, func() *scheduling.HostPortUsage {
+		return lo.Ternary(copyUsage, pods.HostPorts.DeepCopy(), pods.HostPorts)
+	})
+	if pods.Volumes == nil && len(f.CSIDrivers) == 0 {
+		n.Derived.Volumes = scheduling.NewVolumeUsage()
+		return n
+	}
+	n.Derived.Volumes = lo.TernaryF(pods.Volumes == nil, scheduling.NewVolumeUsage, pods.Volumes.DeepCopy)
+	for _, driver := range f.CSIDrivers {
+		if driver.Allocatable == nil || driver.Allocatable.Count == nil {
+			n.Derived.Volumes.AddUnbounded(driver.Name)
+			continue
+		}
+		n.Derived.Volumes.AddLimit(driver.Name, int(*driver.Allocatable.Count))
+	}
+	return n
 }
 
 // Synced validates that the NodeClaims and the Nodes that are stored in the apiserver
@@ -179,20 +480,19 @@ func (c *Cluster) Synced(ctx context.Context) (synced bool) {
 		ClusterStateSynced.Set(lo.Ternary[float64](synced, 1, 0), nil)
 	}()
 
+	stateNodeClaimNames := sets.New[string]()
+	for name, f := range c.nodeClaimNames.List() {
+		// Check to see if any node claim doesn't have a provider ID. If it doesn't, then the nodeclaim hasn't been
+		// launched, and we need to wait to see what the resolved values are before continuing.
+		if f.ProviderID == "" {
+			return false
+		}
+		stateNodeClaimNames.Insert(name)
+	}
 	// If the cluster state has already synced once, then we assume that objects are kept internally consistent
 	// with each other to avoid having to continually re-check that we have fully captured the same view
 	// of cluster state that controller-runtime has
 	if c.hasSynced.Load() {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-
-		for _, providerID := range c.nodeClaimNameToProviderID {
-			// Check to see if any node claim doesn't have a provider ID. If it doesn't, then the nodeclaim hasn't been
-			// launched, and we need to wait to see what the resolved values are before continuing.
-			if providerID == "" {
-				return false
-			}
-		}
 		return true
 	}
 
@@ -212,20 +512,12 @@ func (c *Cluster) Synced(ctx context.Context) (synced bool) {
 		log.FromContext(ctx).Error(err, "failed checking cluster state sync")
 		return false
 	}
-
-	c.mu.RLock()
-	stateNodeClaimNames := sets.New[string]()
-	for name, providerID := range c.nodeClaimNameToProviderID {
-		// Check to see if any node claim doesn't have a provider ID. If it doesn't, then the nodeclaim hasn't been
-		// launched, and we need to wait to see what the resolved values are before continuing.
-		if providerID == "" {
-			c.mu.RUnlock()
-			return false
+	stateNodeNames := sets.New[string]()
+	for name, f := range c.pods.List() {
+		if f.Node != nil {
+			stateNodeNames.Insert(name)
 		}
-		stateNodeClaimNames.Insert(name)
 	}
-	stateNodeNames := sets.New(lo.Keys(c.nodeNameToProviderID)...)
-	c.mu.RUnlock()
 
 	nodeClaimNames := sets.New[string]()
 	for _, nodeClaim := range nodeClaims {
@@ -250,73 +542,172 @@ func (c *Cluster) Synced(ctx context.Context) (synced bool) {
 // currently bound to a node. The pod returned may not be up-to-date with respect to status, however since the
 // anti-affinity terms can't be modified, they will be correct.
 func (c *Cluster) ForPodsWithAntiAffinity(fn func(p *corev1.Pod, n *corev1.Node) bool) {
-	c.antiAffinityPods.Range(func(key, value any) bool {
-		pod := value.(*corev1.Pod)
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		nodeName, ok := c.bindings[client.ObjectKeyFromObject(pod)]
-		if !ok {
-			return true
+	for _, f := range c.pods.List() {
+		if f.Node == nil {
+			continue
 		}
-		node, ok := c.nodes[c.nodeNameToProviderID[nodeName]]
-		if !ok || node.Node == nil {
-			// if we receive the node deletion event before the pod deletion event, this can happen
-			return true
-		}
-		return fn(pod, node.Node)
-	})
-}
-
-// Nodes returns an iterator which iterates over the state nodes in the cluster under a read-lock. It is not safe to
-// store the state.StateNode object and it should only be accessed while the iterator is active.
-func (c *Cluster) Nodes() iter.Seq[*StateNode] {
-	return func(yield func(*StateNode) bool) {
-		c.mu.RLock()
-		defer c.mu.RUnlock()
-		for _, node := range c.nodes {
-			if !yield(node) {
+		for _, pod := range f.AntiAffinityPods {
+			if !fn(pod, f.Node) {
 				return
 			}
 		}
 	}
 }
 
-// DeepCopyNodes creates a DeepCopy of all state nodes.
-// NOTE: This is very inefficient so this should only be used when DeepCopying is absolutely necessary
-func (c *Cluster) DeepCopyNodes() StateNodes {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	return lo.Map(lo.Values(c.nodes), func(n *StateNode, _ int) *StateNode {
-		return n.DeepCopy()
-	})
+// Nodes returns an iterator over the state nodes in the cluster. The StateNodes share their Node, NodeClaim and usage
+// with cluster state, so they must not be modified; use DeepCopyNodes for StateNodes to modify.
+func (c *Cluster) Nodes() iter.Seq[*StateNode] {
+	return func(yield func(*StateNode) bool) {
+		for _, f := range c.nodes.List() {
+			if !yield(c.stateNode(f, false)) {
+				return
+			}
+		}
+	}
 }
 
-// RepairPolicyMatcher returns the matcher cluster state matches Nodes with, or nil when node repair is disabled.
-func (c *Cluster) RepairPolicyMatcher() *health.RepairPolicyMatcher {
-	return c.repairPolicyMatcher
+// DeepCopyNodes returns the state nodes in the cluster, with their own copies of the usage that the scheduler adds
+// simulated pods to. They share their Node and NodeClaim with cluster state, which must not be modified.
+func (c *Cluster) DeepCopyNodes() StateNodes {
+	var nodes StateNodes
+	for _, f := range c.nodes.List() {
+		nodes = append(nodes, c.stateNode(f, true))
+	}
+	return nodes
 }
 
 // IsNodeNominated returns true if the given node was expected to have a pod bound to it during a recent scheduling
 // batch
 func (c *Cluster) IsNodeNominated(providerID string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	if n, ok := c.nodes[providerID]; ok {
-		return n.Nominated(c.clock)
-	}
-	return false
+	f, ok := c.nodes.Get(providerID)
+	return ok && f.NominatedUntil.After(c.clock.Now())
 }
 
 // NominateNodeForPod records that a node was the target of a pending pod during a scheduling batch
 func (c *Cluster) NominateNodeForPod(ctx context.Context, providerID string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	until := metav1.Time{Time: c.clock.Now().Add(nominationWindow(ctx))}
+	c.nodes.Update(providerID, func(f nodeFields) nodeFields {
+		if f.Node != nil || f.NodeClaim != nil {
+			f.NominatedUntil = until // extends nomination window if already nominated
+		}
+		return f
+	})
+}
 
-	if n, ok := c.nodes[providerID]; ok {
-		n.Nominate(ctx, c.clock) // extends nomination window if already nominated
+// UnmarkForDeletion removes the marking on the node as a node the controller intends to delete
+func (c *Cluster) UnmarkForDeletion(providerIDs ...string) {
+	for _, id := range providerIDs {
+		c.nodes.Update(id, func(f nodeFields) nodeFields { f.MarkedForDeletion = false; return f })
 	}
+}
+
+// MarkForDeletion marks the node as pending deletion in the internal cluster state
+func (c *Cluster) MarkForDeletion(providerIDs ...string) {
+	for _, id := range providerIDs {
+		c.nodes.Update(id, func(f nodeFields) nodeFields {
+			if f.Node != nil || f.NodeClaim != nil {
+				f.MarkedForDeletion = true
+			}
+			return f
+		})
+	}
+}
+
+func (c *Cluster) UpdateNodeClaim(nodeClaim *v1.NodeClaim) {
+	ctx := context.Background()
+	_ = c.nodeClaimsByProviderID.Refresh(ctx, nodeClaim)
+	_ = c.nodeClaimsByName.Refresh(ctx, nodeClaim)
+	_ = c.NodePoolState.nodeClaims.Refresh(ctx, nodeClaim)
+}
+
+func (c *Cluster) DeleteNodeClaim(name string) {
+	c.nodeClaimsByProviderID.Forget(types.NamespacedName{Name: name})
+	c.nodeClaimsByName.Forget(types.NamespacedName{Name: name})
+	c.NodePoolState.nodeClaims.Forget(types.NamespacedName{Name: name})
+}
+
+// UpdateNode applies the Node, re-reading its CSINode, and re-reads the pods bound to it, which heals pod events
+// cluster state missed.
+func (c *Cluster) UpdateNode(ctx context.Context, node *corev1.Node) error {
+	if err := c.nodesByProviderID.Refresh(ctx, node); err != nil {
+		return err
+	}
+	if err := c.nodesByName.Refresh(ctx, node); err != nil {
+		return err
+	}
+	if nodeKey(node) == "" {
+		return nil
+	}
+	var pods corev1.PodList
+	if err := c.kubeClient.List(ctx, &pods, client.MatchingFields{"spec.nodeName": node.Name}, client.UnsafeDisableDeepCopy); err != nil {
+		return fmt.Errorf("listing pods, %w", err)
+	}
+	listed := make([]*corev1.Pod, len(pods.Items))
+	for i := range pods.Items {
+		listed[i] = &pods.Items[i]
+	}
+	return c.podsByNodeName.Replace(ctx, node.Name, listed)
+}
+
+func (c *Cluster) DeleteNode(name string) {
+	c.nodesByProviderID.Forget(types.NamespacedName{Name: name})
+	c.nodesByName.Forget(types.NamespacedName{Name: name})
+}
+
+// UpdatePod applies the pod, re-reading its volumes.
+func (c *Cluster) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
+	// A pod's contribution reads its PVCs, which can change while the pod doesn't, so only such a pod recomputes the
+	// version cluster state already holds.
+	byNodeName := c.podsByNodeName.Apply
+	if lo.ContainsBy(pod.Spec.Volumes, func(v corev1.Volume) bool { return v.PersistentVolumeClaim != nil || v.Ephemeral != nil }) {
+		byNodeName = c.podsByNodeName.Refresh
+	}
+	return multierr.Combine(byNodeName(ctx, pod), c.podsByDaemonSet.Apply(ctx, pod))
+}
+
+func (c *Cluster) NodeClaimExists(nodeClaimName string) bool {
+	_, ok := c.nodeClaimNames.Get(nodeClaimName)
+	return ok
+}
+
+func (c *Cluster) UnlaunchedNodeClaimExists(nodeClaimName string) bool {
+	f, ok := c.nodeClaimNames.Get(nodeClaimName)
+	return ok && f.ProviderID == ""
+}
+
+func (c *Cluster) DeletePod(podKey types.NamespacedName) {
+	c.podsByNodeName.Forget(podKey)
+	c.podsByDaemonSet.Forget(podKey)
+	c.ClearPodSchedulingMappings(podKey)
+	c.MarkUnconsolidated()
+}
+
+func (c *Cluster) NodePoolResourcesFor(nodePoolName string) corev1.ResourceList {
+	resources, _ := c.nodePoolResources.Get(nodePoolName)
+	return maps.Clone(resources)
+}
+
+// Reset the cluster state for unit testing
+func (c *Cluster) Reset() {
+	c.unsyncedTimeMu.Lock()
+	defer c.unsyncedTimeMu.Unlock()
+	c.clusterState = time.Time{}
+	c.unsyncedStartTime = time.Time{}
+	c.lastUnsyncedLogTime = time.Time{}
+	c.hasSynced.Store(false)
+	c.newStores()
+	c.podAcks = sync.Map{}
+	c.podsSchedulingAttempted = sync.Map{}
+	c.podsSchedulableTimes = sync.Map{}
+	c.podToNodeClaim = sync.Map{}
+	c.bufferPodCountsMu.Lock()
+	c.bufferPodCounts = map[string]int{}
+	c.bufferPodCountsMu.Unlock()
+}
+
+// RepairPolicyMatcher returns the matcher cluster state matches Nodes with, or nil when node repair is disabled.
+func (c *Cluster) RepairPolicyMatcher() *health.RepairPolicyMatcher {
+	return c.repairPolicyMatcher
 }
 
 // UpdateBufferPodCounts replaces the entire buffer pod count mapping with the
@@ -344,127 +735,6 @@ func (c *Cluster) BufferPodCount(providerID string) int {
 	c.bufferPodCountsMu.RLock()
 	defer c.bufferPodCountsMu.RUnlock()
 	return c.bufferPodCounts[providerID]
-}
-
-// UnmarkForDeletion removes the marking on the node as a node the controller intends to delete
-func (c *Cluster) UnmarkForDeletion(providerIDs ...string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for _, id := range providerIDs {
-		if n, ok := c.nodes[id]; ok {
-			oldNode := n.ShallowCopy()
-			n.markedForDeletion = false
-			c.updateNodePoolResources(oldNode, n)
-		}
-	}
-}
-
-// MarkForDeletion marks the node as pending deletion in the internal cluster state
-func (c *Cluster) MarkForDeletion(providerIDs ...string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for _, id := range providerIDs {
-		if n, ok := c.nodes[id]; ok {
-			oldNode := n.ShallowCopy()
-			n.markedForDeletion = true
-			c.updateNodePoolResources(oldNode, n)
-		}
-	}
-}
-
-func (c *Cluster) UpdateNodeClaim(nodeClaim *v1.NodeClaim) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// If the nodeclaim has a providerID, create a StateNode for it, and populate the data.
-	// We only need to do this for a nodeclaim with a providerID as nodeclaims without provider IDs haven't
-	// been launched yet.
-	if nodeClaim.Status.ProviderID != "" {
-		n := c.newStateFromNodeClaim(nodeClaim, c.nodes[nodeClaim.Status.ProviderID])
-		c.nodes[nodeClaim.Status.ProviderID] = n
-	}
-
-	_ = c.NodePoolState.nodeClaims.Apply(context.Background(), nodeClaim)
-
-	// If the nodeclaim hasn't launched yet, we want to add it into cluster state to ensure
-	// that we're not racing with the internal cache for the cluster, assuming the node doesn't exist.
-	c.nodeClaimNameToProviderID[nodeClaim.Name] = nodeClaim.Status.ProviderID
-	ClusterStateNodesCount.Set(float64(len(c.nodes)), nil)
-}
-
-func (c *Cluster) DeleteNodeClaim(name string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.cleanupNodeClaim(name)
-	ClusterStateNodesCount.Set(float64(len(c.nodes)), nil)
-}
-
-func (c *Cluster) UpdateNode(ctx context.Context, node *corev1.Node) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	managed := node.Labels[v1.NodePoolLabelKey] != ""
-	initialized := node.Labels[v1.NodeInitializedLabelKey] != ""
-	if node.Spec.ProviderID == "" {
-		// If we know that we own this node, we shouldn't allow the providerID to be empty
-		if managed {
-			return nil
-		}
-		node.Spec.ProviderID = node.Name
-	}
-	// If we have a managed node with no instance type label that hasn't been initialized,
-	// we need to wait until the instance type label gets propagated on it
-	if managed && node.Labels[corev1.LabelInstanceTypeStable] == "" && !initialized {
-		return nil
-	}
-	n, err := c.newStateFromNode(ctx, node, c.nodes[node.Spec.ProviderID])
-	if err != nil {
-		return err
-	}
-	c.nodes[node.Spec.ProviderID] = n
-	c.nodeNameToProviderID[node.Name] = node.Spec.ProviderID
-	ClusterStateNodesCount.Set(float64(len(c.nodes)), nil)
-	return nil
-}
-
-func (c *Cluster) DeleteNode(name string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.cleanupNode(name)
-	ClusterStateNodesCount.Set(float64(len(c.nodes)), nil)
-}
-
-func (c *Cluster) UpdatePod(ctx context.Context, pod *corev1.Pod) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	var err error
-	if podutils.IsTerminal(pod) {
-		c.updateNodeUsageFromPodCompletion(client.ObjectKeyFromObject(pod))
-	} else {
-		err = c.updateNodeUsageFromPod(ctx, pod)
-	}
-	c.updatePodAntiAffinities(pod)
-	return err
-}
-
-func (c *Cluster) NodeClaimExists(nodeClaimName string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	_, ok := c.nodeClaimNameToProviderID[nodeClaimName]
-	return ok
-}
-
-func (c *Cluster) UnlaunchedNodeClaimExists(nodeClaimName string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	providerID, ok := c.nodeClaimNameToProviderID[nodeClaimName]
-	return ok && providerID == ""
 }
 
 // AckPods marks the pod as acknowledged for scheduling from the provisioner. This is only done once per-pod.
@@ -601,16 +871,6 @@ func (c *Cluster) PodSchedulingSuccessTimeRegistrationHealthyCheck(podKey types.
 	return time.Time{}
 }
 
-func (c *Cluster) DeletePod(podKey types.NamespacedName) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.antiAffinityPods.Delete(podKey)
-	c.updateNodeUsageFromPodCompletion(podKey)
-	c.ClearPodSchedulingMappings(podKey)
-	c.MarkUnconsolidated()
-}
-
 func (c *Cluster) ClearPodSchedulingMappings(podKey types.NamespacedName) {
 	c.podAcks.Delete(podKey)
 	c.podsSchedulableTimes.Delete(podKey)
@@ -650,38 +910,6 @@ func (c *Cluster) ConsolidationState() time.Time {
 	return c.MarkUnconsolidated()
 }
 
-func (c *Cluster) NodePoolResourcesFor(nodePoolName string) corev1.ResourceList {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	return maps.Clone(c.nodePoolResources[nodePoolName])
-}
-
-// Reset the cluster state for unit testing
-func (c *Cluster) Reset() {
-	c.unsyncedTimeMu.Lock()
-	defer c.unsyncedTimeMu.Unlock()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.clusterState = time.Time{}
-	c.unsyncedStartTime = time.Time{}
-	c.lastUnsyncedLogTime = time.Time{}
-	c.hasSynced.Store(false)
-	c.nodes = map[string]*StateNode{}
-	c.nodeNameToProviderID = map[string]string{}
-	c.nodeClaimNameToProviderID = map[string]string{}
-	c.NodePoolState.Reset()
-	c.nodePoolResources = map[string]corev1.ResourceList{}
-	c.bindings = map[types.NamespacedName]string{}
-	c.antiAffinityPods = sync.Map{}
-	c.daemonSetPods = sync.Map{}
-	c.podAcks = sync.Map{}
-	c.podsSchedulingAttempted = sync.Map{}
-	c.podsSchedulableTimes = sync.Map{}
-	c.podToNodeClaim = sync.Map{}
-	c.bufferPodCounts = map[string]int{}
-}
-
 // sets the cluster to be synced or unsynced for unit testing
 func (c *Cluster) SetSynced(state bool) {
 	c.unsyncedTimeMu.Lock()
@@ -689,338 +917,31 @@ func (c *Cluster) SetSynced(state bool) {
 	c.hasSynced.Store(state)
 }
 
+// daemonSetFields are the fields derived about a DaemonSet from its pods.
+type daemonSetFields struct {
+	// Pod is the DaemonSet's newest pod.
+	Pod *corev1.Pod
+}
+
+func daemonSetKey(pod *corev1.Pod) types.NamespacedName {
+	if owner := metav1.GetControllerOf(pod); owner != nil && owner.Kind == "DaemonSet" {
+		return types.NamespacedName{Namespace: pod.Namespace, Name: owner.Name}
+	}
+	return types.NamespacedName{}
+}
+
+// GetDaemonSetPod returns a copy of the DaemonSet's newest pod, or nil if cluster state hasn't seen one.
 func (c *Cluster) GetDaemonSetPod(daemonset *appsv1.DaemonSet) *corev1.Pod {
-	if pod, ok := c.daemonSetPods.Load(client.ObjectKeyFromObject(daemonset)); ok {
-		return pod.(*corev1.Pod).DeepCopy()
-	}
-
-	return nil
-}
-
-func (c *Cluster) UpdateDaemonSet(ctx context.Context, daemonset *appsv1.DaemonSet) error {
-	pods := &corev1.PodList{}
-	// Scope down this call to only select the pods in this namespace that specifically match the DaemonSet
-	// Because we get so many pods from this response, we are not DeepCopying the cached data here
-	// DO NOT MUTATE pods in this function as this will affect the underlying cached pod
-	if err := c.kubeClient.List(ctx, pods, client.InNamespace(daemonset.Namespace), client.UnsafeDisableDeepCopy); err != nil {
-		return err
-	}
-	if len(pods.Items) == 0 {
+	f, _ := c.daemonSetPods.Get(client.ObjectKeyFromObject(daemonset))
+	if f.Pod == nil {
 		return nil
 	}
-	var pod *corev1.Pod
-	for _, p := range pods.Items {
-		if metav1.IsControlledBy(&p, daemonset) && (pod == nil || p.CreationTimestamp.After(pod.CreationTimestamp.Time)) {
-			pod = &p
-		}
-	}
-	if pod != nil {
-		c.daemonSetPods.Store(client.ObjectKeyFromObject(daemonset), pod.DeepCopy())
-	}
-	return nil
+	return f.Pod.DeepCopy()
 }
 
+// DeleteDaemonSet drops the DaemonSet's pod.
 func (c *Cluster) DeleteDaemonSet(key types.NamespacedName) {
-	c.daemonSetPods.Delete(key)
-}
-
-// WARNING
-// Everything under this section of code assumes that you have already held a lock when you are calling into these functions
-// and explicitly modifying the cluster state. If you do not hold the cluster state lock before calling any of these helpers
-// you will hit race conditions and data corruption
-
-func (c *Cluster) newStateFromNodeClaim(nodeClaim *v1.NodeClaim, oldNode *StateNode) *StateNode {
-	if oldNode == nil {
-		oldNode = NewNode()
-	}
-	n := &StateNode{
-		Node:              oldNode.Node,
-		NodeClaim:         nodeClaim,
-		daemonSetRequests: oldNode.daemonSetRequests,
-		daemonSetLimits:   oldNode.daemonSetLimits,
-		podRequests:       oldNode.podRequests,
-		podLimits:         oldNode.podLimits,
-		hostPortUsage:     oldNode.hostPortUsage,
-		volumeUsage:       oldNode.volumeUsage,
-		markedForDeletion: oldNode.markedForDeletion,
-		nominatedUntil:    oldNode.nominatedUntil,
-
-		repairPolicyMatches: oldNode.repairPolicyMatches,
-	}
-	// Cleanup the old nodeClaim with its old providerID if its providerID changes
-	// This can happen since nodes don't get created with providerIDs. Rather, CCM picks up the
-	// created node and injects the providerID into the spec.providerID
-	if id, ok := c.nodeClaimNameToProviderID[nodeClaim.Name]; ok && id != nodeClaim.Status.ProviderID {
-		c.cleanupNodeClaim(nodeClaim.Name)
-	}
-	c.updateNodePoolResources(oldNode, n)
-	c.triggerConsolidationOnChange(oldNode, n)
-	return n
-}
-
-func (c *Cluster) cleanupNodeClaim(name string) {
-	if id := c.nodeClaimNameToProviderID[name]; id != "" {
-		if c.nodes[id].Node == nil {
-			c.updateNodePoolResources(c.nodes[id], nil)
-			delete(c.nodes, id)
-		} else {
-			oldNode := c.nodes[id].ShallowCopy()
-			c.nodes[id].NodeClaim = nil
-			c.updateNodePoolResources(oldNode, c.nodes[id])
-		}
-		c.MarkUnconsolidated()
-	}
-	// Delete the node claim from the nodeClaimNameToProviderID in the case that the provider ID hasn't resolved
-	// yet. This ensures that if a nodeClaim is created and then deleted before it was able to launch that
-	// this is cleaned up.
-	delete(c.nodeClaimNameToProviderID, name)
-
-	c.NodePoolState.nodeClaims.Forget(types.NamespacedName{Name: name})
-}
-
-func (c *Cluster) newStateFromNode(ctx context.Context, node *corev1.Node, oldNode *StateNode) (*StateNode, error) {
-	if oldNode == nil {
-		oldNode = NewNode()
-	}
-	n := &StateNode{
-		Node:              node,
-		NodeClaim:         oldNode.NodeClaim,
-		daemonSetRequests: map[types.NamespacedName]corev1.ResourceList{},
-		daemonSetLimits:   map[types.NamespacedName]corev1.ResourceList{},
-		podRequests:       map[types.NamespacedName]corev1.ResourceList{},
-		podLimits:         map[types.NamespacedName]corev1.ResourceList{},
-		hostPortUsage:     scheduling.NewHostPortUsage(),
-		volumeUsage:       scheduling.NewVolumeUsage(),
-		markedForDeletion: oldNode.markedForDeletion,
-		nominatedUntil:    oldNode.nominatedUntil,
-	}
-	n.repairPolicyMatches = c.matchRepairPolicies(ctx, node, oldNode)
-	if err := multierr.Combine(
-		c.populateResourceRequests(ctx, n),
-		c.populateVolumeLimits(ctx, n),
-	); err != nil {
-		return nil, err
-	}
-	// Cleanup the old node with its old providerID if its providerID changes
-	// This can happen since nodes don't get created with providerIDs. Rather, CCM picks up the
-	// created node and injects the providerID into the spec.providerID
-	if id, ok := c.nodeNameToProviderID[node.Name]; ok && id != node.Spec.ProviderID {
-		c.cleanupNode(node.Name)
-	}
-	c.updateNodePoolResources(oldNode, n)
-	c.triggerConsolidationOnChange(oldNode, n)
-	return n, nil
-}
-
-func (c *Cluster) cleanupNode(name string) {
-	if id := c.nodeNameToProviderID[name]; id != "" {
-		if c.nodes[id].NodeClaim == nil {
-			c.updateNodePoolResources(c.nodes[id], nil)
-			delete(c.nodes, id)
-		} else {
-			oldNode := c.nodes[id].ShallowCopy()
-			c.nodes[id].Node = nil
-			c.updateNodePoolResources(oldNode, c.nodes[id])
-		}
-		delete(c.nodeNameToProviderID, name)
-		c.MarkUnconsolidated()
-	}
-}
-
-// matchRepairPolicies matches the Node against the repair policies, reusing the old matches when the inputs to matching
-// are unchanged. It logs when the Node starts, changes, or stops matching, which records when and how repair will act.
-func (c *Cluster) matchRepairPolicies(ctx context.Context, node *corev1.Node, oldNode *StateNode) []health.RepairPolicyMatch {
-	if c.repairPolicyMatcher == nil {
-		return nil
-	}
-	if oldNode.Node != nil && health.MatchInputsEqual(oldNode.Node, node) {
-		return oldNode.repairPolicyMatches
-	}
-	matches := c.repairPolicyMatcher.Match(node)
-	// Guard on Enabled so a disabled V(1) logger doesn't pay for building the key/value pairs.
-	if logger := log.FromContext(ctx).V(1); logger.Enabled() {
-		logger = logger.WithValues("Node", klog.KObj(node))
-		for _, m := range matches {
-			logger.WithValues(m.LogValues()...).Info("matched repair policy")
-		}
-		if len(matches) == 0 && len(oldNode.repairPolicyMatches) > 0 {
-			logger.Info("no longer matches any repair policy")
-		}
-	}
-	return matches
-}
-
-// nolint:gocyclo
-func (c *Cluster) updateNodePoolResources(oldNode, newNode *StateNode) {
-	var oldNodePoolName, newNodePoolName string
-	var oldResources, newResources corev1.ResourceList
-	if oldNode != nil && (oldNode.Node != nil || oldNode.NodeClaim != nil) {
-		oldNodePoolName = oldNode.Labels()[v1.NodePoolLabelKey]
-		oldResources = lo.Ternary(oldNode.MarkedForDeletion(), corev1.ResourceList{}, oldNode.Capacity())
-	}
-	if newNode != nil && (newNode.Node != nil || newNode.NodeClaim != nil) {
-		newNodePoolName = newNode.Labels()[v1.NodePoolLabelKey]
-		newResources = lo.Ternary(newNode.MarkedForDeletion(), corev1.ResourceList{}, newNode.Capacity())
-	}
-	if len(oldResources) != 0 {
-		oldResources[resources.Node] = resource.MustParse("1")
-	}
-	if len(newResources) != 0 {
-		newResources[resources.Node] = resource.MustParse("1")
-	}
-	if _, ok := c.nodePoolResources[newNodePoolName]; !ok && newNodePoolName != "" {
-		c.nodePoolResources[newNodePoolName] = corev1.ResourceList{}
-	}
-	if oldNodePoolName != "" {
-		for resourceName, quantity := range oldResources {
-			current := c.nodePoolResources[oldNodePoolName][resourceName]
-			current.Sub(quantity)
-			c.nodePoolResources[oldNodePoolName][resourceName] = current
-		}
-	}
-	if newNodePoolName != "" {
-		for resourceName, quantity := range newResources {
-			current := c.nodePoolResources[newNodePoolName][resourceName]
-			current.Add(quantity)
-			c.nodePoolResources[newNodePoolName][resourceName] = current
-		}
-	}
-	// Garbage collect any NodePool keys that no longer have any resources assigned to them.
-	// We do this when there are no longer any NodeClaims that map to this NodePool
-	// so that we don't leak NodePool keys in our nodePoolResources map
-	for _, name := range []string{oldNodePoolName, newNodePoolName} {
-		allZero := true
-		for _, v := range c.nodePoolResources[name] {
-			if !v.IsZero() {
-				allZero = false
-				break
-			}
-		}
-		if allZero {
-			delete(c.nodePoolResources, name)
-		}
-	}
-}
-
-func (c *Cluster) populateVolumeLimits(ctx context.Context, n *StateNode) error {
-	var csiNode storagev1.CSINode
-	if err := c.kubeClient.Get(ctx, client.ObjectKey{Name: n.Node.Name}, &csiNode); err != nil {
-		return client.IgnoreNotFound(serrors.Wrap(fmt.Errorf("getting CSINode to determine volume limit, %w", err), "CSINode", klog.KRef("", n.Node.Name)))
-	}
-	for _, driver := range csiNode.Spec.Drivers {
-		if driver.Allocatable == nil || driver.Allocatable.Count == nil {
-			n.volumeUsage.AddUnbounded(driver.Name)
-			continue
-		}
-		n.volumeUsage.AddLimit(driver.Name, int(*driver.Allocatable.Count))
-	}
-	return nil
-}
-
-func (c *Cluster) populateResourceRequests(ctx context.Context, n *StateNode) error {
-	var pods corev1.PodList
-	if err := c.kubeClient.List(ctx, &pods, client.MatchingFields{"spec.nodeName": n.Node.Name}); err != nil {
-		return fmt.Errorf("listing pods, %w", err)
-	}
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		if podutils.IsTerminal(pod) {
-			continue
-		}
-		if err := n.updateForPod(ctx, c.kubeClient, pod); err != nil {
-			return err
-		}
-		c.cleanupOldBindings(pod)
-		c.bindings[client.ObjectKeyFromObject(pod)] = pod.Spec.NodeName
-	}
-	return nil
-}
-
-// updateNodeUsageFromPod is called every time a reconcile event occurs for the pod. If the pods binding has changed
-// (unbound to bound), we need to update the resource requests on the node.
-func (c *Cluster) updateNodeUsageFromPod(ctx context.Context, pod *corev1.Pod) error {
-	// nothing to do if the pod isn't bound, checking early allows avoiding unnecessary locking
-	if pod.Spec.NodeName == "" {
-		return nil
-	}
-
-	n, ok := c.nodes[c.nodeNameToProviderID[pod.Spec.NodeName]]
-	if !ok {
-		// the node must exist for us to update the resource requests on the node
-		return errors.NewNotFound(schema.GroupResource{Resource: "Node"}, pod.Spec.NodeName)
-	}
-	if err := n.updateForPod(ctx, c.kubeClient, pod); err != nil {
-		return err
-	}
-	c.cleanupOldBindings(pod)
-	c.bindings[client.ObjectKeyFromObject(pod)] = pod.Spec.NodeName
-	return nil
-}
-
-func (c *Cluster) updateNodeUsageFromPodCompletion(podKey types.NamespacedName) {
-	nodeName, bindingKnown := c.bindings[podKey]
-	if !bindingKnown {
-		// we didn't think the pod was bound, so we weren't tracking it and don't need to do anything
-		return
-	}
-
-	delete(c.bindings, podKey)
-	n, ok := c.nodes[c.nodeNameToProviderID[nodeName]]
-	if !ok {
-		// we weren't tracking the node yet, so nothing to do
-		return
-	}
-	n.cleanupForPod(podKey)
-}
-
-func (c *Cluster) cleanupOldBindings(pod *corev1.Pod) {
-	if oldNodeName, bindingKnown := c.bindings[client.ObjectKeyFromObject(pod)]; bindingKnown {
-		if oldNodeName == pod.Spec.NodeName {
-			// we are already tracking the pod binding, so nothing to update
-			return
-		}
-		// the pod has switched nodes, this can occur if a pod name was re-used, and it was deleted/re-created rapidly,
-		// binding to a different node the second time
-		if oldNode, ok := c.nodes[c.nodeNameToProviderID[oldNodeName]]; ok {
-			// we were tracking the old node, so we need to reduce its capacity by the amount of the pod that left
-			oldNode.cleanupForPod(client.ObjectKeyFromObject(pod))
-			delete(c.bindings, client.ObjectKeyFromObject(pod))
-		}
-	}
-	// new pod binding has occurred
-	c.MarkUnconsolidated()
-}
-
-func (c *Cluster) updatePodAntiAffinities(pod *corev1.Pod) {
-	// We intentionally don't track inverse anti-affinity preferences. We're not
-	// required to enforce them so it just adds complexity for very little
-	// value. The problem with them comes from the relaxation process, the pod
-	// we are relaxing is not the pod with the anti-affinity term.
-	if podKey := client.ObjectKeyFromObject(pod); podutils.HasRequiredPodAntiAffinity(pod) {
-		c.antiAffinityPods.Store(podKey, pod)
-	} else {
-		c.antiAffinityPods.Delete(podKey)
-	}
-}
-
-func (c *Cluster) triggerConsolidationOnChange(old, new *StateNode) {
-	if old == nil || new == nil {
-		c.MarkUnconsolidated()
-		return
-	}
-	// If either the old node or new node are mocked
-	if (old.Node == nil && old.NodeClaim == nil) || (new.Node == nil && new.NodeClaim == nil) {
-		c.MarkUnconsolidated()
-		return
-	}
-	if old.Initialized() != new.Initialized() {
-		c.MarkUnconsolidated()
-		return
-	}
-	if old.MarkedForDeletion() != new.MarkedForDeletion() {
-		c.MarkUnconsolidated()
-		return
-	}
+	c.daemonSetPods.Update(key, func(daemonSetFields) daemonSetFields { return daemonSetFields{} })
 }
 
 // HasSynced returns whether the cluster state has been synchronized at least once.
