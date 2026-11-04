@@ -89,6 +89,15 @@ in `pkg/operator/options/options.go`; the `--feature-gates` default, its help te
   add its field to `FeatureGates`.
 - Reference a gate by its var (e.g. `NodeRepairFeatureGate.Name`), never a string literal.
 
+## Derived Fields
+
+Every value computed about an object from other objects, such as a count or a
+sum, is a derived field: kept in a store, updated on every mutation, and read
+with the object through its state accessor, such as `state.NodePools`. Read an
+object that has an accessor only through it, and use the client only to write
+it. Read `pkg/state/store/AGENTS.md` before adding a map to cluster state or a
+loop that recomputes an aggregate.
+
 ## Issue and PR Guidelines
 
 - Never create an issue.
