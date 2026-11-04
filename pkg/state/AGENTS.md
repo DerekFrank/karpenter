@@ -5,17 +5,21 @@ has its own source of truth and its own rules.
 
 | | Facts | Derived fields | Intent |
 |---|---|---|---|
-| What | the API objects, and joins of objects that are one thing (a Node and its NodeClaim) | values computed from other objects: a NodePool's NodeClaim usage, the pod requests on a Node | what Karpenter has decided and only Karpenter records: nominations, deletion marks |
-| Source of truth | the API server | the API server, through the objects they're computed from | Karpenter's memory |
-| Consistency | an object, or a join, reads as one version | each field may lag the object and the other fields, and converges | per decision |
+| What | the API objects, and joins of objects that are one thing (a Node and its NodeClaim) | values computed from other objects: a NodePool's NodeClaim usage, the pod requests on a Node | what Karpenter has decided to do and is still doing: a node reserved against a limit for a NodeClaim it is creating |
+| Source of truth | the API server | the API server, through the objects they're computed from | Karpenter's memory, until the objects it decided on exist |
+| Consistency | an object, or a join, reads as one version | each field may lag the object and the other fields, and converges | each decision is atomic with the fields it decides on, and counts until its object does |
 
-This file covers facts and derived fields. Intent lives in `state.Cluster` in
-`pkg/controllers/state`.
+A decision that completes with one write, such as marking a node for
+disruption, is a fact: write it to the object, and the overlay serves it as
+soon as the write returns. A decision that takes a while to come true, and that
+other decisions count meanwhile, is intent, kept as a claim. See
+[Claims](#claims).
 
 ## Layout
 
 - **`pkg/state`** holds the primitives, which know no object kinds: `Store`,
-  `Contribute` (`Contributor`), `Derive`, `Accessor` (`NewAccessor`) and `View`.
+  `Contribute` (`Contributor`), `Derive`, `Accessor` (`NewAccessor`), `View`
+  and `Claims`.
 - **`pkg/state/overlay`** holds `overlay.Client`, the read-after-write client:
   its reads include its own writes before the informer delivers them.
 
@@ -85,6 +89,48 @@ stores. Each store has its own lock, so fields from different stores, and a
 join and its fields, may lag each other. A reader that combines them tolerates
 the lag: a pod that moves between nodes can briefly count on both or neither.
 
+## Claims
+
+A claim holds a value against a key for an object a caller is about to create,
+such as a node against a static NodePool's node limit, so a decision against a
+limit counts what is already on its way. Claims live in the same store as the
+derived fields they count with, so admission and the handoff to the counted
+object happen under one lock and are atomic.
+
+```go
+reservations = r.cluster.NodePoolState.ReserveNodeCount(np.Name, nodeLimit, 1) // admits atomically against counted + held
+nodeClaim.Reservation = reservations[0]                                         // the provisioner binds or releases it
+```
+
+- **`state.NewClaims(contributor, hold, counts, ttl, clock)`** makes claims
+  against the keys a `Contributor` feeds. `hold` folds a held value into the
+  fields, as `apply` does. `counts` returns whether an object's contribution
+  counts what its claim held, such as launched capacity for a claim of the
+  largest instance type it might launch.
+- **`Claims.Reserve(key, n, value, admit)`** grants up to `n` claims, one at a
+  time while `admit` accepts the fields with the claim held. Hold the most the
+  object could count, so the limit holds while the object is on its way. A
+  pessimistic hold costs a little headroom until the object counts; an
+  optimistic one lets concurrent callers overshoot.
+- **Every claim ends exactly once.** `Bind` it to the object once created; the
+  `Contributor` releases it when it counts that object, at once if it already
+  has, or when the object goes away first. `Release` it when the caller drops the
+  create. A claim uncounted within its TTL (`state.ReservationTTL` for
+  NodePools) expires, which bounds what a dropped claim or an ambiguous failure
+  holds.
+- **Each object counts at least once.** A claim ends when the `Contributor`
+  counts its object, which can be after the create returns. An object may count
+  twice for a moment, while it counts before its claim is bound; that only
+  refuses a later admission, so it is safe.
+- **A claim travels with its work**, such as `scheduling.NodeClaim.Reservation`
+  on the NodeClaim a command creates. Every path that drops the work releases
+  it, as the provisioner and the disruption queue do.
+- **Claims live in memory**, and end with the process along with the work they
+  are for. Reserve once `state.Cluster` has synced, as the static provisioning
+  controller does, so admission counts every existing object.
+- **Intent is a set of claims.** Each claim has an identity, so it ends exactly
+  once.
+
 ## Adding a derived field
 
 - Add the field to its store's fields struct and to the accessor's `Derived`
@@ -112,3 +158,7 @@ the lag: a pod that moves between nodes can briefly count on both or neither.
 - Check a field against a recount of its objects after many concurrent changes,
   as `TestContributorConcurrentChangesConverge` does.
 - Read through the accessor over a fake client, as `accessor_test.go` does.
+- Test claims as `claims_test.go` does: race reservers that create and delete
+  objects against a recount of what objects count and live claims hold, and
+  check that what objects count stays within the limit
+  (`TestClaimsNeverExceedTheLimitOrCountAnObjectZeroTimes`).
