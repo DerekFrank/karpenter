@@ -74,10 +74,10 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 		limit, ok := np.Spec.Limits[resources.Node]
 		nodeLimit := lo.Ternary(ok, limit.Value(), int64(math.MaxInt64))
 		// Current nodes (includes in‑flight per your cluster state)
-		runningNodes, _, nodesPendingDisruptionCount := d.cluster.NodePoolState.GetNodeCount(npName)
+		runningNodes, _, _ := d.cluster.NodePoolState.GetNodeCount(npName)
 
 		// We dont want to disrupt nodes until scale down is complete
-		if int64(runningNodes+nodesPendingDisruptionCount) > lo.FromPtr(np.Spec.Replicas) {
+		if int64(runningNodes) > lo.FromPtr(np.Spec.Replicas) {
 			continue
 		}
 
@@ -111,7 +111,8 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 		// Acquire limits from cluster state without bursting over. maxAllowedDrifts is how many candidates we can drift
 		// while staging a replacement for each without exceeding the NodePool's node limit; 0 means the pool is at its
 		// limit and can't stage any replacement.
-		maxAllowedDrifts := d.cluster.NodePoolState.ReserveNodeCount(npName, nodeLimit, maxDrifts)
+		reservations := d.cluster.NodePoolState.ReserveNodeCount(npName, nodeLimit, maxDrifts)
+		maxAllowedDrifts := len(reservations)
 
 		// Terminate-first (RFC #3203): when the NodePool is at its node limit it can't stage a replacement first — a
 		// pre-spun replacement would be an (N+1)th node the operator capped out. Issue budget-paced delete-only commands;
@@ -127,9 +128,9 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 		}
 
 		// Select candidates up to maxAllowedDrifts
-		for _, c := range npCandidates[:maxAllowedDrifts] {
+		for i, c := range npCandidates[:maxAllowedDrifts] {
 			result := scheduling.Results{
-				NewNodeClaims: []*scheduling.NodeClaim{{NodeClaimTemplate: *nct}},
+				NewNodeClaims: []*scheduling.NodeClaim{{NodeClaimTemplate: *nct, Reservation: reservations[i]}},
 			}
 			cmds = append(cmds, Command{
 				Candidates:          []*Candidate{c},

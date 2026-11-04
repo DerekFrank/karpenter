@@ -36,6 +36,7 @@ import (
 	"go.uber.org/multierr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/util/workqueue"
@@ -193,18 +194,21 @@ func (p *Provisioner) CreateNodeClaims(ctx context.Context, nodeClaims []*schedu
 	nodeClaimNames := make([]string, len(nodeClaims))
 	workqueue.ParallelizeUntil(ctx, len(nodeClaims), len(nodeClaims), func(i int) {
 		// create a new context to avoid a data race on the ctx variable
-		if name, err := p.Create(ctx, nodeClaims[i], opts...); err != nil {
+		name, err := p.Create(ctx, nodeClaims[i], opts...)
+		if err != nil {
 			errs[i] = fmt.Errorf("creating node claim, %w", err)
 		} else {
 			nodeClaimNames[i] = name
 		}
-
-		// Regardless of if we successfully created the NodeClaim or not, we should release the reservation. If the NodeClaim
-		// was successfully created, we've updated the active node count in Create already. If we failed, we should release
-		// the reservation and allow the provisioner to create new NodeClaims in a subsequent attempt.
-		// NOTE: Only applies to static NodePools since node limits are not supported for dynamic NodePools
-		if nodeClaims[i].IsStaticNodeClaim {
-			p.cluster.NodePoolState.ReleaseNodeCount(nodeClaims[i].NodePoolName, 1)
+		// A created NodeClaim's reservation is held until the NodeClaim counts against the limit. A create that failed
+		// releases it, unless it may have succeeded anyway, which leaves it to expire.
+		if reservation := nodeClaims[i].Reservation; reservation != nil {
+			switch {
+			case err == nil:
+				reservation.Bind(types.NamespacedName{Name: name})
+			case !ambiguous(err):
+				reservation.Release()
+			}
 		}
 	})
 	return nodeClaimNames, multierr.Combine(errs...)
@@ -676,4 +680,9 @@ func validateNodeSelectorTerm(ctx context.Context, term corev1.NodeSelectorTerm)
 		}
 	}
 	return errs
+}
+
+// ambiguous returns whether a create that returned err may have succeeded.
+func ambiguous(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) || apierrors.IsUnexpectedServerError(err)
 }
