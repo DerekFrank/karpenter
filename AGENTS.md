@@ -93,10 +93,10 @@ in `pkg/operator/options/options.go`; the `--feature-gates` default, its help te
 
 Every value computed about an object from other objects, such as a count or a
 sum, is a derived field: kept in a `state.Store`, updated on every mutation, and
-read with the object through its state accessor, a `state.Accessor`. Read an
-object that has an accessor through it, and write it through the client. Read
-`pkg/state/AGENTS.md` before adding an aggregate, or any map or loop that
-computes one.
+read with the object through its state accessor in `pkg/cluster`, such as
+`cluster.NodePools`. Read an object that has an accessor through it, and write
+it through the client. Read `pkg/state/AGENTS.md` before adding an aggregate,
+or any map or loop that computes one.
 
 ## Issue and PR Guidelines
 
