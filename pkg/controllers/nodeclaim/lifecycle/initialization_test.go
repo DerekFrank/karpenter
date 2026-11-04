@@ -17,12 +17,16 @@ limitations under the License.
 package lifecycle_test
 
 import (
+	"time"
+
+	"github.com/awslabs/operatorpkg/status"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	cloudproviderapi "k8s.io/cloud-provider/api"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
@@ -253,6 +257,44 @@ var _ = Describe("Initialization", func() {
 		Expect(node.Labels).ToNot(HaveKeyWithValue(v1.NodeInitializedLabelKey, "true"))
 		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue()).To(BeFalse())
+	})
+	It("should not re-initialize a rebooted node until the pods its reboot deleted finish terminating", func() {
+		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}}})
+		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeLaunched)
+		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeRegistered)
+		nodeClaim.StatusConditions().SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRebooting, "node is rebooting")
+		nodeClaim.StatusConditions().SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster")
+		pod := test.Pod(test.PodOptions{NodeName: node.Name, Phase: corev1.PodRunning})
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, pod)
+		ExpectMakeNodesReady(ctx, env.Client, env.Clock, node)
+		ExpectDeletionTimestampSet(ctx, env.Client, pod)
+
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).Reason).To(Equal("RebootDepartingPodsTerminating"))
+		Expect(ExpectExists(ctx, env.Client, node).Labels).ToNot(HaveKey(v1.NodeInitializedLabelKey))
+
+		// Kubelet finishes terminating the pod.
+		ExpectFinalizersRemoved(ctx, env.Client, pod)
+		Expect(env.Client.Delete(ctx, pod, client.GracePeriodSeconds(0))).To(Succeed())
+		ExpectNotFound(ctx, env.Client, pod)
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+		Expect(ExpectExists(ctx, env.Client, nodeClaim).StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue()).To(BeTrue())
+	})
+	It("should re-initialize a rebooted node anyway once a pod has been stuck terminating past the bound", func() {
+		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}}})
+		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeLaunched)
+		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeRegistered)
+		nodeClaim.StatusConditions().SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRebooting, "node is rebooting")
+		nodeClaim.StatusConditions(status.WithClock(env.Clock)).SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster")
+		pod := test.Pod(test.PodOptions{NodeName: node.Name, Phase: corev1.PodRunning})
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, pod)
+		ExpectMakeNodesReady(ctx, env.Client, env.Clock, node)
+		ExpectDeletionTimestampSet(ctx, env.Client, pod)
+
+		env.Clock.Step(3 * time.Minute)
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
+		Expect(ExpectExists(ctx, env.Client, nodeClaim).StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue()).To(BeTrue())
 	})
 	It("should not consider the Node to be initialized when the status of the Node is NotReady", func() {
 		nodeClaim := test.NodeClaim(v1.NodeClaim{
