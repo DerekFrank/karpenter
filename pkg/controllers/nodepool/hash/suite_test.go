@@ -49,7 +49,7 @@ func TestAPIs(t *testing.T) {
 }
 
 var _ = BeforeSuite(func() {
-	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...))
+	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...), test.WithFieldIndexers(test.NodeClaimNodePoolFieldIndexer(ctx)))
 	cp = fake.NewCloudProvider()
 	nodePoolController = hash.NewController(env.Client, cp)
 })
