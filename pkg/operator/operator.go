@@ -36,9 +36,11 @@ import (
 	"github.com/samber/lo"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -354,4 +356,20 @@ func setupIndexers(ctx context.Context, mgr manager.Manager) {
 	handleCRDIndexerError(mgr.GetFieldIndexer().IndexField(ctx, &v1.NodePool{}, "spec.template.spec.nodeClassRef.name", func(o client.Object) []string {
 		return []string{o.(*v1.NodePool).Spec.Template.Spec.NodeClassRef.Name}
 	}), "failed to setup nodepool nodeclassref name indexer")
+
+	if !options.FromContext(ctx).IgnoreDRARequests {
+		handleCRDIndexerError(mgr.GetFieldIndexer().IndexField(ctx, &resourcev1.ResourceSlice{}, "node", func(o client.Object) []string {
+			slice := o.(*resourcev1.ResourceSlice)
+			nodes := sets.New[string]()
+			if nodeName := lo.FromPtr(slice.Spec.NodeName); nodeName != "" {
+				nodes.Insert(nodeName)
+			}
+			for _, ref := range slice.OwnerReferences {
+				if ref.Kind == "Node" {
+					nodes.Insert(ref.Name)
+				}
+			}
+			return sets.List(nodes)
+		}), "failed to setup resourceslice node indexer")
+	}
 }
