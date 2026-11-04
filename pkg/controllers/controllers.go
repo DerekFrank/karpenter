@@ -69,6 +69,7 @@ import (
 	staticprovisioning "sigs.k8s.io/karpenter/pkg/controllers/static/provisioning"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 	"sigs.k8s.io/karpenter/pkg/state/nodepoolhealth"
 	"sigs.k8s.io/karpenter/pkg/state/prediction"
@@ -124,6 +125,8 @@ func NewControllers(
 	disruptionQueue := disruption.NewQueue(kubeClient, recorder, cluster, clock, p)
 	npState := nodepoolhealth.NewState()
 	clusterCost := cost.NewClusterCost(ctx, cloudProvider, kubeClient)
+	nodePoolUsage := karpenterstate.NewNodePoolUsage(kubeClient, mgr.GetCache())
+	nodePools := karpenterstate.NewNodePools(kubeClient, nodePoolUsage)
 	controllers := []controller.Controller{
 		p, evictionQueue, disruptionQueue,
 		disruption.NewController(ctx, clock, kubeClient, p, cloudProvider, recorder, cluster, disruptionQueue, clusterCost),
@@ -141,7 +144,7 @@ func NewControllers(
 		termination.NewController(clock, kubeClient, cloudProvider, terminator.NewTerminator(clock, kubeClient, evictionQueue, recorder), recorder),
 		nodepoolreadiness.NewController(clock, kubeClient, cloudProvider),
 		nodepoolregistrationhealth.NewController(clock, kubeClient, cloudProvider, npState),
-		nodepoolcounter.NewController(kubeClient, cloudProvider, cluster),
+		nodepoolcounter.NewController(kubeClient, cloudProvider, nodePools, nodePoolUsage),
 		nodepoolvalidation.NewController(clock, kubeClient, cloudProvider),
 		podevents.NewController(clock, kubeClient, cloudProvider),
 		nodeclaimconsistency.NewController(clock, kubeClient, cloudProvider, recorder),
