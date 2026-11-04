@@ -34,7 +34,6 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -710,18 +709,14 @@ func (c *Cluster) GetDaemonSetPod(daemonset *appsv1.DaemonSet) *corev1.Pod {
 
 func (c *Cluster) UpdateDaemonSet(ctx context.Context, daemonset *appsv1.DaemonSet) error {
 	pods := &corev1.PodList{}
-	// Scope down this call to only select the pods in this namespace that specifically match the DaemonSet
-	// Because we get so many pods from this response, we are not DeepCopying the cached data here
+	// We are not DeepCopying the cached data here
 	// DO NOT MUTATE pods in this function as this will affect the underlying cached pod
-	if err := c.kubeClient.List(ctx, pods, client.InNamespace(daemonset.Namespace), client.UnsafeDisableDeepCopy); err != nil {
+	if err := c.kubeClient.List(ctx, pods, client.InNamespace(daemonset.Namespace), client.MatchingFields{"metadata.ownerReferences.daemonSet": string(daemonset.UID)}, client.UnsafeDisableDeepCopy); err != nil {
 		return err
-	}
-	if len(pods.Items) == 0 {
-		return nil
 	}
 	var pod *corev1.Pod
 	for _, p := range pods.Items {
-		if metav1.IsControlledBy(&p, daemonset) && (pod == nil || p.CreationTimestamp.After(pod.CreationTimestamp.Time)) {
+		if pod == nil || p.CreationTimestamp.After(pod.CreationTimestamp.Time) {
 			pod = &p
 		}
 	}

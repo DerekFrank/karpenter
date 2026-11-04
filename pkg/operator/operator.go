@@ -38,6 +38,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -315,6 +316,13 @@ func setupIndexers(ctx context.Context, mgr manager.Manager) {
 	lo.Must0(mgr.GetFieldIndexer().IndexField(ctx, &corev1.Pod{}, "spec.nodeName", func(o client.Object) []string {
 		return []string{o.(*corev1.Pod).Spec.NodeName}
 	}), "failed to setup pod indexer")
+	lo.Must0(mgr.GetFieldIndexer().IndexField(ctx, &corev1.Pod{}, "metadata.ownerReferences.daemonSet", func(o client.Object) []string {
+		owner := metav1.GetControllerOf(o)
+		if owner == nil || owner.Kind != "DaemonSet" {
+			return nil
+		}
+		return []string{string(owner.UID)}
+	}), "failed to setup pod daemonset indexer")
 	lo.Must0(mgr.GetFieldIndexer().IndexField(ctx, &corev1.Node{}, "spec.providerID", func(o client.Object) []string {
 		return []string{o.(*corev1.Node).Spec.ProviderID}
 	}), "failed to setup node provider id indexer")

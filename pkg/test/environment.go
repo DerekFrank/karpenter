@@ -28,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -127,6 +128,18 @@ func NodePoolNodeClassRefFieldIndexer(ctx context.Context) func(cache.Cache) err
 			return []string{obj.(*v1.NodePool).Spec.Template.Spec.NodeClassRef.Name}
 		}))
 		return err
+	}
+}
+
+func PodDaemonSetFieldIndexer(ctx context.Context) func(cache.Cache) error {
+	return func(c cache.Cache) error {
+		return c.IndexField(ctx, &corev1.Pod{}, "metadata.ownerReferences.daemonSet", func(o client.Object) []string {
+			owner := metav1.GetControllerOf(o)
+			if owner == nil || owner.Kind != "DaemonSet" {
+				return nil
+			}
+			return []string{string(owner.UID)}
+		})
 	}
 }
 
