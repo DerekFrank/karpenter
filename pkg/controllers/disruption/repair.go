@@ -38,6 +38,7 @@ import (
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
@@ -177,10 +178,10 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 		// Static NodePools aren't reactively scheduled, so repair can't simulate a replacement — it mirrors StaticDrift.
 		if candidate.OwnedByStaticNodePool() {
 			np := candidate.NodePool
-			active, _, pendingDisruption := r.cluster.NodePoolState.GetNodeCount(np.Name)
+			active, _, _ := r.cluster.NodePoolState.GetNodeCount(np.Name)
 
 			// Skip until scale-down completes: a replacement would just be surplus the deprovisioner deletes.
-			if int64(active+pendingDisruption) > lo.FromPtr(np.Spec.Replicas) {
+			if int64(active) > lo.FromPtr(np.Spec.Replicas) {
 				continue
 			}
 
@@ -208,7 +209,11 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 			// past limits.nodes when commands race. A zero result reserves nothing, so the delete-only path leaks no
 			// reservation; a non-zero result's slot is consumed by the replacement staged below. Full reservations are
 			// checked first so the delete-only path never takes a slot.
-			if reservationsFull || r.cluster.NodePoolState.ReserveNodeCount(np.Name, nodeLimit, 1) == 0 {
+			var reservations state.Reservations
+			if !reservationsFull {
+				reservations = r.cluster.NodePoolState.ReserveNodeCount(np.Name, nodeLimit, 1)
+			}
+			if len(reservations) == 0 {
 				// Static provisioning refuses NotReady or deleting NodePools, so terminating first there would strand
 				// the workload with no replacement.
 				refillable := np.StatusConditions().Root().IsTrue() && np.DeletionTimestamp.IsZero()
@@ -224,7 +229,7 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 					TerminateFirstReason: lo.Ternary(reservationsFull, TerminateFirstNoReservedCapacity, TerminateFirstStaticAtLimit),
 				}}, nil
 			}
-			result := pscheduling.Results{NewNodeClaims: []*pscheduling.NodeClaim{{NodeClaimTemplate: *nct}}}
+			result := pscheduling.Results{NewNodeClaims: []*pscheduling.NodeClaim{{NodeClaimTemplate: *nct, Reservation: reservations[0]}}}
 			return []Command{{
 				Candidates:          []*Candidate{candidate},
 				Replacements:        replacementsFromNodeClaims(result.NewNodeClaims...),

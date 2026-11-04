@@ -47,6 +47,9 @@ type Contributor[K comparable, S client.Object, F, C any] struct {
 	contributions map[types.UID]record[K, C]
 	byTarget      map[K]map[types.UID]struct{}
 	synced        bool
+
+	// settle hands each change of an object's contribution to the Claims against this Contributor's store, if any.
+	settle func(name types.NamespacedName, value C, contributes bool) []change[K, F]
 }
 
 type record[K comparable, C any] struct {
@@ -128,6 +131,7 @@ func (c *Contributor[K, S, F, C]) Forget(name types.NamespacedName) {
 	var changed []change[K, F]
 	if uid, ok := c.sources.forget(name); ok {
 		changed = c.move(uid, record[K, C]{}, false)
+		changed = append(changed, c.settled(name, record[K, C]{}, false)...)
 	}
 	subscribers := c.store.subscribers
 	c.store.mu.Unlock()
@@ -171,6 +175,9 @@ func (c *Contributor[K, S, F, C]) Replace(ctx context.Context, target K, objs []
 	for uid := range c.byTarget[target] {
 		if _, ok := listed[uid]; !ok {
 			changed = append(changed, c.move(uid, record[K, C]{}, false)...)
+			if name, ok := c.sources.name(uid); ok {
+				changed = append(changed, c.settled(name, record[K, C]{}, false)...)
+			}
 		}
 	}
 	subscribers := c.store.subscribers
@@ -218,10 +225,20 @@ func (c *Contributor[K, S, F, C]) changeLocked(obj S, deleted, fromInformer bool
 	if replaced != "" {
 		changed = c.move(replaced, record[K, C]{}, false)
 	}
+	name := client.ObjectKeyFromObject(obj)
 	if gone {
-		return append(changed, c.move(identity(obj), record[K, C]{}, false)...)
+		changed = append(changed, c.move(identity(obj), record[K, C]{}, false)...)
+		return append(changed, c.settled(name, record[K, C]{}, false)...)
 	}
-	return append(changed, c.move(identity(obj), next, contributes)...)
+	changed = append(changed, c.move(identity(obj), next, contributes)...)
+	return append(changed, c.settled(name, next, contributes)...)
+}
+
+func (c *Contributor[K, S, F, C]) settled(name types.NamespacedName, next record[K, C], contributes bool) []change[K, F] {
+	if c.settle == nil {
+		return nil
+	}
+	return c.settle(name, next.value, contributes)
 }
 
 // CompareWith makes the Contributor decide whether a source's contribution changed with equal instead of

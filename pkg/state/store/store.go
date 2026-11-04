@@ -204,6 +204,16 @@ func (f feed) newer(obj client.Object) bool {
 	return !exists || (!cur.deleted && (rv == 0 || rv > cur.rv))
 }
 
+// name returns the name of the object uid identifies.
+func (f feed) name(uid types.UID) (types.NamespacedName, bool) {
+	for name, u := range f.names {
+		if u == uid {
+			return name, true
+		}
+	}
+	return types.NamespacedName{}, false
+}
+
 // identity is an object's UID, or its namespaced name for an object that has none because it never went through the
 // API server.
 func identity(obj client.Object) types.UID {

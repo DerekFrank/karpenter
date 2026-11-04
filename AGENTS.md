@@ -89,14 +89,17 @@ in `pkg/operator/options/options.go`; the `--feature-gates` default, its help te
   add its field to `FeatureGates`.
 - Reference a gate by its var (e.g. `NodeRepairFeatureGate.Name`), never a string literal.
 
-## Derived Fields
+## Derived Fields and Intent
 
 Every value computed about an object from other objects, such as a count or a
 sum, is a derived field: kept in a store, updated on every mutation, and read
 with the object through its state accessor, such as `state.NodePools`. Read an
 object that has an accessor only through it, and use the client only to write
-it. Read `pkg/state/store/AGENTS.md` before adding a map to cluster state or a
-loop that recomputes an aggregate.
+it. A decision that takes a while to come true and that other decisions must
+count, such as a node reserved against a limit, is a claim in the same store.
+Read `pkg/state/store/AGENTS.md` before adding a map to cluster state, a loop
+that recomputes an aggregate, or a counter that callers add to and subtract
+from.
 
 ## Issue and PR Guidelines
 
