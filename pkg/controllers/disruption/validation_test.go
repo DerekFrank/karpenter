@@ -50,7 +50,7 @@ var _ = Describe("Repair Method Registration", func() {
 	})
 
 	It("panics when repair is enabled on cluster state built without a matcher", func() {
-		withoutMatcher := state.NewCluster(env.Clock, env.Client, cloudProvider)
+		withoutMatcher := state.NewCluster(ctx, env.Clock, env.Client, cloudProvider)
 		Expect(func() {
 			disruption.NewMethods(enabledCtx, env.Clock, withoutMatcher, env.Client, prov, cloudProvider, recorder, queue)
 		}).To(PanicWith("node repair requires cluster state built with a repair policy matcher"))

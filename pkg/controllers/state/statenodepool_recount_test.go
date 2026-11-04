@@ -41,7 +41,7 @@ import (
 //nolint:gocyclo
 func TestNodePoolStateMatchesARecount(t *testing.T) {
 	r := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // deterministic seed for reproducible test inputs
-	cluster := state.NewCluster(clock.NewFakeClock(time.Now()), fake.NewClientBuilder().Build(), fakecp.NewCloudProvider())
+	cluster := state.NewCluster(ctx, clock.NewFakeClock(time.Now()), fake.NewClientBuilder().Build(), fakecp.NewCloudProvider())
 	latest := map[string]*v1.NodeClaim{}
 	var rv, uid uint64
 	for i := range 20000 {

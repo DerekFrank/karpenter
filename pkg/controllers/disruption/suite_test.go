@@ -118,7 +118,7 @@ func useRepairPolicies(policies []cloudprovider.RepairPolicy) {
 	cloudProvider.RepairPolicy = policies
 	repairPolicyMatcher := lo.Must(health.NewRepairPolicyMatcher(
 		options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeRepair: new(true)}})), cloudProvider))
-	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider, state.WithRepairPolicyMatcher(repairPolicyMatcher))
+	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider, state.WithRepairPolicyMatcher(repairPolicyMatcher))
 	nodeStateController = informer.NewNodeController(env.Client, cluster)
 	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
 	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client), store)

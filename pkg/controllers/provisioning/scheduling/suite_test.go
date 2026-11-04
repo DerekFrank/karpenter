@@ -100,7 +100,7 @@ var _ = BeforeSuite(func() {
 	// set these on the cloud provider, so we can manipulate them if needed
 	cloudProvider.InstanceTypes = instanceTypes
 	clusterCost = cost.NewClusterCost(ctx, cloudProvider, env.Client)
-	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
+	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider)
 	nodeStateController = informer.NewNodeController(env.Client, cluster)
 	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
 	podStateController = informer.NewPodController(env.Client, cluster)

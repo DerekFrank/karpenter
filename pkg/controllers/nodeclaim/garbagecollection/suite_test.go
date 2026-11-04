@@ -64,7 +64,7 @@ var _ = BeforeSuite(func() {
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...), test.WithFieldIndexers(test.NodeProviderIDFieldIndexer(ctx)))
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
-	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
+	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider)
 	garbageCollectionController = nodeclaimgarbagecollection.NewController(env.Clock, env.Client, cloudProvider)
 	nodeClaimController = nodeclaimlifcycle.NewController(env.Clock, env.Client, cloudProvider, events.NewRecorder(&record.FakeRecorder{}), cluster, nodepoolhealth.NewState(), nil)
 })

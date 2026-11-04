@@ -34,14 +34,21 @@ type Contribution[F, C any] interface {
 // Update(fields, zero). Fields compare semantically, so a nil and an empty map are equal, as are equal quantities.
 func ExpectContribution[F any, C Contribution[F, C]](t testing.TB, base F, prev, next C) {
 	t.Helper()
+	ExpectContributionWith(t, func(a, b F) bool { return equality.Semantic.DeepEqual(a, b) }, base, prev, next)
+}
+
+// ExpectContributionWith checks the laws as ExpectContribution does, comparing fields with equal, for fields that
+// equality.Semantic can't compare, such as ones with unexported fields.
+func ExpectContributionWith[F any, C Contribution[F, C]](t testing.TB, equal func(a, b F) bool, base F, prev, next C) {
+	t.Helper()
 	var zero C
 	for _, c := range []C{prev, next} {
-		if got := c.Delete(c.Update(base, zero)); !equality.Semantic.DeepEqual(got, base) {
+		if got := c.Delete(c.Update(base, zero)); !equal(got, base) {
 			t.Errorf("%+v: Delete after Update from zero = %+v, want the fields it started from, %+v", c, got, base)
 		}
 	}
 	withPrev := prev.Update(base, zero)
-	if got, want := next.Update(withPrev, prev), next.Update(prev.Delete(withPrev), zero); !equality.Semantic.DeepEqual(got, want) {
+	if got, want := next.Update(withPrev, prev), next.Update(prev.Delete(withPrev), zero); !equal(got, want) {
 		t.Errorf("%+v replacing %+v: Update = %+v, want what Delete then Update from zero gives, %+v", next, prev, got, want)
 	}
 }

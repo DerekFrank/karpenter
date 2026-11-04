@@ -81,7 +81,7 @@ var _ = BeforeSuite(func() {
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...))
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
-	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
+	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider)
 	nodeController = informer.NewNodeController(env.Client, cluster)
 	predictionStore = prediction.NewStore(env.Client)
 	prov = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client), predictionStore)
@@ -1070,7 +1070,7 @@ var _ = Describe("Provisioning", func() {
 					ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("2Gi")}},
 				})
 			ExpectApplied(ctx, env.Client, nodePool, daemonsetPod)
-			ExpectReconcileSucceeded(ctx, daemonsetController, client.ObjectKeyFromObject(daemonset))
+			Expect(cluster.UpdatePod(ctx, daemonsetPod)).To(Succeed())
 			pod := test.UnschedulablePod(test.PodOptions{
 				ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")}},
 				NodeSelector:         map[string]string{v1.NodePoolLabelKey: nodePool.Name},
@@ -1380,7 +1380,7 @@ var _ = Describe("Provisioning", func() {
 					ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("2Gi")}},
 				})
 			ExpectApplied(ctx, env.Client, daemonsetPod)
-			ExpectReconcileSucceeded(ctx, daemonsetController, client.ObjectKeyFromObject(daemonset))
+			Expect(cluster.UpdatePod(ctx, daemonsetPod)).To(Succeed())
 
 			// Deploy pod
 			pod := test.UnschedulablePod(test.PodOptions{

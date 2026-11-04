@@ -68,7 +68,7 @@ var _ = BeforeSuite(func() {
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(testv1alpha1.CRDs...))
 	cloudProvider = fake.NewCloudProvider()
 	store = NewInstanceTypeStore()
-	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
+	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider)
 	nodeOverlayController = NewController(env.Clock, env.Client, cloudProvider, store, cluster)
 })
 

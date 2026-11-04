@@ -88,13 +88,12 @@ func (r Reservations) Release() {
 
 // NodePoolState holds each NodePool with its NodePoolFields.
 type NodePoolState struct {
-	nodeClaims   *karpenterstate.Store[types.NamespacedName, *v1.NodeClaim]
 	nodePools    *karpenterstate.Store[string, NodePoolFields]
 	reservations *karpenterstate.Claims[types.NamespacedName, string, *v1.NodeClaim, NodePoolFields, NodeClaimCounts, reservedNodes]
 }
 
-func NewNodePoolState(clk clock.Clock) *NodePoolState {
-	nodeClaims := karpenterstate.NewObjectStore[*v1.NodeClaim](nil, nil)
+// NewNodePoolState returns the NodePools' state, derived from nodeClaims.
+func NewNodePoolState(clk clock.Clock, nodeClaims *karpenterstate.Store[types.NamespacedName, *v1.NodeClaim]) *NodePoolState {
 	nodePools := karpenterstate.NewStore[string, NodePoolFields]()
 	counts := karpenterstate.Derive(nodeClaims, nodePools,
 		func(_ types.NamespacedName, nodeClaim *v1.NodeClaim) string {
@@ -113,8 +112,7 @@ func NewNodePoolState(clk clock.Clock) *NodePoolState {
 		},
 	)
 	return &NodePoolState{
-		nodeClaims: nodeClaims,
-		nodePools:  nodePools,
+		nodePools: nodePools,
 		// A NodeClaim counts against the node limit as soon as it exists, so the first time the counts see it settles
 		// its reservation.
 		reservations: karpenterstate.NewClaims[types.NamespacedName, string, *v1.NodeClaim, NodePoolFields, NodeClaimCounts, reservedNodes](counts,
@@ -139,8 +137,8 @@ func (n *NodePoolState) ReserveNodeCount(np string, limit int64, wantedLimit int
 	})
 }
 
-// Reset empties the state in place, ending every reservation, so that subscribers to its stores stay subscribed.
+// Reset empties the state in place, ending every reservation, so that subscribers to its store stay subscribed. The
+// NodeClaims it's derived from are cleared by their owner.
 func (n *NodePoolState) Reset() {
-	n.nodeClaims.Clear()
 	n.nodePools.Clear()
 }

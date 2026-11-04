@@ -87,7 +87,7 @@ var _ = BeforeSuite(func() {
 	ctx = options.ToContext(ctx, test.Options())
 
 	cloudProvider = fake.NewCloudProvider()
-	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
+	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider)
 	npState = nodepoolhealth.NewState()
 	nodeClaimController = nodeclaimlifecycle.NewController(env.Clock, env.Client, cloudProvider, recorder, cluster, npState, nil)
 })

@@ -94,7 +94,9 @@ func newStores() (*nodeClaimStore, *pools, *Derivation[types.NamespacedName, str
 	return nodeClaims, s, Derive(nodeClaims, s, poolOf, usageOf)
 }
 
-func named(name string) *v1.NodeClaim { return &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: name}} }
+func named(name string) *v1.NodeClaim {
+	return &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: name}}
+}
 
 func fields[K comparable, F any](s *Store[K, F], key K) F {
 	f, _ := s.Get(key)
@@ -335,8 +337,11 @@ type clusterFields struct{ CPU int64 }
 
 type poolCPU int64
 
-func (c poolCPU) Update(f clusterFields, prev poolCPU) clusterFields { f.CPU += int64(c - prev); return f }
-func (c poolCPU) Delete(f clusterFields) clusterFields               { f.CPU -= int64(c); return f }
+func (c poolCPU) Update(f clusterFields, prev poolCPU) clusterFields {
+	f.CPU += int64(c - prev)
+	return f
+}
+func (c poolCPU) Delete(f clusterFields) clusterFields { f.CPU -= int64(c); return f }
 
 func TestDeriveFollowsADerivedStore(t *testing.T) {
 	nodeClaims, s, _ := newStores()

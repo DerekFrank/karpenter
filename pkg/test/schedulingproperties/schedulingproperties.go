@@ -648,7 +648,7 @@ func solve(ctx context.Context, t *caseT, cfg Config, s scenario) (scheduling.Re
 		return c.Get(ctx, key, obj, opts...)
 	}}).Build()
 	cp := drawnInstanceTypes{CloudProvider: cfg.CloudProvider, its: s.its}
-	cluster := state.NewCluster(clock.RealClock{}, kubeClient, cp)
+	cluster := state.NewCluster(ctx, clock.RealClock{}, kubeClient, cp)
 	prov := provisioning.NewProvisioner(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cp, cluster, clock.RealClock{}, nil, nil, nil)
 	opts := *options.FromContext(ctx)
 	opts.MinValuesPolicy = s.minValuesPolicy

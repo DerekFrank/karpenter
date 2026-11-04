@@ -53,7 +53,7 @@ func TestAPIs(t *testing.T) {
 var _ = BeforeSuite(func() {
 	env = test.NewEnvironment()
 	cloudProvider = fake.NewCloudProvider()
-	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
+	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider)
 	podController = pod.NewController(env.Client, cluster)
 })
 

@@ -83,7 +83,7 @@ var _ = BeforeSuite(func() {
 	}))
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
-	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
+	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider)
 	clusterCost = cost.NewClusterCost(ctx, cloudProvider, env.Client)
 	nodeClaimController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
 	nodeController = informer.NewNodeController(env.Client, cluster)
@@ -1614,6 +1614,7 @@ var _ = Describe("DaemonSet Controller", func() {
 			})
 		daemonsetPod.Spec = daemonset.Spec.Template.Spec
 		ExpectApplied(ctx, env.Client, daemonsetPod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(daemonsetPod))
 		ExpectReconcileSucceeded(ctx, daemonsetController, client.ObjectKeyFromObject(daemonset))
 
 		Expect(cluster.GetDaemonSetPod(daemonset)).To(Equal(daemonsetPod))
@@ -1642,6 +1643,7 @@ var _ = Describe("DaemonSet Controller", func() {
 			})
 		daemonsetPod1.Spec = daemonset.Spec.Template.Spec
 		ExpectApplied(ctx, env.Client, daemonsetPod1)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(daemonsetPod1))
 		ExpectReconcileSucceeded(ctx, daemonsetController, client.ObjectKeyFromObject(daemonset))
 
 		Expect(cluster.GetDaemonSetPod(daemonset)).To(Equal(daemonsetPod1))
@@ -1664,6 +1666,7 @@ var _ = Describe("DaemonSet Controller", func() {
 		time.Sleep(time.Second) // Making sure the two pods have different creationTime
 		daemonsetPod2.Spec = daemonset.Spec.Template.Spec
 		ExpectApplied(ctx, env.Client, daemonsetPod2)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(daemonsetPod2))
 		ExpectReconcileSucceeded(ctx, daemonsetController, client.ObjectKeyFromObject(daemonset))
 		Expect(cluster.GetDaemonSetPod(daemonset)).To(Equal(daemonsetPod2))
 	})
@@ -1691,6 +1694,7 @@ var _ = Describe("DaemonSet Controller", func() {
 			})
 		daemonsetPod.Spec = daemonset.Spec.Template.Spec
 		ExpectApplied(ctx, env.Client, daemonsetPod)
+		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(daemonsetPod))
 		ExpectReconcileSucceeded(ctx, daemonsetController, client.ObjectKeyFromObject(daemonset))
 
 		Expect(cluster.GetDaemonSetPod(daemonset)).To(Equal(daemonsetPod))

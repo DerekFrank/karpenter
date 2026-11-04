@@ -90,7 +90,7 @@ var _ = Describe("Unhealthy Nodes", func() {
 	var matcher *health.RepairPolicyMatcher
 	// useMatcher builds cluster state around a matcher, as the operator does once at startup.
 	useMatcher := func(m *health.RepairPolicyMatcher) {
-		cluster = state.NewCluster(env.Clock, env.Client, cloudProvider, state.WithRepairPolicyMatcher(m))
+		cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider, state.WithRepairPolicyMatcher(m))
 		nodeController = informer.NewNodeController(env.Client, cluster)
 		nodeClaimController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
 	}
@@ -184,7 +184,7 @@ var _ = Describe("Unhealthy Nodes", func() {
 	})
 	It("should match nodes in a newly constructed cluster", func() {
 		_, node := managedNode(badNode())
-		fresh := state.NewCluster(env.Clock, env.Client, cloudProvider, state.WithRepairPolicyMatcher(matcher))
+		fresh := state.NewCluster(ctx, env.Clock, env.Client, cloudProvider, state.WithRepairPolicyMatcher(matcher))
 
 		Expect(fresh.UpdateNode(ctx, ExpectExists(ctx, env.Client, node))).To(Succeed())
 		Expect(lo.SomeBy(fresh.DeepCopyNodes(), func(n *state.StateNode) bool {

@@ -94,7 +94,7 @@ var _ = BeforeSuite(func() {
 
 	ctx = options.ToContext(ctx, opts)
 	cloudProvider = fake.NewCloudProvider()
-	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
+	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider)
 	nodeStateController = informer.NewNodeController(env.Client, cluster)
 	clusterCost := cost.NewClusterCost(ctx, cloudProvider, env.Client)
 	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
