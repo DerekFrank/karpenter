@@ -365,7 +365,7 @@ func (p *Provisioner) NewScheduler(
 		if err != nil {
 			return nil, fmt.Errorf("gathering resourceslices, %w", err)
 		}
-		allocatedDevices, err := p.gatherAllocatedDevices(ctx, deletingPodUIDs)
+		allocatedDevices, err := p.gatherAllocatedDevices(ctx, deletingPodUIDs, stateNodes)
 		if err != nil {
 			return nil, fmt.Errorf("gathering allocated devices, %w", err)
 		}

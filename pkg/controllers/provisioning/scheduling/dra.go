@@ -19,6 +19,7 @@ package scheduling
 import (
 	"context"
 	"fmt"
+	"maps"
 	"unique"
 
 	"github.com/samber/lo"
@@ -83,6 +84,8 @@ type draExistingNode struct {
 	// instanceType is the resolved cloud provider instance type for the node, or nil if it could not be resolved
 	// (e.g. an unmanaged node, or an instance type no longer offered by the NodePool).
 	instanceType *cloudprovider.InstanceType
+	// ridingDevices counts, per driver, the devices pods staying on a rebooting node still hold.
+	ridingDevices map[unique.Handle[string]]int
 }
 
 func (d *draExistingNode) ID() dynamicresources.NodeClaimID {
@@ -111,12 +114,26 @@ func (d *draExistingNode) InstanceTypes() []dynamicresources.InstanceTypeID {
 
 func (d *draExistingNode) ResourceSlices() map[dynamicresources.InstanceTypeID][]dynamicresources.ResourceSlice {
 	// Initialized nodes have their devices published in-cluster; uninitialized nodes are represented by templates.
-	if d.en.Initialized() || d.instanceType == nil {
+	if (d.en.Initialized() && !d.en.RebootInProgress()) || d.instanceType == nil {
 		return map[dynamicresources.InstanceTypeID][]dynamicresources.ResourceSlice{}
 	}
 	return map[dynamicresources.InstanceTypeID][]dynamicresources.ResourceSlice{
-		unique.Make(d.instanceType.Name): templateSlicesForInstanceType(d.instanceType),
+		unique.Make(d.instanceType.Name): templateSlicesWithout(d.instanceType, d.ridingDevices),
 	}
+}
+
+// templateSlicesWithout returns the instance type's template slices minus the given number of devices per driver.
+func templateSlicesWithout(it *cloudprovider.InstanceType, held map[unique.Handle[string]]int) []dynamicresources.ResourceSlice {
+	remaining := maps.Clone(held)
+	return lo.Map(it.DynamicResources.ResourceSliceTemplates, func(t *cloudprovider.ResourceSliceTemplate, _ int) dynamicresources.ResourceSlice {
+		if k := min(remaining[t.Driver], len(t.Devices)); k > 0 {
+			remaining[t.Driver] -= k
+			trimmed := *t
+			trimmed.Devices = t.Devices[k:]
+			t = &trimmed
+		}
+		return dynamicresources.NewTemplateSlice(t)
+	})
 }
 
 func templateSlicesForInstanceType(it *cloudprovider.InstanceType) []dynamicresources.ResourceSlice {
