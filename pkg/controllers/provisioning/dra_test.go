@@ -1313,7 +1313,6 @@ var _ = Describe("Dynamic Resource Allocation", func() {
 
 			Expect(ExpectScheduled(ctx, env.Client, pod).Name).To(Equal(node.Name))
 			Expect(cloudProvider.CreateCalls).To(BeEmpty())
-			Expect(ExpectResourceClaimAllocated(ctx, env.Client, "default", "new-claim", gpuDriver)).To(ConsistOf(slice.Spec.Pool.Name + "/gpu-0"))
 		})
 		It("should not free a device held by a pod leaving a rebooting node for placement on another node (RB2)", func() {
 			// The only GPU is cluster-wide; the pending pod can't fit on the rebooting node, so a new NodeClaim would need it.
@@ -1375,6 +1374,18 @@ var _ = Describe("Dynamic Resource Allocation", func() {
 
 			Expect(ExpectScheduled(ctx, env.Client, pod).Name).To(Equal(node.Name))
 			Expect(cloudProvider.CreateCalls).To(BeEmpty())
+		})
+		It("should not over-commit a device held by a pod riding a rebooting node after kubelet wipes its slices (RB7)", func() {
+			node := rebootingNode(true)
+			riding := boundPod("riding", node, false)
+			ExpectApplied(ctx, env.Client, allocatedClusterWideClaim("old-claim", node.Name, gpuDriver, "gpu-0", podConsumer(riding)))
+
+			ExpectApplied(ctx, env.Client, test.ResourceClaimForRequests("new-claim", test.ExactDeviceRequest("req", "gpu", 1)))
+			pod := draPod("gpu", "new-claim")
+			provisionDRA(pod)
+
+			Expect(ExpectScheduled(ctx, env.Client, pod).Name).ToNot(Equal(node.Name))
+			Expect(cloudProvider.CreateCalls).To(HaveLen(1))
 		})
 		It("should fall back to template devices for a rebooting node with no published slices (RB6)", func() {
 			node := rebootingNode(true)

@@ -365,11 +365,7 @@ func (p *Provisioner) NewScheduler(
 		if err != nil {
 			return nil, fmt.Errorf("gathering resourceslices, %w", err)
 		}
-		rebootDepartingPods, err := p.rebootDepartingPods(ctx, stateNodes)
-		if err != nil {
-			return nil, fmt.Errorf("gathering reboot departing pods, %w", err)
-		}
-		allocatedDevices, err := p.gatherAllocatedDevices(ctx, deletingPodUIDs, rebootDepartingPods)
+		allocatedDevices, err := p.gatherAllocatedDevices(ctx, deletingPodUIDs, stateNodes)
 		if err != nil {
 			return nil, fmt.Errorf("gathering allocated devices, %w", err)
 		}

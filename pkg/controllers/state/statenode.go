@@ -190,6 +190,7 @@ type StateNode struct {
 	podDisruptionCosts map[types.NamespacedName]float64
 	// terminatingPods are the pods with a deletion timestamp that a rebooting node won't have when it returns.
 	terminatingPods map[types.NamespacedName]bool
+	podUIDs         map[types.NamespacedName]types.UID
 
 	hostPortUsage *scheduling.HostPortUsage
 	volumeUsage   *scheduling.VolumeUsage
@@ -211,6 +212,7 @@ func NewNode() *StateNode {
 		podLimits:          map[types.NamespacedName]corev1.ResourceList{},
 		podDisruptionCosts: map[types.NamespacedName]float64{},
 		terminatingPods:    map[types.NamespacedName]bool{},
+		podUIDs:            map[types.NamespacedName]types.UID{},
 		hostPortUsage:      scheduling.NewHostPortUsage(),
 		volumeUsage:        scheduling.NewVolumeUsage(),
 	}
@@ -226,6 +228,7 @@ func (in *StateNode) ShallowCopy() *StateNode {
 		podLimits:           in.podLimits,
 		podDisruptionCosts:  in.podDisruptionCosts,
 		terminatingPods:     in.terminatingPods,
+		podUIDs:             in.podUIDs,
 		hostPortUsage:       in.hostPortUsage,
 		volumeUsage:         in.volumeUsage,
 		markedForDeletion:   in.markedForDeletion,
@@ -521,6 +524,20 @@ func (in *StateNode) RebootDepartingPods() []types.NamespacedName {
 	return lo.Keys(in.terminatingPods)
 }
 
+// RebootRidingPodUIDs returns the UIDs of the pods a rebooting node still has when it returns.
+func (in *StateNode) RebootRidingPodUIDs() []types.UID {
+	if !in.RebootInProgress() {
+		return nil
+	}
+	var uids []types.UID
+	for podKey, uid := range in.podUIDs {
+		if !in.terminatingPods[podKey] {
+			uids = append(uids, uid)
+		}
+	}
+	return uids
+}
+
 func (in *StateNode) DaemonSetRequests() corev1.ResourceList {
 	return resources.Merge(lo.Values(in.daemonSetRequests)...)
 }
@@ -592,6 +609,10 @@ func (in *StateNode) updateForPod(ctx context.Context, kubeClient client.Client,
 		return fmt.Errorf("tracking volume usage, %w", err)
 	}
 	in.podRequests[podKey] = resources.RequestsForPods(pod)
+	if in.podUIDs == nil {
+		in.podUIDs = map[types.NamespacedName]types.UID{}
+	}
+	in.podUIDs[podKey] = pod.UID
 	in.podLimits[podKey] = resources.LimitsForPods(pod)
 	// if it's a daemonset, we track what it has requested separately
 	if podutils.IsOwnedByDaemonSet(pod) {
@@ -632,6 +653,7 @@ func (in *StateNode) cleanupForPod(podKey types.NamespacedName) {
 	delete(in.daemonSetLimits, podKey)
 	delete(in.podDisruptionCosts, podKey)
 	delete(in.terminatingPods, podKey)
+	delete(in.podUIDs, podKey)
 }
 
 func nominationWindow(ctx context.Context) time.Duration {

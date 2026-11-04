@@ -41,9 +41,6 @@ type AllocationTracker struct {
 	// Immutable after construction. Map: deviceID → dimensionName → consumed quantity.
 	PreallocatedConsumedCapacity map[DeviceID]map[resourcev1.QualifiedName]resource.Quantity
 
-	// RebootReleasableDevices maps preallocated devices to the one rebooting node they're free on. Immutable.
-	RebootReleasableDevices map[DeviceID]string
-
 	// InflightClusterAllocations contains the allocation metadata by device for a given device ID. Note that entries in
 	// this structure are not immutable - as instance types are released by NodeClaims, devices also have the potential to
 	// be released and removed from the map.
@@ -99,14 +96,9 @@ func NewAllocationTracker(allocatedState AllocatedDeviceState) *AllocationTracke
 	for id, capacity := range allocatedState.ConsumedCapacity {
 		preallocatedCapacity[DeviceID{DeviceID: id}] = capacity
 	}
-	rebootReleasable := make(map[DeviceID]string, len(allocatedState.RebootReleasableDevices))
-	for id, nodeName := range allocatedState.RebootReleasableDevices {
-		rebootReleasable[DeviceID{DeviceID: id}] = nodeName
-	}
 	return &AllocationTracker{
 		PreallocatedDevices:                   preallocatedDevices,
 		PreallocatedConsumedCapacity:          preallocatedCapacity,
-		RebootReleasableDevices:               rebootReleasable,
 		InflightClusterAllocations:            make(map[DeviceID]*InflightAllocationMetadata),
 		InflightClusterAllocationsByNodeClaim: make(map[NodeClaimID]map[InstanceTypeID]sets.Set[DeviceID]),
 		InflightTemplateAllocations:           make(map[NodeClaimID]map[InstanceTypeID]sets.Set[DeviceID]),
@@ -256,9 +248,7 @@ func (at *AllocationTracker) IsAllocated(deviceID DeviceID, nodeClaim NodeClaim,
 
 	// The device is already marked as allocated on the cluster
 	if at.PreallocatedDevices.Has(deviceID) {
-		if nodeName, ok := at.RebootReleasableDevices[deviceID]; !ok || nodeName != nodeClaim.NodeName() {
-			return true
-		}
+		return true
 	}
 	if meta, ok := at.InflightClusterAllocations[deviceID]; ok {
 		// If the device is marked as allocating for a different NodeClaim, we pessimistically assume it will be allocated
