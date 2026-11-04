@@ -62,9 +62,6 @@ func (c *DaemonSetController) Reconcile(ctx context.Context, req reconcile.Reque
 		}
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
-	if err := c.cluster.UpdateDaemonSet(ctx, &daemonSet); err != nil {
-		return reconcile.Result{}, err
-	}
 	return reconcile.Result{RequeueAfter: time.Minute}, nil
 }
 
