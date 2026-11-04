@@ -136,9 +136,7 @@ func (n *ExistingNode) CanAdd(ctx context.Context, pod *v1.Pod, podData *PodData
 			if podData.ResourceClaimErr != nil {
 				return nil, nil, podData.ResourceClaimErr
 			}
-			draNode := &draExistingNode{en: n, instanceType: n.instanceType}
-			draNode.hasPublishedSlices = n.RebootInProgress() && allocator.HasNodeSlices(draNode.NodeName())
-			result, err := allocator.Allocate(ctx, draNode, podData.ResourceClaims)
+			result, err := allocator.Allocate(ctx, &draExistingNode{en: n, instanceType: n.instanceType, ridingDevices: allocator.RebootRidingDevices(n.Name())}, podData.ResourceClaims)
 			if err != nil {
 				lastErr = fmt.Errorf("allocating dynamic resources, %w", err)
 				continue

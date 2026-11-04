@@ -753,6 +753,7 @@ func (c *Cluster) newStateFromNodeClaim(nodeClaim *v1.NodeClaim, oldNode *StateN
 		podRequests:       oldNode.podRequests,
 		podLimits:         oldNode.podLimits,
 		terminatingPods:   oldNode.terminatingPods,
+		podUIDs:           oldNode.podUIDs,
 		hostPortUsage:     oldNode.hostPortUsage,
 		volumeUsage:       oldNode.volumeUsage,
 		markedForDeletion: oldNode.markedForDeletion,
