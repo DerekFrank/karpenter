@@ -24,6 +24,20 @@ other decisions count meanwhile, is intent, kept as a claim. See
 - **`pkg/state/statetest`** checks a `Contribution`'s laws in tests.
 - **`pkg/state/overlay`** holds `overlay.Client`, the read-after-write client:
   its reads include its own writes before the informer delivers them.
+- **`pkg/cluster`** holds the cluster's state built from those primitives: one
+  file per kind, each with its accessor, such as `cluster.NodePools` in
+  `nodepool.go`, and the stores of its derived fields, such as
+  `cluster.NodePoolUsage`.
+- **`cluster.State`** holds every accessor and the stores behind them.
+  `cluster.New` builds it once, in `pkg/controllers/controllers.go`. Each
+  controller's constructor takes the accessors it reads, as
+  `nodepoolcounter.NewController` takes `s.NodePools` and `s.NodePoolUsage`.
+- **`pkg/controllers/state`** holds `state.Cluster`, the stores behind the
+  nodes Karpenter schedules onto and disrupts: a join of each Node and its
+  NodeClaim, the pods bound to each node, and the intent kept about them.
+- **Imports point one way:** controllers import `pkg/cluster`, which imports
+  `pkg/state`. depguard (`.golangci.yaml`, rules `state` and `cluster`) enforces
+  it.
 
 ## Stores
 

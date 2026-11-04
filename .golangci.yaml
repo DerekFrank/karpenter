@@ -48,6 +48,26 @@ linters:
           deny:
             - pkg: github.com/avast/retry-go
               desc: use k8s.io/apimachinery/pkg/util/wait
+        # pkg/state holds kind-free primitives, pkg/cluster builds the cluster's state from them, and controllers read
+        # it; never the reverse. See pkg/state/AGENTS.md.
+        state:
+          files:
+            - "**/pkg/state/*.go"
+            - "**/pkg/state/**/*.go"
+            - "!$test"
+          deny:
+            - pkg: sigs.k8s.io/karpenter/pkg/controllers
+              desc: pkg/state never depends on controllers
+            - pkg: sigs.k8s.io/karpenter/pkg/cluster
+              desc: pkg/cluster builds on pkg/state, not the reverse
+        cluster:
+          files:
+            - "**/pkg/cluster/*.go"
+            - "**/pkg/cluster/**/*.go"
+            - "!$test"
+          deny:
+            - pkg: sigs.k8s.io/karpenter/pkg/controllers
+              desc: pkg/cluster never depends on controllers
     gocyclo:
       min-complexity: 11
     goheader:
