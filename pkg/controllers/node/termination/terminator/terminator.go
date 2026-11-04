@@ -93,19 +93,19 @@ func (t *Terminator) Taint(ctx context.Context, node *corev1.Node, taint corev1.
 type DrainOption func(*drainOptions)
 
 type drainOptions struct {
-	leaveResidualPods bool
-	skipDaemonSets    bool
-}
-
-// LeaveResidualPods only evicts, and leaves pods still on the node once the deadline passes. Without it, pods whose
-// grace period would extend past the deadline are deleted, bypassing PDBs and do-not-disrupt.
-func LeaveResidualPods() DrainOption {
-	return func(o *drainOptions) { o.leaveResidualPods = true }
+	skipDaemonSets            bool
+	drainDisruptionTolerating bool
 }
 
 // SkipDaemonSets leaves DaemonSet pods on the node.
 func SkipDaemonSets() DrainOption {
 	return func(o *drainOptions) { o.skipDaemonSets = true }
+}
+
+// DrainDisruptionTolerating also drains pods that tolerate the karpenter.sh/disrupted taint, which a drain otherwise
+// leaves to go with the instance. They're never evicted, only deleted once the deadline nears.
+func DrainDisruptionTolerating() DrainOption {
+	return func(o *drainOptions) { o.drainDisruptionTolerating = true }
 }
 
 // Drain evicts pods from the node and returns true when all pods are evicted
@@ -115,13 +115,18 @@ func (t *Terminator) Drain(ctx context.Context, node *corev1.Node, nodeGracePeri
 	for _, opt := range opts {
 		opt(o)
 	}
-	timeout := o.leaveResidualPods && nodeGracePeriodExpirationTime != nil
 	pods, err := nodeutils.GetPods(ctx, t.kubeClient, node.Name)
 	if err != nil {
 		return fmt.Errorf("listing pods on node, %w", err)
 	}
 	waiting := lo.Filter(pods, func(p *corev1.Pod, _ int) bool {
-		return podutil.IsWaitingEviction(p, t.clock) && (!o.skipDaemonSets || !podutil.IsOwnedByDaemonSet(p))
+		if o.skipDaemonSets && podutil.IsOwnedByDaemonSet(p) {
+			return false
+		}
+		if o.drainDisruptionTolerating && podutil.ToleratesDisruptedNoScheduleTaint(p) {
+			return !podutil.IsTerminal(p) && !podutil.IsStuckTerminating(p, t.clock) && !podutil.IsOwnedByNode(p)
+		}
+		return podutil.IsWaitingEviction(p, t.clock)
 	})
 
 	// Split waiting pods into two disjoint sets:
@@ -137,7 +142,7 @@ func (t *Terminator) Drain(ctx context.Context, node *corev1.Node, nodeGracePeri
 	// naturally.
 	var deleteEligible, gracefulCandidates []*corev1.Pod
 	for _, p := range waiting {
-		if !o.leaveResidualPods && needsDeleteByDeadline(p, nodeGracePeriodExpirationTime, t.clock) {
+		if needsDeleteByDeadline(p, nodeGracePeriodExpirationTime, t.clock) {
 			deleteEligible = append(deleteEligible, p)
 		} else {
 			gracefulCandidates = append(gracefulCandidates, p)
@@ -149,11 +154,7 @@ func (t *Terminator) Drain(ctx context.Context, node *corev1.Node, nodeGracePeri
 	podGroups := t.groupPodsByPriority(gracefulCandidates)
 	for _, group := range podGroups {
 		if len(group) > 0 {
-			if timeout {
-				t.evictionQueue.AddWithTimeout(*nodeGracePeriodExpirationTime, group...)
-			} else {
-				t.evictionQueue.Add(nodeGracePeriodExpirationTime, group...)
-			}
+			t.evictionQueue.Add(nodeGracePeriodExpirationTime, group...)
 			return NewNodeDrainError(fmt.Errorf("%d pods are waiting to be evicted", len(waiting)))
 		}
 	}
