@@ -46,6 +46,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
+	"sigs.k8s.io/karpenter/pkg/operator/overlay"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
@@ -117,12 +118,12 @@ func WithRepairPolicyMatcher(matcher *health.RepairPolicyMatcher) option.Functio
 	}
 }
 
-func NewCluster(clk clock.Clock, client client.Client, cloudProvider cloudprovider.CloudProvider, opts ...option.Function[ClusterOptions]) *Cluster {
+func NewCluster(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, opts ...option.Function[ClusterOptions]) *Cluster {
 	o := option.Resolve(opts...)
-	return &Cluster{
+	c := &Cluster{
 		repairPolicyMatcher:       o.repairPolicyMatcher,
 		clock:                     clk,
-		kubeClient:                client,
+		kubeClient:                kubeClient,
 		cloudProvider:             cloudProvider,
 		nodes:                     map[string]*StateNode{},
 		bindings:                  map[types.NamespacedName]string{},
@@ -141,6 +142,22 @@ func NewCluster(clk clock.Clock, client client.Client, cloudProvider cloudprovid
 		podHealthyNodePoolScheduledTime: sync.Map{},
 		podToNodeClaim:                  sync.Map{},
 	}
+	// With the read-after-write overlay, Karpenter's own writes reach cluster state before the writer returns, rather
+	// than when the informer delivers them.
+	if writes, ok := kubeClient.(writeNotifier); ok {
+		lo.Must(writes.AddWriteHandler(&v1.NodeClaim{}, func(obj client.Object, deleted bool) {
+			if deleted {
+				c.NodePoolState.DeleteNodeClaim(obj.GetName())
+				return
+			}
+			c.NodePoolState.UpdateNodeClaim(obj.(*v1.NodeClaim))
+		}))
+	}
+	return c
+}
+
+type writeNotifier interface {
+	AddWriteHandler(obj client.Object, handler overlay.WriteHandler) (func(), error)
 }
 
 // Synced validates that the NodeClaims and the Nodes that are stored in the apiserver
@@ -356,9 +373,6 @@ func (c *Cluster) UnmarkForDeletion(providerIDs ...string) {
 			oldNode := n.ShallowCopy()
 			n.markedForDeletion = false
 			c.updateNodePoolResources(oldNode, n)
-			if n.NodeClaim != nil && n.NodeClaim.DeletionTimestamp.IsZero() {
-				c.NodePoolState.MarkNodeClaimActive(n.NodeClaim.Labels[v1.NodePoolLabelKey], n.NodeClaim.Name)
-			}
 		}
 	}
 }
@@ -373,9 +387,6 @@ func (c *Cluster) MarkForDeletion(providerIDs ...string) {
 			oldNode := n.ShallowCopy()
 			n.markedForDeletion = true
 			c.updateNodePoolResources(oldNode, n)
-			if n.NodeClaim != nil {
-				c.NodePoolState.MarkNodeClaimDeleting(n.NodeClaim.Labels[v1.NodePoolLabelKey], n.NodeClaim.Name)
-			}
 		}
 	}
 }
@@ -392,12 +403,7 @@ func (c *Cluster) UpdateNodeClaim(nodeClaim *v1.NodeClaim) {
 		c.nodes[nodeClaim.Status.ProviderID] = n
 	}
 
-	// Update nodepool state with NodeClaim
-	markedForDel := false
-	if n, ok := c.nodes[nodeClaim.Status.ProviderID]; ok {
-		markedForDel = n.MarkedForDeletion()
-	}
-	c.NodePoolState.UpdateNodeClaim(nodeClaim, markedForDel)
+	c.NodePoolState.UpdateNodeClaim(nodeClaim)
 
 	// If the nodeclaim hasn't launched yet, we want to add it into cluster state to ensure
 	// that we're not racing with the internal cache for the cluster, assuming the node doesn't exist.
@@ -786,8 +792,7 @@ func (c *Cluster) cleanupNodeClaim(name string) {
 	// this is cleaned up.
 	delete(c.nodeClaimNameToProviderID, name)
 
-	// Delete the NodeClaim that is tracked in NodePoolState
-	c.NodePoolState.Cleanup(name)
+	c.NodePoolState.DeleteNodeClaim(name)
 }
 
 func (c *Cluster) newStateFromNode(ctx context.Context, node *corev1.Node, oldNode *StateNode) (*StateNode, error) {

@@ -177,10 +177,10 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 		// Static NodePools aren't reactively scheduled, so repair can't simulate a replacement — it mirrors StaticDrift.
 		if candidate.OwnedByStaticNodePool() {
 			np := candidate.NodePool
-			active, _, pendingDisruption := r.cluster.NodePoolState.GetNodeCount(np.Name)
+			active, _, _ := r.cluster.NodePoolState.GetNodeCount(np.Name)
 
 			// Skip until scale-down completes: a replacement would just be surplus the deprovisioner deletes.
-			if int64(active+pendingDisruption) > lo.FromPtr(np.Spec.Replicas) {
+			if int64(active) > lo.FromPtr(np.Spec.Replicas) {
 				continue
 			}
 

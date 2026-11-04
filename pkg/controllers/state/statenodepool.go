@@ -17,209 +17,132 @@ limitations under the License.
 package state
 
 import (
+	"strconv"
 	"sync"
-	"sync/atomic"
 
-	"github.com/samber/lo"
-	"k8s.io/apimachinery/pkg/util/sets"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
-// Currently NodeClaims be in one of these states
-type NodeClaimState struct {
-	// NodeClaims that have been launched
-	Active sets.Set[string]
-	// NodeClaims that are pending disruption
-	PendingDisruption sets.Set[string]
-	// NodeClaims are marked for Deletion
-	Deleting sets.Set[string]
+// NodeClaimCounts are a NodePool's NodeClaims by state. A NodeClaim is deleting once it has a deletionTimestamp or its
+// DisruptionReason condition is true, and active otherwise.
+type NodeClaimCounts struct {
+	Active   int
+	Deleting int
 }
 
-// StateNodePool is a cached version of a NodePool in the cluster that maintains state which is expensive to compute every time it's needed.
+// NodePoolState counts each NodePool's NodeClaims, and holds the nodes controllers reserve against a NodePool's node
+// limit for NodeClaims they're about to create.
+//
+// The counts are kept incrementally rather than computed from the cache: static provisioning reserves after every
+// NodeClaim it creates, so a recount on each reservation would make a scale-up quadratic in the NodePool's size.
 type NodePoolState struct {
-	mu sync.RWMutex
+	mu         sync.Mutex
+	nodeClaims map[string]counted // NodeClaim name -> what it's counted as
+	counts     map[string]NodeClaimCounts
+	reserved   map[string]int64
+}
 
-	nodePoolNameToNodeClaimState map[string]NodeClaimState // node pool name -> node claim state (Active and Deleting node claim names)
-	nodeClaimNameToNodePoolName  map[string]string         // node claim name -> node pool name
-	nodePoolNameToNodePoolLimit  map[string]*atomic.Int64  // node pool -> nodepool limit
+type counted struct {
+	nodePool        string
+	deleting        bool
+	resourceVersion uint64
 }
 
 func NewNodePoolState() *NodePoolState {
-	return &NodePoolState{
-		nodePoolNameToNodeClaimState: map[string]NodeClaimState{},
-		nodeClaimNameToNodePoolName:  map[string]string{},
-		nodePoolNameToNodePoolLimit:  map[string]*atomic.Int64{},
-	}
+	return &NodePoolState{nodeClaims: map[string]counted{}, counts: map[string]NodeClaimCounts{}, reserved: map[string]int64{}}
 }
 
-// Helper methods that hold the lock
-
-// Sets up the NodePoolState to track NodeClaim
-func (n *NodePoolState) SetNodeClaimMapping(npName, ncName string) {
-	if npName == "" || ncName == "" {
+// UpdateNodeClaim counts nodeClaim on its NodePool, unless a newer version of it is already counted.
+func (n *NodePoolState) UpdateNodeClaim(nodeClaim *v1.NodeClaim) {
+	rv, _ := strconv.ParseUint(nodeClaim.ResourceVersion, 10, 64)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	old, ok := n.nodeClaims[nodeClaim.Name]
+	if ok && rv != 0 && rv < old.resourceVersion {
 		return
 	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	n.ensureNodePoolEntry(npName)
-	n.nodeClaimNameToNodePoolName[ncName] = npName
-}
-
-// Marks the given NodeClaim as active in NodePoolState
-func (n *NodePoolState) MarkNodeClaimActive(npName, ncName string) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.ensureNodePoolEntry(npName)
-
-	n.nodePoolNameToNodeClaimState[npName].PendingDisruption.Delete(ncName)
-	n.nodePoolNameToNodeClaimState[npName].Deleting.Delete(ncName)
-	n.nodePoolNameToNodeClaimState[npName].Active.Insert(ncName)
-}
-
-// Marks the given NodeClaim as Deleting in NodePoolState
-func (n *NodePoolState) MarkNodeClaimDeleting(npName, ncName string) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.ensureNodePoolEntry(npName)
-
-	n.nodePoolNameToNodeClaimState[npName].PendingDisruption.Delete(ncName)
-	n.nodePoolNameToNodeClaimState[npName].Deleting.Insert(ncName)
-	n.nodePoolNameToNodeClaimState[npName].Active.Delete(ncName)
-}
-
-// Marks the given NodeClaim as Deleting in NodePoolState
-func (n *NodePoolState) MarkNodeClaimPendingDisruption(npName, ncName string) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.ensureNodePoolEntry(npName)
-
-	n.nodePoolNameToNodeClaimState[npName].Active.Delete(ncName)
-	n.nodePoolNameToNodeClaimState[npName].Deleting.Delete(ncName)
-	n.nodePoolNameToNodeClaimState[npName].PendingDisruption.Insert(ncName)
-}
-
-// Cleans up the NodeClaim in NodePoolState and NodePool keys if NodePool is deleted or its sized down to 0
-func (n *NodePoolState) Cleanup(ncName string) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	npName := n.nodeClaimNameToNodePoolName[ncName]
-
-	if npState, exists := n.nodePoolNameToNodeClaimState[npName]; exists {
-		npState.Deleting.Delete(ncName)
-		npState.Active.Delete(ncName)
-		npState.PendingDisruption.Delete(ncName)
-
-		if npState.Active.Len() == 0 && npState.Deleting.Len() == 0 {
-			delete(n.nodePoolNameToNodeClaimState, npName)
-			delete(n.nodePoolNameToNodePoolLimit, npName)
-		}
+	if ok {
+		n.countLocked(old, -1)
 	}
-
-	delete(n.nodeClaimNameToNodePoolName, ncName)
+	next := counted{nodePool: nodeClaim.Labels[v1.NodePoolLabelKey], deleting: deleting(nodeClaim), resourceVersion: rv}
+	n.nodeClaims[nodeClaim.Name] = next
+	n.countLocked(next, 1)
 }
 
-// Returns the current NodeClaims for a NodePool by its state (active, deleting, pendingdisruption)
-func (n *NodePoolState) GetNodeCount(npName string) (active, deleting, pendingdisruption int) {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-
-	return n.nodeCounts(npName)
-}
-
-// ReserveNodeCount attempts to reserve nodes against a NodePool's limit.
-// It ensures that the total of active nodes + deleting nodes + reserved nodes doesn't exceed the limit.
-func (n *NodePoolState) ReserveNodeCount(np string, limit int64, wantedLimit int64) int64 {
+// DeleteNodeClaim stops counting the NodeClaim.
+func (n *NodePoolState) DeleteNodeClaim(name string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-
-	n.ensureNodePoolEntry(np)
-	active, deleting, pendingdisruption := n.nodeCounts(np)
-
-	// We retry until CompareAndSwap is successful
-	for {
-		currentlyReserved := n.nodePoolNameToNodePoolLimit[np].Load()
-		remainingLimit := limit - int64(active+deleting+pendingdisruption) - currentlyReserved
-		if remainingLimit < 0 {
-			return 0
-		}
-		grantedLimit := lo.Ternary(wantedLimit > remainingLimit,
-			remainingLimit,
-			wantedLimit,
-		)
-
-		if n.nodePoolNameToNodePoolLimit[np].CompareAndSwap(currentlyReserved, currentlyReserved+grantedLimit) {
-			return grantedLimit
-		}
+	if old, ok := n.nodeClaims[name]; ok {
+		n.countLocked(old, -1)
+		delete(n.nodeClaims, name)
 	}
 }
 
-// ReleaseNodeCount releases the NodePoolTracker ReservedNodeLimit
-func (n *NodePoolState) ReleaseNodeCount(npName string, count int64) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	// We retry until CompareAndSwap is successful
-	for {
-		reserved, ok := n.nodePoolNameToNodePoolLimit[npName]
-		// Cleanup can drop the entry between reserve and release. Nothing to release then.
-		if !ok {
-			return
-		}
-		currentlyReserved := reserved.Load()
-		if reserved.CompareAndSwap(
-			currentlyReserved,
-			lo.Ternary(currentlyReserved-count < 0, 0, currentlyReserved-count)) {
-			return
-		}
-	}
-}
-
-// Methods that expect the caller to hold the lock
-
-func (n *NodePoolState) nodeCounts(npName string) (active, deleting, pendingdisruption int) {
-	if st, ok := n.nodePoolNameToNodeClaimState[npName]; ok {
-		return len(st.Active), len(st.Deleting), len(st.PendingDisruption)
-	}
-	return 0, 0, 0
-}
-
-// Updates the NodeClaim state and releases the Limit if NodeClaim transitions from not Active to Active
-func (n *NodePoolState) UpdateNodeClaim(nodeClaim *v1.NodeClaim, markedForDeletion bool) {
-	// If we are launching/deleting a NodeClaim we need to track the state of the NodeClaim and its limits
-	npName := nodeClaim.Labels[v1.NodePoolLabelKey]
-	if npName == "" {
+func (n *NodePoolState) countLocked(c counted, delta int) {
+	if c.nodePool == "" {
 		return
 	}
-	n.SetNodeClaimMapping(npName, nodeClaim.Name)
-
-	// If our node/nodeclaim is marked for deletion, we need to make sure that we delete it
-	if markedForDeletion {
-		n.MarkNodeClaimDeleting(npName, nodeClaim.Name)
+	counts := n.counts[c.nodePool]
+	if c.deleting {
+		counts.Deleting += delta
 	} else {
-		n.MarkNodeClaimActive(npName, nodeClaim.Name)
+		counts.Active += delta
 	}
+	if counts == (NodeClaimCounts{}) {
+		delete(n.counts, c.nodePool)
+		return
+	}
+	n.counts[c.nodePool] = counts
 }
 
-func (n *NodePoolState) ensureNodePoolEntry(np string) {
-	if _, ok := n.nodePoolNameToNodeClaimState[np]; !ok {
-		n.nodePoolNameToNodeClaimState[np] = NodeClaimState{
-			Active:            sets.New[string](),
-			Deleting:          sets.New[string](),
-			PendingDisruption: sets.New[string](),
+func deleting(nodeClaim *v1.NodeClaim) bool {
+	if !nodeClaim.DeletionTimestamp.IsZero() {
+		return true
+	}
+	// Read the condition directly, since StatusConditions() builds a condition set on every call.
+	for i := range nodeClaim.Status.Conditions {
+		if nodeClaim.Status.Conditions[i].Type == v1.ConditionTypeDisruptionReason && nodeClaim.Status.Conditions[i].Status == metav1.ConditionTrue {
+			return true
 		}
 	}
-	if _, ok := n.nodePoolNameToNodePoolLimit[np]; !ok {
-		n.nodePoolNameToNodePoolLimit[np] = &atomic.Int64{}
+	return false
+}
+
+// GetNodeCount returns the NodePool's active and deleting NodeClaims, and the nodes reserved for NodeClaims that
+// haven't been created yet.
+func (n *NodePoolState) GetNodeCount(nodePool string) (active, deleting, reserved int) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	counts := n.counts[nodePool]
+	return counts.Active, counts.Deleting, int(n.reserved[nodePool])
+}
+
+// ReserveNodeCount reserves up to wantedLimit nodes for NodeClaims a caller is about to create, without the NodePool's
+// active, deleting and reserved nodes exceeding limit, and returns how many it reserved. The caller releases them with
+// ReleaseNodeCount once it has created the NodeClaims, or failed to.
+func (n *NodePoolState) ReserveNodeCount(nodePool string, limit int64, wantedLimit int64) int64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	counts := n.counts[nodePool]
+	granted := max(0, min(wantedLimit, limit-int64(counts.Active+counts.Deleting)-n.reserved[nodePool]))
+	n.reserved[nodePool] += granted
+	return granted
+}
+
+// ReleaseNodeCount releases count of the NodePool's reserved nodes.
+func (n *NodePoolState) ReleaseNodeCount(nodePool string, count int64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.reserved[nodePool] -= count; n.reserved[nodePool] <= 0 {
+		delete(n.reserved, nodePool)
 	}
 }
 
 func (n *NodePoolState) Reset() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.nodePoolNameToNodeClaimState = make(map[string]NodeClaimState)
-	n.nodeClaimNameToNodePoolName = make(map[string]string)
-	n.nodePoolNameToNodePoolLimit = make(map[string]*atomic.Int64)
+	n.nodeClaims, n.counts, n.reserved = map[string]counted{}, map[string]NodeClaimCounts{}, map[string]int64{}
 }
