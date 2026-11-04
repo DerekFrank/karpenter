@@ -305,7 +305,6 @@ func recordCandidateDisrupted(cmd *Command, candidate *Candidate) {
 }
 
 // markDisrupted taints the node and adds the Disrupted condition to the NodeClaim for a candidate that is about to be disrupted
-// For static NodeClaims, we mark NodeClaims as pendingdisruption in statenodepool
 func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, error) {
 	errs := make([]error, len(cmd.Candidates))
 	workqueue.ParallelizeUntil(ctx, len(cmd.Candidates), len(cmd.Candidates), func(i int) {
@@ -326,6 +325,7 @@ func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, 
 			errs[i] = client.IgnoreNotFound(err)
 			return
 		}
+		q.cluster.UpdateNodeClaim(nodeClaim)
 	})
 	var markedCandidates []*Candidate
 	for i := range errs {
@@ -333,11 +333,6 @@ func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, 
 			continue
 		}
 		markedCandidates = append(markedCandidates, cmd.Candidates[i])
-
-		// Mark all StaticNodeClaims as pendingdisruption in nodepoolstate
-		if cmd.Candidates[i].OwnedByStaticNodePool() {
-			q.cluster.NodePoolState.MarkNodeClaimPendingDisruption(cmd.Candidates[i].NodePool.Name, cmd.Candidates[i].NodeClaim.Name)
-		}
 	}
 	return markedCandidates, multierr.Combine(errs...)
 }
@@ -363,18 +358,10 @@ func (q *Queue) createReplacementNodeClaims(ctx context.Context, cmd *Command) e
 // 2. Spin up replacement nodes
 // 3. Add Command to the queue to wait to delete the candidates.
 func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
-	queueOwnsStaticReservation := true
+	queueOwnsReservations := true
 	defer func() {
-		if !queueOwnsStaticReservation {
-			return
-		}
-		staticReplacements := lo.Filter(cmd.Replacements, func(replacement *Replacement, _ int) bool {
-			return replacement.IsStaticNodeClaim
-		})
-		for nodePoolName, replacements := range lo.GroupBy(staticReplacements, func(replacement *Replacement) string {
-			return replacement.NodePoolName
-		}) {
-			q.cluster.NodePoolState.ReleaseNodeCount(nodePoolName, int64(len(replacements)))
+		if queueOwnsReservations {
+			releaseReservations(cmd)
 		}
 	}()
 	// First check if we can add the command.
@@ -409,8 +396,8 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	// Update the command to only consider the successfully MarkDisrupted candidates
 	cmd.Candidates = markedCandidates
 
-	// From this point onward the provisioner releases static reservations whether creation succeeds or fails.
-	queueOwnsStaticReservation = false
+	// From this point onward the provisioner binds or releases the replacements' reservations.
+	queueOwnsReservations = false
 	if err := q.createReplacementNodeClaims(ctx, cmd); err != nil {
 		// If we failed to launch the replacement, don't disrupt.  If this is some permanent failure,
 		// we don't want to disrupt workloads with no way to provision new nodes for them.
@@ -474,6 +461,15 @@ func (q *Queue) recordDecisionPerformed(cmd *Command) {
 		metrics.ReasonLabel:    strings.ToLower(string(cmd.Reason())),
 		ConsolidationTypeLabel: cmd.ConsolidationType(),
 	})
+}
+
+// releaseReservations releases the reservations of a command's replacements, for a command that won't create them.
+func releaseReservations(cmd *Command) {
+	for _, replacement := range cmd.Replacements {
+		if replacement.Reservation != nil {
+			replacement.Reservation.Release()
+		}
+	}
 }
 
 // HasAny checks to see if the candidate is part of an currently executing command.

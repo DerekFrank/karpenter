@@ -87,17 +87,18 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 		return reconcile.Result{RequeueAfter: time.Second}, nil
 	}
 
-	runningNodeClaims, _, nodesPendingDisruptionCount := c.cluster.NodePoolState.GetNodeCount(np.Name)
+	runningNodeClaims, _, reservedNodes := c.cluster.NodePoolState.GetNodeCount(np.Name)
 	desiredReplicas := lo.FromPtr(np.Spec.Replicas)
 	// Size down of replicas will be handled in deprovisioning controller to drain nodes and delete NodeClaims
-	// If there are drifting NodeClaims we need to count them as Active as disruption controller is in the process of creating replacements
-	if int64(runningNodeClaims)+int64(nodesPendingDisruptionCount) >= desiredReplicas {
+	// Reserved nodes are replacements the disruption controller is in the process of creating
+	if int64(runningNodeClaims)+int64(reservedNodes) >= desiredReplicas {
 		return reconcile.Result{RequeueAfter: time.Minute}, nil
 	}
 
 	limit, ok := np.Spec.Limits[resources.Node]
 	nodeLimit := lo.Ternary(ok, limit.Value(), int64(math.MaxInt64))
-	countNodeClaimsToProvision := c.cluster.NodePoolState.ReserveNodeCount(np.Name, nodeLimit, desiredReplicas-int64(runningNodeClaims))
+	reservations := c.cluster.NodePoolState.ReserveNodeCount(np.Name, nodeLimit, desiredReplicas-int64(runningNodeClaims)-int64(reservedNodes))
+	countNodeClaimsToProvision := len(reservations)
 
 	if countNodeClaimsToProvision <= 0 {
 		log.FromContext(ctx).Info("nodepool node limit reached")
@@ -108,10 +109,11 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 		Info("provisioning nodeclaims to satisfy replica count")
 
 	nodeClaims := make([]*scheduling.NodeClaim, 0, countNodeClaimsToProvision)
-	for range countNodeClaimsToProvision {
+	for _, reservation := range reservations {
 		nct := scheduling.NewNodeClaimTemplate(np)
 		nodeClaims = append(nodeClaims, &scheduling.NodeClaim{
 			NodeClaimTemplate: *nct,
+			Reservation:       reservation,
 		})
 	}
 
