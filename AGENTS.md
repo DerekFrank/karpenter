@@ -89,6 +89,14 @@ in `pkg/operator/options/options.go`; the `--feature-gates` default, its help te
   add its field to `FeatureGates`.
 - Reference a gate by its var (e.g. `NodeRepairFeatureGate.Name`), never a string literal.
 
+## Aggregated Values
+
+A value derived from objects, such as a count or a sum, is computed from the
+informer cache through a field index, not kept up to date by hand. Cache a hot
+one in a `pkg/state/memo` Memo, invalidated by events. Read
+`pkg/state/memo/AGENTS.md` before adding a map to cluster state or bookkeeping
+that updates an aggregate on each event.
+
 ## Issue and PR Guidelines
 
 - Never create an issue.
