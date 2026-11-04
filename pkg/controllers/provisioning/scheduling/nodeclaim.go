@@ -28,6 +28,7 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -42,6 +43,9 @@ import (
 // will be turned into one or more actual node instances within the cluster after bin packing.
 type NodeClaim struct {
 	NodeClaimTemplate
+
+	// Reservation, if set, holds the NodeClaim's place against a limit until it is created and counted.
+	Reservation Reservation
 
 	Pods                 []*corev1.Pod
 	volumes              scheduling.Volumes
@@ -63,6 +67,13 @@ type NodeClaim struct {
 	// creditReservationCapacity models slots a disruption candidate will free on termination: a reservation with a
 	// positive credit here is classified as reservable even if its offering's static ReservationCapacity is 0.
 	creditReservationCapacity map[string]int // reservationID -> credit count
+}
+
+// Reservation holds a NodeClaim's place against a limit. Bind it to the NodeClaim once created, so it is released
+// once the NodeClaim counts against the limit, or Release it if the NodeClaim won't be created.
+type Reservation interface {
+	Bind(types.NamespacedName)
+	Release()
 }
 
 // ReservedOfferingError indicates a NodeClaim couldn't be created or a pod couldn't be added to an exxisting NodeClaim

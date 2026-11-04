@@ -131,7 +131,7 @@ func NewCluster(clk clock.Clock, client client.Client, cloudProvider cloudprovid
 		nodeClaimNameToProviderID: map[string]string{},
 		nodePoolResources:         map[string]corev1.ResourceList{},
 
-		NodePoolState: NewNodePoolState(),
+		NodePoolState: NewNodePoolState(clk),
 
 		bufferPodCounts: map[string]int{},
 
@@ -356,9 +356,6 @@ func (c *Cluster) UnmarkForDeletion(providerIDs ...string) {
 			oldNode := n.ShallowCopy()
 			n.markedForDeletion = false
 			c.updateNodePoolResources(oldNode, n)
-			if n.NodeClaim != nil && n.NodeClaim.DeletionTimestamp.IsZero() {
-				c.NodePoolState.MarkNodeClaimActive(n.NodeClaim.Labels[v1.NodePoolLabelKey], n.NodeClaim.Name)
-			}
 		}
 	}
 }
@@ -373,9 +370,6 @@ func (c *Cluster) MarkForDeletion(providerIDs ...string) {
 			oldNode := n.ShallowCopy()
 			n.markedForDeletion = true
 			c.updateNodePoolResources(oldNode, n)
-			if n.NodeClaim != nil {
-				c.NodePoolState.MarkNodeClaimDeleting(n.NodeClaim.Labels[v1.NodePoolLabelKey], n.NodeClaim.Name)
-			}
 		}
 	}
 }
@@ -392,12 +386,7 @@ func (c *Cluster) UpdateNodeClaim(nodeClaim *v1.NodeClaim) {
 		c.nodes[nodeClaim.Status.ProviderID] = n
 	}
 
-	// Update nodepool state with NodeClaim
-	markedForDel := false
-	if n, ok := c.nodes[nodeClaim.Status.ProviderID]; ok {
-		markedForDel = n.MarkedForDeletion()
-	}
-	c.NodePoolState.UpdateNodeClaim(nodeClaim, markedForDel)
+	_ = c.NodePoolState.nodeClaims.Observe(context.Background(), nodeClaim)
 
 	// If the nodeclaim hasn't launched yet, we want to add it into cluster state to ensure
 	// that we're not racing with the internal cache for the cluster, assuming the node doesn't exist.
@@ -786,8 +775,7 @@ func (c *Cluster) cleanupNodeClaim(name string) {
 	// this is cleaned up.
 	delete(c.nodeClaimNameToProviderID, name)
 
-	// Delete the NodeClaim that is tracked in NodePoolState
-	c.NodePoolState.Cleanup(name)
+	c.NodePoolState.nodeClaims.Forget(types.NamespacedName{Name: name})
 }
 
 func (c *Cluster) newStateFromNode(ctx context.Context, node *corev1.Node, oldNode *StateNode) (*StateNode, error) {
