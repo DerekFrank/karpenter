@@ -19,6 +19,7 @@ package provisioning
 import (
 	"context"
 	"fmt"
+	"unique"
 
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -52,7 +53,8 @@ func (p *Provisioner) gatherResourceSlices(ctx context.Context, stateNodes []*st
 		if n.Node == nil {
 			continue
 		}
-		if n.Initialized() {
+		// A rebooting node is modeled from templates: kubelet wipes its slices on startup and names may not survive.
+		if n.Initialized() && !n.RebootInProgress() {
 			includedNodeNames.Insert(n.Name())
 		}
 	}
@@ -91,16 +93,33 @@ func nodeOwnerName(slice *resourcev1.ResourceSlice) (string, bool) {
 //
 // The remaining devices form the allocator's immutable seed set of already-allocated in-cluster devices, split into
 // exclusively-allocated devices and the consumed capacity of multi-allocatable (shared) devices.
-func (p *Provisioner) gatherAllocatedDevices(ctx context.Context, deletingPodUIDs sets.Set[types.UID]) (dynamicresources.AllocatedDeviceState, error) {
+func (p *Provisioner) gatherAllocatedDevices(ctx context.Context, deletingPodUIDs sets.Set[types.UID], stateNodes []*state.StateNode) (dynamicresources.AllocatedDeviceState, error) {
 	seq, err := p.deviceAllocationController.AllocatedDevices(ctx)
 	if err != nil {
 		return dynamicresources.AllocatedDeviceState{}, fmt.Errorf("getting allocated devices, %w", err)
 	}
 	state := dynamicresources.AllocatedDeviceState{
-		ExclusiveDevices: sets.New[cloudprovider.DeviceID](),
-		ConsumedCapacity: map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity{},
+		ExclusiveDevices:    sets.New[cloudprovider.DeviceID](),
+		ConsumedCapacity:    map[cloudprovider.DeviceID]map[resourcev1.QualifiedName]resource.Quantity{},
+		RebootRidingDevices: map[string]map[unique.Handle[string]]int{},
+	}
+	ridingPods := map[types.UID]string{}
+	for _, n := range stateNodes {
+		for _, uid := range n.RebootRidingPodUIDs() {
+			ridingPods[uid] = n.Name()
+		}
 	}
 	for id, meta := range seq {
+		// Devices held by pods riding a reboot are counted against that node's template devices.
+		for _, uid := range meta.PodUIDs {
+			if nodeName, ok := ridingPods[uid]; ok {
+				if state.RebootRidingDevices[nodeName] == nil {
+					state.RebootRidingDevices[nodeName] = map[unique.Handle[string]]int{}
+				}
+				state.RebootRidingDevices[nodeName][id.Driver]++
+				break
+			}
+		}
 		// A device with no live consumers that every referencing claim considers releasable is available.
 		if meta.Releasable && len(meta.PodUIDs) == 0 {
 			continue
