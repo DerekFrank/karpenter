@@ -136,6 +136,29 @@ func (f fieldIndexer) IndexField(ctx context.Context, obj client.Object, field s
 	return f.overlay.IndexField(obj, field, extractValue)
 }
 
+// WriteHandler receives the objects a client's writes of one kind return. deleted is true once the object is gone: the
+// client deleted it and the server removed it, or the informer passed the client's last write of an object its store no
+// longer holds. A handler runs on the writer's goroutine, so it must not block.
+type WriteHandler func(obj client.Object, deleted bool)
+
+// AddWriteHandler calls handler with the objects of obj's kind that this client's writes return, and returns a func
+// that removes it. Kinds the client doesn't overlay never call it.
+func (c *Client) AddWriteHandler(obj client.Object, handler WriteHandler) (func(), error) {
+	o, _, err := c.overlayFor(obj)
+	if err != nil || o == nil {
+		return func() {}, err
+	}
+	h := &handler
+	o.handlersMu.Lock()
+	defer o.handlersMu.Unlock()
+	o.handlers[h] = struct{}{}
+	return func() {
+		o.handlersMu.Lock()
+		defer o.handlersMu.Unlock()
+		delete(o.handlers, h)
+	}, nil
+}
+
 func (c *Client) overlayFor(obj runtime.Object) (*overlay, schema.GroupVersionKind, error) {
 	switch obj.(type) {
 	case runtime.Unstructured, *metav1.PartialObjectMetadata, *metav1.PartialObjectMetadataList:
@@ -154,7 +177,9 @@ func (c *Client) record(obj client.Object, created bool) error {
 	if err != nil || o == nil {
 		return err
 	}
-	o.record(obj.DeepCopyObject().(client.Object), c.indexersFor(gvk), created)
+	stored := obj.DeepCopyObject().(client.Object)
+	o.record(stored, c.indexersFor(gvk), created)
+	o.notify(stored, false)
 	return nil
 }
 
@@ -212,6 +237,7 @@ func (c *Client) Delete(ctx context.Context, obj client.Object, opts ...client.D
 		return c.record(obj, false)
 	}
 	o.forget(client.ObjectKeyFromObject(obj))
+	o.notify(obj.DeepCopyObject().(client.Object), true)
 	return nil
 }
 
