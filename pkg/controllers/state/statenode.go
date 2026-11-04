@@ -30,7 +30,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
@@ -180,17 +179,9 @@ type StateNode struct {
 	Node      *corev1.Node
 	NodeClaim *v1.NodeClaim
 
-	// daemonSetRequests is the total amount of resources that have been requested by daemon sets. This allows users
-	// of the Node to identify the remaining resources that we expect future daemonsets to consume.
-	daemonSetRequests map[types.NamespacedName]corev1.ResourceList
-	daemonSetLimits   map[types.NamespacedName]corev1.ResourceList
-
-	podRequests        map[types.NamespacedName]corev1.ResourceList
-	podLimits          map[types.NamespacedName]corev1.ResourceList
-	podDisruptionCosts map[types.NamespacedName]float64
-
-	hostPortUsage *scheduling.HostPortUsage
-	volumeUsage   *scheduling.VolumeUsage
+	// Derived are the fields Karpenter derives about the node from the pods bound to it. They come from their own
+	// store, so they can lag Node and NodeClaim, which are a join and read together.
+	Derived NodeDerived
 
 	// TODO remove this when v1alpha5 APIs are deprecated. With v1 APIs Karpenter relies on the existence
 	// of the karpenter.sh/disruption taint to know when a node is marked for deletion.
@@ -201,29 +192,30 @@ type StateNode struct {
 	repairPolicyMatches []health.RepairPolicyMatch
 }
 
+// NodeDerived are the fields Karpenter derives about a node from the pods bound to it.
+// +k8s:deepcopy-gen=true
+type NodeDerived struct {
+	PodRequests corev1.ResourceList
+	PodLimits   corev1.ResourceList
+	// DaemonSetRequests and DaemonSetLimits are the part of PodRequests and PodLimits from DaemonSet pods, which lets
+	// users of the node identify the resources future DaemonSets are expected to consume.
+	DaemonSetRequests corev1.ResourceList
+	DaemonSetLimits   corev1.ResourceList
+	// DisruptionCost sums the positive eviction costs of the node's non-DaemonSet pods.
+	DisruptionCost float64
+	HostPorts      *scheduling.HostPortUsage
+	Volumes        *scheduling.VolumeUsage
+}
+
 func NewNode() *StateNode {
-	return &StateNode{
-		daemonSetRequests:  map[types.NamespacedName]corev1.ResourceList{},
-		daemonSetLimits:    map[types.NamespacedName]corev1.ResourceList{},
-		podRequests:        map[types.NamespacedName]corev1.ResourceList{},
-		podLimits:          map[types.NamespacedName]corev1.ResourceList{},
-		podDisruptionCosts: map[types.NamespacedName]float64{},
-		hostPortUsage:      scheduling.NewHostPortUsage(),
-		volumeUsage:        scheduling.NewVolumeUsage(),
-	}
+	return &StateNode{Derived: NodeDerived{HostPorts: scheduling.NewHostPortUsage(), Volumes: scheduling.NewVolumeUsage()}}
 }
 
 func (in *StateNode) ShallowCopy() *StateNode {
 	return &StateNode{
 		Node:                in.Node,
 		NodeClaim:           in.NodeClaim,
-		daemonSetRequests:   in.daemonSetRequests,
-		daemonSetLimits:     in.daemonSetLimits,
-		podRequests:         in.podRequests,
-		podLimits:           in.podLimits,
-		podDisruptionCosts:  in.podDisruptionCosts,
-		hostPortUsage:       in.hostPortUsage,
-		volumeUsage:         in.volumeUsage,
+		Derived:             in.Derived,
 		markedForDeletion:   in.markedForDeletion,
 		nominatedUntil:      in.nominatedUntil,
 		repairPolicyMatches: in.repairPolicyMatches,
@@ -496,41 +488,36 @@ func (in *StateNode) Available() corev1.ResourceList {
 }
 
 func (in *StateNode) DaemonSetRequests() corev1.ResourceList {
-	return resources.Merge(lo.Values(in.daemonSetRequests)...)
+	return resources.Merge(in.Derived.DaemonSetRequests)
 }
 
 func (in *StateNode) DaemonSetLimits() corev1.ResourceList {
-	return resources.Merge(lo.Values(in.daemonSetLimits)...)
+	return resources.Merge(in.Derived.DaemonSetLimits)
 }
 
 func (in *StateNode) HostPortUsage() *scheduling.HostPortUsage {
-	return in.hostPortUsage
+	return in.Derived.HostPorts
 }
 
 func (in *StateNode) VolumeUsage() *scheduling.VolumeUsage {
-	return in.volumeUsage
+	return in.Derived.Volumes
 }
 
 func (in *StateNode) PodRequests() corev1.ResourceList {
-	var totalRequests corev1.ResourceList
-	for _, requests := range in.podRequests {
-		totalRequests = resources.MergeInto(totalRequests, requests)
+	if len(in.Derived.PodRequests) == 0 {
+		return nil
 	}
-	return totalRequests
+	return resources.Merge(in.Derived.PodRequests)
 }
 
 func (in *StateNode) PodLimits() corev1.ResourceList {
-	return resources.Merge(lo.Values(in.podLimits)...)
+	return resources.Merge(in.Derived.PodLimits)
 }
 
 // DisruptionCost returns the exact disruption cost for this node:
 // This is maintained incrementally as pods are added/removed.
 func (in *StateNode) DisruptionCost() float64 {
-	cost := disruptionutils.PerNodeBaseDisruptionCost
-	for _, c := range in.podDisruptionCosts {
-		cost += c
-	}
-	return cost
+	return disruptionutils.PerNodeBaseDisruptionCost + in.Derived.DisruptionCost
 }
 
 func (in *StateNode) MarkedForDeletion() bool {
@@ -556,47 +543,6 @@ func (in *StateNode) Nominated(clk clock.Clock) bool {
 
 func (in *StateNode) Managed() bool {
 	return in.NodeClaim != nil
-}
-
-func (in *StateNode) updateForPod(ctx context.Context, kubeClient client.Client, pod *corev1.Pod) error {
-	podKey := client.ObjectKeyFromObject(pod)
-	hostPorts := scheduling.GetHostPorts(pod)
-	volumes, err := scheduling.GetVolumes(ctx, kubeClient, pod)
-	if err != nil {
-		return fmt.Errorf("tracking volume usage, %w", err)
-	}
-	in.podRequests[podKey] = resources.RequestsForPods(pod)
-	in.podLimits[podKey] = resources.LimitsForPods(pod)
-	// if it's a daemonset, we track what it has requested separately
-	if podutils.IsOwnedByDaemonSet(pod) {
-		in.daemonSetRequests[podKey] = resources.RequestsForPods(pod)
-		in.daemonSetLimits[podKey] = resources.LimitsForPods(pod)
-	}
-	// Maintain per-pod disruption cost for balanced scoring. Only non-daemon
-	// pods with positive eviction cost contribute to the node's disruption cost.
-	if !podutils.IsOwnedByDaemonSet(pod) {
-		if in.podDisruptionCosts == nil {
-			in.podDisruptionCosts = map[types.NamespacedName]float64{}
-		}
-		if evictionCost := disruptionutils.EvictionCost(ctx, pod); evictionCost > 0 {
-			in.podDisruptionCosts[podKey] = evictionCost
-		} else {
-			delete(in.podDisruptionCosts, podKey)
-		}
-	}
-	in.hostPortUsage.Add(pod, hostPorts)
-	in.volumeUsage.Add(pod, volumes)
-	return nil
-}
-
-func (in *StateNode) cleanupForPod(podKey types.NamespacedName) {
-	in.hostPortUsage.DeletePod(podKey)
-	in.volumeUsage.DeletePod(podKey)
-	delete(in.podRequests, podKey)
-	delete(in.podLimits, podKey)
-	delete(in.daemonSetRequests, podKey)
-	delete(in.daemonSetLimits, podKey)
-	delete(in.podDisruptionCosts, podKey)
 }
 
 func nominationWindow(ctx context.Context) time.Duration {
