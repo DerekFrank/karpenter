@@ -14,10 +14,21 @@ This file covers facts and derived fields. Intent lives in `state.Cluster` in
 
 ## Layout
 
-- **`pkg/state`** holds the primitives, which know no object kinds: `Store`,
-  `Contribute` (`Contributor`), `Derive`, `Accessor` (`NewAccessor`) and `View`.
+- **`pkg/state`** holds the kind-free primitives: `Store`, `Contribute`
+  (`Contributor`), `Derive`, `Accessor` (`NewAccessor`) and `View`.
 - **`pkg/state/overlay`** holds `overlay.Client`, the read-after-write client:
   its reads include its own writes before the informer delivers them.
+- **`pkg/cluster`** holds the cluster's state built from those primitives: one
+  file per kind, each with its accessor, such as `cluster.NodePools` in
+  `nodepool.go`, and the stores of its derived fields, such as
+  `cluster.NodePoolUsage`.
+- **`cluster.State`** holds every accessor and the stores behind them.
+  `cluster.New` builds it once, in `pkg/controllers/controllers.go`. Each
+  controller's constructor takes the accessors it reads, as
+  `nodepoolcounter.NewController` takes `s.NodePools` and `s.NodePoolUsage`.
+- **Imports point one way:** controllers import `pkg/cluster`, which imports
+  `pkg/state`. depguard (`.golangci.yaml`, rules `state` and `cluster`) enforces
+  it.
 
 ## Reading state
 
@@ -25,24 +36,25 @@ Read an object that has a state accessor through the accessor. Write it through
 the client.
 
 ```go
-np, err := nodePools.Get(ctx, client.ObjectKey{Name: name}) // nodePools is a state.Accessor
-np.Object.Spec.Limits                                     // the NodePool, from the cache
-np.Derived.Usage                                          // fields Karpenter keeps about it
-kubeClient.Status().Patch(ctx, np.Object, client.MergeFrom(stored))
+nodePool, err := c.nodePools.Get(ctx, req.NamespacedName) // c.nodePools is a *cluster.NodePools
+nodePool.Object.Status.Resources = lo.Assign(BaseResources, nodePool.Derived.Usage)
+c.kubeClient.Status().Patch(ctx, nodePool.Object, client.MergeFrom(stored))
 ```
 
-- **A state accessor** is a `state.Accessor` for one kind. `Get` and `List`
-  return a `state.View{Object, Derived}`.
+- **A state accessor** is a `state.Accessor` for one kind, such as
+  `cluster.NodePools`. `Get` and `List` return a `state.View{Object, Derived}`,
+  such as `cluster.NodePool`.
 - **`Object` is the API object**, read through the client, so it is
   read-after-write with the overlay. Write, watch and record events for it as
   for any object.
 - **`Derived` is in-memory only**, read from its stores lock-free.
 - **Derived values are shared and immutable.** Copy one to change it.
 - **The client type enforces the rule.** A controller that reads through
-  accessors takes a client of `client.Writer` and `client.StatusClient`, so a
-  read through the client is a compile error.
+  accessors takes a client of `client.Writer` and `client.StatusClient`, as the
+  `writer` interface in `pkg/controllers/nodepool/counter` does, so a read
+  through the client is a compile error.
 - **Write from derived fields once they're synced.** Check the Contributor's
-  `Synced` first.
+  `Synced` first, as the nodepool counter checks `usage.NodeClaims.Synced()`.
 
 ## Keeping derived fields
 
@@ -57,7 +69,8 @@ independent of the number of objects behind the field.
   (`contribution`), and how a change folds into the fields
   (`apply(fields, prev, next)`).
   - Run it as a manager runnable (`Start`), so it follows the informer and the
-    `overlay.Client`'s writes.
+    `overlay.Client`'s writes, as the nodepool counter's `Register` adds
+    `usage.NodeClaims`.
   - `Observe` feeds an object seen elsewhere, and `Forget` removes one known
     only by name.
   - `Recompute` refreshes a contribution that reads other objects.
@@ -67,7 +80,8 @@ independent of the number of objects behind the field.
 - **`state.Derive` feeds a store from another store's fields**, such as Node
   capacity summed onto its NodePool.
 - **`Store.Update` sets fields Karpenter decides**, under the store's lock.
-  `Store.Subscribe` notifies on each changed key.
+  `Store.Subscribe` notifies on each changed key, as `NodePoolUsage.Subscribe`
+  enqueues NodePools.
 - **The accessor's `derive` reads the stores**, so readers get the fields.
 - **Each aggregate lives in a `Store`**, fed by a `Contributor` or `Derive`.
   Look up objects by a value of one object, such as pods by `spec.nodeName`,
@@ -88,8 +102,8 @@ the lag: a pod that moves between nodes can briefly count on both or neither.
 ## Adding a derived field
 
 - Add the field to its store's fields struct and to the accessor's `Derived`
-  struct. Comment what it holds, which kind feeds it, and when an object stops
-  counting.
+  struct, such as `cluster.NodePoolDerived`. Comment what it holds, which kind
+  feeds it, and when an object stops counting.
 - `target` is a pure function of the object, since a contribution moves only
   when the object changes. Make `contribution` pure too where possible. A
   contribution that reads other objects, such as a pod's PVCs, is current as of
@@ -98,7 +112,7 @@ the lag: a pod that moves between nodes can briefly count on both or neither.
   slice before changing it. `apply` runs under the store's lock, so it is
   non-blocking and free of I/O.
 - `target`, `contribution` and `apply` run on every event. Read the condition or
-  field directly from the object.
+  field directly, as `NewNodePoolUsage` reads `Status.Conditions`.
 
 ## Testing
 
