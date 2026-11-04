@@ -89,7 +89,7 @@ func ForProviderID(providerID string) client.ListOption {
 }
 
 func ForNodePool(nodePoolName string) client.ListOption {
-	return client.MatchingLabels(map[string]string{v1.NodePoolLabelKey: nodePoolName})
+	return client.MatchingFields{"metadata.labels.karpenter.sh/nodepool": nodePoolName}
 }
 
 func ForNodeClass(nodeClass status.Object) client.ListOption {

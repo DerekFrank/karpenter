@@ -344,6 +344,10 @@ func setupIndexers(ctx context.Context, mgr manager.Manager) {
 	handleCRDIndexerError(mgr.GetFieldIndexer().IndexField(ctx, &v1.NodeClaim{}, "spec.nodeClassRef.name", func(o client.Object) []string {
 		return []string{o.(*v1.NodeClaim).Spec.NodeClassRef.Name}
 	}), "failed to setup nodeclaim nodeclassref name indexer")
+	handleCRDIndexerError(mgr.GetFieldIndexer().IndexField(ctx, &v1.NodeClaim{}, "metadata.labels.karpenter.sh/nodepool", func(o client.Object) []string {
+		nodePool, ok := o.GetLabels()[v1.NodePoolLabelKey]
+		return lo.Ternary(ok, []string{nodePool}, nil)
+	}), "failed to setup nodeclaim nodepool indexer")
 
 	handleCRDIndexerError(mgr.GetFieldIndexer().IndexField(ctx, &v1.NodePool{}, "spec.template.spec.nodeClassRef.group", func(o client.Object) []string {
 		return []string{o.(*v1.NodePool).Spec.Template.Spec.NodeClassRef.Group}
