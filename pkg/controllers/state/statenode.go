@@ -20,6 +20,7 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
+	"maps"
 	"time"
 
 	"github.com/awslabs/operatorpkg/serrors"
@@ -30,7 +31,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
@@ -126,8 +126,6 @@ func IgnoreNodeUninitializedError(err error) error {
 	return err
 }
 
-//go:generate go tool -modfile=../../../go.tools.mod controller-gen object:headerFile="../../../hack/boilerplate.go.txt" paths="."
-
 // StateNodes is a typed version of a list of *Node
 // nolint: revive
 type StateNodes []*StateNode
@@ -174,23 +172,13 @@ func (n StateNodes) CurrentlyReschedulablePods(ctx context.Context, kubeClient c
 // StateNode is a cached version of a node in the cluster that maintains state which is expensive to compute every time it's
 // needed.  This currently contains node utilization across all the allocatable resources, but will soon be used to
 // compute topology information.
-// +k8s:deepcopy-gen=true
 // nolint: revive
 type StateNode struct {
 	Node      *corev1.Node
 	NodeClaim *v1.NodeClaim
 
-	// daemonSetRequests is the total amount of resources that have been requested by daemon sets. This allows users
-	// of the Node to identify the remaining resources that we expect future daemonsets to consume.
-	daemonSetRequests map[types.NamespacedName]corev1.ResourceList
-	daemonSetLimits   map[types.NamespacedName]corev1.ResourceList
-
-	podRequests        map[types.NamespacedName]corev1.ResourceList
-	podLimits          map[types.NamespacedName]corev1.ResourceList
-	podDisruptionCosts map[types.NamespacedName]float64
-
-	hostPortUsage *scheduling.HostPortUsage
-	volumeUsage   *scheduling.VolumeUsage
+	// usage returns the usage of the pods bound to the named node.
+	usage func(nodeName string) *PodUsage
 
 	// TODO remove this when v1alpha5 APIs are deprecated. With v1 APIs Karpenter relies on the existence
 	// of the karpenter.sh/disruption taint to know when a node is marked for deletion.
@@ -202,28 +190,14 @@ type StateNode struct {
 }
 
 func NewNode() *StateNode {
-	return &StateNode{
-		daemonSetRequests:  map[types.NamespacedName]corev1.ResourceList{},
-		daemonSetLimits:    map[types.NamespacedName]corev1.ResourceList{},
-		podRequests:        map[types.NamespacedName]corev1.ResourceList{},
-		podLimits:          map[types.NamespacedName]corev1.ResourceList{},
-		podDisruptionCosts: map[types.NamespacedName]float64{},
-		hostPortUsage:      scheduling.NewHostPortUsage(),
-		volumeUsage:        scheduling.NewVolumeUsage(),
-	}
+	return &StateNode{}
 }
 
 func (in *StateNode) ShallowCopy() *StateNode {
 	return &StateNode{
 		Node:                in.Node,
 		NodeClaim:           in.NodeClaim,
-		daemonSetRequests:   in.daemonSetRequests,
-		daemonSetLimits:     in.daemonSetLimits,
-		podRequests:         in.podRequests,
-		podLimits:           in.podLimits,
-		podDisruptionCosts:  in.podDisruptionCosts,
-		hostPortUsage:       in.hostPortUsage,
-		volumeUsage:         in.volumeUsage,
+		usage:               in.usage,
 		markedForDeletion:   in.markedForDeletion,
 		nominatedUntil:      in.nominatedUntil,
 		repairPolicyMatches: in.repairPolicyMatches,
@@ -495,42 +469,68 @@ func (in *StateNode) Available() corev1.ResourceList {
 	return resources.Subtract(in.Allocatable(), in.PodRequests())
 }
 
+// DeepCopy copies the node with the usage of its pods at the time of the copy, which the copy keeps as pods change.
+func (in *StateNode) DeepCopy() *StateNode {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Node = in.Node.DeepCopy()
+	out.NodeClaim = in.NodeClaim.DeepCopy()
+	in.nominatedUntil.DeepCopyInto(&out.nominatedUntil)
+	if in.repairPolicyMatches != nil {
+		out.repairPolicyMatches = make([]health.RepairPolicyMatch, len(in.repairPolicyMatches))
+		for i := range in.repairPolicyMatches {
+			in.repairPolicyMatches[i].DeepCopyInto(&out.repairPolicyMatches[i])
+		}
+	}
+	usage := in.podUsage().DeepCopy()
+	out.usage = func(string) *PodUsage { return usage }
+	return &out
+}
+
+// podUsage returns the usage of the node's pods: the live usage for a node in cluster state, the usage at the time of
+// the copy for a copy, and none for a NodeClaim without a Node.
+func (in *StateNode) podUsage() *PodUsage {
+	if in.usage == nil {
+		return newPodUsage()
+	}
+	var nodeName string
+	if in.Node != nil {
+		nodeName = in.Node.Name
+	}
+	return in.usage(nodeName)
+}
+
 func (in *StateNode) DaemonSetRequests() corev1.ResourceList {
-	return resources.Merge(lo.Values(in.daemonSetRequests)...)
+	return resources.Merge(in.podUsage().DaemonSetRequests)
 }
 
 func (in *StateNode) DaemonSetLimits() corev1.ResourceList {
-	return resources.Merge(lo.Values(in.daemonSetLimits)...)
+	return resources.Merge(in.podUsage().DaemonSetLimits)
 }
 
+// HostPortUsage returns the host ports the node's pods use. Don't modify it unless the node is a copy.
 func (in *StateNode) HostPortUsage() *scheduling.HostPortUsage {
-	return in.hostPortUsage
+	return in.podUsage().HostPorts
 }
 
+// VolumeUsage returns the volumes the node's pods use. Don't modify it unless the node is a copy.
 func (in *StateNode) VolumeUsage() *scheduling.VolumeUsage {
-	return in.volumeUsage
+	return in.podUsage().Volumes
 }
 
 func (in *StateNode) PodRequests() corev1.ResourceList {
-	var totalRequests corev1.ResourceList
-	for _, requests := range in.podRequests {
-		totalRequests = resources.MergeInto(totalRequests, requests)
-	}
-	return totalRequests
+	return maps.Clone(in.podUsage().Requests)
 }
 
 func (in *StateNode) PodLimits() corev1.ResourceList {
-	return resources.Merge(lo.Values(in.podLimits)...)
+	return resources.Merge(in.podUsage().Limits)
 }
 
-// DisruptionCost returns the exact disruption cost for this node:
-// This is maintained incrementally as pods are added/removed.
+// DisruptionCost returns the exact disruption cost for this node.
 func (in *StateNode) DisruptionCost() float64 {
-	cost := disruptionutils.PerNodeBaseDisruptionCost
-	for _, c := range in.podDisruptionCosts {
-		cost += c
-	}
-	return cost
+	return disruptionutils.PerNodeBaseDisruptionCost + in.podUsage().DisruptionCost
 }
 
 func (in *StateNode) MarkedForDeletion() bool {
@@ -556,47 +556,6 @@ func (in *StateNode) Nominated(clk clock.Clock) bool {
 
 func (in *StateNode) Managed() bool {
 	return in.NodeClaim != nil
-}
-
-func (in *StateNode) updateForPod(ctx context.Context, kubeClient client.Client, pod *corev1.Pod) error {
-	podKey := client.ObjectKeyFromObject(pod)
-	hostPorts := scheduling.GetHostPorts(pod)
-	volumes, err := scheduling.GetVolumes(ctx, kubeClient, pod)
-	if err != nil {
-		return fmt.Errorf("tracking volume usage, %w", err)
-	}
-	in.podRequests[podKey] = resources.RequestsForPods(pod)
-	in.podLimits[podKey] = resources.LimitsForPods(pod)
-	// if it's a daemonset, we track what it has requested separately
-	if podutils.IsOwnedByDaemonSet(pod) {
-		in.daemonSetRequests[podKey] = resources.RequestsForPods(pod)
-		in.daemonSetLimits[podKey] = resources.LimitsForPods(pod)
-	}
-	// Maintain per-pod disruption cost for balanced scoring. Only non-daemon
-	// pods with positive eviction cost contribute to the node's disruption cost.
-	if !podutils.IsOwnedByDaemonSet(pod) {
-		if in.podDisruptionCosts == nil {
-			in.podDisruptionCosts = map[types.NamespacedName]float64{}
-		}
-		if evictionCost := disruptionutils.EvictionCost(ctx, pod); evictionCost > 0 {
-			in.podDisruptionCosts[podKey] = evictionCost
-		} else {
-			delete(in.podDisruptionCosts, podKey)
-		}
-	}
-	in.hostPortUsage.Add(pod, hostPorts)
-	in.volumeUsage.Add(pod, volumes)
-	return nil
-}
-
-func (in *StateNode) cleanupForPod(podKey types.NamespacedName) {
-	in.hostPortUsage.DeletePod(podKey)
-	in.volumeUsage.DeletePod(podKey)
-	delete(in.podRequests, podKey)
-	delete(in.podLimits, podKey)
-	delete(in.daemonSetRequests, podKey)
-	delete(in.daemonSetLimits, podKey)
-	delete(in.podDisruptionCosts, podKey)
 }
 
 func nominationWindow(ctx context.Context) time.Duration {
