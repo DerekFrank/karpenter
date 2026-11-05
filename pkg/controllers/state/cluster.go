@@ -262,7 +262,7 @@ func (c *Cluster) ForPodsWithAntiAffinity(fn func(p *corev1.Pod, n *corev1.Node,
 			// if we receive the node deletion event before the pod deletion event, this can happen
 			return true
 		}
-		return fn(pod, node.Node, node.RebootReturning() && node.terminatingPods[client.ObjectKeyFromObject(pod)])
+		return fn(pod, node.Node, node.UninitializedOrRebooting() && node.terminatingPods[client.ObjectKeyFromObject(pod)])
 	})
 }
 

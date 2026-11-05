@@ -431,7 +431,7 @@ func (in *StateNode) Taints() []corev1.Taint {
 	} else {
 		taints = in.Node.Spec.Taints
 	}
-	if (!in.Initialized() || in.RebootInProgress()) && in.Managed() {
+	if in.UninitializedOrRebooting() && in.Managed() {
 		// We reject well-known ephemeral taints, startup taints, and the reboot-owned scheduling fence
 		// while the node is uninitialized or rebooting. Without this the scheduling simulation would
 		// treat these transient taints as permanent and incorrectly assume pods can't schedule onto the
@@ -508,15 +508,17 @@ func (in *StateNode) Allocatable() corev1.ResourceList {
 	return in.Node.Status.Allocatable
 }
 
-// RebootReturning returns true from when a reboot is committed until the node re-initializes after it succeeds. Over
-// that span the node's capacity is coming back, so it's modeled as it will be once it has.
-func (in *StateNode) RebootReturning() bool {
-	return in.RebootInProgress() || in.RebootReinitializing()
+// UninitializedOrRebooting returns true while the node isn't yet serving as it will once it's initialized: before it
+// initializes, and from when a reboot is committed until it re-initializes. A reboot's drain keeps the node
+// Initialized, so the reboot is checked separately. Such a node is modeled as it will be once it's initialized.
+func (in *StateNode) UninitializedOrRebooting() bool {
+	return !in.Initialized() || in.RebootInProgress()
 }
 
-// Available is allocatable minus anything allocated to pods. A returning node is modeled as it will be once it has.
+// Available is allocatable minus anything allocated to pods. A node that's uninitialized or rebooting is modeled as it
+// will be once it's initialized, without its terminating pods.
 func (in *StateNode) Available() corev1.ResourceList {
-	if !in.RebootReturning() {
+	if !in.UninitializedOrRebooting() {
 		return resources.Subtract(in.Allocatable(), in.PodRequests())
 	}
 	var requests corev1.ResourceList
@@ -528,9 +530,9 @@ func (in *StateNode) Available() corev1.ResourceList {
 	return resources.Subtract(in.Allocatable(), requests)
 }
 
-// RebootDepartingPods returns the terminating pods a rebooting node won't have when it returns.
-func (in *StateNode) RebootDepartingPods() []types.NamespacedName {
-	if !in.RebootReturning() {
+// DepartingPods returns the terminating pods a node that's uninitialized or rebooting won't have once it's initialized.
+func (in *StateNode) DepartingPods() []types.NamespacedName {
+	if !in.UninitializedOrRebooting() {
 		return nil
 	}
 	return lo.Keys(in.terminatingPods)

@@ -63,7 +63,7 @@ func NewExistingNode(n *state.StateNode, topology *Topology, taints []v1.Taint, 
 		}
 	}
 	// A rebooting node returns without its terminating pods, so their host ports and volumes don't conflict there
-	for _, podKey := range n.RebootDepartingPods() {
+	for _, podKey := range n.DepartingPods() {
 		n.HostPortUsage().DeletePod(podKey)
 		n.VolumeUsage().DeletePod(podKey)
 	}

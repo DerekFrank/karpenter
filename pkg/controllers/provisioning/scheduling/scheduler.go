@@ -890,15 +890,9 @@ func (s *Scheduler) sortExistingNodes() {
 	// This is done specifically for consolidation where we want to make sure we schedule to initialized nodes
 	// before we attempt to schedule uninitialized ones
 	sort.SliceStable(s.existingNodes, func(i, j int) bool {
-		if s.existingNodes[i].Initialized() && !s.existingNodes[j].Initialized() {
-			return true
-		}
-		if !s.existingNodes[i].Initialized() && s.existingNodes[j].Initialized() {
-			return false
-		}
-		// Capacity a rebooting node offers only exists once it returns, so prefer nodes that can take pods now
-		if ri, rj := s.existingNodes[i].RebootInProgress(), s.existingNodes[j].RebootInProgress(); ri != rj {
-			return rj
+		// Capacity an uninitialized or rebooting node offers only exists once it initializes, so prefer nodes that can take pods now
+		if ui, uj := s.existingNodes[i].UninitializedOrRebooting(), s.existingNodes[j].UninitializedOrRebooting(); ui != uj {
+			return uj
 		}
 		return s.existingNodes[i].Name() < s.existingNodes[j].Name()
 	})
