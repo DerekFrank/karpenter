@@ -18,7 +18,7 @@ package counter
 
 import (
 	"context"
-	"time"
+	"fmt"
 
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
@@ -35,7 +35,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
@@ -44,9 +44,11 @@ import (
 
 // Controller for the resource
 type Controller struct {
-	kubeClient    client.Client
+	// kubeClient only writes: NodePools are read through nodePools.
+	kubeClient    writer
 	cloudProvider cloudprovider.CloudProvider
-	cluster       *state.Cluster
+	nodePools     *cluster.NodePools
+	usage         *cluster.NodePoolUsage
 }
 
 var BaseResources = corev1.ResourceList{
@@ -57,12 +59,18 @@ var BaseResources = corev1.ResourceList{
 	resources.Node:                  resource.MustParse("0"),
 }
 
-// NewController is a constructor
-func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, cluster *state.Cluster) *Controller {
+type writer interface {
+	client.Writer
+	client.StatusClient
+}
+
+// NewController is a constructor. The controller reconciles a NodePool when it's created and whenever its usage changes.
+func NewController(kubeClient writer, cloudProvider cloudprovider.CloudProvider, nodePools *cluster.NodePools, usage *cluster.NodePoolUsage) *Controller {
 	return &Controller{
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
-		cluster:       cluster,
+		nodePools:     nodePools,
+		usage:         usage,
 	}
 }
 
@@ -71,32 +79,32 @@ func (c *Controller) Name() string {
 	return "nodepool.counter"
 }
 
-func (c *Controller) Reconcile(ctx context.Context, nodePool *v1.NodePool) (reconcile.Result, error) {
+func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
-	if !nodepoolutils.IsManaged(nodePool, c.cloudProvider) {
+	nodePool, err := c.nodePools.Get(ctx, req.NamespacedName)
+	if err != nil {
+		return reconcile.Result{}, client.IgnoreNotFound(err)
+	}
+	if !nodepoolutils.IsManaged(nodePool.Object, c.cloudProvider) {
 		return reconcile.Result{}, nil
 	}
 
-	// We need to ensure that our internal cluster state mechanism is synced before we proceed
-	// Otherwise, we have the potential to patch over the status with a lower value for the nodepool resource
-	// counts on startup
-	if !c.cluster.Synced(ctx) {
-		return reconcile.Result{RequeueAfter: time.Second}, nil
-	}
-	stored := nodePool.DeepCopy()
-	// Determine resource usage and update nodepool.status.resources and nodepool.status.Nodes
-	nodePool.Status.Resources = lo.Assign(BaseResources, c.cluster.NodePoolResourcesFor(nodePool.Name))
-	nodeQuantity := nodePool.Status.Resources[resources.Node]
-	nodePool.Status.Nodes = new(nodeQuantity.Value())
-	if !equality.Semantic.DeepEqual(stored, nodePool) {
-		if err := c.kubeClient.Status().Patch(ctx, nodePool, client.MergeFrom(stored)); err != nil {
+	stored := nodePool.Object.DeepCopy()
+	nodePool.Object.Status.Resources = lo.Assign(BaseResources, nodePool.Derived.Usage)
+	nodes := nodePool.Object.Status.Resources[resources.Node]
+	nodePool.Object.Status.Nodes = new(nodes.Value())
+	if !equality.Semantic.DeepEqual(stored, nodePool.Object) {
+		if err := c.kubeClient.Status().Patch(ctx, nodePool.Object, client.MergeFrom(stored)); err != nil {
 			return reconcile.Result{}, client.IgnoreNotFound(err)
 		}
 	}
-	return reconcile.Result{RequeueAfter: time.Second * 5}, nil
+	return reconcile.Result{}, nil
 }
 
 func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
+	if err := m.Add(c.usage.NodeClaims); err != nil {
+		return fmt.Errorf("adding nodepool usage aggregate, %w", err)
+	}
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		For(&v1.NodePool{}, builder.WithPredicates(nodepoolutils.IsManagedPredicateFuncs(c.cloudProvider), predicate.Funcs{
@@ -104,6 +112,9 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 			UpdateFunc: func(e event.UpdateEvent) bool { return false },
 			DeleteFunc: func(e event.DeleteEvent) bool { return false },
 		})).
+		// nodePools reconciles a NodePool whenever its usage changes, and holds off reconciling until the usage has
+		// summed every NodeClaim, so that the status is never patched with a partial count.
+		WatchesRawSource(c.nodePools).
 		WithOptions(controller.Options{MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), 10, 1000)}).
-		Complete(reconcile.AsReconciler(m.GetClient(), c))
+		Complete(c)
 }
