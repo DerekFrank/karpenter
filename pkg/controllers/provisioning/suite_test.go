@@ -1070,7 +1070,7 @@ var _ = Describe("Provisioning", func() {
 					ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("2Gi")}},
 				})
 			ExpectApplied(ctx, env.Client, nodePool, daemonsetPod)
-			ExpectReconcileSucceeded(ctx, daemonsetController, client.ObjectKeyFromObject(daemonset))
+			Expect(cluster.UpdatePod(ctx, daemonsetPod)).To(Succeed())
 			pod := test.UnschedulablePod(test.PodOptions{
 				ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")}},
 				NodeSelector:         map[string]string{v1.NodePoolLabelKey: nodePool.Name},
@@ -1380,7 +1380,7 @@ var _ = Describe("Provisioning", func() {
 					ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("2Gi")}},
 				})
 			ExpectApplied(ctx, env.Client, daemonsetPod)
-			ExpectReconcileSucceeded(ctx, daemonsetController, client.ObjectKeyFromObject(daemonset))
+			Expect(cluster.UpdatePod(ctx, daemonsetPod)).To(Succeed())
 
 			// Deploy pod
 			pod := test.UnschedulablePod(test.PodOptions{
