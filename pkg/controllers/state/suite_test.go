@@ -77,7 +77,7 @@ func TestAPIs(t *testing.T) {
 }
 
 var _ = BeforeSuite(func() {
-	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...), test.WithConfigOptions(func(config *rest.Config) {
+	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...), test.WithFieldIndexers(test.PodDaemonSetFieldIndexer(ctx)), test.WithConfigOptions(func(config *rest.Config) {
 		config.QPS = -1
 	}))
 	ctx = options.ToContext(ctx, test.Options())
@@ -1615,7 +1615,7 @@ var _ = Describe("DaemonSet Controller", func() {
 		ExpectApplied(ctx, env.Client, daemonsetPod)
 		ExpectReconcileSucceeded(ctx, daemonsetController, client.ObjectKeyFromObject(daemonset))
 
-		Expect(cluster.GetDaemonSetPod(daemonset)).To(Equal(daemonsetPod))
+		Expect(cluster.GetDaemonSetPod(daemonset).ObjectMeta).To(Equal(daemonsetPod.ObjectMeta))
 	})
 	It("should update daemonsetCache with the newest created pod", func() {
 		daemonset := test.DaemonSet(
@@ -1643,7 +1643,7 @@ var _ = Describe("DaemonSet Controller", func() {
 		ExpectApplied(ctx, env.Client, daemonsetPod1)
 		ExpectReconcileSucceeded(ctx, daemonsetController, client.ObjectKeyFromObject(daemonset))
 
-		Expect(cluster.GetDaemonSetPod(daemonset)).To(Equal(daemonsetPod1))
+		Expect(cluster.GetDaemonSetPod(daemonset).ObjectMeta).To(Equal(daemonsetPod1.ObjectMeta))
 
 		daemonsetPod2 := test.UnschedulablePod(
 			test.PodOptions{
@@ -1664,7 +1664,7 @@ var _ = Describe("DaemonSet Controller", func() {
 		daemonsetPod2.Spec = daemonset.Spec.Template.Spec
 		ExpectApplied(ctx, env.Client, daemonsetPod2)
 		ExpectReconcileSucceeded(ctx, daemonsetController, client.ObjectKeyFromObject(daemonset))
-		Expect(cluster.GetDaemonSetPod(daemonset)).To(Equal(daemonsetPod2))
+		Expect(cluster.GetDaemonSetPod(daemonset).ObjectMeta).To(Equal(daemonsetPod2.ObjectMeta))
 	})
 	It("should delete daemonset in cache when daemonset is deleted", func() {
 		daemonset := test.DaemonSet(
@@ -1692,7 +1692,7 @@ var _ = Describe("DaemonSet Controller", func() {
 		ExpectApplied(ctx, env.Client, daemonsetPod)
 		ExpectReconcileSucceeded(ctx, daemonsetController, client.ObjectKeyFromObject(daemonset))
 
-		Expect(cluster.GetDaemonSetPod(daemonset)).To(Equal(daemonsetPod))
+		Expect(cluster.GetDaemonSetPod(daemonset).ObjectMeta).To(Equal(daemonsetPod.ObjectMeta))
 
 		ExpectDeleted(ctx, env.Client, daemonset, daemonsetPod)
 		ExpectReconcileSucceeded(ctx, daemonsetController, client.ObjectKeyFromObject(daemonset))

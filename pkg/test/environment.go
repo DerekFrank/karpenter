@@ -26,8 +26,11 @@ import (
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -90,6 +93,15 @@ func NodeProviderIDFieldIndexer(ctx context.Context) func(cache.Cache) error {
 	}
 }
 
+func NodeNodePoolFieldIndexer(ctx context.Context) func(cache.Cache) error {
+	return func(c cache.Cache) error {
+		return c.IndexField(ctx, &corev1.Node{}, "metadata.labels.karpenter.sh/nodepool", func(o client.Object) []string {
+			nodePool, ok := o.GetLabels()[v1.NodePoolLabelKey]
+			return lo.Ternary(ok, []string{nodePool}, nil)
+		})
+	}
+}
+
 func NodeClaimProviderIDFieldIndexer(ctx context.Context) func(cache.Cache) error {
 	return func(c cache.Cache) error {
 		return c.IndexField(ctx, &v1.NodeClaim{}, "status.providerID", func(obj client.Object) []string {
@@ -114,6 +126,15 @@ func NodeClaimNodeClassRefFieldIndexer(ctx context.Context) func(cache.Cache) er
 	}
 }
 
+func NodeClaimNodePoolFieldIndexer(ctx context.Context) func(cache.Cache) error {
+	return func(c cache.Cache) error {
+		return c.IndexField(ctx, &v1.NodeClaim{}, "metadata.labels.karpenter.sh/nodepool", func(obj client.Object) []string {
+			nodePool, ok := obj.GetLabels()[v1.NodePoolLabelKey]
+			return lo.Ternary(ok, []string{nodePool}, nil)
+		})
+	}
+}
+
 func NodePoolNodeClassRefFieldIndexer(ctx context.Context) func(cache.Cache) error {
 	return func(c cache.Cache) error {
 		var err error
@@ -127,6 +148,36 @@ func NodePoolNodeClassRefFieldIndexer(ctx context.Context) func(cache.Cache) err
 			return []string{obj.(*v1.NodePool).Spec.Template.Spec.NodeClassRef.Name}
 		}))
 		return err
+	}
+}
+
+func ResourceSliceNodeFieldIndexer(ctx context.Context) func(cache.Cache) error {
+	return func(c cache.Cache) error {
+		return c.IndexField(ctx, &resourcev1.ResourceSlice{}, "node", func(o client.Object) []string {
+			slice := o.(*resourcev1.ResourceSlice)
+			nodes := sets.New[string]()
+			if nodeName := lo.FromPtr(slice.Spec.NodeName); nodeName != "" {
+				nodes.Insert(nodeName)
+			}
+			for _, ref := range slice.OwnerReferences {
+				if ref.Kind == "Node" {
+					nodes.Insert(ref.Name)
+				}
+			}
+			return sets.List(nodes)
+		})
+	}
+}
+
+func PodDaemonSetFieldIndexer(ctx context.Context) func(cache.Cache) error {
+	return func(c cache.Cache) error {
+		return c.IndexField(ctx, &corev1.Pod{}, "metadata.ownerReferences.daemonSet", func(o client.Object) []string {
+			owner := metav1.GetControllerOf(o)
+			if owner == nil || owner.Kind != "DaemonSet" {
+				return nil
+			}
+			return []string{string(owner.UID)}
+		})
 	}
 }
 
