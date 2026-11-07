@@ -53,8 +53,44 @@ c.kubeClient.Status().Patch(ctx, nodePool.Object, client.MergeFrom(stored))
   accessors takes a client of `client.Writer` and `client.StatusClient`, as the
   `writer` interface in `pkg/controllers/nodepool/counter` does, so a read
   through the client is a compile error.
-- **Write from derived fields once they're synced.** Check the Contributor's
-  `Synced` first, as the nodepool counter checks `usage.NodeClaims.Synced()`.
+
+## Reacting to derived fields
+
+An accessor is a controller-runtime source. A controller that watches it
+reconciles an object whenever the object's derived fields change, as
+`nodepool.counter` reconciles a NodePool on each change to its usage:
+
+```go
+controllerruntime.NewControllerManagedBy(m).
+	Named("nodepool.counter").
+	For(&v1.NodePool{}, ...).        // the object's own events
+	WatchesRawSource(c.nodePools).   // its derived fields' changes
+	Complete(c)
+```
+
+- **`state.From(store, object, synced...)` is a source over one store**:
+  `object` maps the store's key to the object it describes, such as
+  `state.ByName` for a store keyed by name, and `synced` are the Contributors
+  that feed the store. Register it with `NewAccessor`, or watch it on its own.
+- **`state.FromEach(store, objects, synced...)`** maps a key and its fields to
+  every object they affect, such as a NodePool's NodeClaims, or the Node a
+  providerID's fields hold. A change enqueues the objects of the fields before
+  and after it, so an object hears when a key leaves it. Both mappings run on the writer's
+  goroutine, so they read other stores with `Get`, never the API server.
+- **`.When(changed)` filters a source by the key's fields before and after.**
+  Filter every source over a store whose fields change more often than the
+  watcher acts on them, such as pod usage.
+- **`state.Wake(sources...)`** folds every change into one empty request, for a
+  controller that reconciles the whole cluster at once, in place of a
+  singleton's poll. **`state.After(delay, sources...)`** batches each request's
+  changes for `delay`, for a watcher such as metrics.
+- **`Start` enqueues every object that has derived fields, then each one whose
+  fields change.** The workqueue holds a key once, so a burst of changes
+  reconciles the object once, with the fields as they are when it runs.
+- **`WaitForSync` holds the controller's workers until every store is synced**,
+  so a reconcile never writes from partial fields.
+- **The source wakes the controller; the reconcile reads the fields** through
+  the accessor.
 
 ## Keeping derived fields
 
@@ -80,8 +116,8 @@ independent of the number of objects behind the field.
 - **`state.Derive` feeds a store from another store's fields**, such as Node
   capacity summed onto its NodePool.
 - **`Store.Update` sets fields Karpenter decides**, under the store's lock.
-  `Store.Subscribe` notifies on each changed key, as `NodePoolUsage.Subscribe`
-  enqueues NodePools.
+  `Store.Subscribe` calls a func with each changed key until the func it returns
+  is called, as `state.From` enqueues the accessor's objects.
 - **The accessor's `derive` reads the stores**, so readers get the fields.
 - **Each aggregate lives in a `Store`**, fed by a `Contributor` or `Derive`.
   Look up objects by a value of one object, such as pods by `spec.nodeName`,
@@ -126,3 +162,6 @@ the lag: a pod that moves between nodes can briefly count on both or neither.
 - Check a field against a recount of its objects after many concurrent changes,
   as `TestContributorConcurrentChangesConverge` does.
 - Read through the accessor over a fake client, as `accessor_test.go` does.
+- Start the accessor on a workqueue and assert on what it queues, as
+  `TestAccessorEnqueuesObjectsWhoseDerivedFieldsChange` and the counter's
+  "should reconcile a NodePool whenever its usage changes" do.

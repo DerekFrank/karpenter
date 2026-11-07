@@ -49,7 +49,7 @@ type Store[K comparable, F any] struct {
 
 	mu          sync.Mutex
 	refs        map[K]int
-	subscribers []func(key K, old, new F)
+	subscribers []*func(key K, old, new F)
 }
 
 // NewStore returns an empty store.
@@ -87,12 +87,17 @@ func (s *Store[K, F]) Update(key K, update func(F) F) {
 	notify(subscribers, changed)
 }
 
-// Subscribe calls fn with each key whose fields change, and its fields before and after. fn runs on the goroutine that
-// made the change, after the store's lock is released, so it must not block.
-func (s *Store[K, F]) Subscribe(fn func(key K, old, new F)) {
+// Subscribe calls fn with each key whose fields change, and its fields before and after, until the returned func is
+// called. fn runs on the goroutine that made the change, after the store's lock is released, so it must not block.
+func (s *Store[K, F]) Subscribe(fn func(key K, old, new F)) (unsubscribe func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.subscribers = append(slices.Clip(s.subscribers), fn)
+	s.subscribers = append(slices.Clip(s.subscribers), &fn)
+	return func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.subscribers = slices.DeleteFunc(slices.Clone(s.subscribers), func(f *func(K, F, F)) bool { return f == &fn })
+	}
 }
 
 type change[K comparable, F any] struct {
@@ -129,10 +134,10 @@ func (s *Store[K, F]) storeLocked(key K, cur, next F) []change[K, F] {
 	return []change[K, F]{{key: key, old: cur, new: next}}
 }
 
-func notify[K comparable, F any](subscribers []func(K, F, F), changed []change[K, F]) {
+func notify[K comparable, F any](subscribers []*func(K, F, F), changed []change[K, F]) {
 	for _, c := range changed {
 		for _, subscriber := range subscribers {
-			subscriber(c.key, c.old, c.new)
+			(*subscriber)(c.key, c.old, c.new)
 		}
 	}
 }

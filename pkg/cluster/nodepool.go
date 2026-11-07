@@ -60,7 +60,8 @@ func NewNodePools(kubeClient client.Reader, usage *NodePoolUsage) *NodePools {
 		func(np *v1.NodePool) NodePoolDerived {
 			derived, _ := usage.store.Get(np.Name)
 			return derived
-		})
+		},
+		state.From(usage.store, state.ByName, usage.NodeClaims))
 }
 
 // NodePoolUsage keeps NodePoolDerived.Usage from the NodePools' NodeClaims.
@@ -97,9 +98,4 @@ func NewNodePoolUsage(kubeClient client.Client, informers cache.Informers) *Node
 			},
 		),
 	}
-}
-
-// Subscribe calls fn with the name of each NodePool whose usage changes. fn must not block.
-func (u *NodePoolUsage) Subscribe(fn func(nodePool string)) {
-	u.store.Subscribe(func(name string, _, _ NodePoolDerived) { fn(name) })
 }

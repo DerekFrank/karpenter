@@ -27,9 +27,11 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/cache/informertest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllertest"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -44,6 +46,7 @@ import (
 )
 
 var nodePoolController *counter.Controller
+var nodePools *cluster.NodePools
 var nodeClaimInformer *controllertest.FakeInformer
 var ctx context.Context
 var env *test.Environment
@@ -87,7 +90,8 @@ var _ = Describe("Counter", func() {
 	BeforeEach(func() {
 		informers := &informertest.FakeInformers{Scheme: scheme.Scheme}
 		usage := cluster.NewNodePoolUsage(env.Client, informers)
-		nodePoolController = counter.NewController(env.Client, cloudProvider, cluster.NewNodePools(env.Client, usage), usage)
+		nodePools = cluster.NewNodePools(env.Client, usage)
+		nodePoolController = counter.NewController(env.Client, cloudProvider, nodePools, usage)
 		started, stop := context.WithCancel(ctx)
 		DeferCleanup(stop)
 		go func() { _ = usage.NodeClaims.Start(started) }()
@@ -209,6 +213,28 @@ var _ = Describe("Counter", func() {
 		expected = resources.MergeInto(expected, nodeClaim2.Status.Capacity)
 		expected[resources.Node] = resource.MustParse("1")
 		Expect(nodePool.Status.Resources).To(BeComparableTo(expected))
+	})
+	It("should reconcile a NodePool whenever its usage changes", func() {
+		queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+		DeferCleanup(queue.ShutDown)
+		started, stop := context.WithCancel(ctx)
+		DeferCleanup(stop)
+		Expect(nodePools.WaitForSync(started)).To(Succeed())
+		Expect(nodePools.Start(started, queue)).To(Succeed())
+		Expect(queue.Len()).To(BeZero())
+		expectQueued := func() {
+			GinkgoHelper()
+			Expect(queue.Len()).To(Equal(1))
+			req, _ := queue.Get()
+			Expect(req.Name).To(Equal(nodePool.Name))
+			queue.Done(req)
+		}
+
+		ExpectApplied(ctx, env.Client, nodeClaim)
+		observe(nodeClaim)
+		expectQueued()
+		deleteNodeClaims(nodeClaim)
+		expectQueued()
 	})
 	It("should zero out the counter when all NodeClaims are deleted", func() {
 		ExpectApplied(ctx, env.Client, nodeClaim)
