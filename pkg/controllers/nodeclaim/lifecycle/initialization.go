@@ -176,31 +176,10 @@ func (i *Initialization) draDriverPoolsPublished(ctx context.Context, node *core
 // use. Cluster-wide (AllNodes) slices are not node-owned and are intentionally excluded.
 func (i *Initialization) resourceSlicesForNode(ctx context.Context, node *corev1.Node) ([]resourcev1.ResourceSlice, error) {
 	sliceList := &resourcev1.ResourceSliceList{}
-	if err := i.kubeClient.List(ctx, sliceList); err != nil {
+	if err := i.kubeClient.List(ctx, sliceList, client.MatchingFields{"node": node.Name}); err != nil {
 		return nil, fmt.Errorf("listing resourceslices, %w", err)
 	}
-	var slices []resourcev1.ResourceSlice
-	for i := range sliceList.Items {
-		slice := &sliceList.Items[i]
-		if sliceBelongsToNode(slice, node.Name) {
-			slices = append(slices, *slice)
-		}
-	}
-	return slices, nil
-}
-
-// sliceBelongsToNode reports whether a ResourceSlice is local to the named node, via spec.nodeName or a Node owner
-// reference.
-func sliceBelongsToNode(slice *resourcev1.ResourceSlice, nodeName string) bool {
-	if lo.FromPtr(slice.Spec.NodeName) == nodeName {
-		return true
-	}
-	for _, ref := range slice.OwnerReferences {
-		if ref.Kind == "Node" && ref.Name == nodeName {
-			return true
-		}
-	}
-	return false
+	return sliceList.Items, nil
 }
 
 // DRADriversPublished checks whether every DRA driver recorded in the NodeClaim's requested-dra-drivers annotation has published

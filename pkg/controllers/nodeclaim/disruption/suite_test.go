@@ -53,7 +53,7 @@ func TestAPIs(t *testing.T) {
 }
 
 var _ = BeforeSuite(func() {
-	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...), test.WithFieldIndexers(test.NodeProviderIDFieldIndexer(ctx)))
+	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...), test.WithFieldIndexers(test.NodeProviderIDFieldIndexer(ctx), test.NodeClaimNodePoolFieldIndexer(ctx)))
 	ctx = options.ToContext(ctx, test.Options())
 	cp = fake.NewCloudProvider()
 	nodeClaimDisruptionController = nodeclaimdisruption.NewController(env.Clock, env.Client, cp)

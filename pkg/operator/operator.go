@@ -36,9 +36,12 @@ import (
 	"github.com/samber/lo"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -315,9 +318,20 @@ func setupIndexers(ctx context.Context, mgr manager.Manager) {
 	lo.Must0(mgr.GetFieldIndexer().IndexField(ctx, &corev1.Pod{}, "spec.nodeName", func(o client.Object) []string {
 		return []string{o.(*corev1.Pod).Spec.NodeName}
 	}), "failed to setup pod indexer")
+	lo.Must0(mgr.GetFieldIndexer().IndexField(ctx, &corev1.Pod{}, "metadata.ownerReferences.daemonSet", func(o client.Object) []string {
+		owner := metav1.GetControllerOf(o)
+		if owner == nil || owner.Kind != "DaemonSet" {
+			return nil
+		}
+		return []string{string(owner.UID)}
+	}), "failed to setup pod daemonset indexer")
 	lo.Must0(mgr.GetFieldIndexer().IndexField(ctx, &corev1.Node{}, "spec.providerID", func(o client.Object) []string {
 		return []string{o.(*corev1.Node).Spec.ProviderID}
 	}), "failed to setup node provider id indexer")
+	lo.Must0(mgr.GetFieldIndexer().IndexField(ctx, &corev1.Node{}, "metadata.labels.karpenter.sh/nodepool", func(o client.Object) []string {
+		nodePool, ok := o.GetLabels()[v1.NodePoolLabelKey]
+		return lo.Ternary(ok, []string{nodePool}, nil)
+	}), "failed to setup node nodepool indexer")
 	lo.Must0(mgr.GetFieldIndexer().IndexField(ctx, &storagev1.VolumeAttachment{}, "spec.nodeName", func(o client.Object) []string {
 		return []string{o.(*storagev1.VolumeAttachment).Spec.NodeName}
 	}), "failed to setup volumeattachment indexer")
@@ -344,6 +358,10 @@ func setupIndexers(ctx context.Context, mgr manager.Manager) {
 	handleCRDIndexerError(mgr.GetFieldIndexer().IndexField(ctx, &v1.NodeClaim{}, "spec.nodeClassRef.name", func(o client.Object) []string {
 		return []string{o.(*v1.NodeClaim).Spec.NodeClassRef.Name}
 	}), "failed to setup nodeclaim nodeclassref name indexer")
+	handleCRDIndexerError(mgr.GetFieldIndexer().IndexField(ctx, &v1.NodeClaim{}, "metadata.labels.karpenter.sh/nodepool", func(o client.Object) []string {
+		nodePool, ok := o.GetLabels()[v1.NodePoolLabelKey]
+		return lo.Ternary(ok, []string{nodePool}, nil)
+	}), "failed to setup nodeclaim nodepool indexer")
 
 	handleCRDIndexerError(mgr.GetFieldIndexer().IndexField(ctx, &v1.NodePool{}, "spec.template.spec.nodeClassRef.group", func(o client.Object) []string {
 		return []string{o.(*v1.NodePool).Spec.Template.Spec.NodeClassRef.Group}
@@ -354,4 +372,20 @@ func setupIndexers(ctx context.Context, mgr manager.Manager) {
 	handleCRDIndexerError(mgr.GetFieldIndexer().IndexField(ctx, &v1.NodePool{}, "spec.template.spec.nodeClassRef.name", func(o client.Object) []string {
 		return []string{o.(*v1.NodePool).Spec.Template.Spec.NodeClassRef.Name}
 	}), "failed to setup nodepool nodeclassref name indexer")
+
+	if !options.FromContext(ctx).IgnoreDRARequests {
+		handleCRDIndexerError(mgr.GetFieldIndexer().IndexField(ctx, &resourcev1.ResourceSlice{}, "node", func(o client.Object) []string {
+			slice := o.(*resourcev1.ResourceSlice)
+			nodes := sets.New[string]()
+			if nodeName := lo.FromPtr(slice.Spec.NodeName); nodeName != "" {
+				nodes.Insert(nodeName)
+			}
+			for _, ref := range slice.OwnerReferences {
+				if ref.Kind == "Node" {
+					nodes.Insert(ref.Name)
+				}
+			}
+			return sets.List(nodes)
+		}), "failed to setup resourceslice node indexer")
+	}
 }

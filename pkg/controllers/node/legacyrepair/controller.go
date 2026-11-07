@@ -277,7 +277,7 @@ func (c *Controller) annotateTerminationGracePeriod(ctx context.Context, nodeCla
 // For example, given a NodePool with three nodes, one may be unhealthy without rendering the NodePool unhealthy, even though that's 33% of the total nodes.
 // This is analogous to how minAvailable and maxUnavailable work for PodDisruptionBudgets: https://kubernetes.io/docs/tasks/run-application/configure-pdb/#rounding-logic-when-specifying-percentages.
 func (c *Controller) isNodePoolHealthy(ctx context.Context, nodePoolName string) (bool, error) {
-	return c.areNodesHealthy(ctx, client.MatchingLabels(map[string]string{v1.NodePoolLabelKey: nodePoolName}))
+	return c.areNodesHealthy(ctx, client.MatchingFields{"metadata.labels.karpenter.sh/nodepool": nodePoolName})
 }
 
 func (c *Controller) isClusterHealthy(ctx context.Context) (bool, error) {

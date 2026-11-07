@@ -11,6 +11,7 @@ linters:
     - copyloopvar
     - depguard
     - errorlint
+    - forbidigo
     - gocyclo
     - goheader
     - gosec
@@ -48,6 +49,11 @@ linters:
           deny:
             - pkg: github.com/avast/retry-go
               desc: use k8s.io/apimachinery/pkg/util/wait
+    # The cache has no label index, so a label selector scans every object of the kind.
+    forbidigo:
+      forbid:
+        - pattern: ^client\.(MatchingLabels|MatchingLabelsSelector|HasLabels)$
+          msg: label selectors scan every cached object of the kind; register a field index in setupIndexers and use client.MatchingFields
     gocyclo:
       min-complexity: 11
     goheader:
@@ -100,6 +106,9 @@ linters:
       - path-except: pkg/apis/
         linters:
           - kubeapilinter
+      - path: (_test\.go|pkg/test/|^test/)
+        linters:
+          - forbidigo
     paths:
       - tools
       - website
