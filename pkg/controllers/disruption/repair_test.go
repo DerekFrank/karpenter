@@ -1148,8 +1148,9 @@ var _ = Describe("Repair", func() {
 		delete(queue.ProviderIDToCommand, candidates[0].ProviderID())
 		queue.Unlock()
 
-		Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 6, 1)).To(Equal(int64(1)))
-		cluster.NodePoolState.ReleaseNodeCount(nodePool.Name, 1)
+		reservations := cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 6, 1)
+		Expect(reservations).To(HaveLen(1))
+		reservations.Release()
 	})
 
 	It("should propagate replacement simulation errors", func() {
