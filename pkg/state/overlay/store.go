@@ -44,6 +44,9 @@ type overlay struct {
 	indexed map[indexKey]map[types.NamespacedName]struct{}
 
 	cached func(types.NamespacedName) bool
+
+	handlersMu sync.RWMutex
+	handlers   map[*WriteHandler]struct{}
 }
 
 type entry struct {
@@ -71,7 +74,7 @@ func parseResourceVersion(resourceVersion string) uint64 {
 }
 
 func newOverlay() *overlay {
-	return &overlay{pinned: map[uint64]int{}, indexed: map[indexKey]map[types.NamespacedName]struct{}{}}
+	return &overlay{pinned: map[uint64]int{}, indexed: map[indexKey]map[types.NamespacedName]struct{}{}, handlers: map[*WriteHandler]struct{}{}}
 }
 
 func (o *overlay) standsIn(key types.NamespacedName, e *entry) bool {
@@ -142,6 +145,7 @@ func (o *overlay) indexedKeys(k indexKey) []types.NamespacedName {
 	return slices.Collect(maps.Keys(o.indexed[k]))
 }
 
+//nolint:gocyclo
 func (o *overlay) observe(raw any) {
 	if tombstone, ok := raw.(toolscache.DeletedFinalStateUnknown); ok {
 		raw = tombstone.Obj
@@ -159,12 +163,26 @@ func (o *overlay) observe(raw any) {
 		safe = min(safe, w0)
 	}
 	o.pinMu.Unlock()
+	var gone []client.Object
 	o.heapMu.Lock()
-	defer o.heapMu.Unlock()
 	for len(o.byRV) > 0 && o.byRV[0].rv <= safe {
 		item := heap.Pop(&o.byRV).(rvItem)
-		o.entries.CompareAndDelete(item.key, item.entry)
+		if o.entries.CompareAndDelete(item.key, item.entry) && item.entry.created && o.cached != nil && !o.cached(item.key) {
+			gone = append(gone, item.entry.obj)
+		}
 		o.unindex(item.key, item.entry)
+	}
+	o.heapMu.Unlock()
+	for _, obj := range gone {
+		o.notify(obj, true)
+	}
+}
+
+func (o *overlay) notify(obj client.Object, deleted bool) {
+	o.handlersMu.RLock()
+	defer o.handlersMu.RUnlock()
+	for h := range o.handlers {
+		(*h)(obj, deleted)
 	}
 }
 
