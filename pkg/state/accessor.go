@@ -19,7 +19,6 @@ package state
 import (
 	"context"
 	"fmt"
-	"maps"
 
 	fieldselector "k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
@@ -84,54 +83,27 @@ func (r *Accessor[O, L, D]) List(ctx context.Context, opts ...client.ListOption)
 type JoinAccessor[K comparable, F any, O client.Object, D any] struct {
 	store   *Store[K, F]
 	view    func(K, F) (O, D, bool)
-	indexes map[string]*Store[string, members[K]]
+	indexes map[string]func(string) []K
 }
 
-// members are the keys of a store whose fields index to one value.
-type members[K comparable] map[K]struct{}
+// indexed counts the keys whose fields index to one value. The keys themselves are the index Derive's sources, kept in
+// place, because a set of them in the fields would be copied on every change.
+type indexed int
 
-// member is a key's contribution to the value its fields index to: the key itself.
-type member[K comparable] struct{ key K }
-
-func (m member[K]) Update(f members[K], prev member[K]) members[K] {
-	if _, ok := f[m.key]; ok && prev == m {
-		return f
-	}
-	next := make(members[K], len(f)+1)
-	for k := range f {
-		next[k] = struct{}{}
-	}
-	delete(next, prev.key)
-	next[m.key] = struct{}{}
-	return next
-}
-
-func (m member[K]) Delete(f members[K]) members[K] {
-	next := make(members[K], len(f))
-	for k := range f {
-		if k != m.key {
-			next[k] = struct{}{}
-		}
-	}
-	if len(next) == 0 {
-		return nil
-	}
-	return next
-}
+func (i indexed) Update(f int, prev indexed) int { return f + int(i-prev) }
+func (i indexed) Delete(f int) int               { return f - int(i) }
 
 // NewJoinAccessor returns a JoinAccessor over store. view returns the object of a key's fields and its derived fields,
 // reading the stores that keep them without blocking, or false for fields without the object.
 func NewJoinAccessor[K comparable, F any, O client.Object, D any](store *Store[K, F], view func(K, F) (O, D, bool)) *JoinAccessor[K, F, O, D] {
-	return &JoinAccessor[K, F, O, D]{store: store, view: view, indexes: map[string]*Store[string, members[K]]{}}
+	return &JoinAccessor[K, F, O, D]{store: store, view: view, indexes: map[string]func(string) []K{}}
 }
 
 // IndexField indexes field, so that List with client.MatchingFields{field: value} reads only the keys whose fields
 // index to value, as a field index does for the client's List. index returns a key's value, or "" for a key the index
 // leaves out. Index every field before the accessor's first List.
 func (a *JoinAccessor[K, F, O, D]) IndexField(field string, index func(K, F) string) *JoinAccessor[K, F, O, D] {
-	values := NewStore[string, members[K]]()
-	Derive(a.store, values, index, func(k K, _ F) member[K] { return member[K]{key: k} })
-	a.indexes[field] = values
+	a.indexes[field] = Derive(a.store, NewStore[string, int](), index, func(K, F) indexed { return 1 }).Sources
 	return a
 }
 
@@ -186,25 +158,23 @@ func (a *JoinAccessor[K, F, O, D]) List(opts ...client.ListOption) ([]View[O, D]
 }
 
 // selected returns the keys selector selects through the indexes, or nil to select every key.
-func (a *JoinAccessor[K, F, O, D]) selected(selector fieldselector.Selector) (members[K], error) {
+func (a *JoinAccessor[K, F, O, D]) selected(selector fieldselector.Selector) (map[K]struct{}, error) {
 	if selector == nil || selector.Empty() {
 		return nil, nil
 	}
-	var keys members[K]
+	var keys map[K]struct{}
 	for i, r := range selector.Requirements() {
-		index, ok := a.indexes[r.Field]
+		sources, ok := a.indexes[r.Field]
 		if !ok || r.Operator != selection.Equals && r.Operator != selection.DoubleEquals {
 			return nil, fmt.Errorf("field selector %q isn't an equality on an indexed field", selector)
 		}
-		indexed, _ := index.Get(r.Value)
-		if i == 0 {
-			keys = maps.Clone(indexed)
-		} else {
-			maps.DeleteFunc(keys, func(k K, _ struct{}) bool { _, ok := indexed[k]; return !ok })
+		indexed := map[K]struct{}{}
+		for _, k := range sources(r.Value) {
+			if _, ok := keys[k]; i == 0 || ok {
+				indexed[k] = struct{}{}
+			}
 		}
-		if keys == nil {
-			keys = members[K]{}
-		}
+		keys = indexed
 	}
 	return keys, nil
 }

@@ -25,7 +25,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/clock"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -35,12 +34,9 @@ import (
 )
 
 func TestNodePoolMembersKeepTheContributionLaws(t *testing.T) {
-	other := types.NamespacedName{Name: "other"}
-	for _, base := range []nodePoolMembers{{}, {ProviderIDs: sets.New("other"), Unlaunched: sets.New(other)}} {
-		statetest.ExpectContribution(t, base, nodePoolNode("a"), nodePoolNode("b"))
-		statetest.ExpectContribution(t, base, nodePoolNode("a"), nodePoolNode("a"))
-		statetest.ExpectContribution(t, base, unlaunchedNodeClaim{Name: "a"}, unlaunchedNodeClaim{Name: "b"})
-		statetest.ExpectContribution(t, base, unlaunchedNodeClaim{Name: "a"}, unlaunchedNodeClaim{Name: "a"})
+	for _, base := range []nodePoolMembers{{}, {Nodes: 3, Unlaunched: 2}} {
+		statetest.ExpectContribution(t, base, nodePoolNode(1), nodePoolNode(1))
+		statetest.ExpectContribution(t, base, unlaunchedNodeClaim(1), unlaunchedNodeClaim(1))
 	}
 }
 
@@ -92,7 +88,7 @@ func TestNodePoolMembersIndexEachNodePoolsNodesAndUnlaunchedNodeClaims(t *testin
 	c.DeleteNodeClaim("1")
 	c.DeleteNodeClaim("3")
 	expect()
-	if members, ok := c.nodePoolMembers.Get("a"); ok && (members.ProviderIDs.Len() > 0 || members.Unlaunched.Len() > 0) {
+	if members, ok := c.nodePoolMembers.Get("a"); ok && (members.Nodes > 0 || members.Unlaunched > 0) {
 		t.Errorf("NodePool a keeps members %+v once nothing contributes", members)
 	}
 }

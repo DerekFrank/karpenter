@@ -88,6 +88,8 @@ type Cluster struct {
 	daemonSetPods *karpenterstate.Store[types.NamespacedName, daemonSetFields]
 	// nodePoolMembers indexes each NodePool's nodes and unlaunched NodeClaims, by NodePool name.
 	nodePoolMembers *karpenterstate.Store[string, nodePoolMembers]
+	poolNodes       *karpenterstate.Derivation[string, string, nodeFields, nodePoolMembers, nodePoolNode]
+	poolUnlaunched  *karpenterstate.Derivation[types.NamespacedName, string, *v1.NodeClaim, nodePoolMembers, unlaunchedNodeClaim]
 	// nodeHealth counts the nodes, and those that match a repair policy, per NodePool and across the cluster.
 	nodeHealth *NodeHealth
 
@@ -519,9 +521,9 @@ func (c *Cluster) newStores() {
 			n := &StateNode{Node: f.Node, NodeClaim: f.NodeClaim}
 			return nodePoolCapacity(lo.Assign(n.Capacity(), corev1.ResourceList{resources.Node: resource.MustParse("1")}))
 		})
-	karpenterstate.Derive(c.nodes, c.nodePoolMembers, nodePoolOfNode, func(k string, _ nodeFields) nodePoolNode { return nodePoolNode(k) })
-	karpenterstate.Derive(c.nodeClaims, c.nodePoolMembers, nodePoolOfUnlaunched,
-		func(k types.NamespacedName, _ *v1.NodeClaim) unlaunchedNodeClaim { return unlaunchedNodeClaim(k) })
+	c.poolNodes = karpenterstate.Derive(c.nodes, c.nodePoolMembers, nodePoolOfNode, func(string, nodeFields) nodePoolNode { return 1 })
+	c.poolUnlaunched = karpenterstate.Derive(c.nodeClaims, c.nodePoolMembers, nodePoolOfUnlaunched,
+		func(types.NamespacedName, *v1.NodeClaim) unlaunchedNodeClaim { return 1 })
 	c.nodeHealth = c.newNodeHealth(func(f nodeFields) bool { return len(f.RepairPolicyMatches) > 0 })
 	karpenterstate.Derive(c.nodes, c.nodePoolDisruption, nodePoolDisruptionKey, nodePoolDisruptionOf)
 	c.nodes.Subscribe(func(change karpenterstate.Change[string, nodeFields]) {

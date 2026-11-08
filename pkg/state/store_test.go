@@ -482,7 +482,7 @@ func TestClearEmptiesInPlaceAndKeepsSubscriptions(t *testing.T) {
 func TestContributionsKeepTheirLaws(t *testing.T) {
 	statetest.ExpectContribution(t, poolFields{CPU: 3, Count: 1}, usage{CPU: 2, Count: 1}, usage{CPU: 8, Count: 1})
 	statetest.ExpectContribution(t, clusterFields{CPU: 5}, poolCPU(2), poolCPU(7))
-	statetest.ExpectContribution(t, members[string]{"z": {}}, member[string]{key: "a"}, member[string]{key: "a"})
+	statetest.ExpectContribution(t, 3, indexed(1), indexed(1))
 }
 
 // counted counts its Update and Delete calls, to check how Derive dispatches.
@@ -563,7 +563,9 @@ func TestJoinAccessorCopiesUnlessTheCallerOptsOut(t *testing.T) {
 
 func TestJoinAccessorListsByAnIndexedField(t *testing.T) {
 	nodeClaims := NewObjectStore[*v1.NodeClaim](nil, nil)
-	accessor := NewJoinAccessor(nodeClaims, func(_ types.NamespacedName, nc *v1.NodeClaim) (*v1.NodeClaim, struct{}, bool) { return nc, struct{}{}, nc != nil }).
+	accessor := NewJoinAccessor(nodeClaims, func(_ types.NamespacedName, nc *v1.NodeClaim) (*v1.NodeClaim, struct{}, bool) {
+		return nc, struct{}{}, nc != nil
+	}).
 		IndexField("pool", func(_ types.NamespacedName, nc *v1.NodeClaim) string { return nc.Labels[v1.NodePoolLabelKey] })
 	nodeClaims.Observe(nodeClaim("a", "x", 1, "2"))
 	nodeClaims.Observe(nodeClaim("b", "y", 2, "2"))

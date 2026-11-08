@@ -138,6 +138,12 @@ returns, so a `Derive` made after its source filled still sees everything.
   so they never block and never do I/O.
 - **Implement `Equal`** for a contribution holding maps or quantities, so an
   unchanged contribution costs a comparison and nothing else.
+- **Keep fields small, and never a collection that grows with the cluster.**
+  Fields are immutable, so a change copies them. A set of every node in a
+  NodePool would be copied on every node event, which makes the NodePool's
+  fields quadratic to keep. Count the members in the fields, and read the
+  members themselves from the `Derivation`'s `Sources(key)`, which indexes them
+  in place, as `Cluster.NodePoolNodes` and `JoinAccessor.IndexField` do.
 - **A contribution that keeps a sample instead of counting**, such as a
   DaemonSet's newest pod (`newestPod`), has a `Delete` that doesn't undo
   `Update`. Say so on the type, and leave it out of the law check.
