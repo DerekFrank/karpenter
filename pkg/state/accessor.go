@@ -18,8 +18,12 @@ package state
 
 import (
 	"context"
+	"fmt"
+	"maps"
 
+	fieldselector "k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -78,14 +82,57 @@ func (r *Accessor[O, L, D]) List(ctx context.Context, opts ...client.ListOption)
 // overlay.Client. Each read returns a copy of the object unless the caller opts out with client.UnsafeDisableDeepCopy,
 // and must then leave the object intact.
 type JoinAccessor[K comparable, F any, O client.Object, D any] struct {
-	store *Store[K, F]
-	view  func(K, F) (O, D, bool)
+	store   *Store[K, F]
+	view    func(K, F) (O, D, bool)
+	indexes map[string]*Store[string, members[K]]
+}
+
+// members are the keys of a store whose fields index to one value.
+type members[K comparable] map[K]struct{}
+
+// member is a key's contribution to the value its fields index to: the key itself.
+type member[K comparable] struct{ key K }
+
+func (m member[K]) Update(f members[K], prev member[K]) members[K] {
+	if _, ok := f[m.key]; ok && prev == m {
+		return f
+	}
+	next := make(members[K], len(f)+1)
+	for k := range f {
+		next[k] = struct{}{}
+	}
+	delete(next, prev.key)
+	next[m.key] = struct{}{}
+	return next
+}
+
+func (m member[K]) Delete(f members[K]) members[K] {
+	next := make(members[K], len(f))
+	for k := range f {
+		if k != m.key {
+			next[k] = struct{}{}
+		}
+	}
+	if len(next) == 0 {
+		return nil
+	}
+	return next
 }
 
 // NewJoinAccessor returns a JoinAccessor over store. view returns the object of a key's fields and its derived fields,
 // reading the stores that keep them without blocking, or false for fields without the object.
 func NewJoinAccessor[K comparable, F any, O client.Object, D any](store *Store[K, F], view func(K, F) (O, D, bool)) *JoinAccessor[K, F, O, D] {
-	return &JoinAccessor[K, F, O, D]{store: store, view: view}
+	return &JoinAccessor[K, F, O, D]{store: store, view: view, indexes: map[string]*Store[string, members[K]]{}}
+}
+
+// IndexField indexes field, so that List with client.MatchingFields{field: value} reads only the keys whose fields
+// index to value, as a field index does for the client's List. index returns a key's value, or "" for a key the index
+// leaves out. Index every field before the accessor's first List.
+func (a *JoinAccessor[K, F, O, D]) IndexField(field string, index func(K, F) string) *JoinAccessor[K, F, O, D] {
+	values := NewStore[string, members[K]]()
+	Derive(a.store, values, index, func(k K, _ F) member[K] { return member[K]{key: k} })
+	a.indexes[field] = values
+	return a
 }
 
 // Get returns key's object with its derived fields, and whether it exists.
@@ -104,20 +151,60 @@ func (a *JoinAccessor[K, F, O, D]) Get(key K, opts ...client.GetOption) (View[O,
 	return View[O, D]{Object: obj, Derived: derived}, true
 }
 
-// List returns the objects whose labels match opts' label selector, with their derived fields.
-func (a *JoinAccessor[K, F, O, D]) List(opts ...client.ListOption) []View[O, D] {
+// List returns the objects that opts select, with their derived fields. A field selector selects on indexed fields
+// only, each requirement an equality, as the client's List does for a cache with field indexes.
+func (a *JoinAccessor[K, F, O, D]) List(opts ...client.ListOption) ([]View[O, D], error) {
 	o := (&client.ListOptions{}).ApplyOptions(opts)
 	shared := o.UnsafeDisableDeepCopy != nil && *o.UnsafeDisableDeepCopy
+	keys, err := a.selected(o.FieldSelector)
+	if err != nil {
+		return nil, err
+	}
 	var views []View[O, D]
-	for k, f := range a.store.List() {
+	add := func(k K, f F) {
 		obj, derived, ok := a.view(k, f)
 		if !ok || (o.LabelSelector != nil && !o.LabelSelector.Matches(labels.Set(obj.GetLabels()))) {
-			continue
+			return
 		}
 		if !shared {
 			obj = obj.DeepCopyObject().(O)
 		}
 		views = append(views, View[O, D]{Object: obj, Derived: derived})
 	}
-	return views
+	if keys == nil {
+		for k, f := range a.store.List() {
+			add(k, f)
+		}
+		return views, nil
+	}
+	for k := range keys {
+		if f, ok := a.store.Get(k); ok {
+			add(k, f)
+		}
+	}
+	return views, nil
+}
+
+// selected returns the keys selector selects through the indexes, or nil to select every key.
+func (a *JoinAccessor[K, F, O, D]) selected(selector fieldselector.Selector) (members[K], error) {
+	if selector == nil || selector.Empty() {
+		return nil, nil
+	}
+	var keys members[K]
+	for i, r := range selector.Requirements() {
+		index, ok := a.indexes[r.Field]
+		if !ok || r.Operator != selection.Equals && r.Operator != selection.DoubleEquals {
+			return nil, fmt.Errorf("field selector %q isn't an equality on an indexed field", selector)
+		}
+		indexed, _ := index.Get(r.Value)
+		if i == 0 {
+			keys = maps.Clone(indexed)
+		} else {
+			maps.DeleteFunc(keys, func(k K, _ struct{}) bool { _, ok := indexed[k]; return !ok })
+		}
+		if keys == nil {
+			keys = members[K]{}
+		}
+	}
+	return keys, nil
 }

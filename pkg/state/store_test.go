@@ -482,6 +482,7 @@ func TestClearEmptiesInPlaceAndKeepsSubscriptions(t *testing.T) {
 func TestContributionsKeepTheirLaws(t *testing.T) {
 	statetest.ExpectContribution(t, poolFields{CPU: 3, Count: 1}, usage{CPU: 2, Count: 1}, usage{CPU: 8, Count: 1})
 	statetest.ExpectContribution(t, clusterFields{CPU: 5}, poolCPU(2), poolCPU(7))
+	statetest.ExpectContribution(t, members[string]{"z": {}}, member[string]{key: "a"}, member[string]{key: "a"})
 }
 
 // counted counts its Update and Delete calls, to check how Derive dispatches.
@@ -555,7 +556,38 @@ func TestJoinAccessorCopiesUnlessTheCallerOptsOut(t *testing.T) {
 	if shared, _ := accessor.Get(key, client.UnsafeDisableDeepCopy); shared.Object != held {
 		t.Fatal("Get with UnsafeDisableDeepCopy copied")
 	}
-	if views := accessor.List(client.MatchingLabels{v1.NodePoolLabelKey: "y"}); len(views) != 1 || views[0].Object.Name != "b" {
-		t.Fatalf("List = %v, want only b", views)
+	if views, err := accessor.List(client.MatchingLabels{v1.NodePoolLabelKey: "y"}); err != nil || len(views) != 1 || views[0].Object.Name != "b" {
+		t.Fatalf("List = %v, %v, want only b", views, err)
+	}
+}
+
+func TestJoinAccessorListsByAnIndexedField(t *testing.T) {
+	nodeClaims := NewObjectStore[*v1.NodeClaim](nil, nil)
+	accessor := NewJoinAccessor(nodeClaims, func(_ types.NamespacedName, nc *v1.NodeClaim) (*v1.NodeClaim, struct{}, bool) { return nc, struct{}{}, nc != nil }).
+		IndexField("pool", func(_ types.NamespacedName, nc *v1.NodeClaim) string { return nc.Labels[v1.NodePoolLabelKey] })
+	nodeClaims.Observe(nodeClaim("a", "x", 1, "2"))
+	nodeClaims.Observe(nodeClaim("b", "y", 2, "2"))
+	nodeClaims.Observe(nodeClaim("c", "x", 3, "2"))
+	names := func(views []View[*v1.NodeClaim, struct{}]) []string {
+		var out []string
+		for _, v := range views {
+			out = append(out, v.Object.Name)
+		}
+		slices.Sort(out)
+		return out
+	}
+	views, err := accessor.List(client.MatchingFields{"pool": "x"})
+	if err != nil || !slices.Equal(names(views), []string{"a", "c"}) {
+		t.Fatalf("List = %v, %v, want a and c", names(views), err)
+	}
+	nodeClaims.Observe(nodeClaim("c", "y", 4, "2"))
+	if views, _ := accessor.List(client.MatchingFields{"pool": "x"}); !slices.Equal(names(views), []string{"a"}) {
+		t.Fatalf("List = %v once c moved, want a", names(views))
+	}
+	if views, err := accessor.List(client.MatchingFields{"pool": "none"}); err != nil || len(views) != 0 {
+		t.Fatalf("List = %v, %v for a value nothing indexes to, want nothing", names(views), err)
+	}
+	if _, err := accessor.List(client.MatchingFields{"unindexed": "x"}); err == nil {
+		t.Fatal("List by an unindexed field succeeded, want an error as the client returns")
 	}
 }

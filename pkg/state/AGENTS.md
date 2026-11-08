@@ -176,6 +176,10 @@ kubeClient.Status().Patch(ctx, np.Object, client.MergeFrom(stored))
 - **A join-backed accessor**, `state.NewJoinAccessor`, reads from its join
   store. It returns a copy of the object unless the caller passes
   `client.UnsafeDisableDeepCopy`, and filters `List` by label selector.
+- **A join-backed accessor's field indexes** work as a cache's do:
+  `IndexField(field, index)` derives a store of keys by `index`'s value, and
+  `List(client.MatchingFields{field: value})` reads only that value's keys. A
+  field selector on an unindexed field is an error, as it is for the client.
 - **`Get` and `List` return a `state.View{Object, Derived}`.** `Derived` is
   read from its stores lock-free, and is shared and immutable: copy one to
   change it.
