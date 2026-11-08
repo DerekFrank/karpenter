@@ -104,7 +104,7 @@ func TestClaimsReleaseWhenTheirObjectGoesAwayBeforeItCounts(t *testing.T) {
 	for name, gone := range map[string]func(){
 		"a": func() { nodeClaims.Forget(named("a")) },
 		"b": func() {
-			nodeClaims.change(nodeClaim("b", "x", 2, "0"), true, true)
+			nodeClaims.change(nodeClaim("b", "x", 2, "0"), true, cached)
 		},
 		"c": func() { Resync(nodeClaims, []*v1.NodeClaim(nil), claims.derivation.Sources("x")) },
 	} {

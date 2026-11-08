@@ -14,16 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package state
+// Command storelint runs the storelint analyzer: go run ./hack/storelint/cmd ./...
+package main
 
 import (
-	"testing"
+	"golang.org/x/tools/go/analysis/singlechecker"
 
-	"sigs.k8s.io/karpenter/pkg/state/statetest"
+	"sigs.k8s.io/karpenter/hack/storelint"
 )
 
-func TestContributionsKeepTheContributionLaws(t *testing.T) {
-	base := NodePoolFields{NodeClaims: NodeClaimCounts{Active: 3, Deleting: 1}, Reserved: 2}
-	statetest.ExpectContribution(t, base, NodeClaimCounts{Active: 1}, NodeClaimCounts{Deleting: 1})
-	statetest.ExpectContribution(t, base, reservedNodes(1), reservedNodes(2))
-}
+func main() { singlechecker.Main(storelint.Analyzer) }

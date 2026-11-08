@@ -49,6 +49,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
@@ -153,6 +154,8 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 			RateLimiter:             reasonable.RateLimiter(),
 			MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), 10, 1000),
 		}).
+		// The node counts that guard repair are only whole once cluster state has synced.
+		WatchesRawSource(karpenterstate.Requires(c.cluster)).
 		Complete(reconcile.AsReconciler(m.GetClient(), c))
 }
 
@@ -181,10 +184,6 @@ func (c *Controller) Reconcile(ctx context.Context, node *corev1.Node) (reconcil
 	// If a nodeclaim does have a nodepool label, validate the nodeclaims inside the nodepool are healthy (i.e bellow the allowed threshold)
 	// In the case of standalone nodeclaim, validate the nodes inside the cluster are healthy before proceeding
 	// to repair the nodes
-	// The node counts that guard repair are only whole once cluster state has synced.
-	if !c.cluster.Synced(ctx) {
-		return reconcile.Result{RequeueAfter: time.Second}, nil
-	}
 	nodePoolName, found := nodeClaim.Labels[v1.NodePoolLabelKey]
 	if found {
 		if !c.isNodePoolHealthy(nodePoolName) {

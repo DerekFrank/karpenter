@@ -18,8 +18,6 @@ package counter
 
 import (
 	"context"
-	"fmt"
-	"time"
 
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
@@ -41,6 +39,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/state"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
@@ -98,13 +97,6 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	if !nodepoolutils.IsManaged(nodePool.Object, c.cloudProvider) {
 		return reconcile.Result{}, nil
 	}
-
-	// We need to ensure that the usage aggregate has summed the NodeClaims before we proceed
-	// Otherwise, we have the potential to patch over the status with a lower value for the nodepool resource
-	// counts on startup
-	if !c.usage.Synced() {
-		return reconcile.Result{RequeueAfter: time.Second}, nil
-	}
 	stored := nodePool.Object.DeepCopy()
 	nodePool.Object.Status.Resources = lo.Assign(BaseResources, nodePool.Derived.Usage)
 	nodes := nodePool.Object.Status.Resources[resources.Node]
@@ -118,9 +110,6 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 }
 
 func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
-	if err := m.Add(c.usage.NodeClaims); err != nil {
-		return fmt.Errorf("adding nodepool usage aggregate, %w", err)
-	}
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		For(&v1.NodePool{}, builder.WithPredicates(nodepoolutils.IsManagedPredicateFuncs(c.cloudProvider), predicate.Funcs{
@@ -129,6 +118,8 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 			DeleteFunc: func(e event.DeleteEvent) bool { return false },
 		})).
 		WatchesRawSource(source.Channel(c.source, &handler.TypedEnqueueRequestForObject[*v1.NodePool]{})).
+		// The usage sums the NodeClaims only once it has synced; before, a patch would lower the NodePool's counts.
+		WatchesRawSource(state.Requires(c.usage)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), 10, 1000)}).
 		Complete(c)
 }

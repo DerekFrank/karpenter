@@ -25,6 +25,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cluster/repair"
@@ -91,9 +94,14 @@ func (f NodeClaimFields) launched() bool {
 }
 
 // newNodeClaimStore returns the NodeClaim store: a single-part join, so that each entry holds the NodeClaim with the
-// intent kept about it.
-func newNodeClaimStore() *state.Store[string, NodeClaimFields] {
-	return state.NewJoinStore(nil, nil, state.Join(func(nodeClaim *v1.NodeClaim) string { return nodeClaim.Name },
+// intent kept about it. It holds the NodeClaims of the node classes in managed, which are the cloud provider's.
+func newNodeClaimStore(kubeClient client.Client, informers cache.Informers, managed []schema.GroupKind) *state.Store[string, NodeClaimFields] {
+	return state.NewJoinStore(kubeClient, informers, state.Join(func(nodeClaim *v1.NodeClaim) string {
+		if nodeClaim.Spec.NodeClassRef == nil || !slices.Contains(managed, nodeClaim.Spec.NodeClassRef.GroupKind()) {
+			return ""
+		}
+		return nodeClaim.Name
+	},
 		func(f NodeClaimFields, nodeClaim *v1.NodeClaim) NodeClaimFields {
 			f.NodeClaim = nodeClaim
 			return f.orNothing()
@@ -224,9 +232,31 @@ func (s *NodeState) NodeClaimExists(nodeClaimName string) bool {
 }
 
 func (s *NodeState) UnlaunchedNodeClaimExists(nodeClaimName string) bool {
-	f, _ := s.NodeClaimStore.Get(nodeClaimName)
-	return f.NodeClaim != nil && !f.launched()
+	_, ok := s.UnlaunchedNodeClaimStore.Get(nodeClaimName)
+	return ok
 }
+
+// HasUnlaunchedNodeClaims returns whether any NodeClaim is waiting on its launch to resolve its instance. A decision
+// that counts the nodes in the cluster waits for none, since an unlaunched NodeClaim isn't a node in Nodes yet; watch
+// UnlaunchedNodeClaimStore to run again once one launches.
+func (s *NodeState) HasUnlaunchedNodeClaims() bool {
+	for range s.UnlaunchedNodeClaimStore.List() {
+		return true
+	}
+	return false
+}
+
+// unlaunchedKey keys a NodeClaim in the unlaunched store while it has no providerID.
+func unlaunchedKey(name string, f NodeClaimFields) string {
+	return lo.Ternary(f.NodeClaim != nil && !f.launched(), name, "")
+}
+
+// awaitingLaunch is an unlaunched NodeClaim's contribution to its own key in the unlaunched store, which holds no
+// fields: the store holds the key while it contributes.
+type awaitingLaunch struct{}
+
+func (awaitingLaunch) Update(f struct{}, _ awaitingLaunch) struct{} { return f }
+func (awaitingLaunch) Delete(f struct{}) struct{}                   { return f }
 
 // IsNodeNominated returns true if the NodeClaim's node was expected to have a pod bound to it during a recent
 // scheduling batch.

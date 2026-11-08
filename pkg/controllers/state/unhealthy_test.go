@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -86,14 +87,14 @@ var _ = Describe("Unhealthy Nodes", func() {
 	}
 
 	var suiteCluster *state.Cluster
-	var suiteNodeController *informer.NodeController
-	var suiteNodeClaimController *informer.NodeClaimController
+	var suiteNodeController reconcile.Reconciler
+	var suiteNodeClaimController reconcile.Reconciler
 	var matcher *repair.RepairPolicyMatcher
 	// useMatcher builds cluster state around a matcher, as the operator does once at startup.
 	useMatcher := func(m *repair.RepairPolicyMatcher) {
-		cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider, state.WithRepairPolicyMatcher(m))
-		nodeController = informer.NewNodeController(env.Client, cluster)
-		nodeClaimController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
+		cluster = state.NewCluster(env.Clock, env.Client, karpentercluster.NewNodeState(ctx, env.Clock, nil, nil, cloudProvider, m))
+		nodeController = NodeInformer(env.Client, cluster, informer.NewNodeController(env.Client, cluster))
+		nodeClaimController = NodeClaimInformer(env.Client, cluster, informer.NewNodeClaimController(env.Client, cloudProvider, clusterCost))
 	}
 
 	BeforeEach(func() {
@@ -185,10 +186,10 @@ var _ = Describe("Unhealthy Nodes", func() {
 	})
 	It("should match nodes in a newly constructed cluster", func() {
 		nodeClaim, node := managedNode(badNode())
-		fresh := state.NewCluster(ctx, env.Clock, env.Client, cloudProvider, state.WithRepairPolicyMatcher(matcher))
+		fresh := state.NewCluster(env.Clock, env.Client, karpentercluster.NewNodeState(ctx, env.Clock, nil, nil, cloudProvider, matcher))
 
 		fresh.UpdateNodeClaim(ExpectExists(ctx, env.Client, nodeClaim))
-		Expect(fresh.UpdateNode(ctx, ExpectExists(ctx, env.Client, node))).To(Succeed())
+		ExpectNodeObserved(ctx, env.Client, fresh, ExpectExists(ctx, env.Client, node))
 		Expect(lo.SomeBy(fresh.DeepCopyNodes(), func(n *karpentercluster.StateNode) bool {
 			return n.GetRepairResult(env.Clock.Now().Add(24*time.Hour)).Action != ""
 		})).To(BeTrue())

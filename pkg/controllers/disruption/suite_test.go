@@ -29,6 +29,7 @@ import (
 
 	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 
@@ -48,6 +49,7 @@ import (
 	clock "k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/cache/informertest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coreapis "sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -79,8 +81,8 @@ var prov *provisioning.Provisioner
 var draController *deviceallocation.Controller
 var store *prediction.Store
 var cloudProvider *fake.CloudProvider
-var nodeStateController *informer.NodeController
-var nodeClaimStateController *informer.NodeClaimController
+var nodeStateController reconcile.Reconciler
+var nodeClaimStateController reconcile.Reconciler
 var recorder *test.EventRecorder
 var queue *disruption.Queue
 var allKnownDisruptionReasons []v1.DisruptionReason
@@ -118,9 +120,9 @@ func useRepairPolicies(policies []cloudprovider.RepairPolicy) {
 	cloudProvider.RepairPolicy = policies
 	repairPolicyMatcher := lo.Must(repair.NewRepairPolicyMatcher(
 		options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeRepair: new(true)}})), cloudProvider))
-	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider, state.WithRepairPolicyMatcher(repairPolicyMatcher))
-	nodeStateController = informer.NewNodeController(env.Client, cluster)
-	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
+	cluster = state.NewCluster(env.Clock, env.Client, karpentercluster.NewNodeState(ctx, env.Clock, nil, nil, cloudProvider, repairPolicyMatcher))
+	nodeStateController = NodeInformer(env.Client, cluster, informer.NewNodeController(env.Client, cluster))
+	nodeClaimStateController = NodeClaimInformer(env.Client, cluster, informer.NewNodeClaimController(env.Client, cloudProvider, clusterCost))
 	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client), store)
 	*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov))
 }

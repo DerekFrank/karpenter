@@ -37,6 +37,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/apis/v1alpha1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/nodeoverlay"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
@@ -70,7 +71,7 @@ var _ = BeforeSuite(func() {
 	}))
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
-	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider)
+	cluster = state.NewCluster(env.Clock, env.Client, karpentercluster.NewNodeState(ctx, env.Clock, nil, nil, cloudProvider, nil))
 	nodeOverlayStore = nodeoverlay.NewInstanceTypeStore()
 	nodeOverlayController = nodeoverlay.NewController(env.Clock, env.Client, cloudProvider, nodeOverlayStore, cluster)
 	clusterCost = cost.NewClusterCost(ctx, cloudProvider, env.Client)

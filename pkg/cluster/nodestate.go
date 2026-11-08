@@ -20,12 +20,18 @@ import (
 	"context"
 	"iter"
 
+	"github.com/awslabs/operatorpkg/object"
+	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/state"
@@ -39,10 +45,14 @@ import (
 //   - NodeStore holds each Node, by name (node.go). Derived from it: the Node on its NodeClaim's entry, by owner
 //     reference; the providerID fallback link, for the window before registration; each Node with its repair policy
 //     matches, by name, with its usage; the candidate unmanaged Nodes; and the Node health counts.
-//   - PodStore holds each pod, by namespaced name. Derived from it: the usage of each Node, by Node name.
+//   - PodStore holds each pod, by namespaced name. Derived from it: the usage of each Node, by Node name, and each
+//     DaemonSet's newest pod.
+//   - NodePoolState counts each NodePool's NodeClaims, with the reservations against its node limit, and
+//     PodSchedulingStore keeps what the provisioner decides about each pod (podscheduling.go).
 //
 // A StateNode is built at read time from a NodeClaim, its linked Node and that Node's usage, or from an unmanaged Node.
-// A caller feeds the object stores (Observe, Forget, Resync), as cluster state's informers do.
+// Built with a kubeClient and informers, the object stores follow the API server once State.Register starts them;
+// without, a caller feeds them (Observe, Forget, Resync).
 type NodeState struct {
 	// ctx carries the options derived fields read. Derived fields are computed on whatever goroutine changes their
 	// source, so they read configuration fixed at construction rather than a request's.
@@ -52,6 +62,9 @@ type NodeState struct {
 
 	// NodeClaimStore holds each NodeClaim and the intent kept about it, by NodeClaim name.
 	NodeClaimStore *state.Store[string, NodeClaimFields]
+	// UnlaunchedNodeClaimStore holds the name of each NodeClaim without a providerID, fed by the NodeClaim store, until
+	// it launches or goes.
+	UnlaunchedNodeClaimStore *state.Store[string, struct{}]
 	// providerIDs holds the NodeClaims and Nodes with each providerID, fed by both object stores.
 	providerIDs *state.Store[string, ProviderIDFields]
 	// nodePoolMembers counts each NodePool's launched and unlaunched NodeClaims; poolLaunched and poolUnlaunched index
@@ -82,6 +95,15 @@ type NodeState struct {
 	// pvcDrivers keeps the CSI driver of each PersistentVolumeClaim, by namespaced name, which counts its volume against
 	// the driver's limit on the node a pod mounts it on.
 	pvcDrivers *state.Store[types.NamespacedName, pvcFields]
+	// daemonSetPods keeps the newest pod of each DaemonSet, by DaemonSet, fed by the pod store.
+	daemonSetPods *state.Store[types.NamespacedName, daemonSetFields]
+
+	// NodePoolState counts each NodePool's NodeClaims and holds the nodes reserved against its node limit.
+	NodePoolState *NodePoolState
+	// PodSchedulingStore keeps what the provisioner decides about each pod as it schedules it, by namespaced name, for
+	// the pod metrics. NodeClaimPodsStore keeps the pods last simulated to schedule against each NodeClaim, fed by it.
+	PodSchedulingStore *state.Store[types.NamespacedName, PodSchedulingFields]
+	NodeClaimPodsStore *state.Store[string, map[types.NamespacedName]struct{}]
 }
 
 // nodeCountKey is what a source counts toward in nodeCounts.
@@ -103,26 +125,38 @@ type counted int
 func (n counted) Update(f int, prev counted) int { return f + int(n-prev) }
 func (n counted) Delete(f int) int               { return f - int(n) }
 
-// NewNodeState returns empty node state that a caller feeds. ctx carries the options its derived fields read, such as
-// the feature gates that decide a pod's disruption cost. A matcher makes it match each Node against the repair
-// policies as it changes; node repair reads the same matcher back through RepairPolicyMatcher.
-func NewNodeState(ctx context.Context, clk clock.Clock, matcher *repair.RepairPolicyMatcher) *NodeState {
+// NewNodeState returns empty node state. With a kubeClient and informers, its NodeClaim, Node and pod stores follow
+// the API server once they start, as State.Register starts them; with nil, a caller feeds them. It holds the
+// NodeClaims of cloudProvider's node classes. ctx carries the options its derived fields read, such as the feature
+// gates that decide a pod's disruption cost. A matcher makes it match each Node against the repair policies as it
+// changes; node repair reads the same matcher back through RepairPolicyMatcher.
+func NewNodeState(ctx context.Context, clk clock.Clock, kubeClient client.Client, informers cache.Informers, cloudProvider cloudprovider.CloudProvider, matcher *repair.RepairPolicyMatcher) *NodeState {
+	managed := lo.Map(cloudProvider.GetSupportedNodeClasses(), func(nodeClass status.Object, _ int) schema.GroupKind {
+		return object.GVK(nodeClass).GroupKind()
+	})
 	s := &NodeState{
-		ctx:                ctx,
-		clock:              clk,
-		matcher:            matcher,
-		NodeClaimStore:     newNodeClaimStore(),
-		providerIDs:        state.NewStore[string, ProviderIDFields](),
-		nodePoolMembers:    state.NewStore[string, nodePoolMembers](),
-		nodePoolCapacity:   state.NewStore[string, corev1.ResourceList](),
-		nodePoolDisruption: state.NewStore[string, NodePoolDisruption](),
-		NodeStore:          newNodeStore(),
-		nodeCounts:         state.NewStore[nodeCountKey, int](),
-		PodStore:           state.NewObjectStore[*corev1.Pod](nil, nil),
-		nodeUsage:          state.NewStore[string, podFields](),
-		pvcDrivers:         state.NewStore[types.NamespacedName, pvcFields](),
+		ctx:                      ctx,
+		clock:                    clk,
+		matcher:                  matcher,
+		NodeClaimStore:           newNodeClaimStore(kubeClient, informers, managed),
+		UnlaunchedNodeClaimStore: state.NewStore[string, struct{}](),
+		providerIDs:              state.NewStore[string, ProviderIDFields](),
+		nodePoolMembers:          state.NewStore[string, nodePoolMembers](),
+		nodePoolCapacity:         state.NewStore[string, corev1.ResourceList](),
+		nodePoolDisruption:       state.NewStore[string, NodePoolDisruption](),
+		NodeStore:                newNodeStore(kubeClient, informers),
+		nodeCounts:               state.NewStore[nodeCountKey, int](),
+		PodStore:                 state.NewObjectStore[*corev1.Pod](kubeClient, informers),
+		nodeUsage:                state.NewStore[string, podFields](),
+		pvcDrivers:               state.NewStore[types.NamespacedName, pvcFields](),
+		daemonSetPods:            state.NewStore[types.NamespacedName, daemonSetFields](),
 	}
+	s.PodSchedulingStore, s.NodeClaimPodsStore = newPodSchedulingStores()
+	s.NodePoolState = newNodePoolState(clk, s.NodeClaimStore)
 	// The NodeClaim side.
+	state.Derive(s.NodeClaimStore, s.UnlaunchedNodeClaimStore, unlaunchedKey, func(string, NodeClaimFields) awaitingLaunch {
+		return awaitingLaunch{}
+	})
 	state.Derive(s.NodeClaimStore, s.providerIDs,
 		func(_ string, f NodeClaimFields) string {
 			if !f.launched() {
@@ -161,6 +195,7 @@ func NewNodeState(ctx context.Context, clk clock.Clock, matcher *repair.RepairPo
 
 	// The pods.
 	s.PodsOnNodes = state.Derive(s.PodStore, s.nodeUsage, podNodeKey, s.newPodContribution)
+	state.Derive(s.PodStore, s.daemonSetPods, daemonSetKey, func(_ types.NamespacedName, pod *corev1.Pod) newestPod { return newestPod{pod} })
 	return s
 }
 
@@ -172,14 +207,38 @@ func (s *NodeState) nodeCount() int {
 	return launched + bare - claimed
 }
 
+// stores returns every store of the node state.
+func (s *NodeState) stores() []interface {
+	Clear()
+	Synced() bool
+} {
+	return []interface {
+		Clear()
+		Synced() bool
+	}{
+		s.NodeClaimStore, s.UnlaunchedNodeClaimStore, s.NodeStore, s.PodStore, s.providerIDs, s.nodePoolMembers,
+		s.nodePoolCapacity, s.nodePoolDisruption, s.nodeCounts, s.nodeUsage, s.pvcDrivers, s.daemonSetPods,
+		s.NodePoolState.nodePools, s.PodSchedulingStore, s.NodeClaimPodsStore,
+	}
+}
+
 // Clear empties the stores in place, so that their subscribers stay subscribed.
 func (s *NodeState) Clear() {
-	for _, store := range []interface{ Clear() }{
-		s.NodeClaimStore, s.NodeStore, s.PodStore, s.providerIDs, s.nodePoolMembers, s.nodePoolCapacity, s.nodePoolDisruption,
-		s.nodeCounts, s.nodeUsage, s.pvcDrivers,
-	} {
+	for _, store := range s.stores() {
 		store.Clear()
 	}
+}
+
+// Synced returns whether every store holds what the API server held when its object stores started: each object
+// store has applied its first List, and each derived store everything derived from them. A controller that reads node
+// state declares it in Register, with WatchesRawSource(state.Requires(...)).
+func (s *NodeState) Synced() bool {
+	for _, store := range s.stores() {
+		if !store.Synced() {
+			return false
+		}
+	}
+	return true
 }
 
 // Nodes returns an iterator over the state nodes in the cluster: each launched NodeClaim, with its linked Node if any,

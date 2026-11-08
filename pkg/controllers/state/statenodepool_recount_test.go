@@ -31,7 +31,9 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	fakecp "sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/test"
 )
 
 // TestNodePoolStateMatchesARecount applies random NodeClaim updates, deletes, NodePool moves and stale versions
@@ -41,7 +43,8 @@ import (
 //nolint:gocyclo
 func TestNodePoolStateMatchesARecount(t *testing.T) {
 	r := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // deterministic seed for reproducible test inputs
-	c := state.NewCluster(ctx, clock.NewFakeClock(time.Now()), fake.NewClientBuilder().Build(), fakecp.NewCloudProvider())
+	clk := clock.NewFakeClock(time.Now())
+	c := state.NewCluster(clk, fake.NewClientBuilder().Build(), karpentercluster.NewNodeState(ctx, clk, nil, nil, fakecp.NewCloudProvider(), nil))
 	latest := map[string]*v1.NodeClaim{}
 	var rv, uid uint64
 	for i := range 20000 {
@@ -64,6 +67,7 @@ func TestNodePoolStateMatchesARecount(t *testing.T) {
 			nc := &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: name, ResourceVersion: strconv.FormatUint(rv, 10), Labels: map[string]string{
 				v1.NodePoolLabelKey: []string{"a", "b", ""}[r.IntN(3)],
 			}}}
+			nc.Spec.NodeClassRef = test.NodeClaim().Spec.NodeClassRef
 			if old, ok := latest[name]; ok {
 				nc.UID = old.UID
 			} else {
@@ -80,7 +84,7 @@ func TestNodePoolStateMatchesARecount(t *testing.T) {
 			c.UpdateNodeClaim(nc)
 			latest[name] = nc
 		}
-		want := map[string]state.NodeClaimCounts{}
+		want := map[string]karpentercluster.NodeClaimCounts{}
 		for _, nc := range latest {
 			np := nc.Labels[v1.NodePoolLabelKey]
 			if np == "" {

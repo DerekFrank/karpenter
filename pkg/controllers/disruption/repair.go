@@ -34,10 +34,10 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
@@ -204,7 +204,7 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 			// past limits.nodes when commands race. A zero result reserves nothing, so the delete-only path leaks no
 			// reservation; a non-zero result's slot is consumed by the replacement staged below. Full reservations are
 			// checked first so the delete-only path never takes a slot.
-			var reservations state.Reservations
+			var reservations karpentercluster.Reservations
 			if !reservationsFull {
 				reservations = r.cluster.NodePoolState.ReserveNodeCount(np.Name, nodeLimit, 1)
 			}

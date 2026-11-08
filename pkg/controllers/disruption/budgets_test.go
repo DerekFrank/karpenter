@@ -90,7 +90,8 @@ func TestNodePoolStatsMatchARecount(t *testing.T) {
 	kubeClient := fake.NewClientBuilder().WithIndex(&corev1.Pod{}, "spec.nodeName", func(o client.Object) []string {
 		return []string{o.(*corev1.Pod).Spec.NodeName}
 	}).Build()
-	c := state.NewCluster(ctx, clocktesting.NewFakeClock(time.Now()), kubeClient, fakecp.NewCloudProvider())
+	clk := clocktesting.NewFakeClock(time.Now())
+	c := state.NewCluster(clk, kubeClient, karpentercluster.NewNodeState(ctx, clk, nil, nil, fakecp.NewCloudProvider(), nil))
 	nodePools := []string{"a", "b", ""}
 	var rv uint64
 	nextRV := func() string { rv++; return strconv.FormatUint(rv, 10) }
@@ -111,7 +112,7 @@ func TestNodePoolStatsMatchARecount(t *testing.T) {
 			c.DeleteNodeClaim(name)
 			delete(uids, "nc"+name)
 		case op == 1:
-			c.DeleteNode(name)
+			c.NodeStore.Forget(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}})
 			delete(uids, "node"+name)
 			delete(nodeObjects, name)
 		case op == 2:
@@ -121,6 +122,7 @@ func TestNodePoolStatsMatchARecount(t *testing.T) {
 		case op < 7:
 			nc := &v1.NodeClaim{
 				ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid("nc", name), ResourceVersion: nextRV(), Labels: map[string]string{v1.NodePoolLabelKey: nodePool}},
+				Spec:       v1.NodeClaimSpec{NodeClassRef: test.NodeClaim().Spec.NodeClassRef},
 				Status:     v1.NodeClaimStatus{ProviderID: providerID},
 			}
 			if r.IntN(5) == 0 {
@@ -168,9 +170,7 @@ func TestNodePoolStatsMatchARecount(t *testing.T) {
 				node.DeletionTimestamp = &metav1.Time{Time: time.Unix(1, 0)}
 				node.Finalizers = []string{v1.TerminationFinalizer}
 			}
-			if err := c.UpdateNode(ctx, node); err != nil {
-				t.Fatalf("updating node, %v", err)
-			}
+			c.NodeStore.Observe(node)
 			nodeObjects[name] = node
 		}
 		for _, reason := range []v1.DisruptionReason{v1.DisruptionReasonUnderutilized, v1.DisruptionReasonDrifted, v1.DisruptionReasonEmpty, v1.DisruptionReasonUnhealthy} {

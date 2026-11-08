@@ -32,6 +32,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/legacyrepair"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
@@ -60,7 +61,7 @@ func expectApplied(objects ...client.Object) {
 	for _, o := range objects {
 		switch o := o.(type) {
 		case *corev1.Node:
-			Expect(cluster.UpdateNode(ctx, o)).To(Succeed())
+			cluster.NodeStore.Observe(o)
 		case *v1.NodeClaim:
 			cluster.UpdateNodeClaim(o)
 		}
@@ -90,7 +91,7 @@ var _ = BeforeSuite(func() {
 	cloudProvider = fake.NewCloudProvider()
 	recorder = test.NewEventRecorder()
 	queue = terminator.NewQueue(env.Clock, env.Client, recorder)
-	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider)
+	cluster = state.NewCluster(env.Clock, env.Client, karpentercluster.NewNodeState(ctx, env.Clock, nil, nil, cloudProvider, nil))
 })
 
 var _ = AfterSuite(func() {
@@ -137,23 +138,6 @@ var _ = Describe("Node Health", func() {
 
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			Expect(nodeClaim.DeletionTimestamp).ToNot(BeNil())
-		})
-		It("should not delete unhealthy nodes before cluster state has synced", func() {
-			node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
-				Type:               "BadNode",
-				Status:             corev1.ConditionFalse,
-				LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
-			})
-			env.Clock.Step(60 * time.Minute)
-			// Cluster state hasn't seen the Node, so it can't count the NodePool's unhealthy nodes yet.
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-			result := ExpectObjectReconciled(ctx, env.Client, healthController, node)
-			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
-			Expect(ExpectExists(ctx, env.Client, nodeClaim).DeletionTimestamp).To(BeNil())
-
-			expectApplied(nodeClaim, node)
-			ExpectObjectReconciled(ctx, env.Client, healthController, node)
-			Expect(ExpectExists(ctx, env.Client, nodeClaim).DeletionTimestamp).ToNot(BeNil())
 		})
 		It("should delete nodes that registered unhealthy before the NodeClass label was synced", func() {
 			nodeClassLabelKey := v1.NodeClassLabelKey(nodeClaim.Spec.NodeClassRef.GroupKind())

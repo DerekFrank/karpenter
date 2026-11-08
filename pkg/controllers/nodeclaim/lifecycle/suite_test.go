@@ -40,6 +40,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	nodeclaimlifecycle "sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
@@ -87,7 +88,7 @@ var _ = BeforeSuite(func() {
 	ctx = options.ToContext(ctx, test.Options())
 
 	cloudProvider = fake.NewCloudProvider()
-	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider)
+	cluster = state.NewCluster(env.Clock, env.Client, karpentercluster.NewNodeState(ctx, env.Clock, nil, nil, cloudProvider, nil))
 	npState = nodepoolhealth.NewState()
 	nodeClaimController = nodeclaimlifecycle.NewController(env.Clock, env.Client, cloudProvider, recorder, cluster, npState, nil)
 })

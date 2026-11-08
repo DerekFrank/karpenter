@@ -50,6 +50,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
@@ -131,6 +132,8 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		WatchesRawSource(singleton.Source()).
+		WatchesRawSource(karpenterstate.Requires(c.cluster)).
+		WatchesRawSource(karpenterstate.Wake(c.cluster.UnlaunchedNodeClaimStore.Source())).
 		Complete(singleton.AsReconciler(c))
 }
 
@@ -147,11 +150,10 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	// Only validate the first reason, since CEL validation will catch invalid disruption reasons
 	c.logInvalidBudgets(ctx)
 
-	// We need to ensure that our internal cluster state mechanism is synced before we proceed
-	// with making any scheduling decision off of our state nodes. Otherwise, we have the potential to make
-	// a scheduling decision based on a smaller subset of nodes in our cluster state than actually exist.
-	if !c.cluster.Synced(ctx) {
-		return reconciler.Result{RequeueAfter: time.Second}, nil
+	// A NodeClaim that's launching isn't a node in cluster state yet, so a decision made now would be made off a
+	// smaller subset of nodes than actually exist. The unlaunched NodeClaims wake the controller once they launch.
+	if !c.cluster.NodeClaimsLaunched(ctx) {
+		return reconciler.Result{}, nil
 	}
 
 	// Karpenter taints nodes with a karpenter.sh/disruption taint as part of the disruption process while it progresses in memory.

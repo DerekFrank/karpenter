@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
@@ -38,6 +39,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -62,7 +64,7 @@ import (
 var (
 	ctx                 context.Context
 	cluster             *state.Cluster
-	nodeController      *informer.NodeController
+	nodeController      reconcile.Reconciler
 	daemonsetController *informer.DaemonSetController
 	cloudProvider       *fake.CloudProvider
 	prov                *provisioning.Provisioner
@@ -81,8 +83,8 @@ var _ = BeforeSuite(func() {
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...))
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
-	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider)
-	nodeController = informer.NewNodeController(env.Client, cluster)
+	cluster = state.NewCluster(env.Clock, env.Client, karpentercluster.NewNodeState(ctx, env.Clock, nil, nil, cloudProvider, nil))
+	nodeController = NodeInformer(env.Client, cluster, informer.NewNodeController(env.Client, cluster))
 	predictionStore = prediction.NewStore(env.Client)
 	prov = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client), predictionStore)
 	daemonsetController = informer.NewDaemonSetController(env.Client, cluster)
@@ -1042,7 +1044,7 @@ var _ = Describe("Provisioning", func() {
 					ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("2Gi")}},
 				})
 			ExpectApplied(ctx, env.Client, nodePool, daemonsetPod)
-			Expect(cluster.UpdatePod(ctx, daemonsetPod)).To(Succeed())
+			cluster.PodStore.Observe(daemonsetPod)
 			pod := test.UnschedulablePod(test.PodOptions{
 				ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")}},
 				NodeSelector:         map[string]string{v1.NodePoolLabelKey: nodePool.Name},
@@ -1352,7 +1354,7 @@ var _ = Describe("Provisioning", func() {
 					ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("2Gi")}},
 				})
 			ExpectApplied(ctx, env.Client, daemonsetPod)
-			Expect(cluster.UpdatePod(ctx, daemonsetPod)).To(Succeed())
+			cluster.PodStore.Observe(daemonsetPod)
 
 			// Deploy pod
 			pod := test.UnschedulablePod(test.PodOptions{

@@ -115,11 +115,10 @@ func benchmarkCluster(ctx context.Context, b *testing.B, provider *fake.CloudPro
 	kubeClient := fakecr.NewClientBuilder().WithIndex(&corev1.Pod{}, "spec.nodeName", func(o client.Object) []string {
 		return []string{o.(*corev1.Pod).Spec.NodeName}
 	}).Build()
-	clusterState := state.NewCluster(ctx, clock.NewFakeClock(now), kubeClient, provider, state.WithRepairPolicyMatcher(matcher))
+	clk := clock.NewFakeClock(now)
+	clusterState := state.NewCluster(clk, kubeClient, karpentercluster.NewNodeState(ctx, clk, nil, nil, provider, matcher))
 	for i := range n {
-		if err := clusterState.UpdateNode(ctx, benchmarkNode(i, i < unhealthy, benchmarkAcceleratorReason(i < unhealthy, 0), now, now)); err != nil {
-			b.Fatal(err)
-		}
+		clusterState.NodeStore.Observe(benchmarkNode(i, i < unhealthy, benchmarkAcceleratorReason(i < unhealthy, 0), now, now))
 	}
 	return clusterState
 }
@@ -168,9 +167,7 @@ func BenchmarkClusterUpdateNode(b *testing.B) {
 					b.ReportAllocs()
 					b.ResetTimer()
 					for i := 0; i < b.N; i++ {
-						if err := clusterState.UpdateNode(ctx, versions[(i/n)%2][i%n]); err != nil {
-							b.Fatal(err)
-						}
+						clusterState.NodeStore.Observe(versions[(i/n)%2][i%n])
 					}
 				})
 			}

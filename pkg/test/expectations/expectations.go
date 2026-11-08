@@ -66,7 +66,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
-	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	pscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
@@ -360,7 +359,8 @@ func ExpectProvisioned(ctx context.Context, c client.Client, cluster *state.Clus
 			} else {
 				ExpectManualBinding(ctx, c, pod, binding.Node)
 			}
-			Expect(cluster.UpdatePod(ctx, pod)).To(Succeed()) // track pod bindings
+			cluster.PodStore.Observe(pod) // track pod bindings, as the pod informer would
+			Expect(cluster.ResolvePVCDrivers(ctx, pod)).To(Succeed())
 
 			if result.ResourceClaimAllocationMetadata != nil {
 				expectDRAClaimsAllocated(ctx, c, pod, binding, result.ResourceClaimAllocationMetadata)
@@ -730,7 +730,7 @@ func ExpectNodeClaimDeployedAndStateUpdated(ctx context.Context, c client.Client
 	if err != nil {
 		return nc, nil
 	}
-	Expect(cluster.UpdateNode(ctx, node)).To(Succeed())
+	ExpectNodeObserved(ctx, c, cluster, node)
 	return nc, node
 }
 
@@ -1019,7 +1019,7 @@ func ExpectStateNodeExistsForNodeClaim(cluster *state.Cluster, nodeClaim *v1.Nod
 	return ret
 }
 
-func ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx context.Context, c client.Client, clk clock.Clock, nodeStateController *informer.NodeController, nodeClaimStateController *informer.NodeClaimController, nodes []*corev1.Node, nodeClaims []*v1.NodeClaim) {
+func ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx context.Context, c client.Client, clk clock.Clock, nodeStateController, nodeClaimStateController reconcile.Reconciler, nodes []*corev1.Node, nodeClaims []*v1.NodeClaim) {
 	GinkgoHelper()
 
 	ExpectMakeNodesInitialized(ctx, c, clk, nodes...)

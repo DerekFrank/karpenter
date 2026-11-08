@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -220,12 +221,12 @@ func TestDeriveMovesContributionsBetweenKeys(t *testing.T) {
 
 func TestObjectStoreKeepsTheNewestVersionAcrossWritesAndTheInformer(t *testing.T) {
 	nodeClaims, s, _ := newStores()
-	nodeClaims.change(nodeClaim("a", "x", 5, "8"), false, false)
-	nodeClaims.change(nodeClaim("a", "x", 3, "2"), false, true)
+	nodeClaims.change(nodeClaim("a", "x", 5, "8"), false, copied)
+	nodeClaims.change(nodeClaim("a", "x", 3, "2"), false, cached)
 	if got := fields(s, "x").CPU; got != 8 {
 		t.Fatalf("x = %d cpu after the informer delivered an older version than the write, want 8", got)
 	}
-	nodeClaims.change(nodeClaim("a", "x", 6, "4"), false, true)
+	nodeClaims.change(nodeClaim("a", "x", 6, "4"), false, cached)
 	if got := fields(s, "x"); got.CPU != 4 || got.Count != 1 {
 		t.Fatalf("x = %+v after another writer's newer version, want 4 cpu over 1", got)
 	}
@@ -233,13 +234,13 @@ func TestObjectStoreKeepsTheNewestVersionAcrossWritesAndTheInformer(t *testing.T
 
 func TestObjectStoreIgnoresOlderVersionsOfAnObjectItDeleted(t *testing.T) {
 	nodeClaims, s, _ := newStores()
-	nodeClaims.change(nodeClaim("a", "x", 1, "2"), false, true)
-	nodeClaims.change(nodeClaim("a", "x", 1, "2"), true, false)
-	nodeClaims.change(nodeClaim("a", "x", 2, "2"), false, true)
+	nodeClaims.change(nodeClaim("a", "x", 1, "2"), false, cached)
+	nodeClaims.change(nodeClaim("a", "x", 1, "2"), true, copied)
+	nodeClaims.change(nodeClaim("a", "x", 2, "2"), false, cached)
 	if got := fields(s, "x").Count; got != 0 {
 		t.Fatalf("x counts %d NodeClaims after the informer delivered an update from before the delete, want 0", got)
 	}
-	nodeClaims.change(nodeClaim("a", "x", 2, "2"), true, true)
+	nodeClaims.change(nodeClaim("a", "x", 2, "2"), true, cached)
 	p := nodeClaims.parts[0].(*joinPart[types.NamespacedName, *v1.NodeClaim, *v1.NodeClaim])
 	if len(p.sources.versions) != 0 || len(p.held) != 0 {
 		t.Fatalf("versions %v, held %v once the informer delivered the delete, want none", p.sources.versions, p.held)
@@ -248,12 +249,12 @@ func TestObjectStoreIgnoresOlderVersionsOfAnObjectItDeleted(t *testing.T) {
 
 func TestObjectStoreCountsAnObjectRecreatedWithTheSameNameAsANewObject(t *testing.T) {
 	nodeClaims, s, _ := newStores()
-	nodeClaims.change(nodeClaim("a", "x", 1, "2"), false, true)
-	nodeClaims.change(nodeClaim("a", "x", 1, "2"), true, false)
+	nodeClaims.change(nodeClaim("a", "x", 1, "2"), false, cached)
+	nodeClaims.change(nodeClaim("a", "x", 1, "2"), true, copied)
 	recreated := nodeClaim("a", "x", 7, "4")
 	recreated.UID = "a-2"
 	nodeClaims.Observe(recreated)
-	nodeClaims.change(nodeClaim("a", "x", 2, "2"), true, true)
+	nodeClaims.change(nodeClaim("a", "x", 2, "2"), true, cached)
 	if got := fields(s, "x"); got.CPU != 4 || got.Count != 1 {
 		t.Fatalf("x = %+v after the old object's delete, want the recreated object's 4 cpu over 1", got)
 	}
@@ -418,7 +419,7 @@ func TestDeriveConcurrentChangesConverge(t *testing.T) {
 	for w := range 4 {
 		wg.Go(func() {
 			for i := range 1000 {
-				nodeClaims.change(nodeClaim(fmt.Sprintf("nc-%d", i%50), fmt.Sprintf("pool-%d", (i+w)%3), uint64(i*4+w+1), "1"), false, w%2 == 0) //nolint:gosec
+				nodeClaims.change(nodeClaim(fmt.Sprintf("nc-%d", i%50), fmt.Sprintf("pool-%d", (i+w)%3), uint64(i*4+w+1), "1"), false, lo.Ternary(w%2 == 0, cached, copied)) //nolint:gosec
 			}
 		})
 	}

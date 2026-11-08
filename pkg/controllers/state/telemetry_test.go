@@ -78,7 +78,7 @@ var _ = Describe("Pod Ack", func() {
 		Expect(cluster.PodNodeClaimMapping(nn)).To(BeEquivalentTo("nc1"))
 
 		// Delete the pod
-		cluster.DeletePod(client.ObjectKeyFromObject(pod))
+		cluster.ClearPodSchedulingMappings(nn)
 		Expect(cluster.PodSchedulingSuccessTime(nn).IsZero()).To(BeTrue())
 		Expect(cluster.PodSchedulingDecisionTime(nn).IsZero()).To(BeTrue())
 		Expect(cluster.PodNodeClaimMapping(nn)).To(BeEquivalentTo(""))
@@ -144,7 +144,7 @@ var _ = Describe("Pods Mapped To NodeClaim", func() {
 		cluster.MarkPodSchedulingDecisions(ctx, nil, map[string][]*corev1.Pod{"np1": {pod, other}}, map[string][]*corev1.Pod{"nc1": {pod, other}})
 		Expect(cluster.PodsMappedToNodeClaim("nc1")).To(HaveLen(2))
 
-		cluster.DeletePod(nn)
+		cluster.ClearPodSchedulingMappings(nn)
 		Expect(cluster.PodAckTime(nn).IsZero()).To(BeTrue())
 		Expect(cluster.PodSchedulingDecisionTime(nn).IsZero()).To(BeTrue())
 		Expect(cluster.PodSchedulingSuccessTime(nn).IsZero()).To(BeTrue())

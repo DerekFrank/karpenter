@@ -26,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coreapis "sigs.k8s.io/karpenter/pkg/apis"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
@@ -76,8 +77,8 @@ var ctx context.Context
 var env *test.Environment
 var cluster *state.Cluster
 var cloudProvider *fake.CloudProvider
-var nodeStateController *informer.NodeController
-var nodeClaimStateController *informer.NodeClaimController
+var nodeStateController reconcile.Reconciler
+var nodeClaimStateController reconcile.Reconciler
 var queue *deletioncost.Queue
 
 func TestAPIs(t *testing.T) {
@@ -95,10 +96,10 @@ var _ = BeforeSuite(func() {
 
 	ctx = options.ToContext(ctx, opts)
 	cloudProvider = fake.NewCloudProvider()
-	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider)
-	nodeStateController = informer.NewNodeController(env.Client, cluster)
+	cluster = state.NewCluster(env.Clock, env.Client, karpentercluster.NewNodeState(ctx, env.Clock, nil, nil, cloudProvider, nil))
+	nodeStateController = NodeInformer(env.Client, cluster, informer.NewNodeController(env.Client, cluster))
 	clusterCost := cost.NewClusterCost(ctx, cloudProvider, env.Client)
-	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
+	nodeClaimStateController = NodeClaimInformer(env.Client, cluster, informer.NewNodeClaimController(env.Client, cloudProvider, clusterCost))
 })
 
 var _ = AfterSuite(func() {

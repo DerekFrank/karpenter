@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package state
+package cluster
 
 import (
 	"time"
@@ -23,8 +23,7 @@ import (
 	"k8s.io/utils/clock"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/cluster"
-	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
+	"sigs.k8s.io/karpenter/pkg/state"
 )
 
 // ReservationTTL bounds how long a reservation holds a node for a NodeClaim that is never created or never counted, such
@@ -41,7 +40,7 @@ type NodePoolFields struct {
 	Reserved int64
 }
 
-// NodeClaimCounts are a NodePool's NodeClaims by karpenterstate. A NodeClaim contributes a count of one to its NodePool.
+// NodeClaimCounts are a NodePool's NodeClaims by state. A NodeClaim contributes a count of one to its NodePool.
 type NodeClaimCounts struct {
 	Active   int
 	Deleting int
@@ -74,7 +73,7 @@ func (r reservedNodes) Delete(f NodePoolFields) NodePoolFields {
 
 // Reservation holds one node against a NodePool's node limit for a NodeClaim a controller is about to create, until the
 // NodePool's counts include that NodeClaim. Bind it to the NodeClaim once created, or Release it if it won't be.
-type Reservation = *karpenterstate.Claim[string, string, reservedNodes]
+type Reservation = *state.Claim[string, string, reservedNodes]
 
 // Reservations are the Reservations one ReserveNodeCount granted.
 type Reservations []Reservation
@@ -88,21 +87,21 @@ func (r Reservations) Release() {
 
 // NodePoolState holds each NodePool with its NodePoolFields.
 type NodePoolState struct {
-	nodePools    *karpenterstate.Store[string, NodePoolFields]
-	reservations *karpenterstate.Claims[string, string, cluster.NodeClaimFields, NodePoolFields, NodeClaimCounts, reservedNodes]
+	nodePools    *state.Store[string, NodePoolFields]
+	reservations *state.Claims[string, string, NodeClaimFields, NodePoolFields, NodeClaimCounts, reservedNodes]
 }
 
-// NewNodePoolState returns the NodePools' state, derived from the NodeClaim store, keyed by NodeClaim name.
-func NewNodePoolState(clk clock.Clock, nodeClaims *karpenterstate.Store[string, cluster.NodeClaimFields]) *NodePoolState {
-	nodePools := karpenterstate.NewStore[string, NodePoolFields]()
-	counts := karpenterstate.Derive(nodeClaims, nodePools,
-		func(_ string, f cluster.NodeClaimFields) string {
+// newNodePoolState returns the NodePools' state, derived from the NodeClaim store, keyed by NodeClaim name.
+func newNodePoolState(clk clock.Clock, nodeClaims *state.Store[string, NodeClaimFields]) *NodePoolState {
+	nodePools := state.NewStore[string, NodePoolFields]()
+	counts := state.Derive(nodeClaims, nodePools,
+		func(_ string, f NodeClaimFields) string {
 			if f.NodeClaim == nil {
 				return ""
 			}
 			return f.NodeClaim.Labels[v1.NodePoolLabelKey]
 		},
-		func(_ string, f cluster.NodeClaimFields) NodeClaimCounts {
+		func(_ string, f NodeClaimFields) NodeClaimCounts {
 			nodeClaim := f.NodeClaim
 			if !nodeClaim.DeletionTimestamp.IsZero() {
 				return NodeClaimCounts{Deleting: 1}
@@ -119,7 +118,7 @@ func NewNodePoolState(clk clock.Clock, nodeClaims *karpenterstate.Store[string, 
 		nodePools: nodePools,
 		// A NodeClaim counts against the node limit as soon as it exists, so the first time the counts see it settles
 		// its reservation.
-		reservations: karpenterstate.NewClaims[string, string, cluster.NodeClaimFields, NodePoolFields, NodeClaimCounts, reservedNodes](counts,
+		reservations: state.NewClaims[string, string, NodeClaimFields, NodePoolFields, NodeClaimCounts, reservedNodes](counts,
 			func(NodeClaimCounts) bool { return true },
 			ReservationTTL, clk,
 		),
@@ -139,10 +138,4 @@ func (n *NodePoolState) ReserveNodeCount(np string, limit int64, wantedLimit int
 	return n.reservations.Reserve(np, int(max(0, wantedLimit)), 1, func(f NodePoolFields) bool {
 		return int64(f.NodeClaims.Active+f.NodeClaims.Deleting)+f.Reserved <= limit
 	})
-}
-
-// Reset empties the state in place, ending every reservation, so that subscribers to its store stay subscribed. The
-// NodeClaims it's derived from are cleared by their owner.
-func (n *NodePoolState) Reset() {
-	n.nodePools.Clear()
 }

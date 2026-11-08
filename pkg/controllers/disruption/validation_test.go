@@ -28,6 +28,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -50,7 +51,7 @@ var _ = Describe("Repair Method Registration", func() {
 	})
 
 	It("panics when repair is enabled on cluster state built without a matcher", func() {
-		withoutMatcher := state.NewCluster(ctx, env.Clock, env.Client, cloudProvider)
+		withoutMatcher := state.NewCluster(env.Clock, env.Client, karpentercluster.NewNodeState(ctx, env.Clock, nil, nil, cloudProvider, nil))
 		Expect(func() {
 			disruption.NewMethods(enabledCtx, env.Clock, withoutMatcher, env.Client, prov, cloudProvider, recorder, queue)
 		}).To(PanicWith("node repair requires cluster state built with a repair policy matcher"))
@@ -277,7 +278,7 @@ func churn(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim) {
 			cluster.NominateNodeForPod(ctx, nodeClaim.Name)
 		}
 	}
-	Expect(cluster.UpdateNode(ctx, nodes[0])).To(Succeed())
+	ExpectNodeObserved(ctx, env.Client, cluster, nodes[0])
 }
 
 func blockingBudget(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim, nodePool *v1.NodePool) {
@@ -293,6 +294,6 @@ func nominated(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim) {
 	for i := range nodes {
 		cluster.NominateNodeForPod(ctx, nodeClaims[i].Name)
 		cluster.NominateNodeForPod(ctx, nodeClaims[i].Name)
-		Expect(cluster.UpdateNode(ctx, nodes[i])).To(Succeed())
+		ExpectNodeObserved(ctx, env.Client, cluster, nodes[i])
 	}
 }

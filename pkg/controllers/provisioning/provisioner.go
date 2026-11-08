@@ -61,6 +61,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
+	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
 	"sigs.k8s.io/karpenter/pkg/utils/daemonset"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
@@ -141,6 +142,7 @@ func (p *Provisioner) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(p.Name()).
 		WatchesRawSource(singleton.Source()).
+		WatchesRawSource(karpenterstate.Requires(p.cluster)).
 		Complete(singleton.AsReconciler(p))
 }
 
@@ -151,10 +153,9 @@ func (p *Provisioner) Reconcile(ctx context.Context) (result reconciler.Result, 
 	if triggered := p.batcher.Wait(ctx); !triggered {
 		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
 	}
-	// We need to ensure that our internal cluster state mechanism is synced before we proceed
-	// with making any scheduling decision off of our state nodes. Otherwise, we have the potential to make
-	// a scheduling decision based on a smaller subset of nodes in our cluster state than actually exist.
-	if !p.cluster.Synced(ctx) {
+	// A NodeClaim that's launching isn't a node in cluster state yet, so scheduling now would schedule pods off a smaller
+	// subset of nodes than actually exist, and provision for them again.
+	if !p.cluster.NodeClaimsLaunched(ctx) {
 		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
 	}
 	if options.FromContext(ctx).FeatureGates.PredictionEnabled && !p.predictionStore.Hydrated(ctx) {

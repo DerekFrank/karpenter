@@ -266,31 +266,6 @@ var _ = Describe("Controller", func() {
 			"second reconcile must rank the newly-added node; if the cursor were advanced by the empty first reconcile, the second would short-circuit")
 	})
 
-	It("should requeue with 1s backoff when cluster state is not synced", func() {
-		// Applies a NodeClaim + Node to the API server without pushing them into
-		// the state.Cluster informer, then clears hasSynced so Synced() re-runs
-		// its deep check and finds state missing the applied node.
-		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
-			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}},
-			Status:     v1.NodeClaimStatus{Allocatable: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4"), corev1.ResourceMemory: resource.MustParse("8Gi")}},
-		})
-		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-		pod := rsOwnedPod(test.PodOptions{NodeName: node.Name})
-		ExpectApplied(ctx, env.Client, pod)
-		// Skipping ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated is the
-		// point: state.Cluster must not observe the applied node/nodeclaim.
-		cluster.SetSynced(false)
-
-		controller := deletioncost.NewController(env.Clock, env.Client, cloudProvider, cluster, queue)
-		result, err := controller.Reconcile(ctx)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(result.RequeueAfter).To(Equal(time.Second))
-
-		observed := &corev1.Pod{}
-		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(pod), observed)).To(Succeed())
-		Expect(observed.Annotations).ToNot(HaveKey(corev1.PodDeletionCost))
-	})
-
 	It("should retry on the same state after a failed reconcile (skip cursor is not advanced on error)", func() {
 		// Regression: the cursor used to be advanced at the unchanged-state check,
 		// ahead of the rest of Reconcile, so a mid-reconcile error left it

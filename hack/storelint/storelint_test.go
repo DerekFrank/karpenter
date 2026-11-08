@@ -14,22 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package state
+package storelint_test
 
 import (
 	"testing"
 
-	"k8s.io/apimachinery/pkg/types"
+	"golang.org/x/tools/go/analysis/analysistest"
 
-	"sigs.k8s.io/karpenter/pkg/state/statetest"
+	"sigs.k8s.io/karpenter/hack/storelint"
 )
 
-func TestPodOnNodeClaimKeepsTheContributionLaws(t *testing.T) {
-	podKey := func(name string) podOnNodeClaim {
-		return podOnNodeClaim{types.NamespacedName{Namespace: "default", Name: name}}
-	}
-	for _, base := range []map[types.NamespacedName]struct{}{nil, {podKey("other").pod: {}}} {
-		statetest.ExpectContribution(t, base, podKey("a"), podKey("a"))
-		statetest.ExpectContribution(t, base, podKey("a"), podKey("b"))
-	}
+// TestStoresAreBuiltAndStartedWhereTheDesignSays checks both rules: stores are built only in pkg/cluster, pkg/state, a
+// controller's Register or a test, and a shared store is added to the manager only by cluster.State.Register.
+func TestStoresAreBuiltAndStartedWhereTheDesignSays(t *testing.T) {
+	analysistest.Run(t, analysistest.TestData(), storelint.Analyzer, "controllers", "sigs.k8s.io/karpenter/pkg/cluster", "sigs.k8s.io/karpenter/pkg/state")
 }

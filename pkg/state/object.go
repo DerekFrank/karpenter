@@ -80,7 +80,7 @@ func Join[K comparable, F any, S client.Object](key func(S) K, set func(F, S) F)
 // part is the part of a join store that one kind feeds.
 type part[K comparable, F any] interface {
 	kind() reflect.Type
-	changeLocked(s *Store[K, F], obj client.Object, deleted, fromInformer bool) []Change[K, F]
+	changeLocked(s *Store[K, F], obj client.Object, deleted bool, from origin) []Change[K, F]
 	forgetLocked(s *Store[K, F], name types.NamespacedName) []Change[K, F]
 	resyncLocked(s *Store[K, F], objs []client.Object, scope []types.NamespacedName) []Change[K, F]
 	start(ctx context.Context, s *Store[K, F]) error
@@ -118,9 +118,9 @@ func (p *joinPart[K, F, S]) clearLocked() {
 	p.held = map[types.UID]held[K, S]{}
 }
 
-func (p *joinPart[K, F, S]) changeLocked(s *Store[K, F], o client.Object, deleted, fromInformer bool) []Change[K, F] {
+func (p *joinPart[K, F, S]) changeLocked(s *Store[K, F], o client.Object, deleted bool, from origin) []Change[K, F] {
 	obj := o.(S)
-	ok, gone, replaced := p.sources.admit(obj, deleted, fromInformer)
+	ok, gone, replaced := p.sources.admit(obj, deleted, from)
 	if !ok {
 		return nil
 	}
@@ -151,7 +151,7 @@ func (p *joinPart[K, F, S]) resyncLocked(s *Store[K, F], objs []client.Object, s
 	for _, obj := range objs {
 		listed[client.ObjectKeyFromObject(obj)] = struct{}{}
 		if p.sources.newer(obj) {
-			changed = append(changed, p.changeLocked(s, obj, false, false)...)
+			changed = append(changed, p.changeLocked(s, obj, false, copied)...)
 		}
 	}
 	for _, name := range scope {
@@ -204,7 +204,7 @@ func (p *joinPart[K, F, S]) start(ctx context.Context, s *Store[K, F]) error {
 			raw = tombstone.Obj
 		}
 		if o, ok := raw.(S); ok {
-			s.change(o, deleted, true)
+			s.change(o, deleted, cached)
 		}
 	}
 	registration, err := informer.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
@@ -219,7 +219,7 @@ func (p *joinPart[K, F, S]) start(ctx context.Context, s *Store[K, F]) error {
 	if writer, ok := p.kubeClient.(*overlay.Client); ok {
 		remove, err := writer.AddWriteHandler(obj, func(o client.Object, deleted bool) {
 			if _, ok := o.(S); ok {
-				s.change(o, deleted, false)
+				s.change(o, deleted, copied)
 			}
 		})
 		if err != nil {
@@ -239,7 +239,7 @@ func (p *joinPart[K, F, S]) start(ctx context.Context, s *Store[K, F]) error {
 	}
 	var changed []Change[K, F]
 	for _, item := range items {
-		changed = append(changed, p.changeLocked(s, item.(S), false, false)...)
+		changed = append(changed, p.changeLocked(s, item.(S), false, copied)...)
 	}
 	p.listed.Store(true)
 	subscribers := s.subscribers
@@ -265,7 +265,7 @@ func (s *Store[K, F]) Start(ctx context.Context) error {
 // Observe applies a version of an object that a caller saw outside the informer and the client's writes, such as from
 // a reconciler, to the Part of its kind. It ignores a version older than one the store has seen.
 func (s *Store[K, F]) Observe(obj client.Object) {
-	s.change(obj, false, true)
+	s.change(obj, false, observed)
 }
 
 // Forget removes the object of obj's kind named as obj is, for a caller that learns an object is gone by its name
@@ -291,10 +291,10 @@ func Resync[K comparable, F any, S client.Object](s *Store[K, F], objs []S, scop
 	notify(subscribers, changed)
 }
 
-func (s *Store[K, F]) change(obj client.Object, deleted, fromInformer bool) {
+func (s *Store[K, F]) change(obj client.Object, deleted bool, from origin) {
 	p := s.partFor(obj)
 	s.mu.Lock()
-	changed := p.changeLocked(s, obj, deleted, fromInformer)
+	changed := p.changeLocked(s, obj, deleted, from)
 	subscribers := s.subscribers
 	s.mu.Unlock()
 	notify(subscribers, changed)
@@ -321,21 +321,41 @@ type feed struct {
 type version struct {
 	rv      uint64
 	deleted bool
+	// cached is whether the store holds the informer's own object for the version, rather than a copy.
+	cached bool
 }
+
+// origin is where a version of an object comes from.
+type origin int
+
+const (
+	// copied is a copy of the object, from the client's write or a List.
+	copied origin = iota
+	// observed is a version a caller saw elsewhere, such as from a reconciler.
+	observed
+	// cached is the informer's own object.
+	cached
+)
 
 func newFeed() feed {
 	return feed{versions: map[types.UID]version{}, names: map[types.NamespacedName]types.UID{}}
 }
 
-// admit returns whether obj is a version to apply, whether the object is gone, and the UID of an object it replaces.
+// admit returns whether obj is a version to apply, whether the object is gone, and the UID of an object it replaces. The
+// informer's own object for the version the store holds replaces a copy of it, so the store holds no copy of an object
+// the informer's cache holds once the informer delivers it.
 //
 //nolint:gocyclo
-func (f feed) admit(obj client.Object, deleted, fromInformer bool) (bool, bool, types.UID) {
+func (f feed) admit(obj client.Object, deleted bool, from origin) (bool, bool, types.UID) {
 	uid := identity(obj)
 	name := client.ObjectKeyFromObject(obj)
 	rv, _ := strconv.ParseUint(obj.GetResourceVersion(), 10, 64)
 	cur, exists := f.versions[uid]
+	fromInformer := from != copied
 	switch {
+	case exists && !cur.deleted && !deleted && from == cached && !cur.cached && rv != 0 && rv == cur.rv:
+		f.versions[uid] = version{rv: rv, cached: true}
+		return true, false, ""
 	case deleted && fromInformer:
 		if !exists {
 			return false, false, ""
@@ -360,7 +380,7 @@ func (f feed) admit(obj client.Object, deleted, fromInformer bool) (bool, bool, 
 			return false, false, ""
 		}
 	}
-	f.versions[uid] = version{rv: max(rv, cur.rv), deleted: deleted}
+	f.versions[uid] = version{rv: max(rv, cur.rv), deleted: deleted, cached: from == cached}
 	f.names[name] = uid
 	return true, deleted, replaced
 }

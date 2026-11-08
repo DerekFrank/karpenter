@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -130,7 +131,7 @@ func TestPodContributionsKeepTheContributionLaws(t *testing.T) {
 	withHostPort := func(p *corev1.Pod) {
 		p.Spec.Containers[0].Ports = []corev1.ContainerPort{{HostPort: 80, Protocol: corev1.ProtocolTCP}}
 	}
-	s := NewNodeState(options.ToContext(context.Background(), test.Options()), clock.RealClock{}, nil)
+	s := NewNodeState(options.ToContext(context.Background(), test.Options()), clock.RealClock{}, nil, nil, fake.NewCloudProvider(), nil)
 	contribution := func(p *corev1.Pod) podContribution { return s.newPodContribution(client.ObjectKeyFromObject(p), p) }
 	other := contribution(pod("other", "1", withPVC, withHostPort)).Update(podFields{}, podContribution{})
 	for _, base := range []podFields{{}, other} {
@@ -176,4 +177,20 @@ func testMatcher(t *testing.T) *repair.RepairPolicyMatcher {
 		t.Fatalf("building repair policy matcher: %v", err)
 	}
 	return matcher
+}
+
+func TestNodePoolStateContributionsKeepTheContributionLaws(t *testing.T) {
+	base := NodePoolFields{NodeClaims: NodeClaimCounts{Active: 3, Deleting: 1}, Reserved: 2}
+	statetest.ExpectContribution(t, base, NodeClaimCounts{Active: 1}, NodeClaimCounts{Deleting: 1})
+	statetest.ExpectContribution(t, base, reservedNodes(1), reservedNodes(2))
+}
+
+func TestPodOnNodeClaimKeepsTheContributionLaws(t *testing.T) {
+	podKey := func(name string) podOnNodeClaim {
+		return podOnNodeClaim{k8stypes.NamespacedName{Namespace: "default", Name: name}}
+	}
+	for _, base := range []map[k8stypes.NamespacedName]struct{}{nil, {podKey("other").pod: {}}} {
+		statetest.ExpectContribution(t, base, podKey("a"), podKey("a"))
+		statetest.ExpectContribution(t, base, podKey("a"), podKey("b"))
+	}
 }

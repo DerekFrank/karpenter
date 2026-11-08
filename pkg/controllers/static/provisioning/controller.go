@@ -41,6 +41,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
+	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
 	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -78,13 +79,6 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 
 	if !nodepoolutils.IsManaged(np, c.cloudProvider) || !np.StatusConditions().Root().IsTrue() || np.Spec.Replicas == nil || !np.DeletionTimestamp.IsZero() {
 		return reconcile.Result{}, nil
-	}
-
-	// We need to wait until our representation of cluster is populated accurately with what we have in api-server or else
-	// we would end up over provisioning due to misrepresentation of NodePoolState in our cluster state.
-	// This usually happens when there is controller crash, so we check if the cluster has synced atleast once.
-	if !c.cluster.HasSynced() && !c.cluster.Synced(ctx) {
-		return reconcile.Result{RequeueAfter: time.Second}, nil
 	}
 
 	runningNodeClaims, _, reservedNodes := c.cluster.NodePoolState.GetNodeCount(np.Name)
@@ -161,6 +155,9 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 				return false
 			},
 		})).
+		// Cluster state's NodePoolState counts the NodePool's NodeClaims only once it has synced; before, it would count
+		// fewer than exist and provision too many.
+		WatchesRawSource(karpenterstate.Requires(c.cluster)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 10}).
 		Complete(reconcile.AsReconciler(m.GetClient(), c))
 }

@@ -27,48 +27,15 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"sigs.k8s.io/karpenter/pkg/cluster"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 )
-
-// podSchedulingFields are the fields Karpenter decides about a pod as it schedules it, keyed by its namespaced name.
-// Each time is set once, the first time; they go with the pod when it's deleted or has started.
-type podSchedulingFields struct {
-	// AckedAt is when the provisioner first saw the pod as pending.
-	AckedAt time.Time
-	// DecidedAt is when the provisioner first decided whether the pod could schedule.
-	DecidedAt time.Time
-	// SchedulableAt is when a scheduling simulation first fit the pod to a node, until one fails it.
-	SchedulableAt time.Time
-	// NodeClaim is the NodeClaim the most recent scheduling simulation placed the pod on.
-	NodeClaim string
-}
-
-// podOnNodeClaim is a pod's contribution to the NodeClaim it was simulated to schedule against: the pod's key.
-type podOnNodeClaim struct{ pod types.NamespacedName }
-
-func (p podOnNodeClaim) Update(pods map[types.NamespacedName]struct{}, prev podOnNodeClaim) map[types.NamespacedName]struct{} {
-	pods = maps.Clone(pods)
-	if pods == nil {
-		pods = map[types.NamespacedName]struct{}{}
-	}
-	if prev != (podOnNodeClaim{}) {
-		delete(pods, prev.pod)
-	}
-	pods[p.pod] = struct{}{}
-	return pods
-}
-
-func (p podOnNodeClaim) Delete(pods map[types.NamespacedName]struct{}) map[types.NamespacedName]struct{} {
-	pods = maps.Clone(pods)
-	delete(pods, p.pod)
-	return lo.Ternary(len(pods) == 0, nil, pods)
-}
 
 // AckPods marks the pod as acknowledged for scheduling from the provisioner. This is only done once per-pod.
 func (c *Cluster) AckPods(pods ...*corev1.Pod) {
 	now := c.clock.Now()
 	for _, pod := range pods {
-		c.podScheduling.Update(client.ObjectKeyFromObject(pod), func(f podSchedulingFields) podSchedulingFields {
+		c.PodSchedulingStore.Update(client.ObjectKeyFromObject(pod), func(f cluster.PodSchedulingFields) cluster.PodSchedulingFields {
 			f.AckedAt = lo.Ternary(f.AckedAt.IsZero(), now, f.AckedAt)
 			return f
 		})
@@ -77,7 +44,7 @@ func (c *Cluster) AckPods(pods ...*corev1.Pod) {
 
 // PodAckTime will return the time the pod was first seen in our cache.
 func (c *Cluster) PodAckTime(podKey types.NamespacedName) time.Time {
-	f, _ := c.podScheduling.Get(podKey)
+	f, _ := c.PodSchedulingStore.Get(podKey)
 	return f.AckedAt
 }
 
@@ -87,7 +54,7 @@ func (c *Cluster) PodAckTime(podKey types.NamespacedName) time.Time {
 func (c *Cluster) MarkPodSchedulingDecisions(_ context.Context, podErrors map[*corev1.Pod]error, npPods map[string][]*corev1.Pod, ncPods map[string][]*corev1.Pod) {
 	now := c.clock.Now()
 	for pod := range podErrors {
-		c.markPodSchedulingDecision(client.ObjectKeyFromObject(pod), now, func(f podSchedulingFields) podSchedulingFields {
+		c.markPodSchedulingDecision(client.ObjectKeyFromObject(pod), now, func(f cluster.PodSchedulingFields) cluster.PodSchedulingFields {
 			f.SchedulableAt, f.NodeClaim = time.Time{}, ""
 			return f
 		})
@@ -101,7 +68,7 @@ func (c *Cluster) MarkPodSchedulingDecisions(_ context.Context, podErrors map[*c
 			if podutils.IsScheduled(p) {
 				continue
 			}
-			c.markPodSchedulingDecision(client.ObjectKeyFromObject(p), now, func(f podSchedulingFields) podSchedulingFields {
+			c.markPodSchedulingDecision(client.ObjectKeyFromObject(p), now, func(f cluster.PodSchedulingFields) cluster.PodSchedulingFields {
 				f.SchedulableAt = lo.Ternary(f.SchedulableAt.IsZero(), now, f.SchedulableAt)
 				return f
 			})
@@ -112,10 +79,10 @@ func (c *Cluster) MarkPodSchedulingDecisions(_ context.Context, podErrors map[*c
 
 // markPodSchedulingDecision applies the decision to the pod's fields, records now as when the pod was first decided
 // on, and observes the decision latency from the pod's ack the first time.
-func (c *Cluster) markPodSchedulingDecision(podKey types.NamespacedName, now time.Time, decide func(podSchedulingFields) podSchedulingFields) {
+func (c *Cluster) markPodSchedulingDecision(podKey types.NamespacedName, now time.Time, decide func(cluster.PodSchedulingFields) cluster.PodSchedulingFields) {
 	var first bool
 	var ackedAt time.Time
-	c.podScheduling.Update(podKey, func(f podSchedulingFields) podSchedulingFields {
+	c.PodSchedulingStore.Update(podKey, func(f cluster.PodSchedulingFields) cluster.PodSchedulingFields {
 		f = decide(f)
 		if first = f.DecidedAt.IsZero(); first {
 			f.DecidedAt = now
@@ -132,7 +99,7 @@ func (c *Cluster) markPodSchedulingDecision(podKey types.NamespacedName, now tim
 func (c *Cluster) UpdatePodToNodeClaimMapping(ncPods map[string][]*corev1.Pod) {
 	for ncName, pods := range ncPods {
 		for _, p := range pods {
-			c.podScheduling.Update(client.ObjectKeyFromObject(p), func(f podSchedulingFields) podSchedulingFields {
+			c.PodSchedulingStore.Update(client.ObjectKeyFromObject(p), func(f cluster.PodSchedulingFields) cluster.PodSchedulingFields {
 				f.NodeClaim = ncName
 				return f
 			})
@@ -143,31 +110,31 @@ func (c *Cluster) UpdatePodToNodeClaimMapping(ncPods map[string][]*corev1.Pod) {
 // PodSchedulingDecisionTime returns when Karpenter first decided if a pod could schedule a pod in scheduling simulations.
 // This returns 0, false if Karpenter never made a decision on the pod.
 func (c *Cluster) PodSchedulingDecisionTime(podKey types.NamespacedName) time.Time {
-	f, _ := c.podScheduling.Get(podKey)
+	f, _ := c.PodSchedulingStore.Get(podKey)
 	return f.DecidedAt
 }
 
 // PodSchedulingSuccessTime returns when Karpenter first thought it could schedule a pod in its scheduling simulation.
 // This returns 0, false if the pod was never considered in scheduling as a pending pod.
 func (c *Cluster) PodSchedulingSuccessTime(podKey types.NamespacedName) time.Time {
-	f, _ := c.podScheduling.Get(podKey)
+	f, _ := c.PodSchedulingStore.Get(podKey)
 	return f.SchedulableAt
 }
 
 // PodNodeClaimMapping returns the nodeClaim against which the pod is simulated to get scheduled
 func (c *Cluster) PodNodeClaimMapping(podKey types.NamespacedName) string {
-	f, _ := c.podScheduling.Get(podKey)
+	f, _ := c.PodSchedulingStore.Get(podKey)
 	return f.NodeClaim
 }
 
 // PodsMappedToNodeClaim returns the keys of the pods that were simulated to schedule against the given nodeClaim
 // during the most recent scheduling decision for each pod
 func (c *Cluster) PodsMappedToNodeClaim(nodeClaimName string) []types.NamespacedName {
-	pods, _ := c.nodeClaimPods.Get(nodeClaimName)
+	pods, _ := c.NodeClaimPodsStore.Get(nodeClaimName)
 	return slices.Collect(maps.Keys(pods))
 }
 
 // ClearPodSchedulingMappings drops what Karpenter decided about the pod as it scheduled it.
 func (c *Cluster) ClearPodSchedulingMappings(podKey types.NamespacedName) {
-	c.podScheduling.Update(podKey, func(podSchedulingFields) podSchedulingFields { return podSchedulingFields{} })
+	c.PodSchedulingStore.Update(podKey, func(cluster.PodSchedulingFields) cluster.PodSchedulingFields { return cluster.PodSchedulingFields{} })
 }

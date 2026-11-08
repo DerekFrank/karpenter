@@ -40,6 +40,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 )
 
@@ -80,6 +81,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		WatchesRawSource(singleton.Source()).
+		WatchesRawSource(karpenterstate.Requires(c.cluster)).
 		Complete(singleton.AsReconciler(c))
 }
 
@@ -91,10 +93,6 @@ func (c *Controller) Name() string {
 // Queue to drain.
 func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
-
-	if !c.cluster.Synced(ctx) {
-		return reconciler.Result{RequeueAfter: time.Second}, nil
-	}
 
 	// Assigned only after enqueueing succeeds, so a mid-reconcile error retries
 	// against the same state. Do not hoist the assignment up here.

@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -67,12 +68,12 @@ func (f *failingClient) Create(ctx context.Context, obj client.Object, opts ...c
 var (
 	ctx                      context.Context
 	cluster                  *state.Cluster
-	nodeController           *informer.NodeController
+	nodeController           reconcile.Reconciler
 	daemonsetController      *informer.DaemonSetController
 	cloudProvider            *fake.CloudProvider
 	controller               *static.Controller
 	env                      *test.Environment
-	nodeClaimStateController *informer.NodeClaimController
+	nodeClaimStateController reconcile.Reconciler
 	prov                     *provisioning.Provisioner
 	clusterCost              *cost.ClusterCost
 )
@@ -90,11 +91,11 @@ var _ = BeforeSuite(func() {
 	virtualPodCache := virtualpods.NewVirtualPodCache(env.Client)
 	prov = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(env.Client), virtualPodCache, nil)
 	clusterCost = cost.NewClusterCost(ctx, cloudProvider, env.Client)
-	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider)
-	nodeController = informer.NewNodeController(env.Client, cluster)
+	cluster = state.NewCluster(env.Clock, env.Client, karpentercluster.NewNodeState(ctx, env.Clock, nil, nil, cloudProvider, nil))
+	nodeController = NodeInformer(env.Client, cluster, informer.NewNodeController(env.Client, cluster))
 	daemonsetController = informer.NewDaemonSetController(env.Client, cluster)
 	controller = static.NewController(env.Client, cluster, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, prov, env.Clock, deviceallocation.NewController(env.Client), virtualPodCache)
-	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
+	nodeClaimStateController = NodeClaimInformer(env.Client, cluster, informer.NewNodeClaimController(env.Client, cloudProvider, clusterCost))
 })
 
 var _ = BeforeEach(func() {
@@ -555,7 +556,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 				ExpectStateNodePoolCount(cluster, nodePool.Name, 10, 0, 0)
 			}, 5*time.Second)
 		})
-		It("should wait for cluster to be synced and not over provision", func() {
+		It("should not over provision across many reconciles", func() {
 			nodePool := test.StaticNodePool()
 			nodePool.Spec.Limits = v1.Limits{
 				corev1.ResourceName("nodes"): resource.MustParse("10"),
@@ -567,9 +568,6 @@ var _ = Describe("Static Provisioning Controller", func() {
 			n := 50
 			lo.ForEach(lo.Range(n), func(i int, _ int) {
 				defer GinkgoRecover()
-				if i%4 == 0 {
-					cluster.SetSynced(false)
-				}
 				ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 
 				// we should never observe > limit NodeClaims.
@@ -577,9 +575,6 @@ var _ = Describe("Static Provisioning Controller", func() {
 				Expect(env.Client.List(ctx, &list)).To(Succeed())
 				Expect(len(list.Items)).To(BeNumerically("<=", 10))
 			})
-
-			// Ensure cluster is synced before final reconcile to allow it to create remaining NodeClaims
-			cluster.SetSynced(true)
 
 			Eventually(func() {
 				ExpectObjectReconciled(ctx, env.Client, controller, nodePool)

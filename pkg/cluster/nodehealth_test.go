@@ -32,6 +32,7 @@ import (
 	"k8s.io/utils/clock"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/state/statetest"
 	"sigs.k8s.io/karpenter/pkg/test"
@@ -39,7 +40,7 @@ import (
 
 func newNodeHealthCluster(t *testing.T) *NodeState {
 	t.Helper()
-	return NewNodeState(options.ToContext(context.Background(), test.Options()), clock.RealClock{}, testMatcher(t))
+	return NewNodeState(options.ToContext(context.Background(), test.Options()), clock.RealClock{}, nil, nil, fake.NewCloudProvider(), testMatcher(t))
 }
 
 // healthNode is a Node cluster state tracks, labeled with nodePool unless it's empty.
@@ -77,6 +78,7 @@ func TestNodeHealthCountsNodesPerNodePoolAndAcrossTheCluster(t *testing.T) {
 	// A NodeClaim without a Node isn't a node yet.
 	c.NodeClaimStore.Observe(&v1.NodeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: "launching", UID: "launching", Labels: map[string]string{v1.NodePoolLabelKey: "a"}},
+		Spec:       v1.NodeClaimSpec{NodeClassRef: test.NodeClaim().Spec.NodeClassRef},
 		Status:     v1.NodeClaimStatus{ProviderID: "fake://launching"},
 	})
 

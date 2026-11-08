@@ -43,9 +43,11 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	fakecp "sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/test"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 )
 
@@ -85,6 +87,7 @@ func newFixture(numNodes, podsPerNode int) *fixture {
 		capacity := corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("16"), corev1.ResourceMemory: resource.MustParse("64Gi"), corev1.ResourcePods: resource.MustParse("110")}
 		nc := &v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("nc-%d", i), UID: types.UID(fmt.Sprintf("nc-uid-%d", i)), Labels: labels},
+			Spec:       v1.NodeClaimSpec{NodeClassRef: test.NodeClaim().Spec.NodeClassRef},
 			Status:     v1.NodeClaimStatus{ProviderID: providerID, NodeName: fmt.Sprintf("node-%d", i), Capacity: capacity, Allocatable: capacity},
 		}
 		nc.StatusConditions().SetTrue(v1.ConditionTypeLaunched)
@@ -115,7 +118,8 @@ func newFixture(numNodes, podsPerNode int) *fixture {
 		}
 		f.pods = append(f.pods, pods)
 	}
-	f.cluster = state.NewCluster(compareContext(), clock.NewFakeClock(time.Now()), f.cache, fakecp.NewCloudProvider())
+	clk := clock.NewFakeClock(time.Now())
+	f.cluster = state.NewCluster(clk, f.cache, karpentercluster.NewNodeState(compareContext(), clk, nil, nil, fakecp.NewCloudProvider(), nil))
 	return f
 }
 
@@ -203,16 +207,12 @@ func (c *cacheClient) List(ctx context.Context, list client.ObjectList, opts ...
 	return nil
 }
 
-func (f *fixture) ingest(ctx context.Context, tb testing.TB) {
+func (f *fixture) ingest() {
 	for i := range f.nodes {
 		f.cluster.UpdateNodeClaim(f.nodeClaims[i])
-		if err := f.cluster.UpdateNode(ctx, f.nodes[i]); err != nil {
-			tb.Fatal(err)
-		}
+		f.cluster.NodeStore.Observe(f.nodes[i])
 		for _, pod := range f.pods[i] {
-			if err := f.cluster.UpdatePod(ctx, pod); err != nil {
-				tb.Fatal(err)
-			}
+			f.cluster.PodStore.Observe(pod)
 		}
 	}
 }
@@ -220,14 +220,13 @@ func (f *fixture) ingest(ctx context.Context, tb testing.TB) {
 // BenchmarkClusterIngest feeds every NodeClaim, Node and pod to cluster state and takes the first snapshot, which is
 // when cluster state is ready to schedule against.
 func BenchmarkClusterIngest(b *testing.B) {
-	ctx := compareContext()
 	for _, n := range []int{1000, 5000} {
 		b.Run(fmt.Sprintf("nodes=%d/pods=30", n), func(b *testing.B) {
 			for range b.N {
 				b.StopTimer()
 				f := newFixture(n, 30)
 				b.StartTimer()
-				f.ingest(ctx, b)
+				f.ingest()
 				_ = f.cluster.DeepCopyNodes()
 			}
 			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(n*31)/1e3, "µs/event")
@@ -236,35 +235,29 @@ func BenchmarkClusterIngest(b *testing.B) {
 }
 
 func BenchmarkClusterNodeUpdate(b *testing.B) {
-	ctx := compareContext()
 	f := newFixture(1000, 30)
-	f.ingest(ctx, b)
+	f.ingest()
 	b.ResetTimer()
 	for i := range b.N {
 		node := f.nodes[i%len(f.nodes)].DeepCopy()
 		node.Status.Conditions[0].LastHeartbeatTime = metav1.NewTime(time.Unix(int64(i), 0))
 		f.version(node)
-		if err := f.cluster.UpdateNode(ctx, node); err != nil {
-			b.Fatal(err)
-		}
+		f.cluster.NodeStore.Observe(node)
 	}
 }
 
 func BenchmarkClusterPodChurn(b *testing.B) {
-	ctx := compareContext()
 	f := newFixture(1000, 30)
-	f.ingest(ctx, b)
+	f.ingest()
 	b.ResetTimer()
 	for i := range b.N {
 		pod := f.pods[i%len(f.pods)][i%30]
 		f.cache.remove(pod)
-		f.cluster.DeletePod(client.ObjectKeyFromObject(pod))
+		f.cluster.PodStore.Forget(pod)
 		next := pod.DeepCopy()
 		f.version(next)
 		f.cache.put(next)
-		if err := f.cluster.UpdatePod(ctx, next); err != nil {
-			b.Fatal(err)
-		}
+		f.cluster.PodStore.Observe(next)
 	}
 }
 
@@ -288,23 +281,20 @@ func resize(pod *corev1.Pod, i int) *corev1.Pod {
 // BenchmarkClusterPodChurnThenSnapshot updates one pod on every node between snapshots: its conditions, which can't
 // change the node's usage, or its requests, which change every node's usage.
 func BenchmarkClusterPodChurnThenSnapshot(b *testing.B) {
-	ctx := compareContext()
 	for _, update := range []struct {
 		name string
 		fn   func(*corev1.Pod, int) *corev1.Pod
 	}{{"conditions", conditionUpdate}, {"resize", resize}} {
 		b.Run(update.name, func(b *testing.B) {
 			f := newFixture(1000, 30)
-			f.ingest(ctx, b)
+			f.ingest()
 			b.ResetTimer()
 			for i := range b.N {
 				for n := range f.pods {
 					pod := update.fn(f.pods[n][i%30], i)
 					f.version(pod)
 					f.cache.put(pod)
-					if err := f.cluster.UpdatePod(ctx, pod); err != nil {
-						b.Fatal(err)
-					}
+					f.cluster.PodStore.Observe(pod)
 				}
 				_ = f.cluster.DeepCopyNodes()
 			}
@@ -333,7 +323,7 @@ func BenchmarkClusterDaemonSetReconcile(b *testing.B) {
 		f.cache.put(pod)
 		f.pods[i] = append(f.pods[i], pod)
 	}
-	f.ingest(ctx, b)
+	f.ingest()
 	controller := informer.NewDaemonSetController(f.cache, f.cluster)
 	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(daemonSet)}
 	b.ReportAllocs()
@@ -350,11 +340,10 @@ func BenchmarkClusterDaemonSetReconcile(b *testing.B) {
 }
 
 func BenchmarkClusterDeepCopyNodes(b *testing.B) {
-	ctx := compareContext()
 	for _, n := range []int{1000, 5000} {
 		b.Run(fmt.Sprintf("nodes=%d/pods=30", n), func(b *testing.B) {
 			f := newFixture(n, 30)
-			f.ingest(ctx, b)
+			f.ingest()
 			_ = f.cluster.DeepCopyNodes()
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -370,9 +359,8 @@ func BenchmarkClusterDeepCopyNodes(b *testing.B) {
 // BenchmarkClusterSnapshotUnderChurn runs a disruption-style reader taking snapshots while writers update pods'
 // conditions, and reports the reader's p99 and the writers' throughput.
 func BenchmarkClusterSnapshotUnderChurn(b *testing.B) {
-	ctx := compareContext()
 	f := newFixture(2000, 30)
-	f.ingest(ctx, b)
+	f.ingest()
 	var stop atomic.Bool
 	var writes atomic.Int64
 	var wg sync.WaitGroup
@@ -382,7 +370,7 @@ func BenchmarkClusterSnapshotUnderChurn(b *testing.B) {
 				pod := conditionUpdate(f.pods[i%len(f.pods)][i%30], i)
 				f.version(pod)
 				f.cache.put(pod)
-				_ = f.cluster.UpdatePod(ctx, pod)
+				f.cluster.PodStore.Observe(pod)
 				writes.Add(1)
 			}
 		})
@@ -409,7 +397,7 @@ func BenchmarkClusterSnapshotUnderChurn(b *testing.B) {
 func TestClusterConcurrentAccess(t *testing.T) {
 	ctx := compareContext()
 	f := newFixture(200, 10)
-	f.ingest(ctx, t)
+	f.ingest()
 	var stop atomic.Bool
 	var wg sync.WaitGroup
 	for w := range 4 {
@@ -419,11 +407,11 @@ func TestClusterConcurrentAccess(t *testing.T) {
 				pod := f.pods[n][i%10].DeepCopy()
 				f.version(pod)
 				f.cache.put(pod)
-				_ = f.cluster.UpdatePod(ctx, pod)
+				f.cluster.PodStore.Observe(pod)
 				node := f.nodes[n].DeepCopy()
 				node.Labels["churn"] = strconv.Itoa(i)
 				f.version(node)
-				_ = f.cluster.UpdateNode(ctx, node)
+				f.cluster.NodeStore.Observe(node)
 				nc := f.nodeClaims[n].DeepCopy()
 				f.version(nc)
 				f.cluster.UpdateNodeClaim(nc)
@@ -467,15 +455,12 @@ func TestClusterConcurrentAccess(t *testing.T) {
 // when the pod informer is ahead of the node informer, and checks the node's usage once the node arrives without the
 // pods being reconciled again.
 func TestClusterCountsPodsBoundBeforeTheirNode(t *testing.T) {
-	ctx := compareContext()
 	f := newFixture(1, 10)
 	for _, pod := range f.pods[0] {
-		_ = f.cluster.UpdatePod(ctx, pod)
+		f.cluster.PodStore.Observe(pod)
 	}
 	f.cluster.UpdateNodeClaim(f.nodeClaims[0])
-	if err := f.cluster.UpdateNode(ctx, f.nodes[0]); err != nil {
-		t.Fatal(err)
-	}
+	f.cluster.NodeStore.Observe(f.nodes[0])
 	nodes := f.cluster.DeepCopyNodes()
 	requests := nodes[0].PodRequests()
 	if got := requests.Cpu(); got.Cmp(resource.MustParse("1")) != 0 {
@@ -483,36 +468,11 @@ func TestClusterCountsPodsBoundBeforeTheirNode(t *testing.T) {
 	}
 }
 
-// TestClusterForgetsPodsDeletedBeforeTheirEvent deletes a pod the cache held when cluster state last computed its
-// node's usage, but that cluster state never reconciled, and checks the node's usage after the delete.
-func TestClusterForgetsPodsDeletedBeforeTheirEvent(t *testing.T) {
-	ctx := compareContext()
-	f := newFixture(1, 10)
-	f.ingest(ctx, t)
-	extra := f.pods[0][0].DeepCopy()
-	extra.Name, extra.UID = "extra", "extra-uid"
-	f.version(extra)
-	f.cache.put(extra)
-	node := f.nodes[0].DeepCopy()
-	f.version(node)
-	if err := f.cluster.UpdateNode(ctx, node); err != nil {
-		t.Fatal(err)
-	}
-	_ = f.cluster.DeepCopyNodes()
-	f.cache.remove(extra)
-	f.cluster.DeletePod(client.ObjectKeyFromObject(extra))
-	requests := f.cluster.DeepCopyNodes()[0].PodRequests()
-	if got := requests.Cpu(); got.Cmp(resource.MustParse("1")) != 0 {
-		t.Fatalf("pod cpu requests = %s after the extra pod's delete, want 1 (10 pods of 100m)", got.String())
-	}
-}
-
 // TestClusterTracksConditionUpdatesAndResizes updates a pod's conditions, which don't change its node's usage, and
 // then resizes it in place, which does, and checks the node's usage after each.
 func TestClusterTracksConditionUpdatesAndResizes(t *testing.T) {
-	ctx := compareContext()
 	f := newFixture(1, 10)
-	f.ingest(ctx, t)
+	f.ingest()
 	cpu := func() resource.Quantity {
 		requests := f.cluster.DeepCopyNodes()[0].PodRequests()
 		return *requests.Cpu()
@@ -521,9 +481,7 @@ func TestClusterTracksConditionUpdatesAndResizes(t *testing.T) {
 	ready := conditionUpdate(f.pods[0][0], 1)
 	f.version(ready)
 	f.cache.put(ready)
-	if err := f.cluster.UpdatePod(ctx, ready); err != nil {
-		t.Fatal(err)
-	}
+	f.cluster.PodStore.Observe(ready)
 	if got := cpu(); got.Cmp(resource.MustParse("1")) != 0 {
 		t.Fatalf("pod cpu requests = %s after a condition update, want 1", got.String())
 	}
@@ -531,9 +489,7 @@ func TestClusterTracksConditionUpdatesAndResizes(t *testing.T) {
 	resized := resize(ready, 1)
 	f.version(resized)
 	f.cache.put(resized)
-	if err := f.cluster.UpdatePod(ctx, resized); err != nil {
-		t.Fatal(err)
-	}
+	f.cluster.PodStore.Observe(resized)
 	if got := cpu(); got.Cmp(resource.MustParse("1100m")) != 0 {
 		t.Fatalf("pod cpu requests = %s after a resize to 200m, want 1100m", got.String())
 	}
@@ -541,9 +497,8 @@ func TestClusterTracksConditionUpdatesAndResizes(t *testing.T) {
 
 // TestClusterKeepsDisruptionCostAcrossNodeClaimUpdates checks the node's disruption cost after its NodeClaim changes.
 func TestClusterKeepsDisruptionCostAcrossNodeClaimUpdates(t *testing.T) {
-	ctx := compareContext()
 	f := newFixture(1, 10)
-	f.ingest(ctx, t)
+	f.ingest()
 	before := f.cluster.DeepCopyNodes()[0].DisruptionCost()
 	nc := f.nodeClaims[0].DeepCopy()
 	nc.Labels["updated"] = "true"
@@ -557,9 +512,8 @@ func TestClusterKeepsDisruptionCostAcrossNodeClaimUpdates(t *testing.T) {
 // TestClusterSnapshotsAreConsistentAcrossNodes moves pods between nodes while a reader sums the pods' requests across
 // a snapshot of every node, and counts the snapshots whose total isn't the constant total.
 func TestClusterSnapshotsAreConsistentAcrossNodes(t *testing.T) {
-	ctx := compareContext()
 	f := newFixture(50, 10)
-	f.ingest(ctx, t)
+	f.ingest()
 	want := resource.MustParse("50")
 	var stop atomic.Bool
 	var wg sync.WaitGroup
@@ -569,7 +523,7 @@ func TestClusterSnapshotsAreConsistentAcrossNodes(t *testing.T) {
 			pod.Spec.NodeName = f.nodes[(i+1)%50].Name
 			f.version(pod)
 			f.cache.put(pod)
-			_ = f.cluster.UpdatePod(ctx, pod)
+			f.cluster.PodStore.Observe(pod)
 		}
 	})
 	torn, total := 0, 0

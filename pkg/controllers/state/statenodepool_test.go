@@ -26,7 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -158,7 +158,7 @@ var _ = Describe("NodePoolState", func() {
 			bound[0].Bind(nodeClaim.Name)
 			Expect(cluster.NodePoolState.ReserveNodeCount(np.Name, 2, 1)).To(BeEmpty())
 
-			env.Clock.Step(state.ReservationTTL)
+			env.Clock.Step(karpentercluster.ReservationTTL)
 			Expect(cluster.NodePoolState.ReserveNodeCount(np.Name, 2, 2)).To(HaveLen(2))
 		})
 

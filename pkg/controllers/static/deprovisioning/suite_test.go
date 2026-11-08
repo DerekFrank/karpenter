@@ -31,10 +31,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	static "sigs.k8s.io/karpenter/pkg/controllers/static/deprovisioning"
@@ -49,12 +51,12 @@ import (
 var (
 	ctx                      context.Context
 	cluster                  *state.Cluster
-	nodeController           *informer.NodeController
+	nodeController           reconcile.Reconciler
 	daemonsetController      *informer.DaemonSetController
 	cloudProvider            *fake.CloudProvider
 	controller               *static.Controller
 	env                      *test.Environment
-	nodeClaimStateController *informer.NodeClaimController
+	nodeClaimStateController reconcile.Reconciler
 	clusterCost              *cost.ClusterCost
 	recorder                 *test.EventRecorder
 )
@@ -81,12 +83,12 @@ var _ = BeforeSuite(func() {
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
 	clusterCost = cost.NewClusterCost(ctx, cloudProvider, env.Client)
-	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider)
-	nodeController = informer.NewNodeController(env.Client, cluster)
+	cluster = state.NewCluster(env.Clock, env.Client, karpentercluster.NewNodeState(ctx, env.Clock, nil, nil, cloudProvider, nil))
+	nodeController = NodeInformer(env.Client, cluster, informer.NewNodeController(env.Client, cluster))
 	daemonsetController = informer.NewDaemonSetController(env.Client, cluster)
 	recorder = test.NewEventRecorder()
 	controller = static.NewController(env.Client, cluster, cloudProvider, env.Clock, recorder)
-	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
+	nodeClaimStateController = NodeClaimInformer(env.Client, cluster, informer.NewNodeClaimController(env.Client, cloudProvider, clusterCost))
 })
 
 var _ = BeforeEach(func() {

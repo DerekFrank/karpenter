@@ -26,6 +26,7 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
@@ -41,8 +42,8 @@ import (
 
 // newNodeStore returns the Node store: the Nodes by name. A Node is cluster-scoped, so its name is its key, whatever
 // namespace an object built outside the API server carries.
-func newNodeStore() *state.Store[string, *corev1.Node] {
-	return state.NewJoinStore(nil, nil, state.Join(func(node *corev1.Node) string { return node.Name },
+func newNodeStore(kubeClient client.Client, informers cache.Informers) *state.Store[string, *corev1.Node] {
+	return state.NewJoinStore(kubeClient, informers, state.Join(func(node *corev1.Node) string { return node.Name },
 		func(_ *corev1.Node, node *corev1.Node) *corev1.Node { return node }))
 }
 

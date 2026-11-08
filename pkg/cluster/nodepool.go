@@ -65,7 +65,7 @@ func NewNodePools(kubeClient client.Reader, usage *NodePoolUsage) *NodePools {
 // NodePoolUsage keeps NodePoolDerived.Usage from the NodePools' NodeClaims.
 type NodePoolUsage struct {
 	store *state.Store[string, NodePoolDerived]
-	// NodeClaims holds the NodeClaims the usage is derived from. It must run as a manager runnable.
+	// NodeClaims holds the NodeClaims the usage is derived from. State.Register starts it.
 	NodeClaims *state.Store[types.NamespacedName, *v1.NodeClaim]
 }
 

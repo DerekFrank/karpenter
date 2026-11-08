@@ -178,7 +178,7 @@ func buildScenario(tb testing.TB, s Scenario) *ScenarioFixture {
 	cp.InstanceTypes = instanceTypes
 	c := fakecr.NewFakeClient()
 	clk := &clock.RealClock{}
-	cl := state.NewCluster(ctx, clk, c, cp)
+	cl := state.NewCluster(clk, c, karpentercluster.NewNodeState(ctx, clk, nil, nil, cp, nil))
 
 	nodePools := benchNodePools(s.NodePools)
 	itsByNP := map[string][]*cloudprovider.InstanceType{}

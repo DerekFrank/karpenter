@@ -25,10 +25,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/metrics/node"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
@@ -44,8 +46,8 @@ import (
 var ctx context.Context
 var env *test.Environment
 var cluster *state.Cluster
-var nodeController *informer.NodeController
-var nodeClaimController *informer.NodeClaimController
+var nodeController reconcile.Reconciler
+var nodeClaimController reconcile.Reconciler
 var metricsStateController *node.Controller
 var cloudProvider *fake.CloudProvider
 
@@ -61,10 +63,10 @@ var _ = BeforeSuite(func() {
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
 	cloudProvider.InstanceTypes = fake.InstanceTypesAssorted()
-	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider)
+	cluster = state.NewCluster(env.Clock, env.Client, karpentercluster.NewNodeState(ctx, env.Clock, nil, nil, cloudProvider, nil))
 	clusterCost := cost.NewClusterCost(ctx, cloudProvider, env.Client)
-	nodeController = informer.NewNodeController(env.Client, cluster)
-	nodeClaimController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
+	nodeController = NodeInformer(env.Client, cluster, informer.NewNodeController(env.Client, cluster))
+	nodeClaimController = NodeClaimInformer(env.Client, cluster, informer.NewNodeClaimController(env.Client, cloudProvider, clusterCost))
 	metricsStateController = node.NewController(cluster.NodeState)
 })
 

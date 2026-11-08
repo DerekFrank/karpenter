@@ -103,6 +103,9 @@ func WithRegistrationHook(hook cloudprovider.NodeLifecycleHook) option.Function[
 	}
 }
 
+// NewControllers returns Karpenter's controllers, which read the cluster's state from s, and from clusterState, the
+// façade over s.Nodes. The caller builds s with cluster.New and starts its stores with s.Register.
+//
 //nolint:gocyclo
 func NewControllers(
 	ctx context.Context,
@@ -112,6 +115,7 @@ func NewControllers(
 	recorder events.Recorder,
 	cloudProvider cloudprovider.CloudProvider,
 	overlayUndecoratedCloudProvider cloudprovider.CloudProvider,
+	s cluster.State,
 	clusterState *state.Cluster,
 	instanceTypeStore *nodeoverlay.InstanceTypeStore,
 	predictionStore *prediction.Store,
@@ -125,7 +129,6 @@ func NewControllers(
 	disruptionQueue := disruption.NewQueue(kubeClient, recorder, clusterState, clock, p)
 	npState := nodepoolhealth.NewState()
 	clusterCost := cost.NewClusterCost(ctx, cloudProvider, kubeClient)
-	s := cluster.New(kubeClient, mgr.GetCache())
 	controllers := []controller.Controller{
 		p, evictionQueue, disruptionQueue,
 		disruption.NewController(ctx, clock, kubeClient, p, cloudProvider, recorder, clusterState, disruptionQueue, clusterCost),
@@ -138,7 +141,7 @@ func NewControllers(
 		informer.NewPodController(kubeClient, clusterState),
 		informer.NewPersistentVolumeClaimController(kubeClient, clusterState),
 		informer.NewNodePoolController(kubeClient, cloudProvider, clusterState, clusterCost),
-		informer.NewNodeClaimController(kubeClient, cloudProvider, clusterState, clusterCost),
+		informer.NewNodeClaimController(kubeClient, cloudProvider, clusterCost),
 		informer.NewPricingController(kubeClient, cloudProvider, clusterCost),
 		statenodeclaimgc.NewController(kubeClient, clusterState),
 		termination.NewController(clock, kubeClient, cloudProvider, terminator.NewTerminator(clock, kubeClient, evictionQueue, recorder), recorder),

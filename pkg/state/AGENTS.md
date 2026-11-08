@@ -30,21 +30,25 @@ other decisions count meanwhile, is intent, kept as a claim. See
   `nodepool.go`, and the stores of its derived fields, such as
   `cluster.NodePoolUsage`.
 - **`cluster.State`** holds every accessor and the stores behind them.
-  `cluster.New` builds it once, in `pkg/controllers/controllers.go`. Each
-  controller's constructor takes the accessors it reads, as
-  `nodepoolcounter.NewController` takes `s.NodePools` and `s.NodePoolUsage`.
+  `cluster.New` builds it once, where the operator is wired (`kwok/main.go`),
+  and passes it to `controllers.NewControllers`. Each controller's constructor
+  takes the accessors it reads, as `nodepoolcounter.NewController` takes
+  `s.NodePools` and `s.NodePoolUsage`. See [Startup](#startup).
 - **`cluster.NodeState`** holds the stores behind the nodes Karpenter
   schedules onto and disrupts, NodeClaim first: each NodeClaim with the intent
   kept about its node and the Node its owner reference links, by name
   (`nodeclaim.go`); each Node, by name, and the providerID link from a
   NodeClaim to its Node before registration (`node.go`); and the pods bound to
-  each Node. A `cluster.StateNode` is a view built from them at read time.
+  each Node. Its NodeClaim, Node and pod stores follow the informers. A
+  `cluster.StateNode` is a view built from them at read time.
 - **`pkg/controllers/state`** holds `state.Cluster`, a façade over
-  `cluster.NodeState` that the cluster state informers feed, with the sync
-  check, the pod scheduling telemetry and the consolidation state.
+  `cluster.NodeState`, with the wait on unlaunched NodeClaims, the pod
+  scheduling telemetry and the consolidation state. Its informer controllers
+  keep only what takes I/O to read: CSINode drivers, PVC drivers and cost.
 - **Imports point one way:** controllers import `pkg/cluster`, which imports
   `pkg/state`. depguard (`.golangci.yaml`, rules `state` and `cluster`) enforces
-  it.
+  it. `hack/storelint`, run by `make verify`, checks where stores are built
+  and started: see [Startup](#startup).
 
 ## Stores
 
@@ -67,6 +71,11 @@ three kinds, and each is the source of the next:
   scheme), then follows the informer and the `overlay.Client`'s writes. The
   overlay calls its write handlers before a write returns, so the store holds a
   write as soon as it returns.
+- **A store following an informer holds the informer's own objects.** A copy
+  from the first List or a write holds an object's version only until the
+  informer delivers its own object for it, so the store adds no copy to the
+  informer's cache. A caller that feeds a store passes the cache's objects
+  (`client.UnsafeDisableDeepCopy`), never a deep copy.
 - **Without a kubeClient, a caller feeds it.** `Observe(obj)` applies a version
   seen elsewhere, `Forget(obj)` removes the object of `obj`'s kind and name,
   and `state.Resync(store, objs, scope)` makes `objs` the objects among those
@@ -250,6 +259,42 @@ controllerruntime.NewControllerManagedBy(m).
   changes for `delay`, for a watcher such as metrics.
 - **The source wakes the controller; the reconcile reads the fields** through
   the accessor.
+
+## Startup
+
+```go
+s := cluster.New(ctx, clk, kubeClient, mgr.GetCache(), cloudProvider)
+lo.Must0(s.Register(mgr))
+op.WithControllers(ctx, controllers.NewControllers(ctx, mgr, ..., s, ...)...).Start(ctx)
+```
+
+1. **`cluster.New` builds the shared stores** and does nothing else.
+2. **`s.Register(mgr)` starts them**: it adds every shared object and join
+   store as a manager runnable, exactly once. A controller never adds a shared
+   store; it adds only the stores it builds itself.
+3. **Each controller's `Register` builds its local stores**: its local
+   `Derive`s, held in typed fields of the controller, and the sources and
+   `Requires` it reads. There is no registry and no lookup by name.
+4. **`mgr.Start` syncs the cache, then starts the stores and controllers
+   together.** `WaitForSync` orders them, not runnable groups: each store lists
+   and marks itself synced, and each controller's workers wait on its sources
+   and `Requires`.
+
+- **Declare a controller's stores with `state.Requires` in `Register`**, never
+  with a `Synced` check in `Reconcile`. A store's sync is one-way and bounded by
+  its first List, so gating the start is enough.
+- **Wait for unbounded conditions in `Reconcile`, and wake on them.** "No
+  NodeClaim is launching" may never hold, so it isn't in `Requires`: the
+  provisioner and disruption check `NodeClaimsLaunched`, and disruption wakes
+  on `cluster.NodeState.UnlaunchedNodeClaimStore`.
+- **`hack/storelint` enforces where stores are built and started.**
+  `state.NewStore`, `NewObjectStore`, `NewJoinStore`, `Join` and `Derive` are
+  called only in a `Register(context.Context, manager.Manager) error` method,
+  in `pkg/cluster`, in `pkg/state` or in a test; and only `cluster.State.Register`
+  adds a shared store, one reached through a `pkg/cluster` value, to a manager.
+- **A suite's cluster state has no informers.** It reconciles the informer
+  stand-ins in `pkg/test/expectations` (`NodeClaimInformer`, `NodeInformer`,
+  `PodInformer`), which show cluster state an object as the informer would.
 
 ## Claims
 

@@ -28,6 +28,7 @@ import (
 	"k8s.io/utils/clock"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/state/statetest"
 	"sigs.k8s.io/karpenter/pkg/test"
@@ -36,10 +37,11 @@ import (
 // TestNodePoolMembersIndexEachNodePoolsNodesAndUnlaunchedNodeClaims checks the index against a scan of every node and
 // NodeClaim as its NodeClaims launch, move between NodePools and go away.
 func TestNodePoolMembersIndexEachNodePoolsNodesAndUnlaunchedNodeClaims(t *testing.T) {
-	s := NewNodeState(options.ToContext(context.Background(), test.Options()), clock.RealClock{}, nil)
+	s := NewNodeState(options.ToContext(context.Background(), test.Options()), clock.RealClock{}, nil, nil, fake.NewCloudProvider(), nil)
 	nodeClaim := func(name, nodePool, providerID, rv string) *v1.NodeClaim {
 		return &v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(name), ResourceVersion: rv, Labels: map[string]string{v1.NodePoolLabelKey: nodePool}},
+			Spec:       v1.NodeClaimSpec{NodeClassRef: test.NodeClaim().Spec.NodeClassRef},
 			Status:     v1.NodeClaimStatus{ProviderID: providerID},
 		}
 	}
