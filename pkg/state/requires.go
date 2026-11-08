@@ -26,20 +26,20 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
-// Syncer is a store, or anything else that reports whether it holds what its sources held when it started.
-type Syncer interface {
+// Synced is a store, or anything else that reports whether it holds what its sources held when it started.
+type Synced interface {
 	Synced() bool
 }
 
 // Requires returns a source that enqueues nothing and holds the controller's workers until every store is synced. A
 // controller that reads stores without watching them declares it in Register, with WatchesRawSource(Requires(...)), so
 // that it never acts on a store that is still filling. The wait counts against the controller's CacheSyncTimeout.
-func Requires(stores ...Syncer) source.SyncingSource {
+func Requires(stores ...Synced) source.SyncingSource {
 	return requires{stores: stores, poll: 10 * time.Millisecond}
 }
 
 type requires struct {
-	stores []Syncer
+	stores []Synced
 	poll   time.Duration
 }
 

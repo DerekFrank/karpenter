@@ -20,7 +20,8 @@ other decisions count meanwhile, is intent, kept as a claim. See
 - **`pkg/state`** holds the primitives, which know no object kinds: `Store`
   (`NewStore`, `NewObjectStore`, `NewJoinStore`, `Join`), `Derive`
   (`Derivation`, `Contribution`, `Equaler`), `Accessor`, `JoinAccessor`,
-  `View` and `Claims`.
+  `View`, `Claims`, and the sources `Store.Source`, `Requires`, `Wake` and
+  `After`.
 - **`pkg/state/statetest`** checks a `Contribution`'s laws in tests.
 - **`pkg/state/overlay`** holds `overlay.Client`, the read-after-write client:
   its reads include its own writes before the informer delivers them.
@@ -214,6 +215,42 @@ kubeClient.Status().Patch(ctx, np.Object, client.MergeFrom(stored))
 - **Write from derived fields once they're synced.** Check `Store.Synced`
   first.
 
+## Reacting to derived fields
+
+A store is a controller-runtime source whose requests are its keys, and an
+accessor is the source of the stores behind it. A controller that watches one
+reconciles an object whenever the object's derived fields change:
+
+```go
+controllerruntime.NewControllerManagedBy(m).
+	For(&v1.NodePool{}, ...).      // the object's own events
+	WatchesRawSource(nodePools).   // its derived fields' changes
+	Complete(c)
+```
+
+- **Watch a store whose keys and fields are exactly what the controller
+  reconciles on.** A store notifies only when a key's fields change, so its
+  fields are its filter and its keys are its requests. When no store fits,
+  `state.Derive` one in the controller's `Register`: keyed by the object the
+  controller reconciles, holding only the fields it acts on, such as the number
+  of pods on each deleting node rather than every pod's usage. It moves to
+  `pkg/cluster` once a second controller reads it.
+- **`store.Source()` is the store as a source**, for a store keyed by name or
+  `types.NamespacedName`. Pass it to `NewAccessor`, or watch it on its own.
+- **`Start` enqueues every key the store holds, then each one that changes.**
+  The workqueue holds a key once, so a burst of changes reconciles the object
+  once, with the fields as they are when it runs.
+- **`WaitForSync` holds the controller's workers until the store is synced.**
+  That is bounded, as controller-runtime's `CacheSyncTimeout` requires.
+- **`state.Requires(stores...)`** holds the workers until the stores are synced
+  and enqueues nothing, for a controller that reads stores it doesn't watch.
+- **`state.Wake(sources...)`** folds every change into one empty request, for a
+  controller that reconciles the whole cluster at once, in place of a
+  singleton's poll. **`state.After(delay, sources...)`** batches each request's
+  changes for `delay`, for a watcher such as metrics.
+- **The source wakes the controller; the reconcile reads the fields** through
+  the accessor.
+
 ## Claims
 
 A claim holds a value against a key for an object a caller is about to create,
@@ -273,6 +310,10 @@ nodeClaim.Reservation = reservations[0]                                         
   as `TestDeriveConcurrentChangesConverge` does.
 - Check each contribution's laws with `statetest.ExpectContribution`.
 - Read through the accessor over a fake client, as `accessor_test.go` does.
+- Start a source on a workqueue and assert on what it queues, as
+  `TestAccessorEnqueuesObjectsWhoseDerivedFieldsChange` and `source_test.go` do.
+  Test a derived store's narrowing as
+  `TestADerivedStoreNotifiesOnlyWhenItsNarrowerFieldsChange` does.
 - Test claims as `claims_test.go` does: race reservers that create and delete
   objects against a recount of what objects count and live claims hold, and
   check that what objects count stays within the limit
