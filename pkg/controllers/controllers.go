@@ -163,7 +163,7 @@ func NewControllers(
 		controllers = append(controllers,
 			metricspod.NewController(kubeClient, clusterState),
 			metricsnodepool.NewController(kubeClient, cloudProvider, clusterCost),
-			metricsnode.NewController(clusterState),
+			metricsnode.NewController(clusterState.NodeState),
 			status.NewController[*v1.NodeClaim](
 				kubeClient,
 				mgr.GetEventRecorderFor("karpenter"), //nolint:staticcheck // SA1019: will be replaced by mgr.GetEventRecorder once operatorpkg is updated

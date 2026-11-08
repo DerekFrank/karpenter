@@ -811,7 +811,7 @@ var _ = Describe("Emptiness", func() {
 
 			// Mark the node as hosting buffer pods
 			cluster.UpdateBufferPodCounts(map[string]int{
-				node.Spec.ProviderID: 3,
+				nodeClaim.Name: 3,
 			})
 
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -828,7 +828,7 @@ var _ = Describe("Emptiness", func() {
 
 			// First: mark node as hosting buffer pods
 			cluster.UpdateBufferPodCounts(map[string]int{
-				node.Spec.ProviderID: 2,
+				nodeClaim.Name: 2,
 			})
 
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -852,7 +852,7 @@ var _ = Describe("Emptiness", func() {
 
 			// Only node1 hosts buffer pods
 			cluster.UpdateBufferPodCounts(map[string]int{
-				node.Spec.ProviderID: 1,
+				nodeClaim.Name: 1,
 			})
 
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -873,7 +873,7 @@ var _ = Describe("Emptiness", func() {
 
 			// Node has both real pods and buffer pods
 			cluster.UpdateBufferPodCounts(map[string]int{
-				node.Spec.ProviderID: 2,
+				nodeClaim.Name: 2,
 			})
 
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -889,8 +889,8 @@ var _ = Describe("Emptiness", func() {
 
 			// Both nodes host buffer pods
 			cluster.UpdateBufferPodCounts(map[string]int{
-				node.Spec.ProviderID:  2,
-				node2.Spec.ProviderID: 3,
+				nodeClaim.Name:  2,
+				nodeClaim2.Name: 3,
 			})
 
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -907,7 +907,7 @@ var _ = Describe("Emptiness", func() {
 
 			// Buffer pods were cleared (count = 0 explicitly)
 			cluster.UpdateBufferPodCounts(map[string]int{
-				node.Spec.ProviderID: 0,
+				nodeClaim.Name: 0,
 			})
 
 			ExpectSingletonReconciled(ctx, disruptionController)

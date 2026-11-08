@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/awslabs/operatorpkg/status"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -36,6 +37,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	fakecp "sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
@@ -43,23 +45,34 @@ import (
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 )
 
-// recountNodePoolStats is the loop over every node that NodePoolStats replaced, kept as the reference the derived
-// counts must match. It differs only in reading a missing Node as not Ready, where the loop read its Ready condition
-// unconditionally; a missing Node only reaches that read when it's rebooting, which counts it as disrupting either way.
-func recountNodePoolStats(nodes []*state.StateNode, reason v1.DisruptionReason) (numNodes, disrupting map[string]int) {
+// recountNodePoolStats recounts what NodePoolStats derives, from every node and every Node: a launched NodeClaim
+// counts once it's initialized or rebooting, until its instance is terminating; it's disrupting while it's marked for
+// deletion, deleting or rebooting; and otherwise it consumes every budget but repair's while the tracked Node whose
+// owner reference names it is missing or isn't Ready.
+//
+//nolint:gocyclo
+func recountNodePoolStats(nodes []*karpentercluster.StateNode, nodeObjects map[string]*corev1.Node, reason v1.DisruptionReason) (numNodes, disrupting map[string]int) {
 	numNodes = map[string]int{}
 	disrupting = map[string]int{}
 	for _, node := range nodes {
-		if !node.Managed() || (!node.Initialized() && !node.RebootInProgress()) {
+		if !node.Managed() || (!node.NodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue() && !node.RebootInProgress()) {
 			continue
 		}
 		if node.NodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() {
 			continue
 		}
-		nodePool := node.Labels()[v1.NodePoolLabelKey]
+		nodePool := node.NodeClaim.Labels[v1.NodePoolLabelKey]
 		numNodes[nodePool]++
-		notReady := node.Node == nil || nodeutils.GetCondition(node.Node, corev1.NodeReady).Status != corev1.ConditionTrue
-		if node.MarkedForDeletion() || node.RebootInProgress() || (notReady && reason != v1.DisruptionReasonUnhealthy) {
+		if node.MarkedForDeletion() || node.RebootInProgress() {
+			disrupting[nodePool]++
+			continue
+		}
+		owned, ok := lo.Find(lo.Values(nodeObjects), func(n *corev1.Node) bool {
+			return karpentercluster.Tracked(n) && lo.ContainsBy(n.OwnerReferences, func(o metav1.OwnerReference) bool {
+				return o.Kind == "NodeClaim" && o.Name == node.NodeClaim.Name
+			})
+		})
+		if reason != v1.DisruptionReasonUnhealthy && (!ok || nodeutils.GetCondition(owned, corev1.NodeReady).Status != corev1.ConditionTrue) {
 			disrupting[nodePool]++
 		}
 	}
@@ -82,6 +95,7 @@ func TestNodePoolStatsMatchARecount(t *testing.T) {
 	var rv uint64
 	nextRV := func() string { rv++; return strconv.FormatUint(rv, 10) }
 	uids := map[string]types.UID{}
+	nodeObjects := map[string]*corev1.Node{}
 	uid := func(kind, name string) types.UID {
 		if _, ok := uids[kind+name]; !ok {
 			uids[kind+name] = types.UID(fmt.Sprintf("%s-%s-%d", kind, name, rv))
@@ -99,10 +113,11 @@ func TestNodePoolStatsMatchARecount(t *testing.T) {
 		case op == 1:
 			c.DeleteNode(name)
 			delete(uids, "node"+name)
+			delete(nodeObjects, name)
 		case op == 2:
-			c.MarkForDeletion(providerID)
+			c.MarkForDeletion(name)
 		case op == 3:
-			c.UnmarkForDeletion(providerID)
+			c.UnmarkForDeletion(name)
 		case op < 7:
 			nc := &v1.NodeClaim{
 				ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid("nc", name), ResourceVersion: nextRV(), Labels: map[string]string{v1.NodePoolLabelKey: nodePool}},
@@ -117,6 +132,9 @@ func TestNodePoolStatsMatchARecount(t *testing.T) {
 			}
 			if r.IntN(6) == 0 {
 				nc.Status.Conditions = append(nc.Status.Conditions, status.Condition{Type: v1.ConditionTypeInstanceTerminating, Status: metav1.ConditionTrue})
+			}
+			if r.IntN(3) != 0 {
+				nc.Status.Conditions = append(nc.Status.Conditions, status.Condition{Type: v1.ConditionTypeInitialized, Status: metav1.ConditionTrue})
 			}
 			c.UpdateNodeClaim(nc)
 		default:
@@ -136,6 +154,10 @@ func TestNodePoolStatsMatchARecount(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid("node", name), ResourceVersion: nextRV(), Labels: labels},
 				Spec:       corev1.NodeSpec{ProviderID: providerID},
 			}
+			// Registration links some Nodes to their NodeClaim by owner reference.
+			if r.IntN(2) == 0 {
+				node.OwnerReferences = []metav1.OwnerReference{{APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: name}}
+			}
 			switch r.IntN(3) {
 			case 0:
 				node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
@@ -149,9 +171,10 @@ func TestNodePoolStatsMatchARecount(t *testing.T) {
 			if err := c.UpdateNode(ctx, node); err != nil {
 				t.Fatalf("updating node, %v", err)
 			}
+			nodeObjects[name] = node
 		}
 		for _, reason := range []v1.DisruptionReason{v1.DisruptionReasonUnderutilized, v1.DisruptionReasonDrifted, v1.DisruptionReasonEmpty, v1.DisruptionReasonUnhealthy} {
-			wantNodes, wantDisrupting := recountNodePoolStats(c.DeepCopyNodes(), reason)
+			wantNodes, wantDisrupting := recountNodePoolStats(c.DeepCopyNodes(), nodeObjects, reason)
 			// NodePool names are never empty, so nodes without the label count toward none.
 			for _, np := range []string{"a", "b"} {
 				if numNodes, disrupting := disruption.NodePoolStats(c, np, reason); numNodes != wantNodes[np] || disrupting != wantDisrupting[np] {
@@ -163,7 +186,7 @@ func TestNodePoolStatsMatchARecount(t *testing.T) {
 }
 
 func TestValidateNodeDisruptableRejectsARebootingNode(t *testing.T) {
-	stateNode := func(rebootStatus metav1.ConditionStatus) *state.StateNode {
+	stateNode := func(rebootStatus metav1.ConditionStatus) *karpentercluster.StateNode {
 		nc := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: "default"}}})
 		n := test.Node(test.NodeOptions{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
 			v1.NodePoolLabelKey:        "default",
@@ -175,7 +198,7 @@ func TestValidateNodeDisruptableRejectsARebootingNode(t *testing.T) {
 		} else {
 			nc.StatusConditions().SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "done")
 		}
-		return &state.StateNode{Node: n, NodeClaim: nc}
+		return &karpentercluster.StateNode{Node: n, NodeClaim: nc}
 	}
 	if err := disruption.ValidateNodeDisruptable(stateNode(metav1.ConditionTrue), clock.RealClock{}); err == nil || !strings.Contains(err.Error(), "node is rebooting") {
 		t.Errorf("ValidateNodeDisruptable on a rebooting node = %v, want an error that the node is rebooting", err)

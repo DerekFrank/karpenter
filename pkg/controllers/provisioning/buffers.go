@@ -193,12 +193,12 @@ func computeProvisioningCondition(cb *autoscalingv1beta1.CapacityBuffer, s *buff
 	return nil
 }
 
-// bufferPodCountsFromResults builds a providerID→count mapping of how many
+// bufferPodCountsFromResults builds a NodeClaim name→count mapping of how many
 // virtual buffer pods were placed on each existing node during this scheduling
-// pass. Used to update cluster state (Cluster.bufferPodCounts) so the emptiness
+// pass. Used to update cluster state (Cluster.UpdateBufferPodCounts) so the emptiness
 // disruption path knows which nodes host buffer capacity.
 //
-// Only ExistingNodes are counted — pods on NewNodeClaims don't have a providerID
+// Only ExistingNodes are counted — NewNodeClaims don't have a name
 // yet, and those nodes are naturally protected from consolidation by the
 // Consolidatable condition timer (which hasn't elapsed on a brand-new node).
 //
@@ -210,11 +210,15 @@ func computeProvisioningCondition(cb *autoscalingv1beta1.CapacityBuffer, s *buff
 func bufferPodCountsFromResults(results scheduler.Results) map[string]int {
 	counts := map[string]int{}
 	for _, existing := range results.ExistingNodes {
+		// Buffer pod counts are intent kept with the NodeClaim; an unmanaged node has none.
+		if existing.NodeClaim == nil {
+			continue
+		}
 		for _, pod := range existing.Pods {
 			if !IsVirtualPod(pod) {
 				continue
 			}
-			counts[existing.ProviderID()]++
+			counts[existing.NodeClaim.Name]++
 		}
 	}
 	return counts

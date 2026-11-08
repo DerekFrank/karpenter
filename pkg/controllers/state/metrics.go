@@ -29,17 +29,6 @@ const (
 )
 
 var (
-	ClusterStateNodesCount = opmetrics.NewPrometheusGauge(
-		crmetrics.Registry,
-		prometheus.GaugeOpts{
-			Namespace: metrics.Namespace,
-			Subsystem: stateSubsystem,
-			Name:      "node_count",
-			Help:      "Current count of nodes in cluster state",
-		},
-		[]opmetrics.Label{},
-		opmetrics.GA,
-	)
 	ClusterStateSynced = opmetrics.NewPrometheusGauge(
 		crmetrics.Registry,
 		prometheus.GaugeOpts{

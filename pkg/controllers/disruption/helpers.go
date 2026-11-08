@@ -41,6 +41,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
@@ -71,14 +72,14 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	candidateNames := sets.NewString(lo.Map(candidates, func(t *Candidate, i int) string { return t.Name() })...)
 	nodes := cluster.DeepCopyNodes()
 	deletingNodes := nodes.Deleting()
-	stateNodes := lo.Filter(nodes.Active(), func(n *state.StateNode, _ int) bool {
+	stateNodes := lo.Filter(nodes.Active(), func(n *karpentercluster.StateNode, _ int) bool {
 		return !candidateNames.Has(n.Name())
 	})
 
 	// We do one final check to ensure that the node that we are attempting to consolidate isn't
 	// already handled for deletion by some other controller. This could happen if the node was markedForDeletion
 	// between returning the candidates and getting the stateNodes above
-	if _, ok := lo.Find(deletingNodes, func(n *state.StateNode) bool {
+	if _, ok := lo.Find(deletingNodes, func(n *karpentercluster.StateNode) bool {
 		return candidateNames.Has(n.Name())
 	}); ok {
 		return scheduling.Results{}, errCandidateDeleting
@@ -291,13 +292,13 @@ func GetCandidatesWithTotals(ctx context.Context, cluster *state.Cluster, kubeCl
 	// We don't want the order in which candidates are evaluated to affect their DisruptionCost.
 	var fixedNowClk clock.Clock = fixedNowClock{Clock: clk, now: clk.Now()}
 	allNodes := cluster.DeepCopyNodes()
-	allCandidates := lo.FilterMap(allNodes, func(n *state.StateNode, _ int) (*Candidate, bool) {
+	allCandidates := lo.FilterMap(allNodes, func(n *karpentercluster.StateNode, _ int) (*Candidate, bool) {
 		cn, e := NewCandidate(ctx, kubeClient, recorder, fixedNowClk, n, pdbs, nodePoolMap, nodePoolToInstanceTypesMap, queue, disruptionClass)
 		return cn, e == nil
 	})
 	// Compute totals using ALL nodes for disruption cost denominator (RFC requirement:
 	// "Non-candidate nodes still contribute to the denominators").
-	nodePoolTotals := computeNodePoolTotals(ctx, allCandidates, []*state.StateNode(allNodes), clusterCost)
+	nodePoolTotals := computeNodePoolTotals(ctx, allCandidates, []*karpentercluster.StateNode(allNodes), clusterCost)
 	filtered := lo.Filter(allCandidates, func(c *Candidate, _ int) bool { return shouldDisrupt(ctx, c) })
 	return filtered, nodePoolTotals, nil
 }
@@ -356,7 +357,7 @@ func BuildNodePoolMap(ctx context.Context, kubeClient client.Client, cloudProvid
 // the repair budget would let a wave of unhealthy nodes starve the very budget that repairs them (a node.health cohort
 // could zero the budget and freeze repair). An in-flight repair still counts once its candidate is MarkedForDeletion.
 // Other reasons keep the reason-agnostic "unhealthy nodes consume budget" semantics introduced for consolidation/drift
-// (kubernetes-sigs/karpenter#981). Cluster state derives the counts as nodes change; state.NodePoolDisruption says
+// (kubernetes-sigs/karpenter#981). Cluster state derives the counts as nodes change; karpentercluster.NodePoolDisruption says
 // which nodes count.
 func NodePoolStats(cluster *state.Cluster, nodePool string, reason v1.DisruptionReason) (numNodes, disrupting int) {
 	d := cluster.NodePoolDisruption(nodePool)
@@ -455,7 +456,7 @@ func holdsOfferedReservation(c *Candidate, offered sets.Set[string]) bool {
 // This is used to enforce no taints at the beginning of disruption, and
 // to add/remove taints while executing a disruption action.
 // nolint:gocyclo
-func RequireNoScheduleTaint(ctx context.Context, kubeClient client.Client, addTaint bool, nodes ...*state.StateNode) error {
+func RequireNoScheduleTaint(ctx context.Context, kubeClient client.Client, addTaint bool, nodes ...*karpentercluster.StateNode) error {
 	errs := make([]error, len(nodes))
 	workqueue.ParallelizeUntil(ctx, len(nodes), len(nodes), func(i int) {
 		// If the StateNode is Karpenter owned and only has a nodeclaim, or is not owned by
@@ -508,7 +509,7 @@ func RequireNoScheduleTaint(ctx context.Context, kubeClient client.Client, addTa
 }
 
 // ClearNodeClaimsCondition will remove the conditionType from the NodeClaim status of the provided statenodes
-func ClearNodeClaimsCondition(ctx context.Context, kubeClient client.Client, clk clock.Clock, conditionType string, nodes ...*state.StateNode) error {
+func ClearNodeClaimsCondition(ctx context.Context, kubeClient client.Client, clk clock.Clock, conditionType string, nodes ...*karpentercluster.StateNode) error {
 	errs := make([]error, len(nodes))
 	workqueue.ParallelizeUntil(ctx, len(nodes), len(nodes), func(i int) {
 		if !nodes[i].Initialized() || nodes[i].NodeClaim == nil {

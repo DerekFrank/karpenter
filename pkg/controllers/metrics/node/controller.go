@@ -36,7 +36,7 @@ import (
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
@@ -183,14 +183,15 @@ func nodeLabelNames() []opmetrics.Label {
 }
 
 type Controller struct {
-	cluster     *state.Cluster
+	nodes       *karpentercluster.NodeState
 	metricStore *metrics.Store
 }
 
-func NewController(cluster *state.Cluster) *Controller {
+// NewController returns the node metrics controller, which reads the nodes of cluster state.
+func NewController(nodes *karpentercluster.NodeState) *Controller {
 	initializeMetrics()
 	return &Controller{
-		cluster:     cluster,
+		nodes:       nodes,
 		metricStore: metrics.NewStore(),
 	}
 }
@@ -199,15 +200,15 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name()) //nolint:ineffassign,staticcheck
 
 	// The metrics only read the nodes, so they share cluster state's rather than copying their usage.
-	var nodes state.StateNodes
-	for n := range c.cluster.Nodes() {
+	var nodes karpentercluster.StateNodes
+	for n := range c.nodes.Nodes() {
 		if n.Node != nil {
 			nodes = append(nodes, n)
 		}
 	}
 
 	// Build per-node metrics
-	metricsMap := lo.SliceToMap(nodes, func(n *state.StateNode) (string, []*metrics.StoreMetric) {
+	metricsMap := lo.SliceToMap(nodes, func(n *karpentercluster.StateNode) (string, []*metrics.StoreMetric) {
 		return client.ObjectKeyFromObject(n.Node).String(), buildMetrics(n)
 	})
 
@@ -230,7 +231,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 		Complete(singleton.AsReconciler(c))
 }
 
-func buildClusterUtilizationMetric(nodes state.StateNodes) []*metrics.StoreMetric {
+func buildClusterUtilizationMetric(nodes karpentercluster.StateNodes) []*metrics.StoreMetric {
 
 	// Aggregate resources allocated/utilized for all the nodes and pods inside the nodes
 	allocatableAggregate, utilizedAggregate := corev1.ResourceList{}, corev1.ResourceList{}
@@ -267,7 +268,7 @@ func buildClusterUtilizationMetric(nodes state.StateNodes) []*metrics.StoreMetri
 	return res
 }
 
-func buildMetrics(n *state.StateNode) (res []*metrics.StoreMetric) {
+func buildMetrics(n *karpentercluster.StateNode) (res []*metrics.StoreMetric) {
 	for gaugeMetric, resourceList := range map[opmetrics.GaugeMetric]corev1.ResourceList{
 		SystemOverhead:      resources.Subtract(n.Node.Status.Capacity, n.Node.Status.Allocatable),
 		TotalPodRequests:    n.PodRequests(),
@@ -292,13 +293,13 @@ func buildMetrics(n *state.StateNode) (res []*metrics.StoreMetric) {
 		})
 }
 
-func getNodeLabelsWithResourceType(n *state.StateNode, resourceTypeName string) prometheus.Labels {
+func getNodeLabelsWithResourceType(n *karpentercluster.StateNode, resourceTypeName string) prometheus.Labels {
 	metricLabels := getNodeLabels(n)
 	metricLabels[metrics.ResourceTypeLabel] = resourceTypeName
 	return metricLabels
 }
 
-func getNodeLabels(n *state.StateNode) prometheus.Labels {
+func getNodeLabels(n *karpentercluster.StateNode) prometheus.Labels {
 	node := n.Node
 	metricLabels := map[string]string{}
 	metricLabels[nodeName] = node.Name

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package state
+package cluster
 
 import (
 	"context"
@@ -31,7 +31,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
+	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	disruptionutils "sigs.k8s.io/karpenter/pkg/utils/disruption"
@@ -39,7 +39,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
-//go:generate go tool -modfile=../../../go.tools.mod controller-gen object:headerFile="../../../hack/boilerplate.go.txt" paths="."
+//go:generate go tool -modfile=../../go.tools.mod controller-gen object:headerFile="../../hack/boilerplate.go.txt" paths="."
 
 // StateNodes is a typed version of a list of *Node
 // nolint: revive
@@ -84,26 +84,30 @@ func (n StateNodes) CurrentlyReschedulablePods(ctx context.Context, kubeClient c
 	return pods, nil
 }
 
-// StateNode is a cached version of a node in the cluster that maintains state which is expensive to compute every time it's
-// needed.  This currently contains node utilization across all the allocatable resources, but will soon be used to
-// compute topology information.
+// StateNode is a view of one node Karpenter schedules onto or disrupts, built at read time from cluster state's
+// stores: a NodeClaim with the intent Karpenter keeps about it and its linked Node, if any, or an unmanaged Node that
+// has no NodeClaim. The linked Node is the one whose owner reference names the NodeClaim, or else, before registration
+// adds the owner reference, the Node with the NodeClaim's providerID.
+//
+// The NodeClaim's name keys the intent Karpenter keeps about a node (MarkForDeletion, NominateNodeForPod, buffer pod
+// counts, NodePool membership): pass NodeClaim.Name to those. Name is for display and logs: the Node's name once the
+// node is registered, and the NodeClaim's before.
 // +k8s:deepcopy-gen=true
 // nolint: revive
 type StateNode struct {
 	Node      *corev1.Node
 	NodeClaim *v1.NodeClaim
 
-	// Derived are the fields Karpenter derives about the node from the pods bound to it. They come from their own
-	// store, so they can lag Node and NodeClaim, which are a join and read together.
+	// Derived are the fields Karpenter derives about the node from the pods bound to its Node. They come from their own
+	// store, so they can lag Node and NodeClaim, which come from theirs.
 	Derived NodeDerived
 
-	// TODO remove this when v1alpha5 APIs are deprecated. With v1 APIs Karpenter relies on the existence
-	// of the karpenter.sh/disruption taint to know when a node is marked for deletion.
+	// markedForDeletion and nominatedUntil are the intent kept with the NodeClaim; an unmanaged Node has none.
 	markedForDeletion bool
 	nominatedUntil    metav1.Time
 
 	// repairPolicyMatches are the repair policies matching the Node's conditions, recomputed when they change.
-	repairPolicyMatches []health.RepairPolicyMatch
+	repairPolicyMatches []repair.RepairPolicyMatch
 }
 
 // NodeDerived are the fields Karpenter derives about a node from the pods bound to it.
@@ -140,19 +144,23 @@ func (in *StateNode) ShallowCopy() *StateNode {
 // current. An empty Action means no policy applies or none has waited out its toleration yet. Tolerations are measured
 // from no earlier than the end of the last reboot, since a node rejoins uninitialized after a successful reboot and its
 // conditions may not have caught up yet.
-func (in *StateNode) GetRepairResult(now time.Time) health.RepairResult {
+func (in *StateNode) GetRepairResult(now time.Time) repair.RepairResult {
 	if in.Node == nil {
-		return health.RepairResult{}
+		return repair.RepairResult{}
 	}
 	var rebootFinishedAt time.Time
 	if in.NodeClaim != nil {
-		if rebooting := in.NodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting); rebooting != nil && rebooting.IsFalse() {
-			rebootFinishedAt = rebooting.LastTransitionTime.Time
+		for i := range in.NodeClaim.Status.Conditions {
+			if c := in.NodeClaim.Status.Conditions[i]; c.Type == v1.ConditionTypeRebooting && c.Status == metav1.ConditionFalse {
+				rebootFinishedAt = c.LastTransitionTime.Time
+			}
 		}
 	}
-	return health.Resolve(in.repairPolicyMatches, now, rebootFinishedAt)
+	return repair.Resolve(in.repairPolicyMatches, now, rebootFinishedAt)
 }
 
+// Name is the Node's name once the node is registered, and the NodeClaim's before, so it stays the same name for a
+// registered node across reads. Key intent by NodeClaim.Name, not Name.
 func (in *StateNode) Name() string {
 	if in.Node == nil {
 		return in.NodeClaim.Name
@@ -166,12 +174,14 @@ func (in *StateNode) Name() string {
 	return in.Node.Name
 }
 
-// ProviderID is the key that is used to map this StateNode
-// If the Node and NodeClaim have a providerID, this should map to a real providerID
-// If the Node does not have a providerID, this will map to the node name
+// ProviderID is the node's providerID: the Node's, or the NodeClaim's without a Node. An unmanaged Node without a
+// providerID reads as its name.
 func (in *StateNode) ProviderID() string {
 	if in.Node == nil {
 		return in.NodeClaim.Status.ProviderID
+	}
+	if in.Node.Spec.ProviderID == "" {
+		return in.Node.Name
 	}
 	return in.Node.Spec.ProviderID
 }
@@ -236,8 +246,7 @@ func (in *StateNode) RebootInProgress() bool {
 	if in.NodeClaim == nil {
 		return false
 	}
-	cond := in.NodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
-	return cond != nil && cond.IsTrue()
+	return rebooting(in.NodeClaim)
 }
 
 func (in *StateNode) Taints() []corev1.Taint {
@@ -374,7 +383,7 @@ func (in *StateNode) MarkedForDeletion() bool {
 }
 
 func (in *StateNode) Deleted() bool {
-	return (in.NodeClaim != nil && (!in.NodeClaim.DeletionTimestamp.IsZero() || in.NodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue())) ||
+	return (in.NodeClaim != nil && deleted(in.NodeClaim)) ||
 		(in.Node != nil && in.NodeClaim == nil && !in.Node.DeletionTimestamp.IsZero())
 }
 

@@ -43,6 +43,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -157,8 +158,8 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	// If Karpenter restarts or fails with an error during a disruption action, some nodes can be left tainted.
 	// Idempotently remove this taint from candidates that are not in the orchestration queue before continuing.
 	// Reboot bypasses the queue, so preserve its DisruptionReason during drain.
-	outdatedNodes := lo.Reject(c.cluster.DeepCopyNodes(), func(s *state.StateNode, _ int) bool {
-		return c.queue.HasAny(s.ProviderID()) || s.MarkedForDeletion() || s.RebootInProgress()
+	outdatedNodes := lo.Reject(c.cluster.DeepCopyNodes(), func(s *karpentercluster.StateNode, _ int) bool {
+		return (s.NodeClaim != nil && c.queue.HasAny(s.NodeClaim.Name)) || s.MarkedForDeletion() || s.RebootInProgress()
 	})
 	if err := RequireNoScheduleTaint(ctx, c.kubeClient, false, outdatedNodes...); err != nil {
 		if errors.IsConflict(err) {

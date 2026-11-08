@@ -14,17 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package state
+package cluster
 
 import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
+	"sigs.k8s.io/karpenter/pkg/state"
 )
 
-// NodeCounts count the Nodes cluster state holds, with or without a NodeClaim, and the unhealthy ones among them.
+// NodeCounts count the Nodes cluster state tracks, with or without a NodeClaim, and the unhealthy ones among them.
 type NodeCounts struct {
 	Nodes     int
 	Unhealthy int
@@ -38,10 +38,10 @@ type nodeHealthKey struct {
 	Cluster bool
 }
 
-// NodeHealth keeps NodeCounts per NodePool and across the cluster, derived from cluster state's nodes. A Node counts
-// once cluster state holds it, and stops counting once it's gone.
+// NodeHealth keeps NodeCounts per NodePool and across the cluster, derived from the Node store. A Node counts once
+// cluster state tracks it (Tracked), and stops counting once it's gone.
 type NodeHealth struct {
-	store *karpenterstate.Store[nodeHealthKey, NodeCounts]
+	store *state.Store[nodeHealthKey, NodeCounts]
 }
 
 // NodePool returns the counts of the Nodes labeled with the NodePool.
@@ -79,29 +79,29 @@ func (n nodeCount) Delete(f NodeCounts) NodeCounts {
 	return f
 }
 
-// newNodeHealth derives NodeHealth from the nodes, counting a Node as unhealthy when unhealthy accepts its fields.
-// unhealthy reads only the fields, as a Derive's value must.
-func (c *Cluster) newNodeHealth(unhealthy func(nodeFields) bool) *NodeHealth {
-	h := &NodeHealth{store: karpenterstate.NewStore[nodeHealthKey, NodeCounts]()}
-	value := func(_ string, f nodeFields) nodeCount { return newNodeCount(unhealthy(f)) }
-	karpenterstate.Derive(c.nodes, h.store, func(_ string, f nodeFields) nodeHealthKey {
-		if f.Node == nil || f.Node.Labels[v1.NodePoolLabelKey] == "" {
+// newNodeHealth derives NodeHealth from the tracked Nodes, counting a Node as unhealthy when unhealthy accepts it.
+// unhealthy must be pure, as a Derive's value must.
+func (s *NodeState) newNodeHealth(unhealthy func(*corev1.Node) bool) *NodeHealth {
+	h := &NodeHealth{store: state.NewStore[nodeHealthKey, NodeCounts]()}
+	value := func(_ string, node *corev1.Node) nodeCount { return newNodeCount(unhealthy(node)) }
+	state.Derive(s.NodeStore, h.store, func(_ string, node *corev1.Node) nodeHealthKey {
+		if !Tracked(node) || node.Labels[v1.NodePoolLabelKey] == "" {
 			return nodeHealthKey{}
 		}
-		return nodeHealthKey{NodePool: f.Node.Labels[v1.NodePoolLabelKey]}
+		return nodeHealthKey{NodePool: node.Labels[v1.NodePoolLabelKey]}
 	}, value)
-	karpenterstate.Derive(c.nodes, h.store, func(_ string, f nodeFields) nodeHealthKey {
-		return nodeHealthKey{Cluster: f.Node != nil}
+	state.Derive(s.NodeStore, h.store, func(_ string, node *corev1.Node) nodeHealthKey {
+		return nodeHealthKey{Cluster: Tracked(node)}
 	}, value)
 	return h
 }
 
-// NodeHealth returns the counts of the Nodes, and of those with a condition that matches a repair policy of the
-// matcher cluster state was built with, regardless of toleration. Without a matcher, no Node is unhealthy.
-func (c *Cluster) NodeHealth() *NodeHealth { return c.nodeHealth }
+// NodeHealth returns the counts of the tracked Nodes, and of those with a condition that matches a repair policy of
+// the matcher cluster state was built with, regardless of toleration. Without a matcher, no Node is unhealthy.
+func (s *NodeState) NodeHealth() *NodeHealth { return s.nodeHealth }
 
-// DeriveNodeHealth returns counts of the Nodes, and of those that unhealthy accepts, kept from now on, for a caller
-// whose idea of unhealthy isn't the matcher's. unhealthy must be pure: it runs on every change of a Node.
-func (c *Cluster) DeriveNodeHealth(unhealthy func(*corev1.Node) bool) *NodeHealth {
-	return c.newNodeHealth(func(f nodeFields) bool { return f.Node != nil && unhealthy(f.Node) })
+// DeriveNodeHealth returns counts of the tracked Nodes, and of those that unhealthy accepts, kept from now on, for a
+// caller whose idea of unhealthy isn't the matcher's. unhealthy must be pure: it runs on every change of a Node.
+func (s *NodeState) DeriveNodeHealth(unhealthy func(*corev1.Node) bool) *NodeHealth {
+	return s.newNodeHealth(unhealthy)
 }

@@ -4787,7 +4787,7 @@ var _ = Describe("Consolidation", func() {
 
 			// Mark the node for deletion and re-trigger reconciliation
 			oldNodeName := nodes[0].Name
-			cluster.MarkForDeletion(nodes[0].Spec.ProviderID)
+			cluster.MarkForDeletion(nodeClaims[0].Name)
 			ExpectProvisionedNoBinding(ctx, env.Client, cluster, cloudProvider, prov, lo.Map(pods, func(p *corev1.Pod, _ int) *corev1.Pod { return p.DeepCopy() })...)
 
 			// Make sure that the cluster state is aware of the current node state
@@ -5192,7 +5192,7 @@ var _ = Describe("Consolidation", func() {
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 			cluster.UpdateBufferPodCounts(map[string]int{
-				node.Spec.ProviderID: 5,
+				nodeClaim.Name: 5,
 			})
 
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -5218,7 +5218,7 @@ var _ = Describe("Consolidation", func() {
 
 			// Node hosts buffer pods (but also has a real pod making it a consolidation candidate)
 			cluster.UpdateBufferPodCounts(map[string]int{
-				node.Spec.ProviderID: 2,
+				nodeClaim.Name: 2,
 			})
 
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -5265,8 +5265,8 @@ var _ = Describe("Consolidation", func() {
 
 			// node1 has only buffer pods, node2 has real pod + buffer pods
 			cluster.UpdateBufferPodCounts(map[string]int{
-				nodes[0].Spec.ProviderID: 4,
-				nodes[1].Spec.ProviderID: 2,
+				nodeClaims[0].Name: 4,
+				nodeClaims[1].Name: 2,
 			})
 
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -5291,7 +5291,7 @@ var _ = Describe("Consolidation", func() {
 
 			// First pass: buffer pods present → protected
 			cluster.UpdateBufferPodCounts(map[string]int{
-				node.Spec.ProviderID: 3,
+				nodeClaim.Name: 3,
 			})
 			ExpectSingletonReconciled(ctx, disruptionController)
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))

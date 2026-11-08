@@ -53,9 +53,9 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
-	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
@@ -116,7 +116,7 @@ var _ = BeforeSuite(func() {
 // them, as the operator does once at startup. Specs must call it before any Node reaches cluster state.
 func useRepairPolicies(policies []cloudprovider.RepairPolicy) {
 	cloudProvider.RepairPolicy = policies
-	repairPolicyMatcher := lo.Must(health.NewRepairPolicyMatcher(
+	repairPolicyMatcher := lo.Must(repair.NewRepairPolicyMatcher(
 		options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeRepair: new(true)}})), cloudProvider))
 	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider, state.WithRepairPolicyMatcher(repairPolicyMatcher))
 	nodeStateController = informer.NewNodeController(env.Client, cluster)
@@ -260,9 +260,9 @@ var _ = Describe("Simulate Scheduling", func() {
 		// Mark all nodeclaims as marked for deletion
 		for i, nc := range nodeClaims {
 			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nc))
-			cluster.MarkForDeletion(nodeClaims[i].Status.ProviderID)
+			cluster.MarkForDeletion(nodeClaims[i].Name)
 		}
-		cluster.UnmarkForDeletion(nodeClaims[0].Status.ProviderID)
+		cluster.UnmarkForDeletion(nodeClaims[0].Name)
 		// Mark all nodes as marked for deletion
 		for _, n := range nodes {
 			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(n))
@@ -836,7 +836,7 @@ var _ = Describe("BuildDisruptionBudgetMapping", func() {
 		// Delete one node and nodeclaim
 		Expect(env.Client.Delete(ctx, nodeClaims[0])).To(Succeed())
 		Expect(env.Client.Delete(ctx, nodes[0])).To(Succeed())
-		cluster.MarkForDeletion(nodeClaims[1].Status.ProviderID)
+		cluster.MarkForDeletion(nodeClaims[1].Name)
 
 		// Mark all nodeclaims as marked for deletion
 		for _, i := range nodeClaims {
@@ -1794,7 +1794,14 @@ var _ = Describe("Candidate Filtering", func() {
 		})
 		ExpectApplied(ctx, env.Client, nodePool, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, nil)
+		// A Node with the NodePool label and no NodeClaim is orphaned, and isn't a state node at all.
+		Expect(cluster.DeepCopyNodes()).To(BeEmpty())
 
+		// Without the label, it's unmanaged: a state node, but never a candidate.
+		node = ExpectExists(ctx, env.Client, node)
+		delete(node.Labels, v1.NodePoolLabelKey)
+		ExpectApplied(ctx, env.Client, node)
+		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
 		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
 		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
@@ -1832,7 +1839,7 @@ var _ = Describe("Candidate Filtering", func() {
 		})
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
-		cluster.NominateNodeForPod(ctx, node.Spec.ProviderID)
+		cluster.NominateNodeForPod(ctx, nodeClaim.Name)
 
 		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
 		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
@@ -1876,7 +1883,7 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
-		cluster.MarkForDeletion(node.Spec.ProviderID)
+		cluster.MarkForDeletion(nodeClaim.Name)
 
 		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
 		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)

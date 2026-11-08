@@ -60,6 +60,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/apis/v1alpha1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
@@ -71,6 +72,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
 	"sigs.k8s.io/karpenter/pkg/test"
 	testv1alpha1 "sigs.k8s.io/karpenter/pkg/test/v1alpha1"
+	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 )
 
 const (
@@ -991,11 +993,11 @@ func ExpectNodeClaims(ctx context.Context, c client.Client) []*v1.NodeClaim {
 	return lo.ToSlicePtr(nodeClaims.Items)
 }
 
-func ExpectStateNodeExists(cluster *state.Cluster, node *corev1.Node) *state.StateNode {
+func ExpectStateNodeExists(cluster *state.Cluster, node *corev1.Node) *karpentercluster.StateNode {
 	GinkgoHelper()
-	var ret *state.StateNode
+	var ret *karpentercluster.StateNode
 	for n := range cluster.Nodes() {
-		if n.Node.Name == node.Name {
+		if n.Node != nil && n.Node.Name == node.Name {
 			ret = n.DeepCopy()
 			break
 		}
@@ -1004,11 +1006,11 @@ func ExpectStateNodeExists(cluster *state.Cluster, node *corev1.Node) *state.Sta
 	return ret
 }
 
-func ExpectStateNodeExistsForNodeClaim(cluster *state.Cluster, nodeClaim *v1.NodeClaim) *state.StateNode {
+func ExpectStateNodeExistsForNodeClaim(cluster *state.Cluster, nodeClaim *v1.NodeClaim) *karpentercluster.StateNode {
 	GinkgoHelper()
-	var ret *state.StateNode
+	var ret *karpentercluster.StateNode
 	for n := range cluster.Nodes() {
-		if n.NodeClaim.Status.ProviderID == nodeClaim.Status.ProviderID {
+		if n.NodeClaim != nil && n.NodeClaim.Status.ProviderID == nodeClaim.Status.ProviderID {
 			ret = n.DeepCopy()
 			break
 		}
@@ -1022,6 +1024,16 @@ func ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx context.Context,
 
 	ExpectMakeNodesInitialized(ctx, c, clk, nodes...)
 	ExpectMakeNodeClaimsInitialized(ctx, c, clk, nodeClaims...)
+	// Registration links each Node to its NodeClaim by owner reference, which cluster state reads the Node by.
+	for i := range nodes {
+		for _, nodeClaim := range nodeClaims {
+			if nodeClaim.Status.ProviderID != "" && nodeClaim.Status.ProviderID == nodes[i].Spec.ProviderID {
+				nodes[i] = ExpectExists(ctx, c, nodes[i])
+				nodes[i] = nodeclaimutils.UpdateNodeOwnerReferences(nodeClaim, nodes[i])
+				ExpectApplied(ctx, c, nodes[i])
+			}
+		}
+	}
 
 	// Inform cluster state about node and nodeclaim readiness
 	for _, n := range nodes {

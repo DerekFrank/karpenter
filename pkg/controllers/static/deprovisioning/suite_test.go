@@ -735,7 +735,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 					// nodes[0] and nodes[1] are empty, but nodes[0] is already marked for deletion.
 					ExpectApplied(ctx, env.Client, test.Pod(test.PodOptions{NodeName: nodes[2].Name}))
 					ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeController, nodeClaimStateController, nodes, nodeClaims)
-					cluster.MarkForDeletion(nodeClaims[0].Status.ProviderID)
+					cluster.MarkForDeletion(nodeClaims[0].Name)
 
 					ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 

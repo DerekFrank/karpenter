@@ -41,14 +41,14 @@ import (
 //nolint:gocyclo
 func TestNodePoolStateMatchesARecount(t *testing.T) {
 	r := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // deterministic seed for reproducible test inputs
-	cluster := state.NewCluster(ctx, clock.NewFakeClock(time.Now()), fake.NewClientBuilder().Build(), fakecp.NewCloudProvider())
+	c := state.NewCluster(ctx, clock.NewFakeClock(time.Now()), fake.NewClientBuilder().Build(), fakecp.NewCloudProvider())
 	latest := map[string]*v1.NodeClaim{}
 	var rv, uid uint64
 	for i := range 20000 {
 		name := fmt.Sprintf("nc-%d", r.IntN(50))
 		switch op := r.IntN(10); {
 		case op == 0:
-			cluster.DeleteNodeClaim(name)
+			c.DeleteNodeClaim(name)
 			delete(latest, name)
 		case op == 1 && latest[name] != nil:
 			// A stale version arriving after a newer one doesn't count.
@@ -57,7 +57,7 @@ func TestNodePoolStateMatchesARecount(t *testing.T) {
 				stale := latest[name].DeepCopy()
 				stale.ResourceVersion = strconv.FormatUint(1+r.Uint64N(current-1), 10)
 				stale.Labels[v1.NodePoolLabelKey] = "stale"
-				cluster.UpdateNodeClaim(stale)
+				c.UpdateNodeClaim(stale)
 			}
 		default:
 			rv++
@@ -77,7 +77,7 @@ func TestNodePoolStateMatchesARecount(t *testing.T) {
 			if r.IntN(3) == 0 {
 				nc.Status.Conditions = []status.Condition{{Type: v1.ConditionTypeDisruptionReason, Status: metav1.ConditionTrue}}
 			}
-			cluster.UpdateNodeClaim(nc)
+			c.UpdateNodeClaim(nc)
 			latest[name] = nc
 		}
 		want := map[string]state.NodeClaimCounts{}
@@ -95,7 +95,7 @@ func TestNodePoolStateMatchesARecount(t *testing.T) {
 			want[np] = counts
 		}
 		for _, np := range []string{"a", "b", "stale"} {
-			if active, deleting, _ := cluster.NodePoolState.GetNodeCount(np); active != want[np].Active || deleting != want[np].Deleting {
+			if active, deleting, _ := c.NodePoolState.GetNodeCount(np); active != want[np].Active || deleting != want[np].Deleting {
 				t.Fatalf("after change %d, %s counts %d active and %d deleting, want %+v", i, np, active, deleting, want[np])
 			}
 		}

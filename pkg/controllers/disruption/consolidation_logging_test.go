@@ -26,9 +26,10 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+
 	"sigs.k8s.io/karpenter/pkg/events"
 	pkgscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
@@ -479,7 +480,7 @@ func TestCommand_String(t *testing.T) {
 
 func mockCandidate(name string) *Candidate {
 	return &Candidate{
-		StateNode: &state.StateNode{
+		StateNode: &karpentercluster.StateNode{
 			Node: &corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: name,
@@ -532,7 +533,7 @@ func TestConsolidationCandidateEvent(t *testing.T) {
 
 	// Create a mock candidate with Node and NodeClaim
 	candidate := &Candidate{
-		StateNode: &state.StateNode{
+		StateNode: &karpentercluster.StateNode{
 			Node: &corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "test-node",

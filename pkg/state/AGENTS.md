@@ -5,7 +5,7 @@ has its own source of truth and its own rules.
 
 | | Facts | Derived fields | Intent |
 |---|---|---|---|
-| What | the API objects, and joins of objects that are one thing (a Node and its NodeClaim) | values computed from other objects: a NodePool's NodeClaim usage, the pod requests on a Node | what Karpenter has decided to do and is still doing: a node reserved against a limit for a NodeClaim it is creating |
+| What | the API objects, and joins of objects that are one thing | values computed from other objects: a NodePool's NodeClaim usage, the pod requests on a Node | what Karpenter has decided to do and is still doing: a node reserved against a limit for a NodeClaim it is creating |
 | Source of truth | the API server | the API server, through the objects they're computed from | Karpenter's memory, until the objects it decided on exist |
 | Consistency | an object, or a join, reads as one version | each field may lag the object and the other fields, and converges | each decision is atomic with the fields it decides on, and counts until its object does |
 
@@ -32,9 +32,15 @@ other decisions count meanwhile, is intent, kept as a claim. See
   `cluster.New` builds it once, in `pkg/controllers/controllers.go`. Each
   controller's constructor takes the accessors it reads, as
   `nodepoolcounter.NewController` takes `s.NodePools` and `s.NodePoolUsage`.
-- **`pkg/controllers/state`** holds `state.Cluster`, the stores behind the
-  nodes Karpenter schedules onto and disrupts: a join of each Node and its
-  NodeClaim, the pods bound to each node, and the intent kept about them.
+- **`cluster.NodeState`** holds the stores behind the nodes Karpenter
+  schedules onto and disrupts, NodeClaim first: each NodeClaim with the intent
+  kept about its node and the Node its owner reference links, by name
+  (`nodeclaim.go`); each Node, by name, and the providerID link from a
+  NodeClaim to its Node before registration (`node.go`); and the pods bound to
+  each Node. A `cluster.StateNode` is a view built from them at read time.
+- **`pkg/controllers/state`** holds `state.Cluster`, a façade over
+  `cluster.NodeState` that the cluster state informers feed, with the sync
+  check, the pod scheduling telemetry and the consolidation state.
 - **Imports point one way:** controllers import `pkg/cluster`, which imports
   `pkg/state`. depguard (`.golangci.yaml`, rules `state` and `cluster`) enforces
   it.
@@ -80,15 +86,24 @@ three kinds, and each is the source of the next:
 
 ## Joins
 
-A join is several objects that are one thing, such as a Node and its NodeClaim
-joined on providerID. `Join(key, set)` is one kind's part: `key` is the join
+A join is several objects that are one thing under one key. `Join(key, set)`
+is one kind's part: `key` is the join
 key of an object, and `set` stores the object in the fields, or a nil object
 once it leaves the key. One store has one lock, so a join reads as one version.
 
-- **Intent about a join lives in its entry**, set with `Store.Update`, such as
-  a node's deletion mark. `set` drops the intent once no part is left
-  (`nodeFields.orNothing` in cluster state), so a gone node leaves nothing
-  behind.
+- **Intent about an object lives in its entry**, set with `Store.Update`, such
+  as a node's deletion mark kept with its NodeClaim, in a single-part join
+  store. `set` drops the intent once no part is left
+  (`NodeClaimFields.orNothing` in `pkg/cluster`), so a gone NodeClaim leaves
+  nothing behind.
+- **Objects of different kinds that are one thing only some of the time**,
+  such as a Node and its NodeClaim, live in their own stores. Once one names
+  the other, a `Derive` puts it on the other's entry: a store can be fed by
+  both its join part and a `Derive`, as the NodeClaim store holds the Node
+  whose owner reference names it. The join part's `set` and the
+  contribution's `Delete` each clear only what they set. Before then, a
+  derived index links them at read time, as `NodeState.linkedNode` links a
+  NodeClaim to the Node with its providerID until the Node registers.
 - **`set` is pure and cheap.** It runs under the store's lock on every event.
 
 ## Derived fields
@@ -143,7 +158,7 @@ returns, so a `Derive` made after its source filled still sees everything.
   NodePool would be copied on every node event, which makes the NodePool's
   fields quadratic to keep. Count the members in the fields, and read the
   members themselves from the `Derivation`'s `Sources(key)`, which indexes them
-  in place, as `Cluster.NodePoolNodes` and `JoinAccessor.IndexField` do.
+  in place, as `NodeState.NodePoolNodes` and `JoinAccessor.IndexField` do.
 - **A contribution that keeps a sample instead of counting**, such as a
   DaemonSet's newest pod (`newestPod`), has a `Delete` that doesn't undo
   `Update`. Say so on the type, and leave it out of the law check.
@@ -156,10 +171,10 @@ behind them.
 - **Read only the source's fields.** A value that depends on another object
   belongs in that object's own store, combined at read time. A pod's volumes
   are the PVC keys it mounts (from the pod) and each PVC's driver (from the
-  PVC's store); `stateNode` groups the node's PVCs by driver when it builds a
+  PVC's store); `NodeState.withNode` groups the node's PVCs by driver when it builds a
   StateNode.
 - **Capture configuration at construction**, such as the options in the
-  context `NewCluster` takes, which decide a pod's disruption cost.
+  context `NewNodeState` takes, which decide a pod's disruption cost.
 - **Data Karpenter reads with I/O**, such as a Node's CSINode drivers, goes in a
   derived store keyed by its object, set with `Store.Update` by the caller that
   read it.
@@ -189,7 +204,7 @@ kubeClient.Status().Patch(ctx, np.Object, client.MergeFrom(stored))
 - **`Get` and `List` return a `state.View{Object, Derived}`.** `Derived` is
   read from its stores lock-free, and is shared and immutable: copy one to
   change it.
-- **Combine stores at read time**, as `stateNode` combines a node, its pods'
+- **Combine stores at read time**, as `NodeState` combines a NodeClaim, its linked Node, its pods'
   usage, its CSI drivers and its PVCs' drivers. Each store is from its own
   moment, so a reader tolerates the lag: a pod that moves between nodes can
   briefly count on both or neither.

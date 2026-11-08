@@ -4317,7 +4317,7 @@ var _ = Context("Scheduling", func() {
 			Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("small-instance-type"))
 
 			// Mark for deletion so that we consider all pods on this node for reschedulability
-			cluster.MarkForDeletion(node.Spec.ProviderID)
+			cluster.MarkForDeletion(lo.Must(cluster.NodeClaimForProviderID(node.Spec.ProviderID)))
 
 			// Trigger a provisioning loop and expect another node to get created
 			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov)
@@ -4343,7 +4343,7 @@ var _ = Context("Scheduling", func() {
 			Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("small-instance-type"))
 
 			// Mark for deletion so that we consider all pods on this node for reschedulability
-			cluster.MarkForDeletion(node.Spec.ProviderID)
+			cluster.MarkForDeletion(lo.Must(cluster.NodeClaimForProviderID(node.Spec.ProviderID)))
 
 			// Trigger an eviction to set the deletion timestamp but not delete the pod
 			ExpectEvicted(ctx, env.Client, pod)
@@ -4400,7 +4400,7 @@ var _ = Context("Scheduling", func() {
 			ExpectManualBinding(ctx, env.Client, pod, node)
 
 			// Mark for deletion so that we consider all pods on this node for reschedulability
-			cluster.MarkForDeletion(node.Spec.ProviderID)
+			cluster.MarkForDeletion(nodeClaim.Name)
 
 			// Trigger an eviction to set the deletion timestamp but not delete the pod
 			ExpectEvicted(ctx, env.Client, pod)
@@ -4444,7 +4444,7 @@ var _ = Context("Scheduling", func() {
 			Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("small-instance-type"))
 
 			// Mark for deletion so that we consider all pods on this node for reschedulability
-			cluster.MarkForDeletion(node.Spec.ProviderID)
+			cluster.MarkForDeletion(lo.Must(cluster.NodeClaimForProviderID(node.Spec.ProviderID)))
 
 			// Trigger an eviction to set the deletion timestamp but not delete the pod
 			ExpectEvicted(ctx, env.Client, pod)
@@ -4488,7 +4488,7 @@ var _ = Context("Scheduling", func() {
 			Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("small-instance-type"))
 
 			// Mark for deletion so that we consider all pods on this node for reschedulability
-			cluster.MarkForDeletion(node.Spec.ProviderID)
+			cluster.MarkForDeletion(lo.Must(cluster.NodeClaimForProviderID(node.Spec.ProviderID)))
 
 			// Trigger an eviction to set the deletion timestamp but not delete the pod
 			ExpectEvicted(ctx, env.Client, pod)
@@ -4524,7 +4524,7 @@ var _ = Context("Scheduling", func() {
 				Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("small-instance-type"))
 
 				// Mark for deletion so that we consider all pods on this node for reschedulability
-				cluster.MarkForDeletion(node.Spec.ProviderID)
+				cluster.MarkForDeletion(lo.Must(cluster.NodeClaimForProviderID(node.Spec.ProviderID)))
 
 				// Trigger a provisioning loop and expect that we don't create more nodes
 				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov)

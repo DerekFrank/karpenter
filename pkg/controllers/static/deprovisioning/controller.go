@@ -43,6 +43,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
@@ -194,7 +195,7 @@ func (c *Controller) getDeprovisioningCandidates(ctx context.Context, np *v1.Nod
 	}
 
 	// The NodePool's StateNodes, from its index in cluster state
-	nodes := lo.Filter(c.cluster.NodePoolNodes(np.Name), func(n *state.StateNode, _ int) bool { return !n.MarkedForDeletion() })
+	nodes := lo.Filter(c.cluster.NodePoolNodes(np.Name), func(n *karpentercluster.StateNode, _ int) bool { return !n.MarkedForDeletion() })
 
 	// Resolved nodes (empty first, then by disruption cost)
 	for _, nc := range c.resolvedDeprovisioningCandidates(ctx, nodes, np, remaining) {
@@ -207,7 +208,7 @@ func (c *Controller) getDeprovisioningCandidates(ctx context.Context, np *v1.Nod
 // isEmpty returns whether the node has no pods, or only DaemonSet pods without an active do-not-disrupt annotation. The
 // counts decide a node without pods, or with a pod no DaemonSet owns. A node with only DaemonSet pods needs the pods
 // themselves, to check their do-not-disrupt annotations against the clock.
-func (c *Controller) isEmpty(ctx context.Context, node *state.StateNode) bool {
+func (c *Controller) isEmpty(ctx context.Context, node *karpentercluster.StateNode) bool {
 	switch bound, daemonSet := podCounts(node); {
 	case bound == 0:
 		return true
@@ -224,13 +225,13 @@ func (c *Controller) isEmpty(ctx context.Context, node *state.StateNode) bool {
 
 // podCounts returns the number of pods bound to the node and how many of them DaemonSets own, from the fields cluster
 // state derives about the node, where each pod requests one of the pods resource.
-func podCounts(node *state.StateNode) (pods, daemonSetPods int64) {
+func podCounts(node *karpentercluster.StateNode) (pods, daemonSetPods int64) {
 	return node.Derived.PodRequests.Pods().Value(), node.Derived.DaemonSetRequests.Pods().Value()
 }
 
 // resolvedDeprovisioningCandidates returns resolved NodeClaims (those with ProviderID) up to the specified count,
 // prioritizing empty nodes first, then nodes with lowest disruption cost
-func (c *Controller) resolvedDeprovisioningCandidates(ctx context.Context, nodes []*state.StateNode, np *v1.NodePool, count int) []*v1.NodeClaim {
+func (c *Controller) resolvedDeprovisioningCandidates(ctx context.Context, nodes []*karpentercluster.StateNode, np *v1.NodePool, count int) []*v1.NodeClaim {
 	if len(nodes) == 0 {
 		return nil
 	}
@@ -238,7 +239,7 @@ func (c *Controller) resolvedDeprovisioningCandidates(ctx context.Context, nodes
 	candidates := make([]*v1.NodeClaim, 0, count)
 
 	// Priority 1: Empty nodes
-	emptyNodes := lo.Filter(nodes, func(node *state.StateNode, _ int) bool { return c.isEmpty(ctx, node) })
+	emptyNodes := lo.Filter(nodes, func(node *karpentercluster.StateNode, _ int) bool { return c.isEmpty(ctx, node) })
 
 	for _, node := range lo.Slice(emptyNodes, 0, count) {
 		candidates = append(candidates, node.NodeClaim)
@@ -252,13 +253,13 @@ func (c *Controller) resolvedDeprovisioningCandidates(ctx context.Context, nodes
 
 	// Get non-empty nodes with their costs
 	type NonEmptyNode struct {
-		node            *state.StateNode
+		node            *karpentercluster.StateNode
 		pods            []*corev1.Pod
 		hasDoNotDisrupt bool
 	}
 
 	emptyNodesSet := sets.New(emptyNodes...)
-	nonEmptyNodes := lo.FilterMap(nodes, func(node *state.StateNode, _ int) (NonEmptyNode, bool) {
+	nonEmptyNodes := lo.FilterMap(nodes, func(node *karpentercluster.StateNode, _ int) (NonEmptyNode, bool) {
 		if emptyNodesSet.Has(node) {
 			return NonEmptyNode{}, false
 		}

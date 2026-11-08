@@ -30,6 +30,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	disruptionutils "sigs.k8s.io/karpenter/pkg/utils/disruption"
@@ -43,11 +44,11 @@ import (
 // SavingsRatio DESC with the rank from RankForBC(i, len(groupBC)), and groupD
 // has its annotations cleared. The disruption budgets bounding groupBC are read
 // from cluster.
-func RankNodes(ctx context.Context, kubeClient client.Client, clk clock.Clock, cluster *state.Cluster, nodes []*state.StateNode, nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType) (groupA, groupBC, groupD []*state.StateNode, err error) {
+func RankNodes(ctx context.Context, kubeClient client.Client, clk clock.Clock, cluster *state.Cluster, nodes []*karpentercluster.StateNode, nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType) (groupA, groupBC, groupD []*karpentercluster.StateNode, err error) {
 	// PDC only annotates pods on nodes Karpenter owns. An unmanaged node with a
 	// deletion timestamp satisfies StateNode.Deleted(), so without this filter it
 	// reaches Group A and gets MinInt32 written on every pod, uncapped.
-	nodes = lo.Filter(nodes, func(n *state.StateNode, _ int) bool { return n.Managed() })
+	nodes = lo.Filter(nodes, func(n *karpentercluster.StateNode, _ int) bool { return n.Managed() })
 	if len(nodes) == 0 {
 		return nil, nil, nil, nil
 	}
@@ -61,7 +62,7 @@ func RankNodes(ctx context.Context, kubeClient client.Client, clk clock.Clock, c
 	// each group inherits SavingsRatio DESC without its own sort.
 	sortBySavingsRatio(ctx, kubeClient, nodes, nodePoolToInstanceTypesMap)
 
-	groups := lo.GroupBy(nodes, func(n *state.StateNode) nodePartition {
+	groups := lo.GroupBy(nodes, func(n *karpentercluster.StateNode) nodePartition {
 		return classifyNode(ctx, kubeClient, clk, n, nodePoolMap, nodePoolToInstanceTypesMap, pdbs)
 	})
 	disruptedBlocked := groups[partitionDisrupted]
@@ -71,7 +72,7 @@ func RankNodes(ctx context.Context, kubeClient client.Client, clk clock.Clock, c
 
 	driftBudget := disruption.NodePoolBudgetMap(ctx, clk, cluster, nodePoolMap, v1.DisruptionReasonDrifted)
 	consolidationBudget := disruption.NodePoolBudgetMap(ctx, clk, cluster, nodePoolMap, v1.DisruptionReasonUnderutilized)
-	var driftOverflow, normalOverflow []*state.StateNode
+	var driftOverflow, normalOverflow []*karpentercluster.StateNode
 	drifted, driftOverflow = applyPerNodePoolBudget(drifted, driftBudget)
 	normal, normalOverflow = applyPerNodePoolBudget(normal, consolidationBudget)
 	cleanupOnly = append(cleanupOnly, driftOverflow...)
@@ -98,7 +99,7 @@ func RankForBC(i, n int) int {
 // applyPerNodePoolBudget requires nodes pre-sorted by cross-pool SavingsRatio
 // DESC. Do not rewrite with lo.GroupBy: map iteration order would randomize
 // cross-pool priority.
-func applyPerNodePoolBudget(nodes []*state.StateNode, budget map[string]int) (bounded, overflow []*state.StateNode) {
+func applyPerNodePoolBudget(nodes []*karpentercluster.StateNode, budget map[string]int) (bounded, overflow []*karpentercluster.StateNode) {
 	used := map[string]int{}
 	for _, node := range nodes {
 		poolName := node.Labels()[v1.NodePoolLabelKey]
@@ -121,7 +122,7 @@ const (
 	partitionCleanupOnly
 )
 
-func classifyNode(ctx context.Context, kubeClient client.Client, clk clock.Clock, node *state.StateNode, nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType, pdbs pdb.Limits) nodePartition {
+func classifyNode(ctx context.Context, kubeClient client.Client, clk clock.Clock, node *karpentercluster.StateNode, nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType, pdbs pdb.Limits) nodePartition {
 	if isGoingAway(node) {
 		return partitionDisrupted
 	}
@@ -131,7 +132,7 @@ func classifyNode(ctx context.Context, kubeClient client.Client, clk clock.Clock
 	return classifyDisruptableNode(ctx, kubeClient, clk, node, nodePoolMap, nodePoolToInstanceTypesMap, pdbs)
 }
 
-func classifyDisruptableNode(ctx context.Context, kubeClient client.Client, clk clock.Clock, node *state.StateNode, nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType, pdbs pdb.Limits) nodePartition {
+func classifyDisruptableNode(ctx context.Context, kubeClient client.Client, clk clock.Clock, node *karpentercluster.StateNode, nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType, pdbs pdb.Limits) nodePartition {
 	pods, verr := disruption.ValidatePodsDisruptable(ctx, kubeClient, node, pdbs, clk, nil)
 	if verr != nil {
 		return partitionCleanupOnly
@@ -161,7 +162,7 @@ func classifyDisruptableNode(ctx context.Context, kubeClient client.Client, clk 
 // or a node missing the NodePool or instance-type label. No ranking is being
 // corrupted then, so the filter stands down instead of routing every node to
 // cleanup.
-func isUnpriceable(node *state.StateNode, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType) bool {
+func isUnpriceable(node *karpentercluster.StateNode, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType) bool {
 	if nodePoolToInstanceTypesMap == nil {
 		return false
 	}
@@ -180,7 +181,7 @@ func isUnpriceable(node *state.StateNode, nodePoolToInstanceTypesMap map[string]
 	return false
 }
 
-func isConsolidationDisabled(node *state.StateNode, nodePoolMap map[string]*v1.NodePool) bool {
+func isConsolidationDisabled(node *karpentercluster.StateNode, nodePoolMap map[string]*v1.NodePool) bool {
 	nodePoolName := node.Labels()[v1.NodePoolLabelKey]
 	if nodePoolName == "" {
 		return false
@@ -192,7 +193,7 @@ func isConsolidationDisabled(node *state.StateNode, nodePoolMap map[string]*v1.N
 	return np.Spec.Disruption.ConsolidateAfter.Duration == nil
 }
 
-func isGoingAway(node *state.StateNode) bool {
+func isGoingAway(node *karpentercluster.StateNode) bool {
 	if node.MarkedForDeletion() {
 		return true
 	}
@@ -212,7 +213,7 @@ func isGoingAway(node *state.StateNode) bool {
 //
 // TODO: the drift-condition read and IsStatic gate are duplicated in
 // disruption/drift.go and disruption/staticdrift.go; dedupe in a follow-up.
-func isDrifted(node *state.StateNode, nodePoolMap map[string]*v1.NodePool) bool {
+func isDrifted(node *karpentercluster.StateNode, nodePoolMap map[string]*v1.NodePool) bool {
 	if node.NodeClaim == nil {
 		return false
 	}
@@ -253,7 +254,7 @@ func hasPinningPods(pods []*corev1.Pod) bool {
 
 // sortBySavingsRatio mirrors disruption.consolidation.sortCandidates so PDC and
 // consolidation prefer the same node.
-func sortBySavingsRatio(ctx context.Context, kubeClient client.Client, nodes []*state.StateNode, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType) {
+func sortBySavingsRatio(ctx context.Context, kubeClient client.Client, nodes []*karpentercluster.StateNode, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType) {
 	if len(nodes) <= 1 {
 		return
 	}

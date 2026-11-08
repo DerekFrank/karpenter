@@ -28,7 +28,6 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -72,7 +71,8 @@ type NodeClaim struct {
 // Reservation holds a NodeClaim's place against a limit. Bind it to the NodeClaim once created, so it is released
 // once the NodeClaim counts against the limit, or Release it if the NodeClaim won't be created.
 type Reservation interface {
-	Bind(types.NamespacedName)
+	// Bind takes the NodeClaim's name.
+	Bind(nodeClaimName string)
 	Release()
 }
 

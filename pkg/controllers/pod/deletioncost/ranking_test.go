@@ -33,9 +33,10 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/pod/deletioncost"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -241,7 +242,7 @@ var _ = Describe("Ranking", func() {
 			ExpectApplied(ctx, env.Client, taintedPod, normalPod)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 
-			var stateNodes []*state.StateNode
+			var stateNodes []*karpentercluster.StateNode
 			for n := range cluster.Nodes() {
 				stateNodes = append(stateNodes, n)
 			}
@@ -570,7 +571,7 @@ var _ = Describe("Ranking", func() {
 			nodePoolMap[staticName] = staticPool
 			nodePoolToInstanceTypesMap[staticName] = nodePoolToInstanceTypesMap[activePool.Name]
 
-			var stateNodes []*state.StateNode
+			var stateNodes []*karpentercluster.StateNode
 			for n := range cluster.Nodes() {
 				stateNodes = append(stateNodes, n)
 			}
@@ -824,7 +825,7 @@ var _ = Describe("Ranking", func() {
 
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 
-			var stateNodes []*state.StateNode
+			var stateNodes []*karpentercluster.StateNode
 			for n := range cluster.Nodes() {
 				stateNodes = append(stateNodes, n)
 			}
@@ -884,7 +885,7 @@ var _ = Describe("Ranking", func() {
 
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 
-			var stateNodes []*state.StateNode
+			var stateNodes []*karpentercluster.StateNode
 			for n := range cluster.Nodes() {
 				stateNodes = append(stateNodes, n)
 			}
@@ -927,7 +928,7 @@ var _ = Describe("Ranking", func() {
 
 				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 
-				var stateNodes []*state.StateNode
+				var stateNodes []*karpentercluster.StateNode
 				for n := range cluster.Nodes() {
 					stateNodes = append(stateNodes, n)
 				}
@@ -1013,7 +1014,7 @@ var _ = Describe("Ranking", func() {
 			}
 			nodePoolMap := map[string]*v1.NodePool{nodePool.Name: nodePool, unmappedPool.Name: unmappedPool}
 
-			var stateNodes []*state.StateNode
+			var stateNodes []*karpentercluster.StateNode
 			for n := range cluster.Nodes() {
 				stateNodes = append(stateNodes, n)
 			}
@@ -1123,7 +1124,7 @@ var _ = Describe("Ranking", func() {
 				}},
 			}
 
-			var stateNodes []*state.StateNode
+			var stateNodes []*karpentercluster.StateNode
 			for n := range cluster.Nodes() {
 				stateNodes = append(stateNodes, n)
 			}
@@ -1158,7 +1159,7 @@ var _ = Describe("Ranking", func() {
 
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 
-			var stateNodes []*state.StateNode
+			var stateNodes []*karpentercluster.StateNode
 			for n := range cluster.Nodes() {
 				stateNodes = append(stateNodes, n)
 			}

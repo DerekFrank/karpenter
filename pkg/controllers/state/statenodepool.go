@@ -20,10 +20,10 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cluster"
 	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
 )
 
@@ -74,7 +74,7 @@ func (r reservedNodes) Delete(f NodePoolFields) NodePoolFields {
 
 // Reservation holds one node against a NodePool's node limit for a NodeClaim a controller is about to create, until the
 // NodePool's counts include that NodeClaim. Bind it to the NodeClaim once created, or Release it if it won't be.
-type Reservation = *karpenterstate.Claim[types.NamespacedName, string, reservedNodes]
+type Reservation = *karpenterstate.Claim[string, string, reservedNodes]
 
 // Reservations are the Reservations one ReserveNodeCount granted.
 type Reservations []Reservation
@@ -89,17 +89,21 @@ func (r Reservations) Release() {
 // NodePoolState holds each NodePool with its NodePoolFields.
 type NodePoolState struct {
 	nodePools    *karpenterstate.Store[string, NodePoolFields]
-	reservations *karpenterstate.Claims[types.NamespacedName, string, *v1.NodeClaim, NodePoolFields, NodeClaimCounts, reservedNodes]
+	reservations *karpenterstate.Claims[string, string, cluster.NodeClaimFields, NodePoolFields, NodeClaimCounts, reservedNodes]
 }
 
-// NewNodePoolState returns the NodePools' state, derived from nodeClaims.
-func NewNodePoolState(clk clock.Clock, nodeClaims *karpenterstate.Store[types.NamespacedName, *v1.NodeClaim]) *NodePoolState {
+// NewNodePoolState returns the NodePools' state, derived from the NodeClaim store, keyed by NodeClaim name.
+func NewNodePoolState(clk clock.Clock, nodeClaims *karpenterstate.Store[string, cluster.NodeClaimFields]) *NodePoolState {
 	nodePools := karpenterstate.NewStore[string, NodePoolFields]()
 	counts := karpenterstate.Derive(nodeClaims, nodePools,
-		func(_ types.NamespacedName, nodeClaim *v1.NodeClaim) string {
-			return nodeClaim.Labels[v1.NodePoolLabelKey]
+		func(_ string, f cluster.NodeClaimFields) string {
+			if f.NodeClaim == nil {
+				return ""
+			}
+			return f.NodeClaim.Labels[v1.NodePoolLabelKey]
 		},
-		func(_ types.NamespacedName, nodeClaim *v1.NodeClaim) NodeClaimCounts {
+		func(_ string, f cluster.NodeClaimFields) NodeClaimCounts {
+			nodeClaim := f.NodeClaim
 			if !nodeClaim.DeletionTimestamp.IsZero() {
 				return NodeClaimCounts{Deleting: 1}
 			}
@@ -115,7 +119,7 @@ func NewNodePoolState(clk clock.Clock, nodeClaims *karpenterstate.Store[types.Na
 		nodePools: nodePools,
 		// A NodeClaim counts against the node limit as soon as it exists, so the first time the counts see it settles
 		// its reservation.
-		reservations: karpenterstate.NewClaims[types.NamespacedName, string, *v1.NodeClaim, NodePoolFields, NodeClaimCounts, reservedNodes](counts,
+		reservations: karpenterstate.NewClaims[string, string, cluster.NodeClaimFields, NodePoolFields, NodeClaimCounts, reservedNodes](counts,
 			func(NodeClaimCounts) bool { return true },
 			ReservationTTL, clk,
 		),

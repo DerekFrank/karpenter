@@ -43,6 +43,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -68,7 +69,7 @@ type ScenarioFixture struct {
 	nodePools     []*v1.NodePool
 	itsByNP       map[string][]*cloudprovider.InstanceType
 	topology      *scheduling.Topology
-	stateNodes    []*state.StateNode
+	stateNodes    []*karpentercluster.StateNode
 	daemonSetPods []*corev1.Pod
 	recorder      events.Recorder
 	clk           clock.Clock
@@ -101,13 +102,13 @@ func benchNodePools(count int) []*v1.NodePool {
 
 // benchStateNodes builds initialized+registered StateNodes directly, distributed
 // round-robin across the given NodePools.
-func benchStateNodes(count int, nodePools []*v1.NodePool) []*state.StateNode {
+func benchStateNodes(count int, nodePools []*v1.NodePool) []*karpentercluster.StateNode {
 	rl := corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse("16"),
 		corev1.ResourceMemory: resource.MustParse("32Gi"),
 		corev1.ResourcePods:   resource.MustParse("110"),
 	}
-	sn := make([]*state.StateNode, 0, count)
+	sn := make([]*karpentercluster.StateNode, 0, count)
 	for i := range count {
 		nc := test.NodeClaim(v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{
@@ -125,7 +126,7 @@ func benchStateNodes(count int, nodePools []*v1.NodePool) []*state.StateNode {
 		node.Labels[corev1.LabelInstanceTypeStable] = "fake-it-0"
 		node.Labels[v1.NodeRegisteredLabelKey] = "true"
 		node.Labels[v1.NodeInitializedLabelKey] = "true"
-		sn = append(sn, &state.StateNode{Node: node, NodeClaim: nc})
+		sn = append(sn, &karpentercluster.StateNode{Node: node, NodeClaim: nc})
 	}
 	return sn
 }

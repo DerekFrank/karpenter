@@ -43,6 +43,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -67,7 +68,7 @@ type Controller struct {
 	cluster       *state.Cluster
 	policies      []replacePolicy
 	// health counts the Nodes, and those a replace policy matches, per NodePool and across the cluster.
-	health *state.NodeHealth
+	health *karpentercluster.NodeHealth
 }
 
 // replacePolicy is a ReplaceNode RepairPolicy. The legacy controller can only replace nodes, so it ignores policies with
@@ -294,7 +295,7 @@ func (c *Controller) isClusterHealthy() bool {
 	return healthy(c.health.Cluster())
 }
 
-func healthy(counts state.NodeCounts) bool {
+func healthy(counts karpentercluster.NodeCounts) bool {
 	threshold := lo.Must(intstr.GetScaledValueFromIntOrPercent(new(allowedUnhealthyPercent), counts.Nodes, true))
 	return counts.Unhealthy <= threshold
 }

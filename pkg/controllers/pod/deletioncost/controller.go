@@ -35,6 +35,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/metrics"
@@ -105,7 +106,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 
 	// Pointer aliases, not deep copies. Torn reads are acceptable: the writes are
 	// best-effort and the next reconcile picks up any drift.
-	var nodes []*state.StateNode
+	var nodes []*karpentercluster.StateNode
 	for n := range c.cluster.Nodes() {
 		nodes = append(nodes, n)
 	}
@@ -143,7 +144,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 
 // Group A bypasses the per-cycle cap so nodes already being torn down always
 // annotate promptly. Returns per-nodepool counts of nodes annotated.
-func (c *Controller) enqueueAnnotationWrites(ctx context.Context, groupA, groupBC, groupD []*state.StateNode) map[string]int {
+func (c *Controller) enqueueAnnotationWrites(ctx context.Context, groupA, groupBC, groupD []*karpentercluster.StateNode) map[string]int {
 	perNodePool := map[string]int{}
 	for _, node := range groupA {
 		c.tryEnqueueNode(ctx, node, math.MinInt32, false, perNodePool)
@@ -158,7 +159,7 @@ func (c *Controller) enqueueAnnotationWrites(ctx context.Context, groupA, groupB
 	return perNodePool
 }
 
-func (c *Controller) tryEnqueueNode(ctx context.Context, node *state.StateNode, rank int, cleanup bool, perNodePool map[string]int) bool {
+func (c *Controller) tryEnqueueNode(ctx context.Context, node *karpentercluster.StateNode, rank int, cleanup bool, perNodePool map[string]int) bool {
 	pods, _ := node.Pods(ctx, c.kubeClient)
 	// kube-controller-manager's ReplicaSet controller is the only in-tree consumer
 	// of corev1.PodDeletionCost, so writing it on a pod controlled by any other
@@ -175,7 +176,7 @@ func (c *Controller) tryEnqueueNode(ctx context.Context, node *state.StateNode, 
 	return true
 }
 
-func (c *Controller) enqueueCapped(ctx context.Context, nodes []*state.StateNode, budget int, perNodePool map[string]int, rankAt func(i int) (int, bool)) int {
+func (c *Controller) enqueueCapped(ctx context.Context, nodes []*karpentercluster.StateNode, budget int, perNodePool map[string]int, rankAt func(i int) (int, bool)) int {
 	if budget <= 0 {
 		return 0
 	}

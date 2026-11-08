@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package state
+package cluster
 
 import (
 	"context"
@@ -34,35 +34,33 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
-	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
+	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
-	"sigs.k8s.io/karpenter/pkg/state/statetest"
 	"sigs.k8s.io/karpenter/pkg/test"
 )
 
-func TestNodeCountKeepsTheContributionLaws(t *testing.T) {
-	for _, base := range []NodeCounts{{}, {Nodes: 3, Unhealthy: 1}} {
-		statetest.ExpectContribution(t, base, newNodeCount(false), newNodeCount(true))
-		statetest.ExpectContribution(t, base, newNodeCount(true), newNodeCount(false))
-		statetest.ExpectContribution(t, base, newNodeCount(true), newNodeCount(true))
-	}
-}
-
-func newNodeHealthCluster(t *testing.T) *Cluster {
+// testMatcher returns a matcher of one policy: a Node whose BadNode condition is False needs replacing.
+func testMatcher(t *testing.T) *repair.RepairPolicyMatcher {
 	t.Helper()
 	cloudProvider := fake.NewCloudProvider()
 	cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
 		{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, Action: cloudprovider.ReplaceNode},
+		{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, ReasonRegex: "^Kernel$", Action: cloudprovider.ReplaceNode},
 	}
 	ctx := options.ToContext(context.Background(), test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeRepair: new(true)}}))
-	matcher, err := health.NewRepairPolicyMatcher(ctx, cloudProvider)
+	matcher, err := repair.NewRepairPolicyMatcher(ctx, cloudProvider)
 	if err != nil || matcher == nil {
 		t.Fatalf("building repair policy matcher: %v", err)
 	}
-	return NewCluster(ctx, clock.RealClock{}, nil, nil, WithRepairPolicyMatcher(matcher))
+	return matcher
 }
 
-// healthNode is a Node cluster state holds by providerID, labeled with nodePool unless it's empty.
+func newNodeHealthCluster(t *testing.T) *NodeState {
+	t.Helper()
+	return NewNodeState(options.ToContext(context.Background(), test.Options()), clock.RealClock{}, testMatcher(t))
+}
+
+// healthNode is a Node cluster state tracks, labeled with nodePool unless it's empty.
 func healthNode(name, nodePool string, bad bool) *corev1.Node {
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: name, UID: k8stypes.UID("uid-" + name), ResourceVersion: "1", Labels: map[string]string{corev1.LabelInstanceTypeStable: "small"}},
@@ -92,10 +90,10 @@ func TestNodeHealthCountsNodesPerNodePoolAndAcrossTheCluster(t *testing.T) {
 		// An unmanaged Node counts across the cluster only.
 		healthNode("unmanaged", "", true),
 	} {
-		c.nodes.Observe(node)
+		c.NodeStore.Observe(node)
 	}
 	// A NodeClaim without a Node isn't a node yet.
-	c.UpdateNodeClaim(&v1.NodeClaim{
+	c.NodeClaimStore.Observe(&v1.NodeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: "launching", UID: "launching", Labels: map[string]string{v1.NodePoolLabelKey: "a"}},
 		Status:     v1.NodeClaimStatus{ProviderID: "fake://launching"},
 	})
@@ -114,23 +112,23 @@ func TestNodeHealthCountsNodesPerNodePoolAndAcrossTheCluster(t *testing.T) {
 	}
 
 	// A Node that recovers stops counting as unhealthy.
-	c.nodes.Observe(withResourceVersion(healthNode("a-1", "a", false), "2"))
+	c.NodeStore.Observe(withResourceVersion(healthNode("a-1", "a", false), "2"))
 	expectCounts(t, h.NodePool("a"), NodeCounts{Nodes: 3, Unhealthy: 0})
 	// A Node that moves between NodePools moves its count.
-	c.nodes.Observe(withResourceVersion(healthNode("b-1", "a", true), "2"))
+	c.NodeStore.Observe(withResourceVersion(healthNode("b-1", "a", true), "2"))
 	expectCounts(t, h.NodePool("a"), NodeCounts{Nodes: 4, Unhealthy: 1})
 	expectCounts(t, h.NodePool("b"), NodeCounts{})
 	expectCounts(t, h.Cluster(), NodeCounts{Nodes: 5, Unhealthy: 2})
 
 	// A Node that's gone stops counting, and a NodePool without Nodes leaves nothing behind.
-	c.DeleteNode("b-1")
+	c.NodeStore.Forget(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "b-1"}})
 	if _, ok := h.store.Get(nodeHealthKey{NodePool: "b"}); ok {
 		t.Errorf("NodePool b has counts after its last Node went")
 	}
 	expectCounts(t, h.NodePool("a"), NodeCounts{Nodes: 3, Unhealthy: 0})
 	expectCounts(t, h.Cluster(), NodeCounts{Nodes: 4, Unhealthy: 1})
 
-	c.Reset()
+	c.Clear()
 	expectCounts(t, h.Cluster(), NodeCounts{})
 	if n := len(lo.Keys(mapOf(h))); n != 0 {
 		t.Errorf("node health holds %d keys after Reset, want 0", n)
@@ -149,12 +147,12 @@ func mapOf(h *NodeHealth) map[nodeHealthKey]NodeCounts {
 
 func TestDeriveNodeHealthCountsWithItsOwnPredicateAndTheNodesAlreadyHeld(t *testing.T) {
 	c := newNodeHealthCluster(t)
-	c.nodes.Observe(healthNode("a-1", "a", true))
-	c.nodes.Observe(healthNode("a-2", "a", false))
+	c.NodeStore.Observe(healthNode("a-1", "a", true))
+	c.NodeStore.Observe(healthNode("a-2", "a", false))
 	// Unhealthy here is a Node without the BadNode condition, the opposite of the matcher's.
 	h := c.DeriveNodeHealth(func(node *corev1.Node) bool { return len(node.Status.Conditions) == 0 })
 	expectCounts(t, h.NodePool("a"), NodeCounts{Nodes: 2, Unhealthy: 1})
-	c.nodes.Observe(healthNode("a-3", "a", false))
+	c.NodeStore.Observe(healthNode("a-3", "a", false))
 	expectCounts(t, h.NodePool("a"), NodeCounts{Nodes: 3, Unhealthy: 2})
 	expectCounts(t, c.NodeHealth().NodePool("a"), NodeCounts{Nodes: 3, Unhealthy: 1})
 }
@@ -169,21 +167,18 @@ func TestNodeHealthConvergesAfterConcurrentChanges(t *testing.T) {
 			for i := range 500 {
 				name := fmt.Sprintf("node-%d", r.IntN(40))
 				if r.IntN(4) == 0 {
-					c.DeleteNode(name)
+					c.NodeStore.Forget(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}})
 					continue
 				}
-				c.nodes.Observe(withResourceVersion(healthNode(name, pools[r.IntN(len(pools))], r.IntN(2) == 0), fmt.Sprint(w*1000+i)))
+				c.NodeStore.Observe(withResourceVersion(healthNode(name, pools[r.IntN(len(pools))], r.IntN(2) == 0), fmt.Sprint(w*1000+i)))
 			}
 		})
 	}
 	wg.Wait()
 	want := map[nodeHealthKey]NodeCounts{}
-	for _, f := range c.nodes.List() {
-		if f.Node == nil {
-			continue
-		}
-		bad := len(f.RepairPolicyMatches) > 0
-		for _, key := range []nodeHealthKey{{Cluster: true}, {NodePool: f.Node.Labels[v1.NodePoolLabelKey]}} {
+	for _, node := range c.NodeStore.List() {
+		bad := len(c.matcher.Match(node)) > 0
+		for _, key := range []nodeHealthKey{{Cluster: true}, {NodePool: node.Labels[v1.NodePoolLabelKey]}} {
 			if key == (nodeHealthKey{}) {
 				continue
 			}

@@ -424,9 +424,9 @@ func TestClusterConcurrentAccess(t *testing.T) {
 				nc := f.nodeClaims[n].DeepCopy()
 				f.version(nc)
 				f.cluster.UpdateNodeClaim(nc)
-				f.cluster.MarkForDeletion(nc.Status.ProviderID)
-				f.cluster.UnmarkForDeletion(nc.Status.ProviderID)
-				f.cluster.NominateNodeForPod(ctx, nc.Status.ProviderID)
+				f.cluster.MarkForDeletion(nc.Name)
+				f.cluster.UnmarkForDeletion(nc.Name)
+				f.cluster.NominateNodeForPod(ctx, nc.Name)
 			}
 		})
 	}
@@ -443,7 +443,7 @@ func TestClusterConcurrentAccess(t *testing.T) {
 				}
 				f.cluster.ForPodsWithAntiAffinity(func(*corev1.Pod, *corev1.Node) bool { return true })
 				_ = f.cluster.NodePoolResourcesFor("pool-0")
-				_ = f.cluster.IsNodeNominated("fake://0")
+				_ = f.cluster.IsNodeNominated("nc-0")
 			}
 		})
 	}

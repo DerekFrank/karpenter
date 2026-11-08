@@ -28,8 +28,8 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
-	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
@@ -63,16 +63,16 @@ var _ = Describe("Repair Method Registration", func() {
 
 	It("builds no matcher when the feature gate is disabled", func() {
 		cloudProvider.RepairPolicy = nil
-		Expect(health.NewRepairPolicyMatcher(disabledCtx, cloudProvider)).To(BeNil())
+		Expect(repair.NewRepairPolicyMatcher(disabledCtx, cloudProvider)).To(BeNil())
 	})
 
 	It("builds a matcher when the feature gate is enabled and policies are valid", func() {
-		Expect(health.NewRepairPolicyMatcher(enabledCtx, cloudProvider)).NotTo(BeNil())
+		Expect(repair.NewRepairPolicyMatcher(enabledCtx, cloudProvider)).NotTo(BeNil())
 	})
 
 	It("fails when repair is enabled without any policies", func() {
 		cloudProvider.RepairPolicy = nil
-		_, err := health.NewRepairPolicyMatcher(enabledCtx, cloudProvider)
+		_, err := repair.NewRepairPolicyMatcher(enabledCtx, cloudProvider)
 		Expect(err).To(MatchError("node repair requires the cloud provider to define RepairPolicies, but it defines none"))
 	})
 
@@ -81,7 +81,7 @@ var _ = Describe("Repair Method Registration", func() {
 			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, ReasonRegex: "[", Action: cloudprovider.ReplaceNode},
 			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, Action: cloudprovider.ReplaceNode},
 		}
-		_, err := health.NewRepairPolicyMatcher(enabledCtx, cloudProvider)
+		_, err := repair.NewRepairPolicyMatcher(enabledCtx, cloudProvider)
 		Expect(err).To(MatchError(ContainSubstring("node repair requires valid RepairPolicies")))
 	})
 })
@@ -271,7 +271,12 @@ func churn(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim) {
 			}}})
 	ExpectApplied(ctx, env.Client, pods[0])
 	ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
-	cluster.NominateNodeForPod(ctx, nodes[0].Spec.ProviderID)
+	// The callers may order nodes and nodeClaims differently, so find the NodeClaim of nodes[0] by its providerID.
+	for _, nodeClaim := range nodeClaims {
+		if nodeClaim.Status.ProviderID == nodes[0].Spec.ProviderID {
+			cluster.NominateNodeForPod(ctx, nodeClaim.Name)
+		}
+	}
 	Expect(cluster.UpdateNode(ctx, nodes[0])).To(Succeed())
 }
 
@@ -286,8 +291,8 @@ func blockingBudget(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim, nodePool *
 func nominated(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim) {
 	ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 	for i := range nodes {
-		cluster.NominateNodeForPod(ctx, nodes[i].Spec.ProviderID)
-		cluster.NominateNodeForPod(ctx, nodes[i].Spec.ProviderID)
+		cluster.NominateNodeForPod(ctx, nodeClaims[i].Name)
+		cluster.NominateNodeForPod(ctx, nodeClaims[i].Name)
 		Expect(cluster.UpdateNode(ctx, nodes[i])).To(Succeed())
 	}
 }

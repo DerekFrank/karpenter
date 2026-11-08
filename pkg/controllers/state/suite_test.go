@@ -41,6 +41,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/nodeoverlay"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
@@ -50,6 +51,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
+	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 	. "sigs.k8s.io/karpenter/pkg/utils/testing"
 )
@@ -244,7 +246,11 @@ var _ = Describe("Reset", func() {
 		nn := client.ObjectKeyFromObject(pod)
 		cluster.AckPods(pod)
 		cluster.MarkPodSchedulingDecisions(ctx, nil, map[string][]*corev1.Pod{"np1": {pod}}, map[string][]*corev1.Pod{"nc1": {pod}})
+		nodeClaim := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "provider-a"}})
+		ExpectApplied(ctx, env.Client, nodeClaim)
+		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 		cluster.UpdateBufferPodCounts(map[string]int{"provider-a": 2})
+		Expect(cluster.BufferPodCount("provider-a")).To(Equal(2))
 
 		cluster.Reset()
 		Expect(cluster.PodAckTime(nn).IsZero()).To(BeTrue())
@@ -299,7 +305,8 @@ var _ = Describe("Volume Usage/Limits", func() {
 		}
 	})
 	It("should hydrate the volume usage on a Node update", func() {
-		ExpectApplied(ctx, env.Client, sc, node, csiNode)
+		ExpectApplied(ctx, env.Client, sc, nodeClaim, node, csiNode)
+		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 		for range 10 {
 			pvc := test.PersistentVolumeClaim(test.PersistentVolumeClaimOptions{
 				StorageClassName: new(sc.Name),
@@ -322,7 +329,8 @@ var _ = Describe("Volume Usage/Limits", func() {
 	DescribeTable("should treat a published driver without an attachment limit as unbounded",
 		func(allocatable *storagev1.VolumeNodeResources) {
 			csiNode.Spec.Drivers[0].Allocatable = allocatable
-			ExpectApplied(ctx, env.Client, node, csiNode)
+			ExpectApplied(ctx, env.Client, nodeClaim, node, csiNode)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 			ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
 
 			volumeUsage := ExpectStateNodeExists(cluster, node).VolumeUsage()
@@ -406,7 +414,8 @@ var _ = Describe("HostPort Usage", func() {
 		})
 	})
 	It("should hydrate the HostPort usage on a Node update", func() {
-		ExpectApplied(ctx, env.Client, node)
+		ExpectApplied(ctx, env.Client, nodeClaim, node)
+		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
 		for i := range 10 {
 			pod := test.Pod(test.PodOptions{
@@ -429,7 +438,8 @@ var _ = Describe("HostPort Usage", func() {
 		})).ToNot(BeNil())
 	})
 	It("should maintain the host port usage state when receiving NodeClaim updates", func() {
-		ExpectApplied(ctx, env.Client, node)
+		ExpectApplied(ctx, env.Client, nodeClaim, node)
+		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
 		for i := range 10 {
 			pod := test.Pod(test.PodOptions{
@@ -465,7 +475,8 @@ var _ = Describe("HostPort Usage", func() {
 		})).ToNot(BeNil())
 	})
 	It("should ignore the host port usage conflict if the pod update is for an already tracked pod", func() {
-		ExpectApplied(ctx, env.Client, node)
+		ExpectApplied(ctx, env.Client, nodeClaim, node)
+		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
 		var pods []*corev1.Pod
 		for i := range 10 {
@@ -510,10 +521,11 @@ var _ = Describe("Node Deletion", func() {
 
 		ExpectStateNodeCount("==", 1)
 
-		// Expect that the node isn't leaked due to names matching
+		// Expect that the node isn't leaked due to names matching. Once its NodeClaim is gone, the Node is orphaned, and
+		// an orphaned Node isn't a state node.
 		ExpectDeleted(ctx, env.Client, nodeClaim)
 		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
-		ExpectStateNodeCount("==", 1)
+		ExpectStateNodeCount("==", 0)
 		ExpectDeleted(ctx, env.Client, node)
 		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
 		ExpectStateNodeCount("==", 0)
@@ -536,7 +548,6 @@ var _ = Describe("Node Resource Level", func() {
 		})
 		node := test.Node(test.NodeOptions{
 			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
-				v1.NodePoolLabelKey:            nodePool.Name,
 				corev1.LabelInstanceTypeStable: cloudProvider.InstanceTypes[0].Name,
 			}},
 			Allocatable: map[corev1.ResourceName]resource.Quantity{
@@ -569,7 +580,6 @@ var _ = Describe("Node Resource Level", func() {
 		})
 		node := test.Node(test.NodeOptions{
 			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
-				v1.NodePoolLabelKey:            nodePool.Name,
 				corev1.LabelInstanceTypeStable: cloudProvider.InstanceTypes[0].Name,
 			}},
 			Allocatable: map[corev1.ResourceName]resource.Quantity{
@@ -609,7 +619,6 @@ var _ = Describe("Node Resource Level", func() {
 		})
 		node := test.Node(test.NodeOptions{
 			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
-				v1.NodePoolLabelKey:            nodePool.Name,
 				corev1.LabelInstanceTypeStable: cloudProvider.InstanceTypes[0].Name,
 			}},
 			Allocatable: map[corev1.ResourceName]resource.Quantity{
@@ -643,7 +652,6 @@ var _ = Describe("Node Resource Level", func() {
 		})
 		node := test.Node(test.NodeOptions{
 			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
-				v1.NodePoolLabelKey:            nodePool.Name,
 				corev1.LabelInstanceTypeStable: cloudProvider.InstanceTypes[0].Name,
 			}},
 			Allocatable: map[corev1.ResourceName]resource.Quantity{
@@ -691,7 +699,6 @@ var _ = Describe("Node Resource Level", func() {
 		})
 		node := test.Node(test.NodeOptions{
 			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
-				v1.NodePoolLabelKey:            nodePool.Name,
 				corev1.LabelInstanceTypeStable: cloudProvider.InstanceTypes[0].Name,
 			}},
 			Allocatable: map[corev1.ResourceName]resource.Quantity{
@@ -722,7 +729,6 @@ var _ = Describe("Node Resource Level", func() {
 		})
 		node := test.Node(test.NodeOptions{
 			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
-				v1.NodePoolLabelKey:            nodePool.Name,
 				corev1.LabelInstanceTypeStable: cloudProvider.InstanceTypes[0].Name,
 			}},
 			Allocatable: map[corev1.ResourceName]resource.Quantity{
@@ -762,7 +768,6 @@ var _ = Describe("Node Resource Level", func() {
 
 		node1 := test.Node(test.NodeOptions{
 			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
-				v1.NodePoolLabelKey:            nodePool.Name,
 				corev1.LabelInstanceTypeStable: cloudProvider.InstanceTypes[0].Name,
 			}},
 			Allocatable: map[corev1.ResourceName]resource.Quantity{
@@ -787,7 +792,6 @@ var _ = Describe("Node Resource Level", func() {
 		// second node has more capacity
 		node2 := test.Node(test.NodeOptions{
 			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
-				v1.NodePoolLabelKey:            nodePool.Name,
 				corev1.LabelInstanceTypeStable: cloudProvider.InstanceTypes[0].Name,
 			}},
 			Allocatable: map[corev1.ResourceName]resource.Quantity{
@@ -837,7 +841,6 @@ var _ = Describe("Node Resource Level", func() {
 		}
 		node := test.Node(test.NodeOptions{
 			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
-				v1.NodePoolLabelKey:            nodePool.Name,
 				corev1.LabelInstanceTypeStable: cloudProvider.InstanceTypes[0].Name,
 			}},
 			Allocatable: map[corev1.ResourceName]resource.Quantity{
@@ -928,7 +931,6 @@ var _ = Describe("Node Resource Level", func() {
 
 		node := test.Node(test.NodeOptions{
 			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
-				v1.NodePoolLabelKey:            nodePool.Name,
 				corev1.LabelInstanceTypeStable: cloudProvider.InstanceTypes[0].Name,
 			}},
 			Allocatable: map[corev1.ResourceName]resource.Quantity{
@@ -973,7 +975,6 @@ var _ = Describe("Node Resource Level", func() {
 		node := test.Node(test.NodeOptions{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels: map[string]string{
-					v1.NodePoolLabelKey:            nodePool.Name,
 					corev1.LabelInstanceTypeStable: cloudProvider.InstanceTypes[0].Name,
 				},
 				Finalizers: []string{v1.TerminationFinalizer},
@@ -1050,7 +1051,7 @@ var _ = Describe("Node Resource Level", func() {
 		Expect(ExpectStateNodeExists(cluster, node).MarkedForDeletion()).To(BeTrue())
 	})
 	It("should nominate the node until the nomination time passes", func() {
-		node := test.Node(test.NodeOptions{
+		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels: map[string]string{
 					v1.NodePoolLabelKey:            nodePool.Name,
@@ -1058,15 +1059,17 @@ var _ = Describe("Node Resource Level", func() {
 				},
 				Finalizers: []string{v1.TerminationFinalizer},
 			},
-			Allocatable: map[corev1.ResourceName]resource.Quantity{
-				corev1.ResourceCPU: resource.MustParse("4"),
+			Status: v1.NodeClaimStatus{
+				Allocatable: map[corev1.ResourceName]resource.Quantity{
+					corev1.ResourceCPU: resource.MustParse("4"),
+				},
 			},
-			ProviderID: test.RandomProviderID(),
 		})
-		ExpectApplied(ctx, env.Client, node)
+		ExpectApplied(ctx, env.Client, nodeClaim, node)
+		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
 
-		cluster.NominateNodeForPod(ctx, node.Spec.ProviderID)
+		cluster.NominateNodeForPod(ctx, nodeClaim.Name)
 
 		// Expect that the node is now nominated
 		Expect(ExpectStateNodeExists(cluster, node).Nominated(env.Clock)).To(BeTrue())
@@ -1297,7 +1300,7 @@ var _ = Describe("Cluster State Sync", func() {
 
 		Expect(cluster.Synced(ctx)).To(BeTrue())
 		ExpectMetricGaugeValue(state.ClusterStateSynced, 1.0, nil)
-		ExpectMetricGaugeValue(state.ClusterStateNodesCount, 1000.0, nil)
+		ExpectMetricGaugeValue(karpentercluster.ClusterStateNodesCount, 1000.0, nil)
 		metric, found := FindMetricWithLabelValues("karpenter_cluster_state_unsynced_time_seconds", map[string]string{})
 		Expect(found).To(BeTrue())
 		Expect(metric.GetGauge().GetValue()).To(BeEquivalentTo(0))
@@ -1336,7 +1339,7 @@ var _ = Describe("Cluster State Sync", func() {
 		wg.Wait()
 		Expect(cluster.Synced(ctx)).To(BeTrue())
 		ExpectMetricGaugeValue(state.ClusterStateSynced, 1.0, nil)
-		ExpectMetricGaugeValue(state.ClusterStateNodesCount, 1000.0, nil)
+		ExpectMetricGaugeValue(karpentercluster.ClusterStateNodesCount, 1000.0, nil)
 
 	})
 	It("should consider the cluster state synced when nodes register provider id", func() {
@@ -1355,7 +1358,7 @@ var _ = Describe("Cluster State Sync", func() {
 			}(i)
 		}
 		wg.Wait()
-		ExpectMetricGaugeValue(state.ClusterStateNodesCount, 1000.0, nil)
+		ExpectMetricGaugeValue(karpentercluster.ClusterStateNodesCount, 1000.0, nil)
 		Expect(cluster.Synced(ctx)).To(BeTrue())
 		for i := range 1000 {
 			wg.Add(1)
@@ -1370,7 +1373,7 @@ var _ = Describe("Cluster State Sync", func() {
 		wg.Wait()
 		Expect(cluster.Synced(ctx)).To(BeTrue())
 		ExpectMetricGaugeValue(state.ClusterStateSynced, 1.0, nil)
-		ExpectMetricGaugeValue(state.ClusterStateNodesCount, 1000.0, nil)
+		ExpectMetricGaugeValue(karpentercluster.ClusterStateNodesCount, 1000.0, nil)
 	})
 	It("should consider the cluster state synced when all nodeclaims are tracked", func() {
 		// Deploy 1000 nodeClaims and sync them all with the cluster
@@ -2184,6 +2187,8 @@ var _ = Describe("NodePool Resources", func() {
 				},
 			},
 		})
+		// Registration links the Node to its NodeClaim by owner reference.
+		node1 = nodeclaimutils.UpdateNodeOwnerReferences(nodeClaim1, node1)
 		cluster.UpdateNodeClaim(nodeClaim1.DeepCopy())
 		Expect(cluster.UpdateNode(ctx, node1.DeepCopy())).To(Succeed())
 
@@ -2249,6 +2254,8 @@ var _ = Describe("NodePool Resources", func() {
 				},
 			},
 		})
+		// Registration links the Node to its NodeClaim by owner reference.
+		node1 = nodeclaimutils.UpdateNodeOwnerReferences(nodeClaim1, node1)
 		cluster.UpdateNodeClaim(nodeClaim1.DeepCopy())
 		Expect(cluster.UpdateNode(ctx, node1.DeepCopy())).To(Succeed())
 
@@ -2258,14 +2265,14 @@ var _ = Describe("NodePool Resources", func() {
 			corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
 		}, cluster.NodePoolResourcesFor(nodeClaim1.Labels[v1.NodePoolLabelKey]))
 
-		// NodeClaim changes providerID for some reason
+		// NodeClaim changes providerID for some reason. Its owner reference still links the Node, which counts once.
 		nodeClaim1.Status.ProviderID = test.RandomProviderID()
 		cluster.UpdateNodeClaim(nodeClaim1.DeepCopy())
 
 		ExpectResources(corev1.ResourceList{
-			corev1.ResourceCPU:              resource.MustParse("4"),
-			corev1.ResourceMemory:           resource.MustParse("4Gi"),
-			corev1.ResourceEphemeralStorage: resource.MustParse("4Gi"),
+			corev1.ResourceCPU:              resource.MustParse("2"),
+			corev1.ResourceMemory:           resource.MustParse("2Gi"),
+			corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
 		}, cluster.NodePoolResourcesFor(nodeClaim1.Labels[v1.NodePoolLabelKey]))
 
 		// Node changes providerID and now matches
@@ -2300,6 +2307,8 @@ var _ = Describe("NodePool Resources", func() {
 			corev1.ResourceMemory:           resource.MustParse("1Gi"),
 			corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
 		}
+		// Registration links the Node to its NodeClaim by owner reference.
+		node1 = nodeclaimutils.UpdateNodeOwnerReferences(nodeClaim1, node1)
 		cluster.UpdateNodeClaim(nodeClaim1.DeepCopy())
 		Expect(cluster.UpdateNode(ctx, node1.DeepCopy())).To(Succeed())
 
@@ -2340,6 +2349,8 @@ var _ = Describe("NodePool Resources", func() {
 			corev1.ResourceMemory:           resource.MustParse("1Gi"),
 			corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
 		}
+		// Registration links the Node to its NodeClaim by owner reference.
+		node1 = nodeclaimutils.UpdateNodeOwnerReferences(nodeClaim1, node1)
 		cluster.UpdateNodeClaim(nodeClaim1.DeepCopy())
 		Expect(cluster.UpdateNode(ctx, node1.DeepCopy())).To(Succeed())
 
@@ -2351,11 +2362,11 @@ var _ = Describe("NodePool Resources", func() {
 
 		cluster.DeleteNodeClaim(nodeClaim1.Name)
 
-		// Should continue to use the Node capacity once we delete the Node
+		// The Node is orphaned once its NodeClaim is gone, and an orphaned Node doesn't count against its NodePool's limits.
 		ExpectResources(corev1.ResourceList{
-			corev1.ResourceCPU:              resource.MustParse("1"),
-			corev1.ResourceMemory:           resource.MustParse("1Gi"),
-			corev1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+			corev1.ResourceCPU:              resource.MustParse("0"),
+			corev1.ResourceMemory:           resource.MustParse("0Gi"),
+			corev1.ResourceEphemeralStorage: resource.MustParse("0Gi"),
 		}, cluster.NodePoolResourcesFor(nodeClaim1.Labels[v1.NodePoolLabelKey]))
 	})
 	It("should update nodepool resources when node is terminating (deletionTimestamp set)", func() {
@@ -2421,7 +2432,7 @@ var _ = Describe("NodePool Resources", func() {
 		}, cluster.NodePoolResourcesFor(nodeClaim1.Labels[v1.NodePoolLabelKey]))
 
 		// MarkForDeletion and expect the count of resources to reduce
-		cluster.MarkForDeletion(nodeClaim1.Status.ProviderID)
+		cluster.MarkForDeletion(nodeClaim1.Name)
 
 		ExpectResources(corev1.ResourceList{
 			corev1.ResourceCPU:              resource.MustParse("0"),
@@ -2430,7 +2441,7 @@ var _ = Describe("NodePool Resources", func() {
 		}, cluster.NodePoolResourcesFor(nodeClaim1.Labels[v1.NodePoolLabelKey]))
 
 		// UnmarkForDeletion and expect the count of resources to be restored
-		cluster.UnmarkForDeletion(nodeClaim1.Status.ProviderID)
+		cluster.UnmarkForDeletion(nodeClaim1.Name)
 
 		ExpectResources(corev1.ResourceList{
 			corev1.ResourceCPU:              resource.MustParse("2"),
@@ -2465,7 +2476,7 @@ var _ = Describe("NodePool Resources", func() {
 		}, cluster.NodePoolResourcesFor(nodeClaim1.Labels[v1.NodePoolLabelKey]))
 
 		// MarkForDeletion and expect the count of resources to reduce
-		cluster.MarkForDeletion(nodeClaim1.Status.ProviderID)
+		cluster.MarkForDeletion(nodeClaim1.Name)
 
 		ExpectResources(corev1.ResourceList{
 			corev1.ResourceCPU:              resource.MustParse("0"),
@@ -2713,7 +2724,7 @@ var _ = Describe("NodePoolState Tracking", func() {
 			})
 
 			It("should not change the counts when a node is marked for deletion", func() {
-				cluster.MarkForDeletion(nodeClaim.Status.ProviderID)
+				cluster.MarkForDeletion(nodeClaim.Name)
 				ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 0)
 			})
 
@@ -2890,9 +2901,26 @@ func ExpectStateNodeCount(comparator string, count int) int {
 }
 
 var _ = Describe("Buffer Pod Counts", func() {
-	It("should return false for unknown providerIDs", func() {
-		Expect(cluster.HasBufferPods("unknown-provider-id")).To(BeFalse())
-		Expect(cluster.BufferPodCount("unknown-provider-id")).To(Equal(0))
+	BeforeEach(func() {
+		// Buffer pod counts are intent kept with each NodeClaim, by name.
+		for _, name := range []string{"provider-a", "provider-b", "provider-c"} {
+			nodeClaim := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: name}})
+			ExpectApplied(ctx, env.Client, nodeClaim)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+		}
+	})
+	It("should return false for unknown NodeClaims", func() {
+		Expect(cluster.HasBufferPods("unknown-nodeclaim")).To(BeFalse())
+		Expect(cluster.BufferPodCount("unknown-nodeclaim")).To(Equal(0))
+	})
+	It("should not keep counts for a NodeClaim cluster state doesn't hold", func() {
+		cluster.UpdateBufferPodCounts(map[string]int{"unknown-nodeclaim": 2})
+		Expect(cluster.BufferPodCount("unknown-nodeclaim")).To(Equal(0))
+	})
+	It("should drop a NodeClaim's counts once the NodeClaim is gone", func() {
+		cluster.UpdateBufferPodCounts(map[string]int{"provider-a": 2})
+		cluster.DeleteNodeClaim("provider-a")
+		Expect(cluster.BufferPodCount("provider-a")).To(Equal(0))
 	})
 
 	It("should track buffer pods after UpdateBufferPodCounts", func() {

@@ -1141,11 +1141,11 @@ var _ = Describe("Repair", func() {
 		Expect(commands).To(HaveLen(1))
 
 		queue.Lock()
-		queue.ProviderIDToCommand[candidates[0].ProviderID()] = &commands[0]
+		queue.NodeClaimToCommand[candidates[0].NodeClaim.Name] = &commands[0]
 		queue.Unlock()
 		Expect(queue.StartCommand(ctx, &commands[0])).To(MatchError("candidate is being disrupted"))
 		queue.Lock()
-		delete(queue.ProviderIDToCommand, candidates[0].ProviderID())
+		delete(queue.NodeClaimToCommand, candidates[0].NodeClaim.Name)
 		queue.Unlock()
 
 		reservations := cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 6, 1)
@@ -1354,7 +1354,7 @@ var _ = Describe("Repair", func() {
 			registerNode(nodeClaim, node)
 			markUnhealthy(node, "BadNode")
 			env.Clock.Step(31 * time.Minute)
-			cluster.NominateNodeForPod(ctx, node.Spec.ProviderID)
+			cluster.NominateNodeForPod(ctx, nodeClaim.Name)
 
 			ExpectSingletonReconciled(ctx, repairController)
 			Expect(queue.GetCommands()).To(HaveLen(1))

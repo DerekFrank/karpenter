@@ -29,6 +29,7 @@ import (
 
 	coreapis "sigs.k8s.io/karpenter/pkg/apis"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/pod/deletioncost"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
@@ -48,7 +49,7 @@ type nodeRankInfo struct {
 
 // rankInfoFor folds the three RankNodes slices into a per-node lookup: RankForBC
 // for B/C, math.MinInt32 for A, cleanup=true for D.
-func rankInfoFor(name string, groupA, groupBC, groupD []*state.StateNode) nodeRankInfo {
+func rankInfoFor(name string, groupA, groupBC, groupD []*karpentercluster.StateNode) nodeRankInfo {
 	for _, n := range groupA {
 		if n.Node != nil && n.Node.Name == name {
 			return nodeRankInfo{rank: math.MinInt32, cleanup: false, found: true}
@@ -67,7 +68,7 @@ func rankInfoFor(name string, groupA, groupBC, groupD []*state.StateNode) nodeRa
 	return nodeRankInfo{}
 }
 
-func totalRanked(groupA, groupBC, groupD []*state.StateNode) int {
+func totalRanked(groupA, groupBC, groupD []*karpentercluster.StateNode) int {
 	return len(groupA) + len(groupBC) + len(groupD)
 }
 

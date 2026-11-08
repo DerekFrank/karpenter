@@ -49,6 +49,7 @@ import (
 	operatorlogging "sigs.k8s.io/karpenter/pkg/operator/logging"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -87,7 +88,7 @@ func IsUnrecoverableError(err error) bool {
 
 func (q *Queue) GetMaxRetryDuration() time.Duration {
 	q.RLock()
-	numCommands := len(q.ProviderIDToCommand)
+	numCommands := len(q.NodeClaimToCommand)
 	q.RUnlock()
 	retryDuration := retryDurationScale * time.Duration(numCommands)
 	return lo.Clamp(retryDuration, minRetryDuration, maxRetryDuration)
@@ -95,13 +96,13 @@ func (q *Queue) GetMaxRetryDuration() time.Duration {
 
 type Queue struct {
 	sync.RWMutex
-	ProviderIDToCommand map[string]*Command // providerID -> command, maps a candidate to its command
-	source              chan event.TypedGenericEvent[*v1.NodeClaim]
-	kubeClient          client.Client
-	recorder            events.Recorder
-	cluster             *state.Cluster
-	clock               clock.Clock
-	provisioner         *provisioning.Provisioner
+	NodeClaimToCommand map[string]*Command // NodeClaim name -> command, maps a candidate to its command
+	source             chan event.TypedGenericEvent[*v1.NodeClaim]
+	kubeClient         client.Client
+	recorder           events.Recorder
+	cluster            *state.Cluster
+	clock              clock.Clock
+	provisioner        *provisioning.Provisioner
 }
 
 // NewQueue creates a queue that will asynchronously orchestrate disruption commands
@@ -111,13 +112,13 @@ func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state
 	queue := &Queue{
 		// nolint:staticcheck
 		// We need to implement a deprecated interface since Command currently doesn't implement "comparable"
-		source:              make(chan event.TypedGenericEvent[*v1.NodeClaim], 10000),
-		ProviderIDToCommand: map[string]*Command{},
-		kubeClient:          kubeClient,
-		recorder:            recorder,
-		cluster:             cluster,
-		clock:               clock,
-		provisioner:         provisioner,
+		source:             make(chan event.TypedGenericEvent[*v1.NodeClaim], 10000),
+		NodeClaimToCommand: map[string]*Command{},
+		kubeClient:         kubeClient,
+		recorder:           recorder,
+		cluster:            cluster,
+		clock:              clock,
+		provisioner:        provisioner,
 	}
 	return queue
 }
@@ -143,7 +144,7 @@ func (q *Queue) Register(ctx context.Context, m manager.Manager) error {
 func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, q.Name())
 	q.RLock()
-	cmd, exists := q.ProviderIDToCommand[nodeClaim.Status.ProviderID]
+	cmd, exists := q.NodeClaimToCommand[nodeClaim.Name]
 	q.RUnlock()
 	if !exists {
 		log.FromContext(ctx).Error(fmt.Errorf("no command found"), "")
@@ -168,7 +169,7 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 			metrics.ReasonLabel:    strings.ToLower(string(cmd.Reason())),
 			ConsolidationTypeLabel: cmd.ConsolidationType(),
 		})
-		stateNodes := lo.Map(cmd.Candidates, func(c *Candidate, _ int) *state.StateNode { return c.StateNode })
+		stateNodes := lo.Map(cmd.Candidates, func(c *Candidate, _ int) *karpentercluster.StateNode { return c.StateNode })
 		multiErr := multierr.Combine(err, RequireNoScheduleTaint(ctx, q.kubeClient, false, stateNodes...))
 		multiErr = multierr.Combine(multiErr, ClearNodeClaimsCondition(ctx, q.kubeClient, q.clock, v1.ConditionTypeDisruptionReason, stateNodes...))
 		// Log the error
@@ -365,10 +366,7 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 		}
 	}()
 	// First check if we can add the command.
-	providerIDs := lo.Map(cmd.Candidates, func(c *Candidate, _ int) string {
-		return c.ProviderID()
-	})
-	if q.HasAny(providerIDs...) {
+	if q.HasAny(candidateNodeClaims(cmd)...) {
 		return fmt.Errorf("candidate is being disrupted")
 	}
 
@@ -409,7 +407,7 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	// If we MarkForDeletion before we create replacements, it's possible for the provisioner
 	// to recognize that it needs to launch capacity for terminating pods, causing us to launch
 	// capacity for these pods twice instead of just once
-	q.cluster.MarkForDeletion(lo.Map(cmd.Candidates, func(c *Candidate, _ int) string { return c.ProviderID() })...)
+	q.cluster.MarkForDeletion(candidateNodeClaims(cmd)...)
 
 	// Nominate each node for scheduling and emit pod nomination events
 	// We emit all nominations before we exit the disruption loop as
@@ -424,7 +422,7 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 
 	q.Lock()
 	for _, c := range cmd.Candidates {
-		q.ProviderIDToCommand[c.ProviderID()] = cmd
+		q.NodeClaimToCommand[c.NodeClaim.Name] = cmd
 	}
 	// IMPORTANT
 	// We are adding the first nodeclaim in the list of candidates into the reconciliation queue
@@ -472,14 +470,19 @@ func releaseReservations(cmd *Command) {
 	}
 }
 
-// HasAny checks to see if the candidate is part of an currently executing command.
-func (q *Queue) HasAny(ids ...string) bool {
+// candidateNodeClaims returns the names of the command's candidates' NodeClaims, which key the intent kept about them.
+func candidateNodeClaims(cmd *Command) []string {
+	return lo.Map(cmd.Candidates, func(c *Candidate, _ int) string { return c.NodeClaim.Name })
+}
+
+// HasAny checks to see if the candidate, by its NodeClaim's name, is part of an currently executing command.
+func (q *Queue) HasAny(nodeClaimNames ...string) bool {
 	q.RLock()
 	defer q.RUnlock()
 
-	// If the mapping has at least one of the candidates' providerIDs, return true.
-	for _, id := range ids {
-		if _, exists := q.ProviderIDToCommand[id]; exists {
+	// If the mapping has at least one of the candidates' NodeClaims, return true.
+	for _, name := range nodeClaimNames {
+		if _, exists := q.NodeClaimToCommand[name]; exists {
 			return true
 		}
 	}
@@ -493,24 +496,24 @@ func (q *Queue) GetCommands() []*Command {
 	q.RLock()
 	defer q.RUnlock()
 
-	return lo.UniqValues(q.ProviderIDToCommand)
+	return lo.UniqValues(q.NodeClaimToCommand)
 }
 
 // CompleteCommand fully clears the queue of all references of a hash/command
 func (q *Queue) CompleteCommand(cmd *Command) {
 	if !cmd.Succeeded {
-		q.cluster.UnmarkForDeletion(lo.Map(cmd.Candidates, func(c *Candidate, _ int) string { return c.ProviderID() })...)
+		q.cluster.UnmarkForDeletion(candidateNodeClaims(cmd)...)
 	}
 	// Remove all candidates linked to the command
 	q.Lock()
 	defer q.Unlock()
 	for _, c := range cmd.Candidates {
-		delete(q.ProviderIDToCommand, c.ProviderID())
+		delete(q.NodeClaimToCommand, c.NodeClaim.Name)
 	}
 }
 
 func (q *Queue) IsEmpty() bool {
 	q.RLock()
 	defer q.RUnlock()
-	return len(q.ProviderIDToCommand) == 0
+	return len(q.NodeClaimToCommand) == 0
 }

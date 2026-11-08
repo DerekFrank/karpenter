@@ -27,8 +27,8 @@ import (
 
 // Store holds fields F per key K. There are three kinds:
 //   - an object store (NewObjectStore) holds the objects of one kind by name;
-//   - a join store (NewJoinStore) holds objects of several kinds that are one thing, such as a Node and its NodeClaim,
-//     under one key;
+//   - a join store (NewJoinStore) holds objects of several kinds that are one thing under one key, or one kind with the
+//     intent Karpenter keeps about each object;
 //   - a derived store (NewStore) holds fields that Derive computes from another store, that Claims hold, or that Update
 //     sets.
 //

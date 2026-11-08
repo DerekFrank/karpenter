@@ -52,6 +52,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	scheduler "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -205,7 +206,7 @@ func (p *Provisioner) CreateNodeClaims(ctx context.Context, nodeClaims []*schedu
 		if reservation := nodeClaims[i].Reservation; reservation != nil {
 			switch {
 			case err == nil:
-				reservation.Bind(types.NamespacedName{Name: name})
+				reservation.Bind(name)
 			case !ambiguous(err):
 				reservation.Release()
 			}
@@ -286,7 +287,7 @@ var ErrNodePoolsNotFound = errors.New("no nodepools found")
 func (p *Provisioner) NewScheduler(
 	ctx context.Context,
 	pods []*corev1.Pod,
-	stateNodes []*state.StateNode,
+	stateNodes []*karpentercluster.StateNode,
 	deletingPodUIDs sets.Set[types.UID],
 	opts ...scheduler.Options,
 ) (*scheduler.Scheduler, error) {
