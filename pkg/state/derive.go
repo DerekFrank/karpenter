@@ -18,7 +18,6 @@ package state
 
 import (
 	"reflect"
-	"sync"
 	"sync/atomic"
 )
 
@@ -53,8 +52,6 @@ type Derivation[K1, K2 comparable, F1, F2 any, C Contribution[F2, C]] struct {
 	key   func(K1, F1) K2
 	value func(K1, F1) C
 
-	// mu orders the source's changes, so a key's contribution is computed from its latest fields.
-	mu sync.Mutex
 	// records and byKey are what each source key contributes, under to's lock.
 	records map[K1]record[K2, C]
 	byKey   map[K2]map[K1]struct{}
@@ -119,19 +116,36 @@ func (d *Derivation[K1, K2, F1, F2, C]) clearLocked() {
 	d.byKey = map[K2]map[K1]struct{}{}
 }
 
+// apply applies k's latest fields. It computes the contribution without a lock, then commits it under to's lock only if
+// from still holds the fields it computed from, and recomputes otherwise, so the last commit for k is from k's latest
+// fields. A store's entries never change once stored, so the entry pointer identifies a version of the fields.
 func (d *Derivation[K1, K2, F1, F2, C]) apply(k K1) {
 	var zero K2
-	d.mu.Lock()
-	fields, exists := d.from.Get(k)
-	next := record[K2, C]{}
-	contributes := false
-	if exists {
-		next.key = d.key(k, fields)
-		if contributes = next.key != zero; contributes {
-			next.value = d.value(k, fields)
+	for {
+		read, _ := d.from.entries.Load(k)
+		next := record[K2, C]{}
+		contributes := false
+		if read != nil {
+			fields := *read.(*F1)
+			next.key = d.key(k, fields)
+			if contributes = next.key != zero; contributes {
+				next.value = d.value(k, fields)
+			}
 		}
+		d.to.mu.Lock()
+		if current, _ := d.from.entries.Load(k); current != read {
+			d.to.mu.Unlock()
+			continue
+		}
+		changed := d.commitLocked(k, next, contributes)
+		subscribers := d.to.subscribers
+		d.to.mu.Unlock()
+		notify(subscribers, changed)
+		return
 	}
-	d.to.mu.Lock()
+}
+
+func (d *Derivation[K1, K2, F1, F2, C]) commitLocked(k K1, next record[K2, C], contributes bool) []Change[K2, F2] {
 	prev, had := d.records[k]
 	if had && (!contributes || prev.key != next.key) {
 		if delete(d.byKey[prev.key], k); len(d.byKey[prev.key]) == 0 {
@@ -153,10 +167,7 @@ func (d *Derivation[K1, K2, F1, F2, C]) apply(k K1) {
 	if d.settle != nil {
 		changed = append(changed, d.settle(k, next.value, contributes)...)
 	}
-	subscribers := d.to.subscribers
-	d.to.mu.Unlock()
-	d.mu.Unlock()
-	notify(subscribers, changed)
+	return changed
 }
 
 // moveContribution moves a source's contribution from prev to next, dispatching to Update and Delete as Contribution

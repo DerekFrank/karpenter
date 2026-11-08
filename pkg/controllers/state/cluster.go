@@ -75,8 +75,6 @@ type Cluster struct {
 	// nodes. podsOnNodes is the Derive from pods, which knows the pods bound to each node.
 	nodeUsage   *karpenterstate.Store[string, podFields]
 	podsOnNodes *karpenterstate.Derivation[types.NamespacedName, string, *corev1.Pod, podFields, podContribution]
-	// csiDrivers keeps each node's CSINode drivers, by node name, read when the Node last changed.
-	csiDrivers *karpenterstate.Store[string, csiFields]
 	// pvcDrivers keeps the CSI driver of each PersistentVolumeClaim, by namespaced name, which counts its volume against
 	// the driver's limit on the node a pod mounts it on.
 	pvcDrivers *karpenterstate.Store[types.NamespacedName, pvcFields]
@@ -151,10 +149,8 @@ type podFields struct {
 	// pvcDrivers.
 	PVCs             map[types.NamespacedName]int
 	AntiAffinityPods map[types.NamespacedName]*corev1.Pod
-}
-
-type csiFields struct {
-	Drivers []storagev1.CSINodeDriver
+	// CSIDrivers are the drivers of the node's CSINode, read when the Node last changed and set by UpdateNode.
+	CSIDrivers []storagev1.CSINodeDriver
 }
 
 // pvcFields are a PVC's CSI driver once resolved; Driver is empty for a PVC whose volume no driver limits.
@@ -274,7 +270,7 @@ func (p podContribution) Delete(f podFields) podFields {
 		delete(f.AntiAffinityPods, key)
 	}
 	if f.Pods == 0 {
-		return podFields{Node: f.Node}
+		return podFields{Node: f.Node, CSIDrivers: f.CSIDrivers}
 	}
 	return f
 }
@@ -392,7 +388,6 @@ func (c *Cluster) newStores() {
 	c.nodeClaims = karpenterstate.NewObjectStore[*v1.NodeClaim](nil, nil)
 	c.pods = karpenterstate.NewObjectStore[*corev1.Pod](nil, nil)
 	c.nodeUsage = karpenterstate.NewStore[string, podFields]()
-	c.csiDrivers = karpenterstate.NewStore[string, csiFields]()
 	c.pvcDrivers = karpenterstate.NewStore[types.NamespacedName, pvcFields]()
 	c.nodePoolResources = karpenterstate.NewStore[string, corev1.ResourceList]()
 	c.daemonSetPods = karpenterstate.NewStore[types.NamespacedName, daemonSetFields]()
@@ -444,7 +439,7 @@ func (c *Cluster) newStores() {
 
 // clearStores empties the stores in place, so that their subscribers stay subscribed.
 func (c *Cluster) clearStores() {
-	for _, s := range []interface{ Clear() }{c.nodes, c.nodeClaims, c.pods, c.nodeUsage, c.csiDrivers, c.pvcDrivers, c.nodePoolResources, c.daemonSetPods} {
+	for _, s := range []interface{ Clear() }{c.nodes, c.nodeClaims, c.pods, c.nodeUsage, c.pvcDrivers, c.nodePoolResources, c.daemonSetPods} {
 		s.Clear()
 	}
 	c.NodePoolState.Reset()
@@ -500,10 +495,8 @@ func (c *Cluster) stateNode(f nodeFields, copyUsage bool) *StateNode {
 		repairPolicyMatches: f.RepairPolicyMatches,
 	}
 	var pods podFields
-	var csi csiFields
 	if f.Node != nil {
 		pods, _ = c.nodeUsage.Get(f.Node.Name)
-		csi, _ = c.csiDrivers.Get(f.Node.Name)
 	}
 	n.Derived.PodRequests, n.Derived.PodLimits = pods.Requests, pods.Limits
 	n.Derived.DaemonSetRequests, n.Derived.DaemonSetLimits = pods.DaemonSetRequests, pods.DaemonSetLimits
@@ -521,7 +514,7 @@ func (c *Cluster) stateNode(f nodeFields, copyUsage bool) *StateNode {
 		}
 		n.Derived.Volumes.Insert(volumes)
 	}
-	for _, driver := range csi.Drivers {
+	for _, driver := range pods.CSIDrivers {
 		if driver.Allocatable == nil || driver.Allocatable.Count == nil {
 			n.Derived.Volumes.AddUnbounded(driver.Name)
 			continue
@@ -722,7 +715,7 @@ func (c *Cluster) UpdateNode(ctx context.Context, node *corev1.Node) error {
 	if err := c.kubeClient.Get(ctx, client.ObjectKey{Name: node.Name}, &csiNode); client.IgnoreNotFound(err) != nil {
 		return serrors.Wrap(fmt.Errorf("getting CSINode to determine volume limit, %w", err), "CSINode", klog.KRef("", node.Name))
 	}
-	c.csiDrivers.Update(node.Name, func(csiFields) csiFields { return csiFields{Drivers: csiNode.Spec.Drivers} })
+	c.nodeUsage.Update(node.Name, func(f podFields) podFields { f.CSIDrivers = csiNode.Spec.Drivers; return f })
 	var pods corev1.PodList
 	if err := c.kubeClient.List(ctx, &pods, client.MatchingFields{"spec.nodeName": node.Name}, client.UnsafeDisableDeepCopy); err != nil {
 		return fmt.Errorf("listing pods, %w", err)
@@ -740,7 +733,7 @@ func (c *Cluster) UpdateNode(ctx context.Context, node *corev1.Node) error {
 
 func (c *Cluster) DeleteNode(name string) {
 	c.nodes.Forget(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}})
-	c.csiDrivers.Update(name, func(csiFields) csiFields { return csiFields{} })
+	c.nodeUsage.Update(name, func(f podFields) podFields { f.CSIDrivers = nil; return f })
 }
 
 // UpdatePod applies the pod, resolving the CSI drivers of the PVCs it mounts that cluster state hasn't seen.

@@ -202,7 +202,6 @@ type VolumeUsage struct {
 func NewVolumeUsage() *VolumeUsage {
 	return &VolumeUsage{
 		volumes:          Volumes{},
-		existing:         Volumes{},
 		podVolumes:       map[types.NamespacedName]Volumes{},
 		limits:           map[string]int{},
 		publishedDrivers: sets.New[string](),
@@ -241,6 +240,9 @@ func (v *VolumeUsage) Add(pod *v1.Pod, volumes Volumes) {
 
 // Insert adds volumes that pods already on the node mount, which DeletePod keeps.
 func (v *VolumeUsage) Insert(volumes Volumes) {
+	if v.existing == nil {
+		v.existing = Volumes{}
+	}
 	v.existing.Insert(volumes)
 	v.volumes.Insert(volumes)
 }
