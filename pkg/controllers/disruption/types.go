@@ -18,6 +18,7 @@ package disruption
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"math"
 	"strings"
@@ -161,12 +162,12 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 		return nil, serrors.Wrap(fmt.Errorf("repair requires a nodepool"), "NodeClaim", klog.KObj(node.NodeClaim))
 	}
 
-	err := node.ValidateNodeDisruptable(clk)
+	err := ValidateNodeDisruptable(node, clk)
 	if err != nil {
 		// Repair is voluntary but is NOT discretionary: do-not-disrupt was never intended to strand a broken node.
 		// Nor is a node that never initializes left stranded, since nothing else replaces it.
 		if disruptionClass == RepairDisruptionClass {
-			err = state.IgnoreNodeUninitializedError(state.IgnoreNodeDoNotDisruptError(err))
+			err = IgnoreNodeUninitializedError(IgnoreNodeDoNotDisruptError(err))
 		}
 		if err != nil {
 			// Only emit an event for Karpenter-managed nodes.
@@ -192,7 +193,7 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 	}
 	// We only care if instanceType in non-empty consolidation to do price-comparison.
 	instanceType := instanceTypeMap[node.Labels()[corev1.LabelInstanceTypeStable]]
-	pods, err := node.ValidatePodsDisruptable(ctx, kubeClient, pdbs, clk, recorder)
+	pods, err := ValidatePodsDisruptable(ctx, kubeClient, node, pdbs, clk, recorder)
 	hasPodBlockers := false
 	if err != nil {
 		// Repair resolves its policy deadline after candidate construction, so retain whether pod blockers were ignored
@@ -200,10 +201,10 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 		validationErr := err
 		switch {
 		case disruptionClass == RepairDisruptionClass:
-			validationErr = state.IgnorePodBlockEvictionError(err)
+			validationErr = IgnorePodBlockEvictionError(err)
 			hasPodBlockers = validationErr == nil
 		case disruptionClass == EventualDisruptionClass && node.NodeClaim.Spec.TerminationGracePeriod != nil:
-			validationErr = state.IgnorePodBlockEvictionError(err)
+			validationErr = IgnorePodBlockEvictionError(err)
 		}
 		if validationErr != nil {
 			recorder.Publish(disruptionevents.Blocked(node.Node, node.NodeClaim, pretty.Sentence(err.Error()))...)
@@ -496,4 +497,148 @@ func launchCapacityType(requirement *scheduling.Requirement) string {
 		}
 	}
 	return v1.CapacityTypeOnDemand
+}
+
+type PodBlockEvictionError struct {
+	error
+}
+
+func NewPodBlockEvictionError(err error) *PodBlockEvictionError {
+	return &PodBlockEvictionError{error: err}
+}
+
+func IsPodBlockEvictionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var podBlockEvictionError *PodBlockEvictionError
+	return stderrors.As(err, &podBlockEvictionError)
+}
+
+func IgnorePodBlockEvictionError(err error) error {
+	if IsPodBlockEvictionError(err) {
+		return nil
+	}
+	return err
+}
+
+// NodeDoNotDisruptError is returned by ValidateNodeDisruptable when a node carries the do-not-disrupt annotation.
+// It is a distinct type so the repair path can selectively ignore it: repair is not discretionary disruption, so
+// do-not-disrupt must not block it (that would be a breaking behavior change and conflate two intents). Repair
+// instead honors the separate do-not-repair annotation.
+type NodeDoNotDisruptError struct {
+	error
+}
+
+func NewNodeDoNotDisruptError(err error) *NodeDoNotDisruptError {
+	return &NodeDoNotDisruptError{error: err}
+}
+
+func IsNodeDoNotDisruptError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var nodeDoNotDisruptError *NodeDoNotDisruptError
+	return stderrors.As(err, &nodeDoNotDisruptError)
+}
+
+func IgnoreNodeDoNotDisruptError(err error) error {
+	if IsNodeDoNotDisruptError(err) {
+		return nil
+	}
+	return err
+}
+
+// NodeUninitializedError is returned when a registered node hasn't initialized. Repair ignores it, since a node that
+// never initializes is otherwise only replaced by a human.
+type NodeUninitializedError struct {
+	error
+}
+
+func NewNodeUninitializedError(err error) *NodeUninitializedError {
+	return &NodeUninitializedError{error: err}
+}
+
+func IsNodeUninitializedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var nodeUninitializedError *NodeUninitializedError
+	return stderrors.As(err, &nodeUninitializedError)
+}
+
+func IgnoreNodeUninitializedError(err error) error {
+	if IsNodeUninitializedError(err) {
+		return nil
+	}
+	return err
+}
+
+// ValidateNodeDisruptable returns an error if the StateNode cannot be disrupted
+// This checks all associated StateNode internals, node labels, and do-not-disrupt annotations on the node.
+// ValidateNodeDisruptable takes in a recorder to emit events on the nodeclaims when the state node is not a candidate
+//
+//nolint:gocyclo
+func ValidateNodeDisruptable(in *state.StateNode, clk clock.Clock) error {
+	if in.NodeClaim == nil {
+		return fmt.Errorf("node isn't managed by karpenter")
+	}
+	if in.Node == nil {
+		return fmt.Errorf("nodeclaim does not have an associated node")
+	}
+	// A rebooting node must not be picked up by other disruption methods. This covers the drain window
+	// too, where the node is still Initialized but a reboot is already committed.
+	if in.RebootInProgress() {
+		return fmt.Errorf("node is rebooting")
+	}
+	if in.MarkedForDeletion() {
+		return fmt.Errorf("node is deleting or marked for deletion")
+	}
+	// Checked ahead of nomination, which provisioning keeps renewing on an uninitialized node while pods wait for it.
+	if !in.Initialized() {
+		// Liveness's registration timeout owns a node until it registers, so only a registered node is ignorable.
+		if !in.Registered() {
+			return fmt.Errorf("node isn't initialized nor registered")
+		}
+		return NewNodeUninitializedError(fmt.Errorf("node isn't initialized"))
+	}
+	// skip the node if it is nominated by a recent provisioning pass to be the target of a pending pod.
+	if in.Nominated(clk) {
+		return fmt.Errorf("node is nominated for a pending pod")
+	}
+	if in.Annotations()[v1.DoNotDisruptAnnotationKey] == "true" {
+		return NewNodeDoNotDisruptError(fmt.Errorf("disruption is blocked through the %q annotation", v1.DoNotDisruptAnnotationKey))
+	}
+	// check whether the node has the NodePool label
+	if _, ok := in.Labels()[v1.NodePoolLabelKey]; !ok {
+		return serrors.Wrap(fmt.Errorf("node doesn't have required label"), "label", v1.NodePoolLabelKey)
+	}
+	return nil
+}
+
+// ValidatePodsDisruptable returns the pods on the StateNode, and an error if one of them cannot be disrupted. contains a pod that cannot be disrupted
+// This checks associated PDBs and do-not-disrupt annotations for each pod on the node.
+// ValidatePodsDisruptable takes in a recorder to emit events on the nodeclaims when the state node is not a candidate
+//
+//nolint:gocyclo
+func ValidatePodsDisruptable(ctx context.Context, kubeClient client.Client, in *state.StateNode, pdbs pdb.Limits, clk clock.Clock, recorder events.Recorder) ([]*corev1.Pod, error) {
+	pods, err := in.Pods(ctx, kubeClient)
+	if err != nil {
+		return nil, err
+	}
+	for _, po := range pods {
+		// We only consider pods that are actively running for "karpenter.sh/do-not-disrupt"
+		// This means that we will allow Mirror Pods and DaemonSets to block disruption using this annotation
+		if !pod.IsDisruptable(po, clk, recorder) {
+			return pods, NewPodBlockEvictionError(serrors.Wrap(fmt.Errorf(`pod has "karpenter.sh/do-not-disrupt" annotation`), "Pod", klog.KObj(po)))
+		}
+	}
+	if pdbKeys, ok := pdbs.CanEvictPods(pods, clk, recorder); !ok {
+		if len(pdbKeys) > 1 {
+			return pods, NewPodBlockEvictionError(serrors.Wrap(fmt.Errorf("eviction does not support multiple PDBs"), "PodDisruptionBudget(s)", pdbKeys))
+		}
+		return pods, NewPodBlockEvictionError(serrors.Wrap(fmt.Errorf("pdb prevents pod evictions"), "PodDisruptionBudget", pdbKeys))
+	}
+
+	return pods, nil
 }

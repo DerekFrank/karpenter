@@ -43,6 +43,7 @@ func TestContributionsKeepTheContributionLaws(t *testing.T) {
 	base := NodePoolFields{NodeClaims: NodeClaimCounts{Active: 3, Deleting: 1}, Reserved: 2}
 	statetest.ExpectContribution(t, base, NodeClaimCounts{Active: 1}, NodeClaimCounts{Deleting: 1})
 	statetest.ExpectContribution(t, base, reservedNodes(1), reservedNodes(2))
+	statetest.ExpectContribution(t, NodePoolDisruption{Nodes: 4, Disrupting: 1, NotReady: 2}, NodePoolDisruption{Nodes: 1, NotReady: 1}, NodePoolDisruption{Nodes: 1, Disrupting: 1})
 }
 
 func TestClusterContributionsKeepTheContributionLaws(t *testing.T) {
