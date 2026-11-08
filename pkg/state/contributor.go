@@ -55,9 +55,12 @@ type record[K comparable, C any] struct {
 }
 
 // Contribute returns a Contributor of list's kind to store. A zero key from target means S contributes to nothing.
+//
+// A Contributor with a kubeClient syncs once Start applies its first List. One without is fed through Observe, Forget
+// and Resync by whatever follows S, which owns when it has caught up, so it reports synced from the start.
 func Contribute[K comparable, S client.Object, F, C any](store *Store[K, F], kubeClient client.Client, informers cache.Informers, list client.ObjectList,
 	target func(S) K, contribution func(context.Context, S) (C, error), apply func(fields F, prev, next C) F) *Contributor[K, S, F, C] {
-	return &Contributor[K, S, F, C]{
+	c := &Contributor[K, S, F, C]{
 		store:         store,
 		kubeClient:    kubeClient,
 		informers:     informers,
@@ -67,9 +70,12 @@ func Contribute[K comparable, S client.Object, F, C any](store *Store[K, F], kub
 		apply:         apply,
 		equal:         func(a, b C) bool { return reflect.DeepEqual(a, b) },
 		sources:       newFeed(),
+		synced:        kubeClient == nil,
 		contributions: map[types.UID]record[K, C]{},
 		byTarget:      map[K]map[types.UID]struct{}{},
 	}
+	store.feedBy(c)
+	return c
 }
 
 // Start follows S's informer and the client's writes until ctx is done. It implements manager.Runnable.

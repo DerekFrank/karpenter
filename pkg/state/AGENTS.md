@@ -14,8 +14,9 @@ This file covers facts and derived fields. Intent lives in `state.Cluster` in
 
 ## Layout
 
-- **`pkg/state`** holds the kind-free primitives: `Store`, `Contribute`
-  (`Contributor`), `Derive`, `Accessor` (`NewAccessor`) and `View`.
+- **`pkg/state`** holds the primitives, which know no object kinds: `Store`,
+  `Contribute` (`Contributor`), `Derive`, `Accessor` (`NewAccessor`), `View`,
+  and the sources `Store.Source`, `Wake` and `After`.
 - **`pkg/state/overlay`** holds `overlay.Client`, the read-after-write client:
   its reads include its own writes before the informer delivers them.
 - **`pkg/cluster`** holds the cluster's state built from those primitives: one
@@ -53,8 +54,44 @@ c.kubeClient.Status().Patch(ctx, nodePool.Object, client.MergeFrom(stored))
   accessors takes a client of `client.Writer` and `client.StatusClient`, as the
   `writer` interface in `pkg/controllers/nodepool/counter` does, so a read
   through the client is a compile error.
-- **Write from derived fields once they're synced.** Check the Contributor's
-  `Synced` first, as the nodepool counter checks `usage.NodeClaims.Synced()`.
+
+## Reacting to derived fields
+
+A store is a controller-runtime source whose requests are its keys, and an
+accessor is the source of the stores behind it. A controller that watches one
+reconciles an object whenever the object's derived fields change, as
+`nodepool.counter` reconciles a NodePool on each change to its usage:
+
+```go
+controllerruntime.NewControllerManagedBy(m).
+	Named("nodepool.counter").
+	For(&v1.NodePool{}, ...).        // the object's own events
+	WatchesRawSource(c.nodePools).   // its derived fields' changes
+	Complete(c)
+```
+
+- **Watch a store whose keys and fields are exactly what the controller
+  reconciles on.** A store notifies only when a key's fields change, so its
+  fields are its filter and its keys are its requests. When no store fits,
+  `state.Derive` one: keyed by the object the controller reconciles, holding
+  only the fields it acts on, such as the number of pods on each deleting node
+  rather than every pod's usage.
+- **`store.Source()` is the store as a source**, for a store keyed by name or
+  `types.NamespacedName`. Register it with `NewAccessor`, or watch it on its
+  own.
+- **`Start` enqueues every key the store holds, then each one that changes.**
+  The workqueue holds a key once, so a burst of changes reconciles the object
+  once, with the fields as they are when it runs.
+- **`WaitForSync` holds the controller's workers until the store is synced**:
+  every Contributor that feeds it has applied its first List, and every store
+  it is derived from is synced. That is bounded, as controller-runtime's
+  `CacheSyncTimeout` requires.
+- **`state.Wake(sources...)`** folds every change into one empty request, for a
+  controller that reconciles the whole cluster at once, in place of a
+  singleton's poll. **`state.After(delay, sources...)`** batches each request's
+  changes for `delay`, for a watcher such as metrics.
+- **The source wakes the controller; the reconcile reads the fields** through
+  the accessor.
 
 ## Keeping derived fields
 
@@ -80,8 +117,8 @@ independent of the number of objects behind the field.
 - **`state.Derive` feeds a store from another store's fields**, such as Node
   capacity summed onto its NodePool.
 - **`Store.Update` sets fields Karpenter decides**, under the store's lock.
-  `Store.Subscribe` notifies on each changed key, as `NodePoolUsage.Subscribe`
-  enqueues NodePools.
+  `Store.Subscribe` calls a func with each changed key until the func it returns
+  is called.
 - **The accessor's `derive` reads the stores**, so readers get the fields.
 - **Each aggregate lives in a `Store`**, fed by a `Contributor` or `Derive`.
   Look up objects by a value of one object, such as pods by `spec.nodeName`,
@@ -126,3 +163,8 @@ the lag: a pod that moves between nodes can briefly count on both or neither.
 - Check a field against a recount of its objects after many concurrent changes,
   as `TestContributorConcurrentChangesConverge` does.
 - Read through the accessor over a fake client, as `accessor_test.go` does.
+- Start a source on a workqueue and assert on what it queues, as
+  `TestAccessorEnqueuesObjectsWhoseDerivedFieldsChange`, `source_test.go` and the
+  counter's "should reconcile a NodePool whenever its usage changes" do.
+  Test a derived store's narrowing as
+  `TestADerivedStoreNotifiesOnlyWhenItsNarrowerFieldsChange` does.
