@@ -190,7 +190,7 @@ func (r *Registration) updateNodePoolRegistrationHealth(ctx context.Context, nod
 			return nil
 		}
 		stored := nodePool.DeepCopy()
-		if r.npState.DryRun(nodePool.UID, true).Status() == nodepoolhealth.StatusHealthy && nodePool.StatusConditions(status.WithClock(r.clock)).SetTrue(v1.ConditionTypeNodeRegistrationHealthy) {
+		if r.npState.DryRun(nodePool, true) == nodepoolhealth.StatusHealthy && nodePool.StatusConditions(status.WithClock(r.clock)).SetTrue(v1.ConditionTypeNodeRegistrationHealthy) {
 			// We use client.MergeFromWithOptimisticLock because patching a list with a JSON merge patch
 			// can cause races due to the fact that it fully replaces the list on a change
 			// Here, we are updating the status condition list
@@ -198,7 +198,7 @@ func (r *Registration) updateNodePoolRegistrationHealth(ctx context.Context, nod
 				return serrors.Wrap(fmt.Errorf("patching nodepool status, %w", err), "NodePool", klog.KObj(nodePool))
 			}
 		}
-		r.npState.Update(nodePool.UID, true)
+		r.npState.Update(nodePool, true)
 	}
 	return nil
 }

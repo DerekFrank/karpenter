@@ -26,7 +26,6 @@ import (
 
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/klog/v2"
@@ -140,12 +139,8 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 		}
 		return candidates[i].Name() < candidates[j].Name()
 	})
-	trippedPools, err := r.breakerTrippedPools(ctx)
-	if err != nil {
-		return []Command{}, err
-	}
 	for _, candidate := range candidates {
-		if trippedPools[candidate.NodePool.Name] {
+		if r.breakerTripped(candidate.NodePool.Name) {
 			r.recorder.Publish(disruptionevents.NodeRepairBlocked(candidate.Node, candidate.NodeClaim, candidate.NodePool,
 				fmt.Sprintf("more than %s of nodes in nodepool %q are unhealthy", repairUnhealthyThreshold, candidate.NodePool.Name))...)
 			continue
@@ -313,37 +308,14 @@ func (r *Repair) commitReboot(ctx context.Context, candidate *Candidate) (bool, 
 	return true, nil
 }
 
-// breakerTrippedPools returns the NodePools whose unhealthy-node fraction exceeds repairUnhealthyThreshold. A node
-// counts as unhealthy as soon as one of its current conditions matches the provider policy set, regardless of policy
-// toleration. The threshold rounds up so one unhealthy node does not halt repair in small pools.
-func (r *Repair) breakerTrippedPools(ctx context.Context) (map[string]bool, error) {
-	// TODO: cache unhealthy node counts by NodePool from Node updates instead of recalculating them on every repair pass.
-	nodeList := &corev1.NodeList{}
-	if err := r.kubeClient.List(ctx, nodeList, client.UnsafeDisableDeepCopy); err != nil {
-		return nil, err
-	}
-	total := map[string]int{}
-	unhealthy := map[string]int{}
-	for i := range nodeList.Items {
-		node := &nodeList.Items[i]
-		nodePool := node.Labels[v1.NodePoolLabelKey]
-		if nodePool == "" {
-			continue
-		}
-		total[nodePool]++
-		if lo.SomeBy(node.Status.Conditions, r.policyMatcher.Matches) {
-			unhealthy[nodePool]++
-		}
-	}
-	tripped := map[string]bool{}
+// breakerTripped returns whether the NodePool's unhealthy-node fraction exceeds repairUnhealthyThreshold. It counts the
+// Nodes labeled with the NodePool that cluster state holds, with or without a NodeClaim, and a Node counts as unhealthy
+// as soon as one of its current conditions matches the provider policy set, regardless of policy toleration. The
+// threshold rounds up so one unhealthy node does not halt repair in small pools.
+func (r *Repair) breakerTripped(nodePool string) bool {
+	counts := r.cluster.NodeHealth().NodePool(nodePool)
 	thresholdValue := intstr.FromString(repairUnhealthyThreshold)
-	for nodePool, count := range total {
-		threshold := lo.Must(intstr.GetScaledValueFromIntOrPercent(&thresholdValue, count, true))
-		if unhealthy[nodePool] > threshold {
-			tripped[nodePool] = true
-		}
-	}
-	return tripped, nil
+	return counts.Unhealthy > lo.Must(intstr.GetScaledValueFromIntOrPercent(&thresholdValue, counts.Nodes, true))
 }
 
 // effectiveDrainBound returns the drain bound for the candidate, carried on the Command and applied by the queue

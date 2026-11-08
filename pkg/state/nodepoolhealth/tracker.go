@@ -14,14 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package nodepoolhealth keeps the recent launch outcomes of each NodePool, which decide its NodeRegistrationHealthy
+// condition.
 package nodepoolhealth
 
 import (
-	"sync"
-
 	"k8s.io/apimachinery/pkg/types"
 
-	"sigs.k8s.io/karpenter/pkg/utils/ringbuffer"
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/state"
 )
 
 const (
@@ -37,121 +38,100 @@ const (
 	StatusUnhealthy
 )
 
-type Tracker struct {
-	sync.RWMutex
-	buffer ringbuffer.RingBuffer[bool]
+// Fields are what Karpenter records about a NodePool's launches, keyed by the NodePool's name. The lifecycle and
+// registration health controllers set them with Store.Update, and they go once the NodePool does.
+type Fields struct {
+	// UID is the NodePool the outcomes are of. Outcomes recorded for an earlier NodePool of the same name don't count.
+	UID types.UID
+	// Outcomes are the NodePool's newest BufferSize launch outcomes, oldest first: true for a NodeClaim that
+	// registered, false for one that failed to launch or register. A stored slice is never modified.
+	Outcomes []bool
 }
 
-func NewTracker(capacity int) *Tracker {
-	return &Tracker{
-		buffer: *ringbuffer.New[bool](capacity),
-	}
-}
-
-func (t *Tracker) Update(success bool) {
-	t.Lock()
-	defer t.Unlock()
-
-	t.buffer.Insert(success)
-}
-
-func (t *Tracker) Reset() {
-	t.Lock()
-	defer t.Unlock()
-
-	t.buffer.Reset()
-}
-
-func (t *Tracker) Status() Status {
-	t.RLock()
-	defer t.RUnlock()
-
-	if t.buffer.Len() == 0 {
-		return StatusUnknown
-	}
-	// Count number of true and false
-	var unhealthyCount int
-	for _, value := range t.buffer.Items() {
-		if !value {
-			unhealthyCount++
-		}
-	}
-	// Determine health status based on threshold
-	if (float64(unhealthyCount) / float64(BufferSize)) >= ThresholdFalse {
-		return StatusUnhealthy
-	} else {
-		return StatusHealthy
-	}
-}
-
-func (t *Tracker) SetStatus(status Status) {
-	t.Lock()
-	defer t.Unlock()
-
-	switch status {
-	case StatusUnknown:
-		t.buffer.Reset()
-	case StatusHealthy:
-		t.buffer.Reset()
-		t.buffer.Insert(true)
-	case StatusUnhealthy:
-		t.buffer.Reset()
-		for range int(BufferSize * ThresholdFalse) {
-			t.buffer.Insert(false)
-		}
-	}
-}
-
+// State keeps the Fields of each NodePool.
 type State struct {
-	sync.RWMutex
-	trackers map[types.UID]*Tracker
+	store *state.Store[string, Fields]
 }
 
 func NewState() *State {
-	return &State{
-		trackers: make(map[types.UID]*Tracker),
-	}
+	return &State{store: state.NewStore[string, Fields]()}
 }
 
-func (s *State) nodePoolNodeRegistration(nodePoolUID types.UID) *Tracker {
-	s.RLock()
-	tracker, exists := s.trackers[nodePoolUID]
-	s.RUnlock()
+// outcomes returns the outcomes recorded for the NodePool, ignoring those of an earlier NodePool with its name.
+func (f Fields) outcomes(nodePool *v1.NodePool) []bool {
+	if f.UID != nodePool.UID {
+		return nil
+	}
+	return f.Outcomes
+}
 
-	if !exists {
-		s.Lock()
-		// Double-check after acquiring write lock
-		if tracker, exists = s.trackers[nodePoolUID]; !exists {
-			tracker = NewTracker(BufferSize)
-			s.trackers[nodePoolUID] = tracker
+// Status returns the NodePool's registration health from its recorded outcomes.
+func (s *State) Status(nodePool *v1.NodePool) Status {
+	f, _ := s.store.Get(nodePool.Name)
+	return status(f.outcomes(nodePool))
+}
+
+// Update records a launch outcome of the NodePool, dropping its oldest once it holds BufferSize.
+func (s *State) Update(nodePool *v1.NodePool, success bool) {
+	s.store.Update(nodePool.Name, func(f Fields) Fields {
+		return Fields{UID: nodePool.UID, Outcomes: record(f.outcomes(nodePool), success)}
+	})
+}
+
+// DryRun returns the NodePool's status as if it had recorded the outcome, without recording it.
+func (s *State) DryRun(nodePool *v1.NodePool, success bool) Status {
+	f, _ := s.store.Get(nodePool.Name)
+	return status(record(f.outcomes(nodePool), success))
+}
+
+// SetStatus replaces the NodePool's outcomes with the fewest that give the status. StatusUnknown drops them.
+func (s *State) SetStatus(nodePool *v1.NodePool, st Status) {
+	var outcomes []bool
+	switch st {
+	case StatusHealthy:
+		outcomes = []bool{true}
+	case StatusUnhealthy:
+		outcomes = make([]bool, int(BufferSize*ThresholdFalse))
+	}
+	s.store.Update(nodePool.Name, func(Fields) Fields {
+		if outcomes == nil {
+			return Fields{}
 		}
-		s.Unlock()
+		return Fields{UID: nodePool.UID, Outcomes: outcomes}
+	})
+}
+
+// Delete drops the outcomes of the NodePool with the name, once it's gone.
+func (s *State) Delete(name string) {
+	s.store.Update(name, func(Fields) Fields { return Fields{} })
+}
+
+// Get returns the Fields recorded under the NodePool name, and whether there are any.
+func (s *State) Get(name string) (Fields, bool) {
+	return s.store.Get(name)
+}
+
+// record returns outcomes with the outcome appended, keeping the newest BufferSize, in a new slice.
+func record(outcomes []bool, success bool) []bool {
+	next := make([]bool, 0, BufferSize)
+	if len(outcomes) >= BufferSize {
+		outcomes = outcomes[len(outcomes)-BufferSize+1:]
 	}
-	return tracker
+	return append(append(next, outcomes...), success)
 }
 
-func (s *State) Status(nodePoolUID types.UID) Status {
-	return s.nodePoolNodeRegistration(nodePoolUID).Status()
-}
-
-func (s *State) Update(nodePoolUID types.UID, launchStatus bool) {
-	s.nodePoolNodeRegistration(nodePoolUID).Update(launchStatus)
-}
-
-func (s *State) SetStatus(nodePoolUID types.UID, status Status) {
-	s.nodePoolNodeRegistration(nodePoolUID).SetStatus(status)
-}
-
-func (s *State) DryRun(nodePoolUID types.UID, launchStatus bool) *Tracker {
-	trackerCopy := NewTracker(BufferSize)
-	originalTracker := s.nodePoolNodeRegistration(nodePoolUID)
-
-	originalTracker.RLock()
-	for _, item := range originalTracker.buffer.Items() {
-		trackerCopy.buffer.Insert(item)
+func status(outcomes []bool) Status {
+	if len(outcomes) == 0 {
+		return StatusUnknown
 	}
-	originalTracker.RUnlock()
-
-	trackerCopy.Update(launchStatus)
-	return trackerCopy
+	var unhealthy int
+	for _, success := range outcomes {
+		if !success {
+			unhealthy++
+		}
+	}
+	if float64(unhealthy)/float64(BufferSize) >= ThresholdFalse {
+		return StatusUnhealthy
+	}
+	return StatusHealthy
 }

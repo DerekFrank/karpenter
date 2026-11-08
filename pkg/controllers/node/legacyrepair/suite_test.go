@@ -26,6 +26,7 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -34,6 +35,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/legacyrepair"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -48,6 +50,30 @@ var env *test.Environment
 var cloudProvider *fake.CloudProvider
 var recorder *test.EventRecorder
 var queue *terminator.Queue
+var cluster *state.Cluster
+
+// expectApplied applies the objects and feeds the Nodes and NodeClaims among them to cluster state, as its informers
+// would.
+func expectApplied(objects ...client.Object) {
+	GinkgoHelper()
+	ExpectApplied(ctx, env.Client, objects...)
+	for _, o := range objects {
+		switch o := o.(type) {
+		case *corev1.Node:
+			Expect(cluster.UpdateNode(ctx, o)).To(Succeed())
+		case *v1.NodeClaim:
+			cluster.UpdateNodeClaim(o)
+		}
+	}
+}
+
+// managedNodeClaim is a NodeClaim whose Node cluster state holds once it's applied, since the Node has an instance type.
+func managedNodeClaim() v1.NodeClaim {
+	return v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+		Finalizers: []string{v1.TerminationFinalizer},
+		Labels:     map[string]string{corev1.LabelInstanceTypeStable: "default-instance-type"},
+	}}
+}
 
 func TestAPIs(t *testing.T) {
 	ctx = TestContextWithLogger(t)
@@ -64,6 +90,7 @@ var _ = BeforeSuite(func() {
 	cloudProvider = fake.NewCloudProvider()
 	recorder = test.NewEventRecorder()
 	queue = terminator.NewQueue(env.Clock, env.Client, recorder)
+	cluster = state.NewCluster(ctx, env.Clock, env.Client, cloudProvider)
 })
 
 var _ = AfterSuite(func() {
@@ -78,10 +105,10 @@ var _ = Describe("Node Health", func() {
 	BeforeEach(func() {
 		env.Clock.SetTime(time.Now())
 		cloudProvider.Reset()
-		healthController = legacyrepair.NewController(env.Client, cloudProvider, env.Clock, recorder)
+		healthController = legacyrepair.NewController(env.Client, cloudProvider, cluster, env.Clock, recorder)
 
 		nodePool = test.NodePool()
-		nodeClaim, node = test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Finalizers: []string{v1.TerminationFinalizer}}})
+		nodeClaim, node = test.NodeClaimAndNode(managedNodeClaim())
 		node.Labels[v1.NodePoolLabelKey] = nodePool.Name
 		nodeClaim.Labels[v1.NodePoolLabelKey] = nodePool.Name
 		cloudProvider.CreatedNodeClaims[node.Spec.ProviderID] = nodeClaim
@@ -89,6 +116,7 @@ var _ = Describe("Node Health", func() {
 
 	AfterEach(func() {
 		ExpectCleanedUp(ctx, env.Client)
+		cluster.Reset()
 
 		// Reset the metrics collectors
 		metrics.NodeClaimsDisruptedTotal.Reset()
@@ -103,12 +131,29 @@ var _ = Describe("Node Health", func() {
 				LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
 			})
 			env.Clock.Step(60 * time.Minute)
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			expectApplied(nodePool, nodeClaim, node)
 			// Determine to delete unhealthy nodes
 			ExpectObjectReconciled(ctx, env.Client, healthController, node)
 
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			Expect(nodeClaim.DeletionTimestamp).ToNot(BeNil())
+		})
+		It("should not delete unhealthy nodes before cluster state has synced", func() {
+			node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
+				Type:               "BadNode",
+				Status:             corev1.ConditionFalse,
+				LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
+			})
+			env.Clock.Step(60 * time.Minute)
+			// Cluster state hasn't seen the Node, so it can't count the NodePool's unhealthy nodes yet.
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			result := ExpectObjectReconciled(ctx, env.Client, healthController, node)
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+			Expect(ExpectExists(ctx, env.Client, nodeClaim).DeletionTimestamp).To(BeNil())
+
+			expectApplied(nodeClaim, node)
+			ExpectObjectReconciled(ctx, env.Client, healthController, node)
+			Expect(ExpectExists(ctx, env.Client, nodeClaim).DeletionTimestamp).ToNot(BeNil())
 		})
 		It("should delete nodes that registered unhealthy before the NodeClass label was synced", func() {
 			nodeClassLabelKey := v1.NodeClassLabelKey(nodeClaim.Spec.NodeClassRef.GroupKind())
@@ -119,13 +164,13 @@ var _ = Describe("Node Health", func() {
 				Status:             corev1.ConditionFalse,
 				LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
 			})
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			expectApplied(nodePool, nodeClaim, node)
 
 			// Sync the NodeClass label onto the Node without changing its conditions
 			node = ExpectExists(ctx, env.Client, node)
 			conditions := node.Status.Conditions
 			node.Labels[nodeClassLabelKey] = nodeClassName
-			ExpectApplied(ctx, env.Client, node)
+			expectApplied(node)
 			node = ExpectExists(ctx, env.Client, node)
 			Expect(node.Status.Conditions).To(Equal(conditions))
 
@@ -142,7 +187,7 @@ var _ = Describe("Node Health", func() {
 				LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
 			})
 			env.Clock.Step(60 * time.Minute)
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			expectApplied(nodePool, nodeClaim, node)
 			// Determine to delete unhealthy nodes
 			ExpectObjectReconciled(ctx, env.Client, healthController, node)
 
@@ -156,7 +201,7 @@ var _ = Describe("Node Health", func() {
 				LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
 			})
 			env.Clock.Step(60 * time.Minute)
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			expectApplied(nodePool, nodeClaim, node)
 			// Determine to delete unhealthy nodes
 			ExpectObjectReconciled(ctx, env.Client, healthController, node)
 
@@ -171,7 +216,7 @@ var _ = Describe("Node Health", func() {
 				LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
 			})
 			env.Clock.Step(20 * time.Minute)
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			expectApplied(nodePool, nodeClaim, node)
 			// Determine to delete unhealthy nodes
 			ExpectObjectReconciled(ctx, env.Client, healthController, node)
 
@@ -186,7 +231,7 @@ var _ = Describe("Node Health", func() {
 				LastTransitionTime: metav1.Time{Time: time.Now()},
 			})
 			env.Clock.Step(60 * time.Minute)
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			expectApplied(nodePool, nodeClaim, node)
 			// Determine to delete unhealthy nodes
 			ExpectObjectReconciled(ctx, env.Client, healthController, node)
 
@@ -202,7 +247,7 @@ var _ = Describe("Node Health", func() {
 				LastTransitionTime: metav1.Time{Time: time.Now()},
 			})
 			env.Clock.Step(60 * time.Minute)
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			expectApplied(nodePool, nodeClaim, node)
 			// Determine to delete unhealthy nodes
 			ExpectObjectReconciled(ctx, env.Client, healthController, node)
 
@@ -219,7 +264,7 @@ var _ = Describe("Node Health", func() {
 				LastTransitionTime: metav1.Time{Time: time.Now()},
 			})
 			env.Clock.Step(60 * time.Minute)
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			expectApplied(nodePool, nodeClaim, node)
 			// Determine to delete unhealthy nodes
 			ExpectObjectReconciled(ctx, env.Client, healthController, node)
 
@@ -241,7 +286,7 @@ var _ = Describe("Node Health", func() {
 					Action:             cloudprovider.ReplaceNode,
 				},
 			}
-			healthController = legacyrepair.NewController(env.Client, cloudProvider, env.Clock, recorder)
+			healthController = legacyrepair.NewController(env.Client, cloudProvider, cluster, env.Clock, recorder)
 			node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
 				Type:   "ValidUnhealthyCondition",
 				Status: corev1.ConditionFalse,
@@ -253,7 +298,7 @@ var _ = Describe("Node Health", func() {
 				// We expect the last transition for HealthyNode condition to wait 30 minutes
 				LastTransitionTime: metav1.Time{Time: time.Now()},
 			})
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			expectApplied(nodePool, nodeClaim, node)
 
 			env.Clock.Step(27 * time.Minute)
 
@@ -267,7 +312,7 @@ var _ = Describe("Node Health", func() {
 				// We expect the last transition for HealthyNode condition to wait 30 minutes
 				LastTransitionTime: metav1.Time{Time: time.Now()},
 			})
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			expectApplied(nodePool, nodeClaim, node)
 
 			env.Clock.Step(27 * time.Minute)
 
@@ -284,14 +329,14 @@ var _ = Describe("Node Health", func() {
 				TolerationDuration: 30 * time.Minute,
 				Action:             cloudprovider.RebootNode,
 			}}
-			healthController = legacyrepair.NewController(env.Client, cloudProvider, env.Clock, recorder)
+			healthController = legacyrepair.NewController(env.Client, cloudProvider, cluster, env.Clock, recorder)
 			node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
 				Type:               "BadNode",
 				Status:             corev1.ConditionFalse,
 				LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
 			})
 			env.Clock.Step(60 * time.Minute)
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			expectApplied(nodePool, nodeClaim, node)
 
 			ExpectObjectReconciled(ctx, env.Client, healthController, node)
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
@@ -313,14 +358,14 @@ var _ = Describe("Node Health", func() {
 					Action:             cloudprovider.ReplaceNode,
 				},
 			}
-			healthController = legacyrepair.NewController(env.Client, cloudProvider, env.Clock, recorder)
+			healthController = legacyrepair.NewController(env.Client, cloudProvider, cluster, env.Clock, recorder)
 			node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
 				Type:               "BadNode",
 				Status:             corev1.ConditionFalse,
 				Reason:             "Transient",
 				LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
 			})
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			expectApplied(nodePool, nodeClaim, node)
 
 			// The reboot policy's 10m toleration doesn't apply; the replace policy waits its own 30m.
 			env.Clock.Step(15 * time.Minute)
@@ -340,7 +385,7 @@ var _ = Describe("Node Health", func() {
 				TolerationDuration: 30 * time.Minute,
 				Action:             cloudprovider.ReplaceNode,
 			}}
-			healthController = legacyrepair.NewController(env.Client, cloudProvider, env.Clock, recorder)
+			healthController = legacyrepair.NewController(env.Client, cloudProvider, cluster, env.Clock, recorder)
 			node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
 				Type:               "BadNode",
 				Status:             corev1.ConditionFalse,
@@ -348,13 +393,13 @@ var _ = Describe("Node Health", func() {
 				LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
 			})
 			env.Clock.Step(60 * time.Minute)
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			expectApplied(nodePool, nodeClaim, node)
 
 			ExpectObjectReconciled(ctx, env.Client, healthController, node)
 			Expect(ExpectExists(ctx, env.Client, nodeClaim).DeletionTimestamp).To(BeNil())
 
 			node.Status.Conditions[len(node.Status.Conditions)-1].Reason = "Fatal"
-			ExpectApplied(ctx, env.Client, node)
+			expectApplied(node)
 			ExpectObjectReconciled(ctx, env.Client, healthController, node)
 			Expect(ExpectExists(ctx, env.Client, nodeClaim).DeletionTimestamp).ToNot(BeNil())
 		})
@@ -376,7 +421,7 @@ var _ = Describe("Node Health", func() {
 				LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
 			})
 			env.Clock.Step(60 * time.Minute)
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			expectApplied(nodePool, nodeClaim, node)
 			// Determine to delete unhealthy nodes
 			ExpectObjectReconciled(ctx, env.Client, healthController, node)
 
@@ -391,7 +436,7 @@ var _ = Describe("Node Health", func() {
 				LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
 			})
 			env.Clock.Step(60 * time.Minute)
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			expectApplied(nodePool, nodeClaim, node)
 			// Determine to delete unhealthy nodes
 			ExpectObjectReconciled(ctx, env.Client, healthController, node)
 
@@ -399,8 +444,8 @@ var _ = Describe("Node Health", func() {
 			Expect(nodeClaim.DeletionTimestamp).ToNot(BeNil())
 		})
 		It("should ignore unhealthy nodes if more then 20% of the nodes are unhealthy in a nodepool", func() {
-			ExpectApplied(ctx, env.Client, nodePool)
-			nodeClaims, nodes := test.NodeClaimsAndNodes(10, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Finalizers: []string{v1.TerminationFinalizer}}})
+			expectApplied(nodePool)
+			nodeClaims, nodes := test.NodeClaimsAndNodes(10, managedNodeClaim())
 			for i := range 3 {
 				nodes[i].Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
 					Type:               "BadNode",
@@ -413,7 +458,7 @@ var _ = Describe("Node Health", func() {
 				nodeClaims[i].Labels[v1.NodePoolLabelKey] = nodePool.Name
 			}
 			for i := range 10 {
-				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
+				expectApplied(nodeClaims[i], nodes[i])
 			}
 			env.Clock.Step(60 * time.Minute)
 
@@ -433,7 +478,7 @@ var _ = Describe("Node Health", func() {
 			Expect(nodeClaim.DeletionTimestamp).To(BeNil())
 		})
 		It("should ignore unhealthy nodes if more then 20% of the nodes are unhealthy in a cluster", func() {
-			nodeClaims, nodes := test.NodeClaimsAndNodes(10, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Finalizers: []string{v1.TerminationFinalizer}}})
+			nodeClaims, nodes := test.NodeClaimsAndNodes(10, managedNodeClaim())
 			for i := range 3 {
 				nodes[i].Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
 					Type:               "BadNode",
@@ -442,7 +487,7 @@ var _ = Describe("Node Health", func() {
 				})
 			}
 			for i := range 10 {
-				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
+				expectApplied(nodeClaims[i], nodes[i])
 			}
 
 			env.Clock.Step(60 * time.Minute)
@@ -473,7 +518,7 @@ var _ = Describe("Node Health", func() {
 			nodeClaims := []*v1.NodeClaim{}
 			nodes := []*corev1.Node{}
 			for i := range 3 {
-				nodeClaim, node = test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Finalizers: []string{v1.TerminationFinalizer}}})
+				nodeClaim, node = test.NodeClaimAndNode(managedNodeClaim())
 				if i == 0 {
 					node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
 						Type:               "BadNode",
@@ -485,7 +530,7 @@ var _ = Describe("Node Health", func() {
 				nodeClaim.Labels[v1.NodePoolLabelKey] = nodePool.Name
 				nodeClaims = append(nodeClaims, nodeClaim)
 				nodes = append(nodes, node)
-				ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+				expectApplied(nodePool, nodeClaim, node)
 			}
 
 			env.Clock.Step(60 * time.Minute)
@@ -503,7 +548,7 @@ var _ = Describe("Node Health", func() {
 				LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
 			})
 			env.Clock.Step(60 * time.Minute)
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			expectApplied(nodePool, nodeClaim, node)
 
 			ExpectObjectReconciled(ctx, env.Client, healthController, node)
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)

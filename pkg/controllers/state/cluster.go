@@ -83,6 +83,8 @@ type Cluster struct {
 	nodeCount         atomic.Int64
 	// daemonSetPods keeps the newest pod derived about each DaemonSet from its pods, by DaemonSet.
 	daemonSetPods *karpenterstate.Store[types.NamespacedName, daemonSetFields]
+	// nodeHealth counts the nodes, and those that match a repair policy, per NodePool and across the cluster.
+	nodeHealth *NodeHealth
 
 	repairPolicyMatcher *health.RepairPolicyMatcher // nil when node repair is disabled
 
@@ -419,6 +421,7 @@ func (c *Cluster) newStores() {
 			n := &StateNode{Node: f.Node, NodeClaim: f.NodeClaim}
 			return nodePoolCapacity(lo.Assign(n.Capacity(), corev1.ResourceList{resources.Node: resource.MustParse("1")}))
 		})
+	c.nodeHealth = c.newNodeHealth(func(f nodeFields) bool { return len(f.RepairPolicyMatches) > 0 })
 	c.nodes.Subscribe(func(change karpenterstate.Change[string, nodeFields]) {
 		if change.Existed != change.Exists {
 			ClusterStateNodesCount.Set(float64(c.nodeCount.Add(int64(lo.Ternary(change.Exists, 1, -1)))), nil)

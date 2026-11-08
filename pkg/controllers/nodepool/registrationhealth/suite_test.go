@@ -30,6 +30,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
@@ -107,7 +109,7 @@ var _ = Describe("RegistrationHealth", func() {
 		nodePool = ExpectExists(ctx, env.Client, nodePool)
 		Expect(nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy).IsUnknown()).To(BeTrue())
 		Expect(nodePool.Status.NodeClassObservedGeneration).To(Equal(int64(2)))
-		Expect(npState.Status(nodePool.UID)).To(BeEquivalentTo(nodepoolhealth.StatusUnknown))
+		Expect(npState.Status(nodePool)).To(BeEquivalentTo(nodepoolhealth.StatusUnknown))
 	})
 	It("should set NodeRegistrationHealthy status condition on nodePool as Unknown if the nodePool is updated", func() {
 		nodePool.StatusConditions().SetFalse(v1.ConditionTypeNodeRegistrationHealthy, "unhealthy", "unhealthy")
@@ -119,7 +121,7 @@ var _ = Describe("RegistrationHealth", func() {
 		_ = ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 		nodePool = ExpectExists(ctx, env.Client, nodePool)
 		Expect(nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy).IsUnknown()).To(BeTrue())
-		Expect(npState.Status(nodePool.UID)).To(BeEquivalentTo(nodepoolhealth.StatusUnknown))
+		Expect(npState.Status(nodePool)).To(BeEquivalentTo(nodepoolhealth.StatusUnknown))
 	})
 	It("should not set NodeRegistrationHealthy status condition on nodePool as Unknown if it is already set to true", func() {
 		nodePool.StatusConditions().SetTrue(v1.ConditionTypeNodeRegistrationHealthy)
@@ -128,7 +130,7 @@ var _ = Describe("RegistrationHealth", func() {
 		_ = ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 		nodePool = ExpectExists(ctx, env.Client, nodePool)
 		Expect(nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy).IsUnknown()).To(BeFalse())
-		Expect(npState.Status(nodePool.UID)).To(BeEquivalentTo(nodepoolhealth.StatusHealthy))
+		Expect(npState.Status(nodePool)).To(BeEquivalentTo(nodepoolhealth.StatusHealthy))
 	})
 	It("should not set NodeRegistrationHealthy status condition on nodePool as Unknown if it is already set to false", func() {
 		nodePool.StatusConditions().SetFalse(v1.ConditionTypeNodeRegistrationHealthy, "unhealthy", "unhealthy")
@@ -137,6 +139,19 @@ var _ = Describe("RegistrationHealth", func() {
 		_ = ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 		nodePool = ExpectExists(ctx, env.Client, nodePool)
 		Expect(nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy).IsUnknown()).To(BeFalse())
-		Expect(npState.Status(nodePool.UID)).To(BeEquivalentTo(nodepoolhealth.StatusUnhealthy))
+		Expect(npState.Status(nodePool)).To(BeEquivalentTo(nodepoolhealth.StatusUnhealthy))
+	})
+	It("should drop the NodePool's launch outcomes once the NodePool is deleted", func() {
+		nodePool.StatusConditions().SetFalse(v1.ConditionTypeNodeRegistrationHealthy, "unhealthy", "unhealthy")
+		nodePool.Status.NodeClassObservedGeneration = int64(1)
+		ExpectApplied(ctx, env.Client, nodePool, nodeClass)
+		ExpectReconcileSucceeded(ctx, controller.RequestReconciler(env.Client), client.ObjectKeyFromObject(nodePool))
+		nodePool = ExpectExists(ctx, env.Client, nodePool)
+		Expect(npState.Status(nodePool)).To(BeEquivalentTo(nodepoolhealth.StatusUnhealthy))
+
+		ExpectDeleted(ctx, env.Client, nodePool)
+		ExpectReconcileSucceeded(ctx, controller.RequestReconciler(env.Client), client.ObjectKeyFromObject(nodePool))
+		_, ok := npState.Get(nodePool.Name)
+		Expect(ok).To(BeFalse())
 	})
 })
