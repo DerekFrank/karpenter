@@ -83,6 +83,8 @@ type Cluster struct {
 	nodeCount         atomic.Int64
 	// daemonSetPods keeps the newest pod derived about each DaemonSet from its pods, by DaemonSet.
 	daemonSetPods *karpenterstate.Store[types.NamespacedName, daemonSetFields]
+	// nodePoolMembers indexes each NodePool's nodes and unlaunched NodeClaims, by NodePool name.
+	nodePoolMembers *karpenterstate.Store[string, nodePoolMembers]
 
 	repairPolicyMatcher *health.RepairPolicyMatcher // nil when node repair is disabled
 
@@ -391,6 +393,7 @@ func (c *Cluster) newStores() {
 	c.pvcDrivers = karpenterstate.NewStore[types.NamespacedName, pvcFields]()
 	c.nodePoolResources = karpenterstate.NewStore[string, corev1.ResourceList]()
 	c.daemonSetPods = karpenterstate.NewStore[types.NamespacedName, daemonSetFields]()
+	c.nodePoolMembers = karpenterstate.NewStore[string, nodePoolMembers]()
 	c.NodePoolState = NewNodePoolState(c.clock, c.nodeClaims)
 
 	c.podsOnNodes = karpenterstate.Derive(c.pods, c.nodeUsage,
@@ -419,6 +422,9 @@ func (c *Cluster) newStores() {
 			n := &StateNode{Node: f.Node, NodeClaim: f.NodeClaim}
 			return nodePoolCapacity(lo.Assign(n.Capacity(), corev1.ResourceList{resources.Node: resource.MustParse("1")}))
 		})
+	karpenterstate.Derive(c.nodes, c.nodePoolMembers, nodePoolOfNode, func(k string, _ nodeFields) nodePoolNode { return nodePoolNode(k) })
+	karpenterstate.Derive(c.nodeClaims, c.nodePoolMembers, nodePoolOfUnlaunched,
+		func(k types.NamespacedName, _ *v1.NodeClaim) unlaunchedNodeClaim { return unlaunchedNodeClaim(k) })
 	c.nodes.Subscribe(func(change karpenterstate.Change[string, nodeFields]) {
 		if change.Existed != change.Exists {
 			ClusterStateNodesCount.Set(float64(c.nodeCount.Add(int64(lo.Ternary(change.Exists, 1, -1)))), nil)
@@ -439,7 +445,7 @@ func (c *Cluster) newStores() {
 
 // clearStores empties the stores in place, so that their subscribers stay subscribed.
 func (c *Cluster) clearStores() {
-	for _, s := range []interface{ Clear() }{c.nodes, c.nodeClaims, c.pods, c.nodeUsage, c.pvcDrivers, c.nodePoolResources, c.daemonSetPods} {
+	for _, s := range []interface{ Clear() }{c.nodes, c.nodeClaims, c.pods, c.nodeUsage, c.pvcDrivers, c.nodePoolResources, c.daemonSetPods, c.nodePoolMembers} {
 		s.Clear()
 	}
 	c.NodePoolState.Reset()
