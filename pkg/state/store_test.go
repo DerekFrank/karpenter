@@ -621,3 +621,19 @@ func TestDeriveSweepStaysUnsyncedAndDropsAKeyDeletedDuringIt(t *testing.T) {
 		t.Fatalf("x = %+v, want only b's 4 cpu: a was deleted while the sweep computed it", got)
 	}
 }
+
+func TestStoreSyncedIsSafeWhileADeriveIsAdded(t *testing.T) {
+	nodeClaims := NewObjectStore[*v1.NodeClaim](nil, nil)
+	s := NewStore[string, poolFields]()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 1000 {
+			_ = s.Synced()
+		}
+	}()
+	for range 50 {
+		Derive(nodeClaims, s, poolOf, usageOf)
+	}
+	<-done
+}

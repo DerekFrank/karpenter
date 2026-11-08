@@ -127,7 +127,12 @@ func (s *Store[K, F]) Synced() bool {
 			return false
 		}
 	}
-	for _, synced := range s.sources {
+	// A Derive can add a source while a caller polls; read the sources under the lock, and call them after it, since
+	// each reads another store.
+	s.mu.Lock()
+	sources := s.sources
+	s.mu.Unlock()
+	for _, synced := range sources {
 		if !synced() {
 			return false
 		}
