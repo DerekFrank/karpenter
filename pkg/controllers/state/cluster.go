@@ -88,11 +88,18 @@ type Cluster struct {
 
 	NodePoolState *NodePoolState
 
-	podAcks                         sync.Map // pod namespaced name -> time when Karpenter first saw the pod as pending
-	podsSchedulingAttempted         sync.Map // pod namespaced name -> time when Karpenter tried to schedule a pod
-	podsSchedulableTimes            sync.Map // pod namespaced name -> time when it was first marked as able to fit to a node
-	podHealthyNodePoolScheduledTime sync.Map // pod namespaced name -> time when pod scheduled to a nodePool that has NodeRegistrationHealthy=true, is marked as able to fit to a node
-	podToNodeClaim                  sync.Map // pod namespaced name -> nodeClaim name
+	// podScheduling keeps what the provisioner decided about each pod, by namespaced name, for the pod metrics.
+	podScheduling *karpenterstate.Store[types.NamespacedName, podSchedulingFields]
+	// nodeClaimPods keeps the pods derived about each NodeClaim from podScheduling, by NodeClaim name: the pods last
+	// simulated to schedule against it.
+	nodeClaimPods *karpenterstate.Store[string, map[types.NamespacedName]struct{}]
+	// bufferPods keeps how many virtual CapacityBuffer pods the provisioner's last scheduling simulation placed on
+	// each node, by providerID. UpdateBufferPodCounts replaces them wholesale after every provisioning pass.
+	//
+	// Emptiness (HasBufferPods in ShouldDisrupt) reads it so that it doesn't consolidate an empty node that hosts
+	// buffer capacity. Consolidation doesn't: SimulateScheduling calls GetPendingPods, which injects the virtual pods
+	// into the pending set, so any replacement must fit both real and virtual pods.
+	bufferPods *karpenterstate.Store[string, int]
 
 	clusterStateMu sync.RWMutex // Separate mutex as this is called in some places that mu is held
 	// A monotonically increasing timestamp representing the time state of the
@@ -105,20 +112,40 @@ type Cluster struct {
 	unsyncedTimeMu      sync.Mutex
 	unsyncedStartTime   time.Time
 	lastUnsyncedLogTime time.Time
+}
 
-	// bufferPodCounts tracks how many virtual CapacityBuffer pods the provisioner's
-	// scheduling simulation placed on each node (keyed by providerID). This is
-	// rebuilt wholesale after every provisioning pass — it is NOT incremental.
-	//
-	// Used by:
-	//   - disruption/emptiness.go: prevents empty-consolidation of nodes that host
-	//     buffer capacity (HasBufferPods check in ShouldDisrupt).
-	//
-	// NOT used by consolidation — consolidation naturally accounts for buffer pods
-	// because SimulateScheduling calls GetPendingPods which injects virtual pods
-	// into the pending set. Any replacement must fit both real and virtual pods.
-	bufferPodCountsMu sync.RWMutex
-	bufferPodCounts   map[string]int
+// podSchedulingFields are the fields Karpenter decides about a pod as it schedules it, keyed by its namespaced name.
+// Each time is set once, the first time; they go with the pod when it's deleted or has started.
+type podSchedulingFields struct {
+	// AckedAt is when the provisioner first saw the pod as pending.
+	AckedAt time.Time
+	// DecidedAt is when the provisioner first decided whether the pod could schedule.
+	DecidedAt time.Time
+	// SchedulableAt is when a scheduling simulation first fit the pod to a node, until one fails it.
+	SchedulableAt time.Time
+	// NodeClaim is the NodeClaim the most recent scheduling simulation placed the pod on.
+	NodeClaim string
+}
+
+// podOnNodeClaim is a pod's contribution to the NodeClaim it was simulated to schedule against: the pod's key.
+type podOnNodeClaim struct{ pod types.NamespacedName }
+
+func (p podOnNodeClaim) Update(pods map[types.NamespacedName]struct{}, prev podOnNodeClaim) map[types.NamespacedName]struct{} {
+	pods = maps.Clone(pods)
+	if pods == nil {
+		pods = map[types.NamespacedName]struct{}{}
+	}
+	if prev != (podOnNodeClaim{}) {
+		delete(pods, prev.pod)
+	}
+	pods[p.pod] = struct{}{}
+	return pods
+}
+
+func (p podOnNodeClaim) Delete(pods map[types.NamespacedName]struct{}) map[types.NamespacedName]struct{} {
+	pods = maps.Clone(pods)
+	delete(pods, p.pod)
+	return lo.Ternary(len(pods) == 0, nil, pods)
 }
 
 // nodeFields are the fields kept for each node, keyed by its providerID, or by its name for an unmanaged Node without
@@ -371,7 +398,6 @@ func NewCluster(ctx context.Context, clk clock.Clock, client client.Client, clou
 		clock:               clk,
 		kubeClient:          client,
 		cloudProvider:       cloudProvider,
-		bufferPodCounts:     map[string]int{},
 		ctx:                 ctx,
 	}
 	c.newStores()
@@ -391,7 +417,14 @@ func (c *Cluster) newStores() {
 	c.pvcDrivers = karpenterstate.NewStore[types.NamespacedName, pvcFields]()
 	c.nodePoolResources = karpenterstate.NewStore[string, corev1.ResourceList]()
 	c.daemonSetPods = karpenterstate.NewStore[types.NamespacedName, daemonSetFields]()
+	c.podScheduling = karpenterstate.NewStore[types.NamespacedName, podSchedulingFields]()
+	c.nodeClaimPods = karpenterstate.NewStore[string, map[types.NamespacedName]struct{}]()
+	c.bufferPods = karpenterstate.NewStore[string, int]()
 	c.NodePoolState = NewNodePoolState(c.clock, c.nodeClaims)
+
+	karpenterstate.Derive(c.podScheduling, c.nodeClaimPods,
+		func(_ types.NamespacedName, f podSchedulingFields) string { return f.NodeClaim },
+		func(pod types.NamespacedName, _ podSchedulingFields) podOnNodeClaim { return podOnNodeClaim{pod} })
 
 	c.podsOnNodes = karpenterstate.Derive(c.pods, c.nodeUsage,
 		func(_ types.NamespacedName, pod *corev1.Pod) string {
@@ -439,7 +472,7 @@ func (c *Cluster) newStores() {
 
 // clearStores empties the stores in place, so that their subscribers stay subscribed.
 func (c *Cluster) clearStores() {
-	for _, s := range []interface{ Clear() }{c.nodes, c.nodeClaims, c.pods, c.nodeUsage, c.pvcDrivers, c.nodePoolResources, c.daemonSetPods} {
+	for _, s := range []interface{ Clear() }{c.nodes, c.nodeClaims, c.pods, c.nodeUsage, c.pvcDrivers, c.nodePoolResources, c.daemonSetPods, c.podScheduling, c.nodeClaimPods, c.bufferPods} {
 		s.Clear()
 	}
 	c.NodePoolState.Reset()
@@ -815,13 +848,6 @@ func (c *Cluster) Reset() {
 	c.lastUnsyncedLogTime = time.Time{}
 	c.hasSynced.Store(false)
 	c.clearStores()
-	c.podAcks = sync.Map{}
-	c.podsSchedulingAttempted = sync.Map{}
-	c.podsSchedulableTimes = sync.Map{}
-	c.podToNodeClaim = sync.Map{}
-	c.bufferPodCountsMu.Lock()
-	c.bufferPodCounts = map[string]int{}
-	c.bufferPodCountsMu.Unlock()
 }
 
 // RepairPolicyMatcher returns the matcher cluster state matches Nodes with, or nil when node repair is disabled.
@@ -829,18 +855,19 @@ func (c *Cluster) RepairPolicyMatcher() *health.RepairPolicyMatcher {
 	return c.repairPolicyMatcher
 }
 
-// UpdateBufferPodCounts replaces the entire buffer pod count mapping with the
-// new counts. Called by the provisioner after each scheduling pass to reflect
-// which nodes are hosting virtual buffer pods. Nodes not in the map are cleared.
-//
-// The mapping is derived from Results.ExistingNodes — each ExistingNode.Pods
-// entry that carries the fake-pod annotation is counted. When buffer capacity
-// is consumed (real pods take the space), virtual pods move to other nodes or
-// new NodeClaims, and this map updates accordingly on the next pass.
+// UpdateBufferPodCounts replaces the buffer pod counts with counts, by providerID. The provisioner calls it after each
+// scheduling pass with the virtual buffer pods it placed on each node, counted from Results.ExistingNodes; a node
+// missing from counts no longer hosts any. When real pods consume buffer capacity, the virtual pods move to other
+// nodes or new NodeClaims, and the next pass's counts follow them.
 func (c *Cluster) UpdateBufferPodCounts(counts map[string]int) {
-	c.bufferPodCountsMu.Lock()
-	defer c.bufferPodCountsMu.Unlock()
-	c.bufferPodCounts = counts
+	for providerID := range c.bufferPods.List() {
+		if _, ok := counts[providerID]; !ok {
+			c.bufferPods.Update(providerID, func(int) int { return 0 })
+		}
+	}
+	for providerID, count := range counts {
+		c.bufferPods.Update(providerID, func(int) int { return count })
+	}
 }
 
 // HasBufferPods returns true if the node with the given providerID has at least
@@ -851,58 +878,40 @@ func (c *Cluster) HasBufferPods(providerID string) bool {
 
 // BufferPodCount returns the number of virtual buffer pods on the node.
 func (c *Cluster) BufferPodCount(providerID string) int {
-	c.bufferPodCountsMu.RLock()
-	defer c.bufferPodCountsMu.RUnlock()
-	return c.bufferPodCounts[providerID]
+	count, _ := c.bufferPods.Get(providerID)
+	return count
 }
 
 // AckPods marks the pod as acknowledged for scheduling from the provisioner. This is only done once per-pod.
 func (c *Cluster) AckPods(pods ...*corev1.Pod) {
 	now := c.clock.Now()
 	for _, pod := range pods {
-		// store the value as now only if it doesn't exist.
-		c.podAcks.LoadOrStore(types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, now)
+		c.podScheduling.Update(client.ObjectKeyFromObject(pod), func(f podSchedulingFields) podSchedulingFields {
+			f.AckedAt = lo.Ternary(f.AckedAt.IsZero(), now, f.AckedAt)
+			return f
+		})
 	}
 }
 
 // PodAckTime will return the time the pod was first seen in our cache.
 func (c *Cluster) PodAckTime(podKey types.NamespacedName) time.Time {
-	if ackTime, ok := c.podAcks.Load(podKey); ok {
-		return ackTime.(time.Time)
-	}
-	return time.Time{}
+	f, _ := c.podScheduling.Get(podKey)
+	return f.AckedAt
 }
 
-// MarkPodSchedulingDecisions keeps track of when we first tried to schedule a pod to a node.
-// It updates podHealthyNodePoolScheduledTime for pods scheduled against nodePool that have
-// NodeRegistrationHealthy=true. This also marks when the pod is first seen as schedulable for pod metrics.
-// We'll only emit a metric for a pod if we haven't done it before.
-// nolint:gocyclo
-func (c *Cluster) MarkPodSchedulingDecisions(ctx context.Context, podErrors map[*corev1.Pod]error, npPods map[string][]*corev1.Pod, ncPods map[string][]*corev1.Pod) {
+// MarkPodSchedulingDecisions keeps track of when we first tried to schedule a pod to a node, and when the pod is first
+// seen as schedulable for pod metrics, and maps each pod to the NodeClaim it was simulated against. We'll only emit a
+// metric for a pod if we haven't done it before.
+func (c *Cluster) MarkPodSchedulingDecisions(_ context.Context, podErrors map[*corev1.Pod]error, npPods map[string][]*corev1.Pod, ncPods map[string][]*corev1.Pod) {
 	now := c.clock.Now()
 	for pod := range podErrors {
-		nn := client.ObjectKeyFromObject(pod)
-		// delete podsSchedulableTimes and podHealthyNodePoolScheduledTime for pods that have pod errors
-		c.podsSchedulableTimes.Delete(nn)
-		_, alreadyExists := c.podsSchedulingAttempted.LoadOrStore(nn, now)
-		// If we already attempted this, we don't need to emit another metric.
-		if !alreadyExists {
-			// We should have ACK'd the pod.
-			if ackTime := c.PodAckTime(nn); !ackTime.IsZero() {
-				PodSchedulingDecisionSeconds.Observe(c.clock.Since(ackTime).Seconds(), nil)
-			}
-		}
-		c.podHealthyNodePoolScheduledTime.Delete(nn)
-		c.podToNodeClaim.Delete(nn)
+		c.markPodSchedulingDecision(client.ObjectKeyFromObject(pod), now, func(f podSchedulingFields) podSchedulingFields {
+			f.SchedulableAt, f.NodeClaim = time.Time{}, ""
+			return f
+		})
 	}
-	for nodePoolName, pods := range npPods {
-		nodePool := &v1.NodePool{}
-		if nodePoolName != "" {
-			// Swallow errors if we can't get the nodepool
-			_ = c.kubeClient.Get(ctx, types.NamespacedName{Name: nodePoolName}, nodePool)
-		}
+	for _, pods := range npPods {
 		for _, p := range pods {
-			nn := client.ObjectKeyFromObject(p)
 			// Skip pods that are already bound to a node (e.g. pods from deleting nodes
 			// included in the scheduling simulation for capacity planning). Storing a new
 			// timestamp for already-bound pods would cause negative metric values since
@@ -910,33 +919,41 @@ func (c *Cluster) MarkPodSchedulingDecisions(ctx context.Context, podErrors map[
 			if podutils.IsScheduled(p) {
 				continue
 			}
-			c.podsSchedulableTimes.LoadOrStore(nn, now)
-			_, alreadyExists := c.podsSchedulingAttempted.LoadOrStore(nn, now)
-			// If we already attempted this, we don't need to emit another metric.
-			if !alreadyExists {
-				// We should have ACK'd the pod.
-				if ackTime := c.PodAckTime(nn); !ackTime.IsZero() {
-					PodSchedulingDecisionSeconds.Observe(c.clock.Since(ackTime).Seconds(), nil)
-				}
-			}
-			// If the pod is scheduled to a nodePool and if the nodePool has NodeRegistrationHealthy=true
-			// then mark the time when we thought it can schedule to now.
-			if nodePoolName != "" && nodePool.StatusConditions().IsTrue(v1.ConditionTypeNodeRegistrationHealthy) {
-				c.podHealthyNodePoolScheduledTime.LoadOrStore(nn, c.clock.Now())
-			} else {
-				// If the pod was scheduled to a healthy nodePool earlier but is now getting scheduled to an
-				// unhealthy one then we need to delete its entry from the map because it will not schedule successfully
-				c.podHealthyNodePoolScheduledTime.Delete(nn)
-			}
+			c.markPodSchedulingDecision(client.ObjectKeyFromObject(p), now, func(f podSchedulingFields) podSchedulingFields {
+				f.SchedulableAt = lo.Ternary(f.SchedulableAt.IsZero(), now, f.SchedulableAt)
+				return f
+			})
 		}
 	}
 	c.UpdatePodToNodeClaimMapping(ncPods)
 }
 
+// markPodSchedulingDecision applies the decision to the pod's fields, records now as when the pod was first decided
+// on, and observes the decision latency from the pod's ack the first time.
+func (c *Cluster) markPodSchedulingDecision(podKey types.NamespacedName, now time.Time, decide func(podSchedulingFields) podSchedulingFields) {
+	var first bool
+	var ackedAt time.Time
+	c.podScheduling.Update(podKey, func(f podSchedulingFields) podSchedulingFields {
+		f = decide(f)
+		if first = f.DecidedAt.IsZero(); first {
+			f.DecidedAt = now
+		}
+		ackedAt = f.AckedAt
+		return f
+	})
+	// We should have ACK'd the pod.
+	if first && !ackedAt.IsZero() {
+		PodSchedulingDecisionSeconds.Observe(c.clock.Since(ackedAt).Seconds(), nil)
+	}
+}
+
 func (c *Cluster) UpdatePodToNodeClaimMapping(ncPods map[string][]*corev1.Pod) {
 	for ncName, pods := range ncPods {
 		for _, p := range pods {
-			c.podToNodeClaim.Store(client.ObjectKeyFromObject(p), ncName)
+			c.podScheduling.Update(client.ObjectKeyFromObject(p), func(f podSchedulingFields) podSchedulingFields {
+				f.NodeClaim = ncName
+				return f
+			})
 		}
 	}
 }
@@ -944,58 +961,33 @@ func (c *Cluster) UpdatePodToNodeClaimMapping(ncPods map[string][]*corev1.Pod) {
 // PodSchedulingDecisionTime returns when Karpenter first decided if a pod could schedule a pod in scheduling simulations.
 // This returns 0, false if Karpenter never made a decision on the pod.
 func (c *Cluster) PodSchedulingDecisionTime(podKey types.NamespacedName) time.Time {
-	if val, found := c.podsSchedulingAttempted.Load(podKey); found {
-		return val.(time.Time)
-	}
-	return time.Time{}
+	f, _ := c.podScheduling.Get(podKey)
+	return f.DecidedAt
 }
 
 // PodSchedulingSuccessTime returns when Karpenter first thought it could schedule a pod in its scheduling simulation.
 // This returns 0, false if the pod was never considered in scheduling as a pending pod.
 func (c *Cluster) PodSchedulingSuccessTime(podKey types.NamespacedName) time.Time {
-	if val, found := c.podsSchedulableTimes.Load(podKey); found {
-		return val.(time.Time)
-	}
-	return time.Time{}
+	f, _ := c.podScheduling.Get(podKey)
+	return f.SchedulableAt
 }
 
 // PodNodeClaimMapping returns the nodeClaim against which the pod is simulated to get scheduled
 func (c *Cluster) PodNodeClaimMapping(podKey types.NamespacedName) string {
-	if val, found := c.podToNodeClaim.Load(podKey); found {
-		return val.(string)
-	}
-	return ""
+	f, _ := c.podScheduling.Get(podKey)
+	return f.NodeClaim
 }
 
 // PodsMappedToNodeClaim returns the keys of the pods that were simulated to schedule against the given nodeClaim
 // during the most recent scheduling decision for each pod
 func (c *Cluster) PodsMappedToNodeClaim(nodeClaimName string) []types.NamespacedName {
-	var podKeys []types.NamespacedName
-	// TODO: store reverse mapping for perf
-	c.podToNodeClaim.Range(func(k, v any) bool {
-		if v.(string) == nodeClaimName {
-			podKeys = append(podKeys, k.(types.NamespacedName))
-		}
-		return true
-	})
-	return podKeys
+	pods, _ := c.nodeClaimPods.Get(nodeClaimName)
+	return slices.Collect(maps.Keys(pods))
 }
 
-// PodSchedulingSuccessTimeRegistrationHealthyCheck returns when Karpenter first thought it could schedule a pod in its scheduling simulation.
-// This returns 0, false if the pod was never considered in scheduling as a pending pod.
-func (c *Cluster) PodSchedulingSuccessTimeRegistrationHealthyCheck(podKey types.NamespacedName) time.Time {
-	if val, found := c.podHealthyNodePoolScheduledTime.Load(podKey); found {
-		return val.(time.Time)
-	}
-	return time.Time{}
-}
-
+// ClearPodSchedulingMappings drops what Karpenter decided about the pod as it scheduled it.
 func (c *Cluster) ClearPodSchedulingMappings(podKey types.NamespacedName) {
-	c.podAcks.Delete(podKey)
-	c.podsSchedulableTimes.Delete(podKey)
-	c.podsSchedulingAttempted.Delete(podKey)
-	c.podHealthyNodePoolScheduledTime.Delete(podKey)
-	c.podToNodeClaim.Delete(podKey)
+	c.podScheduling.Update(podKey, func(podSchedulingFields) podSchedulingFields { return podSchedulingFields{} })
 }
 
 // MarkUnconsolidated marks the cluster state as being unconsolidated.  This should be called in any situation where
