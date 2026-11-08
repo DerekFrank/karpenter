@@ -48,6 +48,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
 	disruptionutils "sigs.k8s.io/karpenter/pkg/utils/disruption"
+	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
@@ -80,7 +81,9 @@ type Cluster struct {
 	pvcDrivers *karpenterstate.Store[types.NamespacedName, pvcFields]
 	// nodePoolResources keeps the capacity derived about each NodePool from its nodes, by NodePool name.
 	nodePoolResources *karpenterstate.Store[string, corev1.ResourceList]
-	nodeCount         atomic.Int64
+	// nodePoolDisruption keeps the nodes counted against each NodePool's disruption budgets, by NodePool name.
+	nodePoolDisruption *karpenterstate.Store[string, NodePoolDisruption]
+	nodeCount          atomic.Int64
 	// daemonSetPods keeps the newest pod derived about each DaemonSet from its pods, by DaemonSet.
 	daemonSetPods *karpenterstate.Store[types.NamespacedName, daemonSetFields]
 
@@ -335,6 +338,64 @@ func nonzero(sum corev1.ResourceList) corev1.ResourceList {
 	return lo.Ternary(len(sum) == 0, nil, sum)
 }
 
+// NodePoolDisruption counts a NodePool's nodes for its disruption budgets. A node counts once it's managed and either
+// initialized or rebooting, until its NodeClaim's instance is terminating. A node without the NodePool label counts
+// toward no NodePool.
+type NodePoolDisruption struct {
+	// Nodes counts the NodePool's nodes.
+	Nodes int
+	// Disrupting counts the nodes marked for deletion or rebooting, which every disruption budget subtracts.
+	Disrupting int
+	// NotReady counts the nodes not Disrupting whose Node isn't Ready, which every disruption budget but repair's
+	// subtracts.
+	NotReady int
+}
+
+func (d NodePoolDisruption) Update(f NodePoolDisruption, prev NodePoolDisruption) NodePoolDisruption {
+	f.Nodes += d.Nodes - prev.Nodes
+	f.Disrupting += d.Disrupting - prev.Disrupting
+	f.NotReady += d.NotReady - prev.NotReady
+	return f
+}
+
+func (d NodePoolDisruption) Delete(f NodePoolDisruption) NodePoolDisruption {
+	f.Nodes -= d.Nodes
+	f.Disrupting -= d.Disrupting
+	f.NotReady -= d.NotReady
+	return f
+}
+
+func (d NodePoolDisruption) Equal(o NodePoolDisruption) bool { return d == o }
+
+// nodePoolDisruptionKey returns the NodePool a node counts toward for disruption budgets, or "" if it counts toward none.
+// A node that's launched or registered but not initialized has no pods scheduled to it yet and counts toward no budget,
+// so that a replacement still initializing doesn't round a percentage budget up; a rebooting node counts until its
+// reboot completes, though it's uninitialized meanwhile. A NodeClaim's instance is terminating only once the node is
+// drained and the cloud provider deleted it.
+func nodePoolDisruptionKey(_ string, f nodeFields) string {
+	n := &StateNode{Node: f.Node, NodeClaim: f.NodeClaim}
+	if !n.Managed() || (!n.Initialized() && !n.RebootInProgress()) {
+		return ""
+	}
+	if n.NodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() {
+		return ""
+	}
+	return n.Labels()[v1.NodePoolLabelKey]
+}
+
+// nodePoolDisruptionOf returns a counted node's contribution to its NodePool's disruption counts.
+func nodePoolDisruptionOf(_ string, f nodeFields) NodePoolDisruption {
+	n := &StateNode{Node: f.Node, NodeClaim: f.NodeClaim, markedForDeletion: f.MarkedForDeletion}
+	if n.MarkedForDeletion() || n.RebootInProgress() {
+		return NodePoolDisruption{Nodes: 1, Disrupting: 1}
+	}
+	// A rebooting node may have no Node yet, but then it's Disrupting above; a Node that's absent reads as not Ready.
+	if f.Node == nil || nodeutils.GetCondition(f.Node, corev1.NodeReady).Status != corev1.ConditionTrue {
+		return NodePoolDisruption{Nodes: 1, NotReady: 1}
+	}
+	return NodePoolDisruption{Nodes: 1}
+}
+
 // newestPod is a pod's contribution to its DaemonSet: the DaemonSet's newest pod, as a sample of its current template.
 // A pod going away leaves the sample in place until a newer one arrives or the DaemonSet goes, so Delete doesn't undo
 // Update, unlike a Contribution that counts.
@@ -390,6 +451,7 @@ func (c *Cluster) newStores() {
 	c.nodeUsage = karpenterstate.NewStore[string, podFields]()
 	c.pvcDrivers = karpenterstate.NewStore[types.NamespacedName, pvcFields]()
 	c.nodePoolResources = karpenterstate.NewStore[string, corev1.ResourceList]()
+	c.nodePoolDisruption = karpenterstate.NewStore[string, NodePoolDisruption]()
 	c.daemonSetPods = karpenterstate.NewStore[types.NamespacedName, daemonSetFields]()
 	c.NodePoolState = NewNodePoolState(c.clock, c.nodeClaims)
 
@@ -419,6 +481,7 @@ func (c *Cluster) newStores() {
 			n := &StateNode{Node: f.Node, NodeClaim: f.NodeClaim}
 			return nodePoolCapacity(lo.Assign(n.Capacity(), corev1.ResourceList{resources.Node: resource.MustParse("1")}))
 		})
+	karpenterstate.Derive(c.nodes, c.nodePoolDisruption, nodePoolDisruptionKey, nodePoolDisruptionOf)
 	c.nodes.Subscribe(func(change karpenterstate.Change[string, nodeFields]) {
 		if change.Existed != change.Exists {
 			ClusterStateNodesCount.Set(float64(c.nodeCount.Add(int64(lo.Ternary(change.Exists, 1, -1)))), nil)
@@ -439,7 +502,7 @@ func (c *Cluster) newStores() {
 
 // clearStores empties the stores in place, so that their subscribers stay subscribed.
 func (c *Cluster) clearStores() {
-	for _, s := range []interface{ Clear() }{c.nodes, c.nodeClaims, c.pods, c.nodeUsage, c.pvcDrivers, c.nodePoolResources, c.daemonSetPods} {
+	for _, s := range []interface{ Clear() }{c.nodes, c.nodeClaims, c.pods, c.nodeUsage, c.pvcDrivers, c.nodePoolResources, c.nodePoolDisruption, c.daemonSetPods} {
 		s.Clear()
 	}
 	c.NodePoolState.Reset()
@@ -804,6 +867,12 @@ func (c *Cluster) DeletePod(podKey types.NamespacedName) {
 func (c *Cluster) NodePoolResourcesFor(nodePoolName string) corev1.ResourceList {
 	resources, _ := c.nodePoolResources.Get(nodePoolName)
 	return maps.Clone(resources)
+}
+
+// NodePoolDisruption returns the NodePool's nodes as its disruption budgets count them.
+func (c *Cluster) NodePoolDisruption(nodePoolName string) NodePoolDisruption {
+	d, _ := c.nodePoolDisruption.Get(nodePoolName)
+	return d
 }
 
 // Reset the cluster state for unit testing

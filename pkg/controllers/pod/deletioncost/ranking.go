@@ -41,8 +41,9 @@ import (
 // RankNodes returns three slices whose position implies the pod-deletion-cost
 // annotation: groupA maps to math.MinInt32, groupBC is drifted then normal by
 // SavingsRatio DESC with the rank from RankForBC(i, len(groupBC)), and groupD
-// has its annotations cleared.
-func RankNodes(ctx context.Context, kubeClient client.Client, clk clock.Clock, nodes []*state.StateNode, nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType) (groupA, groupBC, groupD []*state.StateNode, err error) {
+// has its annotations cleared. The disruption budgets bounding groupBC are read
+// from cluster.
+func RankNodes(ctx context.Context, kubeClient client.Client, clk clock.Clock, cluster *state.Cluster, nodes []*state.StateNode, nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType) (groupA, groupBC, groupD []*state.StateNode, err error) {
 	// PDC only annotates pods on nodes Karpenter owns. An unmanaged node with a
 	// deletion timestamp satisfies StateNode.Deleted(), so without this filter it
 	// reaches Group A and gets MinInt32 written on every pod, uncapped.
@@ -68,12 +69,8 @@ func RankNodes(ctx context.Context, kubeClient client.Client, clk clock.Clock, n
 	normal := groups[partitionNormal]
 	cleanupOnly := groups[partitionCleanupOnly]
 
-	budgetFor := func(reason v1.DisruptionReason) map[string]int {
-		numNodes, disrupting := disruption.NodePoolStatsFromNodes(nodes, reason)
-		return disruption.NodePoolBudgetMap(ctx, clk, nodePoolMap, numNodes, disrupting, reason)
-	}
-	driftBudget := budgetFor(v1.DisruptionReasonDrifted)
-	consolidationBudget := budgetFor(v1.DisruptionReasonUnderutilized)
+	driftBudget := disruption.NodePoolBudgetMap(ctx, clk, cluster, nodePoolMap, v1.DisruptionReasonDrifted)
+	consolidationBudget := disruption.NodePoolBudgetMap(ctx, clk, cluster, nodePoolMap, v1.DisruptionReasonUnderutilized)
 	var driftOverflow, normalOverflow []*state.StateNode
 	drifted, driftOverflow = applyPerNodePoolBudget(drifted, driftBudget)
 	normal, normalOverflow = applyPerNodePoolBudget(normal, consolidationBudget)
@@ -128,14 +125,14 @@ func classifyNode(ctx context.Context, kubeClient client.Client, clk clock.Clock
 	if isGoingAway(node) {
 		return partitionDisrupted
 	}
-	if verr := node.ValidateNodeDisruptable(clk); verr != nil {
+	if verr := disruption.ValidateNodeDisruptable(node, clk); verr != nil {
 		return partitionCleanupOnly
 	}
 	return classifyDisruptableNode(ctx, kubeClient, clk, node, nodePoolMap, nodePoolToInstanceTypesMap, pdbs)
 }
 
 func classifyDisruptableNode(ctx context.Context, kubeClient client.Client, clk clock.Clock, node *state.StateNode, nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType, pdbs pdb.Limits) nodePartition {
-	pods, verr := node.ValidatePodsDisruptable(ctx, kubeClient, pdbs, clk, nil)
+	pods, verr := disruption.ValidatePodsDisruptable(ctx, kubeClient, node, pdbs, clk, nil)
 	if verr != nil {
 		return partitionCleanupOnly
 	}

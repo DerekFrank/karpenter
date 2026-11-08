@@ -22,7 +22,6 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/clock"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -61,16 +60,6 @@ var _ = Describe("StateNode Reboot", func() {
 		})
 		It("is false when the StateNode has no NodeClaim", func() {
 			Expect((&state.StateNode{Node: test.Node()}).RebootInProgress()).To(BeFalse())
-		})
-	})
-
-	Context("ValidateNodeDisruptable", func() {
-		It("rejects a rebooting node so other disruption skips it", func() {
-			err := stateNode(metav1.ConditionTrue).ValidateNodeDisruptable(clock.RealClock{})
-			Expect(err).To(MatchError(ContainSubstring("node is rebooting")))
-		})
-		It("does not reject a node that is not rebooting", func() {
-			Expect(stateNode(metav1.ConditionFalse).ValidateNodeDisruptable(clock.RealClock{})).To(Succeed())
 		})
 	})
 

@@ -23,10 +23,15 @@ import (
 	"time"
 
 	"github.com/awslabs/operatorpkg/serrors"
+	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
+	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/util/retry"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -45,7 +50,6 @@ import (
 	operatorlogging "sigs.k8s.io/karpenter/pkg/operator/logging"
 	pkgscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
-	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/pdb"
 )
@@ -341,23 +345,37 @@ func BuildNodePoolMap(ctx context.Context, kubeClient client.Client, cloudProvid
 	return nodePoolMap, nodePoolToInstanceTypesMap, nil
 }
 
-// The disrupting count is reason-dependent, so pass the same reason on to
-// MustGetAllowedDisruptions or NodePoolBudgetMap.
-func NodePoolStats(cluster *state.Cluster, reason v1.DisruptionReason) (numNodes, disrupting map[string]int) {
-	return NodePoolStatsFromNodes(cluster.DeepCopyNodes(), reason)
+// NodePoolStats returns the NodePool's nodes counted toward its disruption budgets, and how many of them already
+// consume the budget for reason. A node consumes a budget when it is:
+//  1. Marked for deletion (a disruption is already in flight),
+//  2. Rebooting (an in-place disruption is already in flight), for every reason, so that other methods don't disrupt
+//     concurrently and exceed the budget, or
+//  3. NotReady, except for the Unhealthy (repair) budget.
+//
+// Repair must not count merely-unhealthy nodes: NotReady is precisely repair's trigger, so counting those nodes against
+// the repair budget would let a wave of unhealthy nodes starve the very budget that repairs them (a node.health cohort
+// could zero the budget and freeze repair). An in-flight repair still counts once its candidate is MarkedForDeletion.
+// Other reasons keep the reason-agnostic "unhealthy nodes consume budget" semantics introduced for consolidation/drift
+// (kubernetes-sigs/karpenter#981). Cluster state derives the counts as nodes change; state.NodePoolDisruption says
+// which nodes count.
+func NodePoolStats(cluster *state.Cluster, nodePool string, reason v1.DisruptionReason) (numNodes, disrupting int) {
+	d := cluster.NodePoolDisruption(nodePool)
+	return d.Nodes, d.Disrupting + lo.Ternary(reason == v1.DisruptionReasonUnhealthy, 0, d.NotReady)
 }
 
-func NodePoolBudgetMap(ctx context.Context, clk clock.Clock, nodePools map[string]*v1.NodePool, numNodes, disrupting map[string]int, reason v1.DisruptionReason) map[string]int {
+// NodePoolBudgetMap returns the disruptions each NodePool still allows for reason, clamped to zero.
+func NodePoolBudgetMap(ctx context.Context, clk clock.Clock, cluster *state.Cluster, nodePools map[string]*v1.NodePool, reason v1.DisruptionReason) map[string]int {
 	out := map[string]int{}
 	for name, np := range nodePools {
-		allowed := np.MustGetAllowedDisruptions(clk, numNodes[name], reason)
-		remaining := allowed - disrupting[name]
+		numNodes, disrupting := NodePoolStats(cluster, name, reason)
+		allowed := np.MustGetAllowedDisruptions(clk, numNodes, reason)
+		remaining := allowed - disrupting
 		if remaining < 0 {
 			log.FromContext(ctx).V(1).WithValues(
 				"nodePool", name,
 				"reason", string(reason),
 				"allowed", allowed,
-				"disrupting", disrupting[name],
+				"disrupting", disrupting,
 			).Info("disruption budget already exhausted; clamping to 0")
 			remaining = 0
 		}
@@ -366,71 +384,25 @@ func NodePoolBudgetMap(ctx context.Context, clk clock.Clock, nodePools map[strin
 	return out
 }
 
-// NodePoolStats against a snapshot the caller already holds.
-func NodePoolStatsFromNodes(nodes []*state.StateNode, reason v1.DisruptionReason) (numNodes, disrupting map[string]int) {
-	numNodes = map[string]int{}
-	disrupting = map[string]int{}
-	for _, node := range nodes {
-		// We only consider nodes that we own and are initialized towards the total.
-		// If a node is launched/registered, but not initialized, pods aren't scheduled
-		// to the node, and these are treated as unhealthy until they're cleaned up.
-		// This prevents odd roundup cases with percentages where replacement nodes that
-		// aren't initialized could be counted towards the total, resulting in more disruptions
-		// to active nodes than desired, where Karpenter should wait for these nodes to be
-		// healthy before continuing. Reboot resets Initialized after issuance,
-		// but the node still counts against the budget until reboot completes.
-		if !node.Managed() || (!node.Initialized() && !node.RebootInProgress()) {
-			continue
-		}
-
-		// Additionally, don't consider nodeclaims that have the terminating condition. A nodeclaim should have
-		// the Terminating condition only when the node is drained and cloudprovider.Delete() was successful
-		// on the underlying cloud provider machine.
-		if node.NodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() {
-			continue
-		}
-
-		nodePool := node.Labels()[v1.NodePoolLabelKey]
-		numNodes[nodePool]++
-
-		// A node is subtracted from the allowed disruptions when it is:
-		//   1. Marked for deletion (a disruption is already in flight),
-		//   2. Rebooting (an in-place disruption is already in flight), for every reason, or
-		//   3. NotReady — EXCEPT for the Unhealthy (repair) budget.
-		// Repair must not count merely-unhealthy nodes: NotReady is precisely repair's trigger, so counting those
-		// nodes against the repair budget would let a wave of unhealthy nodes starve the very budget that repairs them
-		// (a node.health cohort could zero the budget and freeze repair). An in-flight repair still counts once its
-		// candidate is MarkedForDeletion. Other reasons keep the reason-agnostic "unhealthy nodes consume budget"
-		// semantics introduced for consolidation/drift (kubernetes-sigs/karpenter#981).
-		notReady := nodeutils.GetCondition(node.Node, corev1.NodeReady).Status != corev1.ConditionTrue
-		// Count active reboots against every disruption budget otherwise
-		// other methods could disrupt concurrently and exceed the NodePool budget.
-		if node.MarkedForDeletion() || node.RebootInProgress() || (notReady && reason != v1.DisruptionReasonUnhealthy) {
-			disrupting[nodePool]++
-		}
-	}
-	return numNodes, disrupting
-}
-
 // BuildDisruptionBudgets prepares our disruption budget mapping. The disruption budget maps each disruption reason to the number of allowed disruptions.
 // We calculate allowed disruptions by taking the max disruptions allowed by disruption reason and subtracting the number of nodes that are NotReady and already being deleted by that disruption reason.
 func BuildDisruptionBudgetMapping(ctx context.Context, cluster *state.Cluster, clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, reason v1.DisruptionReason) (map[string]int, error) {
 	disruptionBudgetMapping := map[string]int{}
-	numNodes, disrupting := NodePoolStats(cluster, reason)
 	nodePools, err := nodepoolutils.ListManaged(ctx, kubeClient, cloudProvider)
 	if err != nil {
 		return disruptionBudgetMapping, fmt.Errorf("listing node pools, %w", err)
 	}
 	for _, nodePool := range nodePools {
-		allowedDisruptions := nodePool.MustGetAllowedDisruptions(clk, numNodes[nodePool.Name], reason)
-		disruptionBudgetMapping[nodePool.Name] = lo.Max([]int{allowedDisruptions - disrupting[nodePool.Name], 0})
+		numNodes, disrupting := NodePoolStats(cluster, nodePool.Name, reason)
+		allowedDisruptions := nodePool.MustGetAllowedDisruptions(clk, numNodes, reason)
+		disruptionBudgetMapping[nodePool.Name] = lo.Max([]int{allowedDisruptions - disrupting, 0})
 		NodePoolAllowedDisruptions.Set(float64(allowedDisruptions), map[string]string{
 			metrics.NodePoolLabel: nodePool.Name, metrics.ReasonLabel: strings.ToLower(string(reason)),
 		})
-		NodePoolNodesConsumingBudgets.Set(float64(disrupting[nodePool.Name]), map[string]string{
+		NodePoolNodesConsumingBudgets.Set(float64(disrupting), map[string]string{
 			metrics.NodePoolLabel: nodePool.Name, metrics.ReasonLabel: strings.ToLower(string(reason)),
 		})
-		if numNodes[nodePool.Name] != 0 && allowedDisruptions == 0 {
+		if numNodes != 0 && allowedDisruptions == 0 {
 			recorder.Publish(disruptionevents.NodePoolBlockedForDisruptionReason(nodePool, reason))
 		}
 	}
@@ -477,4 +449,87 @@ func staticReservations(ctx context.Context, cloudProvider cloudprovider.CloudPr
 // terminating it frees a slot its refill can launch into.
 func holdsOfferedReservation(c *Candidate, offered sets.Set[string]) bool {
 	return c.capacityType == v1.CapacityTypeReserved && offered.Has(c.Labels()[cloudprovider.ReservationIDLabel])
+}
+
+// RequireNoScheduleTaint will add/remove the karpenter.sh/disruption:NoSchedule taint from the candidates.
+// This is used to enforce no taints at the beginning of disruption, and
+// to add/remove taints while executing a disruption action.
+// nolint:gocyclo
+func RequireNoScheduleTaint(ctx context.Context, kubeClient client.Client, addTaint bool, nodes ...*state.StateNode) error {
+	errs := make([]error, len(nodes))
+	workqueue.ParallelizeUntil(ctx, len(nodes), len(nodes), func(i int) {
+		// If the StateNode is Karpenter owned and only has a nodeclaim, or is not owned by
+		// Karpenter, thus having no nodeclaim, don't touch the node.
+		if nodes[i].Node == nil || nodes[i].NodeClaim == nil {
+			return
+		}
+		node := &corev1.Node{}
+		if err := retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
+			if e := kubeClient.Get(ctx, client.ObjectKey{Name: nodes[i].Node.Name}, node); e != nil {
+				return e
+			}
+			// If the node already has the taint, continue to the next
+			_, hasTaint := lo.Find(node.Spec.Taints, func(taint corev1.Taint) bool {
+				return taint.MatchTaint(&v1.DisruptedNoScheduleTaint)
+			})
+			// Node is being deleted, so no need to remove taint as the node will be gone soon.
+			// This ensures that the disruption controller doesn't modify taints that the Termination
+			// controller is also modifying
+			if hasTaint && !node.DeletionTimestamp.IsZero() {
+				return nil
+			}
+			stored := node.DeepCopy()
+			// If the taint is present and we want to remove the taint, remove it.
+			if !addTaint {
+				node.Spec.Taints = lo.Reject(node.Spec.Taints, func(taint corev1.Taint, _ int) bool {
+					return taint.MatchTaint(&v1.DisruptedNoScheduleTaint)
+				})
+				// otherwise, add it.
+			} else if addTaint && !hasTaint {
+				// If the taint key is present (but with a different value or effect), remove it.
+				node.Spec.Taints = lo.Reject(node.Spec.Taints, func(taint corev1.Taint, _ int) bool {
+					return taint.MatchTaint(&v1.DisruptedNoScheduleTaint)
+				})
+				node.Spec.Taints = append(node.Spec.Taints, v1.DisruptedNoScheduleTaint)
+			}
+			if !equality.Semantic.DeepEqual(stored, node) {
+				// We use client.MergeFromWithOptimisticLock because patching a list with a JSON merge patch
+				// can cause races due to the fact that it fully replaces the list on a change
+				// Here, we are updating the taint list
+				return kubeClient.Patch(ctx, node, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
+			}
+			return nil
+		}); err != nil {
+			errs[i] = client.IgnoreNotFound(fmt.Errorf("getting node, %w", err))
+			return
+		}
+	})
+	return multierr.Combine(errs...)
+}
+
+// ClearNodeClaimsCondition will remove the conditionType from the NodeClaim status of the provided statenodes
+func ClearNodeClaimsCondition(ctx context.Context, kubeClient client.Client, clk clock.Clock, conditionType string, nodes ...*state.StateNode) error {
+	errs := make([]error, len(nodes))
+	workqueue.ParallelizeUntil(ctx, len(nodes), len(nodes), func(i int) {
+		if !nodes[i].Initialized() || nodes[i].NodeClaim == nil {
+			return
+		}
+		nodeClaim := &v1.NodeClaim{}
+		if err := retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
+			if e := kubeClient.Get(ctx, client.ObjectKeyFromObject(nodes[i].NodeClaim), nodeClaim); e != nil {
+				return e
+			}
+			stored := nodeClaim.DeepCopy()
+			_ = nodeClaim.StatusConditions(status.WithClock(clk)).Clear(conditionType)
+			if !equality.Semantic.DeepEqual(stored, nodeClaim) {
+				return kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
+			}
+			return nil
+		}); err != nil {
+			errs[i] = client.IgnoreNotFound(err)
+			return
+		}
+
+	})
+	return multierr.Combine(errs...)
 }

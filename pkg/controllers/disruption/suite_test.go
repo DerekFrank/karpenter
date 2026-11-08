@@ -1095,7 +1095,7 @@ var _ = Describe("Candidate Filtering", func() {
 		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating pod disruption, pod has "karpenter.sh/do-not-disrupt" annotation (Pod=%s) (Node=%s)`, client.ObjectKeyFromObject(pod), node.Name)))
-		Expect(state.IsPodBlockEvictionError(err)).To(BeTrue())
+		Expect(disruption.IsPodBlockEvictionError(err)).To(BeTrue())
 		Expect(recorder.DetectedEvent(fmt.Sprintf(`Pod has "karpenter.sh/do-not-disrupt" annotation (Pod=%s)`, client.ObjectKeyFromObject(pod)))).To(BeTrue())
 	})
 	It("should not consider candidates that have do-not-disrupt mirror pods scheduled", func() {

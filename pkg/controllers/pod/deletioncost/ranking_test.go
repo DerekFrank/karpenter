@@ -246,7 +246,7 @@ var _ = Describe("Ranking", func() {
 				stateNodes = append(stateNodes, n)
 			}
 
-			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, stateNodes, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
+			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, cluster, stateNodes, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(totalRanked(groupA, groupBC, groupD)).To(Equal(2))
 
@@ -574,7 +574,7 @@ var _ = Describe("Ranking", func() {
 			for n := range cluster.Nodes() {
 				stateNodes = append(stateNodes, n)
 			}
-			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, stateNodes, nodePoolMap, nodePoolToInstanceTypesMap)
+			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, cluster, stateNodes, nodePoolMap, nodePoolToInstanceTypesMap)
 			Expect(err).ToNot(HaveOccurred())
 
 			infoActive := rankInfoFor(nodeActive.Name, groupA, groupBC, groupD)
@@ -798,7 +798,7 @@ var _ = Describe("Ranking", func() {
 
 	Context("Edge: direct-helper partition checks", func() {
 		It("should _Edge_ leave RankNodes a no-op on empty node list", func() {
-			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, nil, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
+			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, cluster, nil, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(totalRanked(groupA, groupBC, groupD)).To(Equal(0))
 		})
@@ -829,7 +829,7 @@ var _ = Describe("Ranking", func() {
 				stateNodes = append(stateNodes, n)
 			}
 
-			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, stateNodes, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
+			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, cluster, stateNodes, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(totalRanked(groupA, groupBC, groupD)).To(Equal(2))
 
@@ -889,7 +889,7 @@ var _ = Describe("Ranking", func() {
 				stateNodes = append(stateNodes, n)
 			}
 
-			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, stateNodes, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
+			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, cluster, stateNodes, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(totalRanked(groupA, groupBC, groupD)).To(Equal(3))
 
@@ -932,7 +932,7 @@ var _ = Describe("Ranking", func() {
 					stateNodes = append(stateNodes, n)
 				}
 
-				groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, stateNodes, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
+				groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, cluster, stateNodes, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(totalRanked(groupA, groupBC, groupD)).To(Equal(2))
 
@@ -1017,7 +1017,7 @@ var _ = Describe("Ranking", func() {
 			for n := range cluster.Nodes() {
 				stateNodes = append(stateNodes, n)
 			}
-			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, stateNodes, nodePoolMap, itMap)
+			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, cluster, stateNodes, nodePoolMap, itMap)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(totalRanked(groupA, groupBC, groupD)).To(Equal(3))
 
@@ -1127,7 +1127,7 @@ var _ = Describe("Ranking", func() {
 			for n := range cluster.Nodes() {
 				stateNodes = append(stateNodes, n)
 			}
-			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, stateNodes, map[string]*v1.NodePool{nodePool.Name: nodePool}, itMap)
+			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, cluster, stateNodes, map[string]*v1.NodePool{nodePool.Name: nodePool}, itMap)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(totalRanked(groupA, groupBC, groupD)).To(Equal(2))
 
@@ -1163,7 +1163,7 @@ var _ = Describe("Ranking", func() {
 				stateNodes = append(stateNodes, n)
 			}
 
-			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, stateNodes, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
+			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, cluster, stateNodes, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(totalRanked(groupA, groupBC, groupD)).To(Equal(2))
 			Expect(groupA).To(BeEmpty(), "kube-system bare pods must not push a node to Group A")
