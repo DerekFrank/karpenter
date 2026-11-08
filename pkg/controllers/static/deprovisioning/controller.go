@@ -47,7 +47,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	disruptionutils "sigs.k8s.io/karpenter/pkg/utils/disruption"
-	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 
 	"sigs.k8s.io/karpenter/pkg/utils/pod"
@@ -184,56 +183,49 @@ func HasNodePoolReplicaCountChanged(oldNP, newNP *v1.NodePool) bool {
 func (c *Controller) getDeprovisioningCandidates(ctx context.Context, np *v1.NodePool, count int) []*v1.NodeClaim {
 	candidates := make([]*v1.NodeClaim, 0, count)
 
-	// Unresolved NodeClaims (haven't launched yet or that failed Create call)
-	unresolvedCandidates := c.unresolvedDeprovisioningCandidates(ctx, np.Name, count)
-	candidates = append(candidates, unresolvedCandidates...)
+	// Unresolved NodeClaims (haven't launched yet or that failed Create call), from the NodePool's index in cluster state
+	for _, nc := range lo.Slice(c.cluster.UnlaunchedNodeClaims(np.Name), 0, count) {
+		candidates = append(candidates, nc.DeepCopy())
+	}
 	remaining := count - len(candidates)
 
 	if remaining == 0 {
 		return candidates
 	}
 
-	// Get all StateNodes for this NodePool
-	nodes := make([]*state.StateNode, 0)
-	for n := range c.cluster.Nodes() {
-		if n.Labels()[v1.NodePoolLabelKey] == np.Name && n.NodeClaim != nil && !n.MarkedForDeletion() {
-			nodes = append(nodes, n.DeepCopy())
-		}
-	}
+	// The NodePool's StateNodes, from its index in cluster state
+	nodes := lo.Filter(c.cluster.NodePoolNodes(np.Name), func(n *state.StateNode, _ int) bool { return !n.MarkedForDeletion() })
 
 	// Resolved nodes (empty first, then by disruption cost)
-	resolvedCandidates := c.resolvedDeprovisioningCandidates(ctx, nodes, np, remaining)
-	candidates = append(candidates, resolvedCandidates...)
+	for _, nc := range c.resolvedDeprovisioningCandidates(ctx, nodes, np, remaining) {
+		candidates = append(candidates, nc.DeepCopy())
+	}
 
 	return candidates
 }
 
-// unResolvedDeprovisioningCandidates returns unresolved NodeClaims (those without ProviderID) up to the specified count
-func (c *Controller) unresolvedDeprovisioningCandidates(ctx context.Context, nodePoolName string, count int) []*v1.NodeClaim {
-	nodeClaimList, err := nodeclaimutils.ListManaged(ctx, c.kubeClient, c.cloudProvider, nodeclaimutils.ForNodePool(nodePoolName))
+// isEmpty returns whether the node has no pods, or only DaemonSet pods without an active do-not-disrupt annotation. The
+// counts decide a node without pods, or with a pod no DaemonSet owns. A node with only DaemonSet pods needs the pods
+// themselves, to check their do-not-disrupt annotations against the clock.
+func (c *Controller) isEmpty(ctx context.Context, node *state.StateNode) bool {
+	switch bound, daemonSet := podCounts(node); {
+	case bound == 0:
+		return true
+	case daemonSet < bound:
+		return false
+	}
+	pods, err := node.Pods(ctx, c.kubeClient)
 	if err != nil {
-		log.FromContext(ctx).Error(err, "failed to list nodeclaims")
-		return nil
+		log.FromContext(ctx).WithValues("node", node.Name()).Error(err, "unable to list pods, treating as non-empty")
+		return false
 	}
+	return len(pods) == 0 || lo.EveryBy(pods, pod.IsOwnedByDaemonSet) && lo.NoneBy(pods, func(p *corev1.Pod) bool { return pod.IsDoNotDisruptActive(p, c.clock, c.recorder) })
+}
 
-	unresolvedNodeClaims := make([]*v1.NodeClaim, 0)
-	for _, nc := range nodeClaimList {
-		if nc.Status.ProviderID == "" && nc.DeletionTimestamp.IsZero() {
-			unresolvedNodeClaims = append(unresolvedNodeClaims, nc)
-		}
-	}
-
-	if len(unresolvedNodeClaims) == 0 {
-		return nil
-	}
-
-	unresolvedToDelete := lo.Min([]int{count, len(unresolvedNodeClaims)})
-	candidates := make([]*v1.NodeClaim, 0, unresolvedToDelete)
-	for i := range unresolvedToDelete {
-		candidates = append(candidates, unresolvedNodeClaims[i])
-	}
-
-	return candidates
+// podCounts returns the number of pods bound to the node and how many of them DaemonSets own, from the fields cluster
+// state derives about the node, where each pod requests one of the pods resource.
+func podCounts(node *state.StateNode) (pods, daemonSetPods int64) {
+	return node.Derived.PodRequests.Pods().Value(), node.Derived.DaemonSetRequests.Pods().Value()
 }
 
 // resolvedDeprovisioningCandidates returns resolved NodeClaims (those with ProviderID) up to the specified count,
@@ -246,14 +238,7 @@ func (c *Controller) resolvedDeprovisioningCandidates(ctx context.Context, nodes
 	candidates := make([]*v1.NodeClaim, 0, count)
 
 	// Priority 1: Empty nodes
-	emptyNodes := lo.Filter(nodes, func(node *state.StateNode, _ int) bool {
-		pods, err := node.Pods(ctx, c.kubeClient)
-		if err != nil {
-			log.FromContext(ctx).WithValues("node", node.Name()).Error(err, "unable to list pods, treating as non-empty")
-			return false
-		}
-		return len(pods) == 0 || lo.EveryBy(pods, pod.IsOwnedByDaemonSet) && lo.NoneBy(pods, func(p *corev1.Pod) bool { return pod.IsDoNotDisruptActive(p, c.clock, c.recorder) })
-	})
+	emptyNodes := lo.Filter(nodes, func(node *state.StateNode, _ int) bool { return c.isEmpty(ctx, node) })
 
 	for _, node := range lo.Slice(emptyNodes, 0, count) {
 		candidates = append(candidates, node.NodeClaim)
@@ -278,6 +263,8 @@ func (c *Controller) resolvedDeprovisioningCandidates(ctx context.Context, nodes
 			return NonEmptyNode{}, false
 		}
 
+		// Ranking needs the pods themselves: their do-not-disrupt annotations against the clock, and their eviction costs,
+		// which DaemonSet pods count toward here, unlike the node's derived DisruptionCost.
 		pods, err := node.Pods(ctx, c.kubeClient)
 		if err != nil {
 			log.FromContext(ctx).WithValues("node", node.Name()).Error(err, "unable to list pods, skipping node")

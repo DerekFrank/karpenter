@@ -637,6 +637,111 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 				ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 0)
 
 			})
+			Describe("candidates from the NodePool's index", func() {
+				nodeClaimsAndNodesFor := func(nodePool *v1.NodePool, n int) ([]*v1.NodeClaim, []*corev1.Node) {
+					return test.NodeClaimsAndNodes(n, v1.NodeClaim{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{
+								v1.NodePoolLabelKey:            nodePool.Name,
+								v1.NodeInitializedLabelKey:     "true",
+								corev1.LabelInstanceTypeStable: "stable.instance",
+							},
+						},
+						Status: v1.NodeClaimStatus{
+							Capacity: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("10"),
+								corev1.ResourceMemory: resource.MustParse("1000Mi"),
+							},
+						},
+					})
+				}
+				unresolvedFor := func(nodePool *v1.NodePool) *v1.NodeClaim {
+					nc := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}}})
+					nc.Status.ProviderID = ""
+					return nc
+				}
+				daemonSetPod := func(node *corev1.Node, annotations map[string]string) *corev1.Pod {
+					return test.Pod(test.PodOptions{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace:   "kube-system",
+							Annotations: annotations,
+							OwnerReferences: []metav1.OwnerReference{{
+								APIVersion: "apps/v1",
+								Kind:       "DaemonSet",
+								Name:       "test-daemonset",
+								UID:        "test-uid",
+							}},
+						},
+						NodeName: node.Name,
+					})
+				}
+				// remaining returns the NodeClaims the controller didn't delete.
+				remaining := func() []string {
+					var ncl v1.NodeClaimList
+					Expect(env.Client.List(ctx, &ncl)).To(Succeed())
+					return lo.FilterMap(ncl.Items, func(nc v1.NodeClaim, _ int) (string, bool) { return nc.Name, nc.DeletionTimestamp.IsZero() })
+				}
+
+				It("should only pick candidates from the reconciled NodePool", func() {
+					nodePool, other := test.StaticNodePool(), test.StaticNodePool()
+					nodePool.Spec.Replicas = new(int64(1))
+					other.Spec.Replicas = new(int64(3))
+					nodeClaims, nodes := nodeClaimsAndNodesFor(nodePool, 2)
+					otherNodeClaims, otherNodes := nodeClaimsAndNodesFor(other, 2)
+					unresolved, otherUnresolved := unresolvedFor(nodePool), unresolvedFor(other)
+					ExpectApplied(ctx, env.Client, nodePool, other, unresolved, otherUnresolved)
+					for i := range 2 {
+						ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i], otherNodeClaims[i], otherNodes[i])
+					}
+					// nodes[1] runs an application pod; every other node is empty.
+					ExpectApplied(ctx, env.Client, test.Pod(test.PodOptions{NodeName: nodes[1].Name}))
+					cluster.UpdateNodeClaim(unresolved)
+					cluster.UpdateNodeClaim(otherUnresolved)
+					ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeController, nodeClaimStateController,
+						append(nodes, otherNodes...), append(nodeClaims, otherNodeClaims...))
+					ExpectStateNodePoolCount(cluster, nodePool.Name, 3, 0, 0)
+
+					ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+
+					// 3 running - 1 desired: the unresolved NodeClaim first, then the empty node, all from nodePool.
+					Expect(remaining()).To(ConsistOf(nodeClaims[1].Name, otherNodeClaims[0].Name, otherNodeClaims[1].Name, otherUnresolved.Name))
+				})
+				It("should not treat a node with only do-not-disrupt DaemonSet pods as empty", func() {
+					nodePool := test.StaticNodePool()
+					nodePool.Spec.Replicas = new(int64(1))
+					nodeClaims, nodes := nodeClaimsAndNodesFor(nodePool, 2)
+					ExpectApplied(ctx, env.Client, nodePool)
+					for i := range 2 {
+						ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
+					}
+					// Both nodes are non-empty; the do-not-disrupt DaemonSet pod ranks nodes[0] after nodes[1].
+					ExpectApplied(ctx, env.Client,
+						daemonSetPod(nodes[0], map[string]string{v1.DoNotDisruptAnnotationKey: "true"}),
+						test.Pod(test.PodOptions{NodeName: nodes[1].Name}))
+					ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeController, nodeClaimStateController, nodes, nodeClaims)
+
+					ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+
+					Expect(remaining()).To(ConsistOf(nodeClaims[0].Name))
+				})
+				It("should not pick a node marked for deletion", func() {
+					nodePool := test.StaticNodePool()
+					nodePool.Spec.Replicas = new(int64(2))
+					nodeClaims, nodes := nodeClaimsAndNodesFor(nodePool, 3)
+					ExpectApplied(ctx, env.Client, nodePool)
+					for i := range 3 {
+						ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
+					}
+					// nodes[0] and nodes[1] are empty, but nodes[0] is already marked for deletion.
+					ExpectApplied(ctx, env.Client, test.Pod(test.PodOptions{NodeName: nodes[2].Name}))
+					ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeController, nodeClaimStateController, nodes, nodeClaims)
+					cluster.MarkForDeletion(nodeClaims[0].Status.ProviderID)
+
+					ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+
+					Expect(remaining()).To(ConsistOf(nodeClaims[0].Name, nodeClaims[2].Name))
+				})
+			})
 			Describe("disruption cost ordering", func() {
 				var (
 					nodePool   *v1.NodePool
