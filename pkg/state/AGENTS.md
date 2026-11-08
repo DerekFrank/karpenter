@@ -59,12 +59,14 @@ c.kubeClient.Status().Patch(ctx, nodePool.Object, client.MergeFrom(stored))
 
 A store is a controller-runtime source whose requests are its keys, and an
 accessor is the source of the stores behind it. A controller that watches one
-reconciles an object whenever the object's derived fields change:
+reconciles an object whenever the object's derived fields change, as
+`nodepool.counter` reconciles a NodePool on each change to its usage:
 
 ```go
 controllerruntime.NewControllerManagedBy(m).
-	For(&v1.NodePool{}, ...).      // the object's own events
-	WatchesRawSource(nodePools).   // its derived fields' changes
+	Named("nodepool.counter").
+	For(&v1.NodePool{}, ...).        // the object's own events
+	WatchesRawSource(c.nodePools).   // its derived fields' changes
 	Complete(c)
 ```
 
@@ -162,6 +164,7 @@ the lag: a pod that moves between nodes can briefly count on both or neither.
   as `TestContributorConcurrentChangesConverge` does.
 - Read through the accessor over a fake client, as `accessor_test.go` does.
 - Start a source on a workqueue and assert on what it queues, as
-  `TestAccessorEnqueuesObjectsWhoseDerivedFieldsChange` and `source_test.go` do.
+  `TestAccessorEnqueuesObjectsWhoseDerivedFieldsChange`, `source_test.go` and the
+  counter's "should reconcile a NodePool whenever its usage changes" do.
   Test a derived store's narrowing as
   `TestADerivedStoreNotifiesOnlyWhenItsNarrowerFieldsChange` does.
