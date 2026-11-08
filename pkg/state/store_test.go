@@ -22,6 +22,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -636,4 +637,32 @@ func TestStoreSyncedIsSafeWhileADeriveIsAdded(t *testing.T) {
 		Derive(nodeClaims, s, poolOf, usageOf)
 	}
 	<-done
+}
+
+type syncFlag struct{ synced atomic.Bool }
+
+func (f *syncFlag) Synced() bool { return f.synced.Load() }
+
+func TestRequiresHoldsUntilEveryStoreIsSyncedAndEnqueuesNothing(t *testing.T) {
+	a, b := &syncFlag{}, &syncFlag{}
+	a.synced.Store(true)
+	src := Requires(a, b)
+	if err := src.Start(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	if err := src.WaitForSync(short); err == nil {
+		t.Fatal("WaitForSync returned before every store synced")
+	}
+	b.synced.Store(true)
+	if err := src.WaitForSync(ctx); err != nil {
+		t.Fatalf("WaitForSync = %v once every store synced", err)
+	}
+	nodeClaims := NewObjectStore[*v1.NodeClaim](nil, nil)
+	s := NewStore[string, poolFields]()
+	Derive(nodeClaims, s, poolOf, usageOf)
+	if err := Requires(nodeClaims, s).WaitForSync(ctx); err != nil {
+		t.Fatalf("WaitForSync = %v for stores fed by a caller, which are synced from the start", err)
+	}
 }
