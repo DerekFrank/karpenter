@@ -79,12 +79,12 @@ func (c *Controller) Reconcile(ctx context.Context, nodePool *v1.NodePool) (reco
 
 	// If Karpenter restarts i.e. if the buffer for the nodePool is empty and the NodeRegistrationHealthy status condition
 	// is set to either true/false then we pre-hydrate the buffer with the existing state of the status condition
-	if c.npState.Status(nodePool.UID) == nodepoolhealth.StatusUnknown {
+	if c.npState.Status(nodePool) == nodepoolhealth.StatusUnknown {
 		if nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy).IsTrue() {
-			c.npState.SetStatus(nodePool.UID, nodepoolhealth.StatusHealthy)
+			c.npState.SetStatus(nodePool, nodepoolhealth.StatusHealthy)
 		}
 		if nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy).IsFalse() {
-			c.npState.SetStatus(nodePool.UID, nodepoolhealth.StatusUnhealthy)
+			c.npState.SetStatus(nodePool, nodepoolhealth.StatusUnhealthy)
 		}
 	}
 
@@ -93,7 +93,7 @@ func (c *Controller) Reconcile(ctx context.Context, nodePool *v1.NodePool) (reco
 		nodePool.Status.NodeClassObservedGeneration != nodeClass.GetGeneration() ||
 		nodePool.Generation != nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy).ObservedGeneration {
 		nodePool.StatusConditions(status.WithClock(c.clock)).SetUnknown(v1.ConditionTypeNodeRegistrationHealthy)
-		c.npState.SetStatus(nodePool.UID, nodepoolhealth.StatusUnknown)
+		c.npState.SetStatus(nodePool, nodepoolhealth.StatusUnknown)
 	}
 
 	nodePool.Status.NodeClassObservedGeneration = nodeClass.GetGeneration()
@@ -119,5 +119,19 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 	for _, nodeClass := range c.cloudProvider.GetSupportedNodeClasses() {
 		b.Watches(nodeClass, nodepoolutils.NodeClassEventHandler(c.kubeClient))
 	}
-	return b.Complete(reconcile.AsReconciler(m.GetClient(), c))
+	return b.Complete(reconcile.Func(func(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+		return c.reconcileRequest(ctx, m.GetClient(), req)
+	}))
+}
+
+// reconcileRequest reconciles the NodePool the request names, and drops its launch outcomes once it's gone.
+func (c *Controller) reconcileRequest(ctx context.Context, kubeClient client.Client, req reconcile.Request) (reconcile.Result, error) {
+	nodePool := &v1.NodePool{}
+	if err := kubeClient.Get(ctx, req.NamespacedName, nodePool); err != nil {
+		if errors.IsNotFound(err) {
+			c.npState.Delete(req.Name)
+		}
+		return reconcile.Result{}, client.IgnoreNotFound(err)
+	}
+	return c.Reconcile(ctx, nodePool)
 }

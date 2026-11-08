@@ -44,6 +44,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
@@ -63,7 +64,10 @@ type Controller struct {
 	recorder      events.Recorder
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
+	cluster       *state.Cluster
 	policies      []replacePolicy
+	// health counts the Nodes, and those a replace policy matches, per NodePool and across the cluster.
+	health *state.NodeHealth
 }
 
 // replacePolicy is a ReplaceNode RepairPolicy. The legacy controller can only replace nodes, so it ignores policies with
@@ -74,7 +78,7 @@ type replacePolicy struct {
 }
 
 // NewController constructs a controller instance
-func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, clock clock.Clock, recorder events.Recorder) *Controller {
+func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, cluster *state.Cluster, clock clock.Clock, recorder events.Recorder) *Controller {
 	var policies []replacePolicy
 	for _, policy := range cloudProvider.RepairPolicies() {
 		if policy.Action != cloudprovider.ReplaceNode {
@@ -90,8 +94,17 @@ func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudPr
 		recorder:      recorder,
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
+		cluster:       cluster,
 		policies:      policies,
+		health:        cluster.DeriveNodeHealth(func(node *corev1.Node) bool { return unhealthy(policies, node) }),
 	}
+}
+
+// unhealthy reports whether one of the policies matches the Node's condition of the policy's type.
+func unhealthy(policies []replacePolicy, node *corev1.Node) bool {
+	return lo.ContainsBy(policies, func(policy replacePolicy) bool {
+		return policy.matches(nodeutils.GetCondition(node, policy.ConditionType))
+	})
 }
 
 // matches reports whether the node's condition for the policy's type has the policy's status and, for a policy with a
@@ -167,24 +180,20 @@ func (c *Controller) Reconcile(ctx context.Context, node *corev1.Node) (reconcil
 	// If a nodeclaim does have a nodepool label, validate the nodeclaims inside the nodepool are healthy (i.e bellow the allowed threshold)
 	// In the case of standalone nodeclaim, validate the nodes inside the cluster are healthy before proceeding
 	// to repair the nodes
+	// The node counts that guard repair are only whole once cluster state has synced.
+	if !c.cluster.Synced(ctx) {
+		return reconcile.Result{RequeueAfter: time.Second}, nil
+	}
 	nodePoolName, found := nodeClaim.Labels[v1.NodePoolLabelKey]
 	if found {
-		nodePoolHealthy, err := c.isNodePoolHealthy(ctx, nodePoolName)
-		if err != nil {
-			return reconcile.Result{}, client.IgnoreNotFound(err)
-		}
-		if !nodePoolHealthy {
+		if !c.isNodePoolHealthy(nodePoolName) {
 			if err := c.publishNodePoolHealthEvent(ctx, node, nodeClaim, nodePoolName); err != nil {
 				return reconcile.Result{}, err
 			}
 			return reconcile.Result{RequeueAfter: 5 * time.Minute}, nil
 		}
 	} else {
-		clusterHealthy, err := c.isClusterHealthy(ctx)
-		if err != nil {
-			return reconcile.Result{}, err
-		}
-		if !clusterHealthy {
+		if !c.isClusterHealthy() {
 			c.recorder.Publish(NodeRepairBlockedUnmanagedNodeClaim(node, nodeClaim, fmt.Sprintf("more then %s nodes are unhealthy in the cluster", allowedUnhealthyPercent.String()))...)
 			return reconcile.Result{RequeueAfter: 5 * time.Minute}, nil
 		}
@@ -276,26 +285,18 @@ func (c *Controller) annotateTerminationGracePeriod(ctx context.Context, nodeCla
 // Up to 20% of Nodes may be unhealthy before the NodePool becomes unhealthy (or the nearest whole number, rounding up).
 // For example, given a NodePool with three nodes, one may be unhealthy without rendering the NodePool unhealthy, even though that's 33% of the total nodes.
 // This is analogous to how minAvailable and maxUnavailable work for PodDisruptionBudgets: https://kubernetes.io/docs/tasks/run-application/configure-pdb/#rounding-logic-when-specifying-percentages.
-func (c *Controller) isNodePoolHealthy(ctx context.Context, nodePoolName string) (bool, error) {
-	return c.areNodesHealthy(ctx, client.MatchingLabels(map[string]string{v1.NodePoolLabelKey: nodePoolName}))
+func (c *Controller) isNodePoolHealthy(nodePoolName string) bool {
+	return healthy(c.health.NodePool(nodePoolName))
 }
 
-func (c *Controller) isClusterHealthy(ctx context.Context) (bool, error) {
-	return c.areNodesHealthy(ctx)
+// isClusterHealthy checks the same threshold across every Node in the cluster, managed or not.
+func (c *Controller) isClusterHealthy() bool {
+	return healthy(c.health.Cluster())
 }
 
-func (c *Controller) areNodesHealthy(ctx context.Context, opts ...client.ListOption) (bool, error) {
-	nodeList := &corev1.NodeList{}
-	if err := c.kubeClient.List(ctx, nodeList, append(opts, client.UnsafeDisableDeepCopy)...); err != nil {
-		return false, err
-	}
-	unhealthyNodeCount := lo.CountBy(nodeList.Items, func(node corev1.Node) bool {
-		return lo.ContainsBy(c.policies, func(policy replacePolicy) bool {
-			return policy.matches(nodeutils.GetCondition(new(node), policy.ConditionType))
-		})
-	})
-	threshold := lo.Must(intstr.GetScaledValueFromIntOrPercent(new(allowedUnhealthyPercent), len(nodeList.Items), true))
-	return unhealthyNodeCount <= threshold, nil
+func healthy(counts state.NodeCounts) bool {
+	threshold := lo.Must(intstr.GetScaledValueFromIntOrPercent(new(allowedUnhealthyPercent), counts.Nodes, true))
+	return counts.Unhealthy <= threshold
 }
 
 func (c *Controller) publishNodePoolHealthEvent(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim, npName string) error {

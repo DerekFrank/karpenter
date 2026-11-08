@@ -189,7 +189,7 @@ func NewControllers(
 	// The repair disruption method is registered in the disruption controller. --legacy-node-repair instead runs the
 	// legacy node.health controller.
 	if len(cloudProvider.RepairPolicies()) != 0 && options.FromContext(ctx).FeatureGates.NodeRepair && options.FromContext(ctx).LegacyNodeRepair {
-		controllers = append(controllers, legacyrepair.NewController(kubeClient, cloudProvider, clock, recorder))
+		controllers = append(controllers, legacyrepair.NewController(kubeClient, cloudProvider, clusterState, clock, recorder))
 	}
 	if options.FromContext(ctx).FeatureGates.StaticCapacity {
 		controllers = append(controllers, staticprovisioning.NewController(kubeClient, clusterState, recorder, cloudProvider, p, clock, deviceAllocationController, virtualPodCache))

@@ -128,7 +128,7 @@ func (l *Liveness) updateNodePoolRegistrationHealth(ctx context.Context, nodeCla
 			return nil
 		}
 		stored := nodePool.DeepCopy()
-		if l.npState.DryRun(nodePool.UID, false).Status() == nodepoolhealth.StatusUnhealthy && !nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy).IsFalse() {
+		if l.npState.DryRun(nodePool, false) == nodepoolhealth.StatusUnhealthy && !nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy).IsFalse() {
 			// If the nodeClaim failed to register during the timeout set NodeRegistrationHealthy status condition on
 			// NodePool to False. If the launch failed get the launch failure reason and message from nodeClaim.
 			if launchCondition := nodeClaim.StatusConditions().Get(v1.ConditionTypeLaunched); launchCondition.IsTrue() {
@@ -143,7 +143,7 @@ func (l *Liveness) updateNodePoolRegistrationHealth(ctx context.Context, nodeCla
 				return serrors.Wrap(fmt.Errorf("patching nodepool status, %w", err), "NodePool", klog.KObj(nodePool))
 			}
 		}
-		l.npState.Update(nodePool.UID, false)
+		l.npState.Update(nodePool, false)
 	}
 	return nil
 }
