@@ -22,7 +22,6 @@ import (
 	"slices"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -543,58 +542,6 @@ func TestDeriveDispatchesUpdateAndDelete(t *testing.T) {
 	}
 }
 
-func TestJoinAccessorCopiesUnlessTheCallerOptsOut(t *testing.T) {
-	nodeClaims := NewObjectStore[*v1.NodeClaim](nil, nil)
-	nodeClaims.Observe(nodeClaim("a", "x", 1, "2"))
-	nodeClaims.Observe(nodeClaim("b", "y", 2, "2"))
-	accessor := NewJoinAccessor(nodeClaims, func(_ types.NamespacedName, nc *v1.NodeClaim) (*v1.NodeClaim, int, bool) { return nc, 1, nc != nil })
-	key := types.NamespacedName{Name: "a"}
-	got, ok := accessor.Get(key)
-	held, _ := nodeClaims.Get(key)
-	if !ok || got.Object == held || got.Object.Name != "a" || got.Derived != 1 {
-		t.Fatalf("Get = %+v, want a copy of a with its derived field", got)
-	}
-	if shared, _ := accessor.Get(key, client.UnsafeDisableDeepCopy); shared.Object != held {
-		t.Fatal("Get with UnsafeDisableDeepCopy copied")
-	}
-	if views, err := accessor.List(client.MatchingLabels{v1.NodePoolLabelKey: "y"}); err != nil || len(views) != 1 || views[0].Object.Name != "b" {
-		t.Fatalf("List = %v, %v, want only b", views, err)
-	}
-}
-
-func TestJoinAccessorListsByAnIndexedField(t *testing.T) {
-	nodeClaims := NewObjectStore[*v1.NodeClaim](nil, nil)
-	accessor := NewJoinAccessor(nodeClaims, func(_ types.NamespacedName, nc *v1.NodeClaim) (*v1.NodeClaim, struct{}, bool) {
-		return nc, struct{}{}, nc != nil
-	}).
-		IndexField("pool", func(_ types.NamespacedName, nc *v1.NodeClaim) string { return nc.Labels[v1.NodePoolLabelKey] })
-	nodeClaims.Observe(nodeClaim("a", "x", 1, "2"))
-	nodeClaims.Observe(nodeClaim("b", "y", 2, "2"))
-	nodeClaims.Observe(nodeClaim("c", "x", 3, "2"))
-	names := func(views []View[*v1.NodeClaim, struct{}]) []string {
-		var out []string
-		for _, v := range views {
-			out = append(out, v.Object.Name)
-		}
-		slices.Sort(out)
-		return out
-	}
-	views, err := accessor.List(client.MatchingFields{"pool": "x"})
-	if err != nil || !slices.Equal(names(views), []string{"a", "c"}) {
-		t.Fatalf("List = %v, %v, want a and c", names(views), err)
-	}
-	nodeClaims.Observe(nodeClaim("c", "y", 4, "2"))
-	if views, _ := accessor.List(client.MatchingFields{"pool": "x"}); !slices.Equal(names(views), []string{"a"}) {
-		t.Fatalf("List = %v once c moved, want a", names(views))
-	}
-	if views, err := accessor.List(client.MatchingFields{"pool": "none"}); err != nil || len(views) != 0 {
-		t.Fatalf("List = %v, %v for a value nothing indexes to, want nothing", names(views), err)
-	}
-	if _, err := accessor.List(client.MatchingFields{"unindexed": "x"}); err == nil {
-		t.Fatal("List by an unindexed field succeeded, want an error as the client returns")
-	}
-}
-
 // TestDeriveSweepStaysUnsyncedAndDropsAKeyDeletedDuringIt deletes a source key while a late Derive's sweep computes
 // its contribution, and checks that the derived store reports unsynced until the sweep ends and doesn't resurrect the
 // deleted key from the sweep's stale read.
@@ -637,32 +584,4 @@ func TestStoreSyncedIsSafeWhileADeriveIsAdded(t *testing.T) {
 		Derive(nodeClaims, s, poolOf, usageOf)
 	}
 	<-done
-}
-
-type syncFlag struct{ synced atomic.Bool }
-
-func (f *syncFlag) Synced() bool { return f.synced.Load() }
-
-func TestRequiresHoldsUntilEveryStoreIsSyncedAndEnqueuesNothing(t *testing.T) {
-	a, b := &syncFlag{}, &syncFlag{}
-	a.synced.Store(true)
-	src := Requires(a, b)
-	if err := src.Start(ctx, nil); err != nil {
-		t.Fatal(err)
-	}
-	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
-	defer cancel()
-	if err := src.WaitForSync(short); err == nil {
-		t.Fatal("WaitForSync returned before every store synced")
-	}
-	b.synced.Store(true)
-	if err := src.WaitForSync(ctx); err != nil {
-		t.Fatalf("WaitForSync = %v once every store synced", err)
-	}
-	nodeClaims := NewObjectStore[*v1.NodeClaim](nil, nil)
-	s := NewStore[string, poolFields]()
-	Derive(nodeClaims, s, poolOf, usageOf)
-	if err := Requires(nodeClaims, s).WaitForSync(ctx); err != nil {
-		t.Fatalf("WaitForSync = %v for stores fed by a caller, which are synced from the start", err)
-	}
 }

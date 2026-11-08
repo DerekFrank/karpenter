@@ -46,6 +46,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 )
 
 type fixture struct {
@@ -65,7 +66,8 @@ func (f *fixture) version(obj client.Object) {
 	obj.SetResourceVersion(strconv.FormatUint(f.rv.Add(1), 10))
 }
 
-// newFixture builds numNodes NodeClaims and Nodes with podsPerNode pods each, with the pods in the cache.
+// newFixture builds numNodes NodeClaims and Nodes with podsPerNode pods each, with the pods in the cache. Each Node
+// carries its NodeClaim's owner reference, as registered Nodes do.
 func newFixture(numNodes, podsPerNode int) *fixture {
 	f := &fixture{cache: &cacheClient{
 		Client: fake.NewClientBuilder().WithScheme(scheme.Scheme).Build(),
@@ -93,6 +95,7 @@ func newFixture(numNodes, podsPerNode int) *fixture {
 			Spec:       corev1.NodeSpec{ProviderID: providerID},
 			Status:     corev1.NodeStatus{Capacity: capacity, Allocatable: capacity, Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}},
 		}
+		node = nodeclaimutils.UpdateNodeOwnerReferences(nc, node)
 		f.version(nc)
 		f.version(node)
 		f.nodeClaims = append(f.nodeClaims, nc)

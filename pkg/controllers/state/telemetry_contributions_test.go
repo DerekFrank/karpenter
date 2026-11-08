@@ -24,10 +24,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/state/statetest"
 )
 
-func TestContributionsKeepTheContributionLaws(t *testing.T) {
-	base := NodePoolFields{NodeClaims: NodeClaimCounts{Active: 3, Deleting: 1}, Reserved: 2}
-	statetest.ExpectContribution(t, base, NodeClaimCounts{Active: 1}, NodeClaimCounts{Deleting: 1})
-	statetest.ExpectContribution(t, base, reservedNodes(1), reservedNodes(2))
+func TestPodOnNodeClaimKeepsTheContributionLaws(t *testing.T) {
 	podKey := func(name string) podOnNodeClaim {
 		return podOnNodeClaim{types.NamespacedName{Namespace: "default", Name: name}}
 	}

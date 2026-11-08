@@ -33,6 +33,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
@@ -42,16 +44,10 @@ import (
 )
 
 func TestNodeClaimSideContributionsKeepTheContributionLaws(t *testing.T) {
-	statetest.ExpectContribution(t, NodePoolDisruption{Nodes: 4, Disrupting: 1, NotReady: 2}, NodePoolDisruption{Nodes: 1}, NodePoolDisruption{Nodes: 1, Disrupting: 1})
-	statetest.ExpectContribution(t, NodePoolDisruption{Nodes: 4, Disrupting: 1, NotReady: 2}, NodePoolDisruption{NotReady: 1}, NodePoolDisruption{NotReady: 1})
 	capacity := func(cpu string) nodePoolCapacity {
 		return nodePoolCapacity{corev1.ResourceCPU: resource.MustParse(cpu), resources.Node: resource.MustParse("1")}
 	}
 	statetest.ExpectContribution(t, corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")}, capacity("2"), capacity("8"))
-	for _, base := range []nodePoolMembers{{}, {Launched: 3, Unlaunched: 2}} {
-		statetest.ExpectContribution(t, base, launchedNodeClaim(1), launchedNodeClaim(1))
-		statetest.ExpectContribution(t, base, unlaunchedNodeClaim(1), unlaunchedNodeClaim(1))
-	}
 	for _, base := range []ProviderIDFields{{}, {NodeClaims: []string{"b"}, Nodes: []string{"n"}, BareNodes: 1}} {
 		statetest.ExpectContribution(t, base, nodeClaimAtProviderID("a"), nodeClaimAtProviderID("c"))
 		statetest.ExpectContribution(t, base, nodeClaimAtProviderID("c"), nodeClaimAtProviderID("a"))
@@ -65,10 +61,6 @@ func TestNodeSideContributionsKeepTheContributionLaws(t *testing.T) {
 	for _, base := range []ProviderIDFields{{}, {NodeClaims: []string{"nc"}, Nodes: []string{"m"}, BareNodes: 1}} {
 		statetest.ExpectContribution(t, base, nodeAtProviderID{name: "a"}, nodeAtProviderID{name: "z", bare: true})
 		statetest.ExpectContribution(t, base, nodeAtProviderID{name: "a", bare: true}, nodeAtProviderID{name: "a"})
-	}
-	for _, base := range []NodeCounts{{}, {Nodes: 3, Unhealthy: 1}} {
-		statetest.ExpectContribution(t, base, newNodeCount(false), newNodeCount(true))
-		statetest.ExpectContribution(t, base, newNodeCount(true), newNodeCount(false))
 	}
 	matcher := testMatcher(t)
 	node := func(name, reason string) *corev1.Node {
@@ -168,4 +160,20 @@ func nodeClaimFieldsEqual(a, b NodeClaimFields) bool {
 	return a.NodeClaim == b.NodeClaim && a.Node == b.Node && a.MarkedForDeletion == b.MarkedForDeletion &&
 		a.NominatedUntil.Equal(&b.NominatedUntil) && a.BufferPods == b.BufferPods &&
 		slices.EqualFunc(a.RepairPolicyMatches, b.RepairPolicyMatches, repair.RepairPolicyMatch.Equal)
+}
+
+// testMatcher returns a matcher of one policy: a Node whose BadNode condition is False needs replacing.
+func testMatcher(t *testing.T) *repair.RepairPolicyMatcher {
+	t.Helper()
+	cloudProvider := fake.NewCloudProvider()
+	cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
+		{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, Action: cloudprovider.ReplaceNode},
+		{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, ReasonRegex: "^Kernel$", Action: cloudprovider.ReplaceNode},
+	}
+	ctx := options.ToContext(context.Background(), test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeRepair: new(true)}}))
+	matcher, err := repair.NewRepairPolicyMatcher(ctx, cloudProvider)
+	if err != nil || matcher == nil {
+		t.Fatalf("building repair policy matcher: %v", err)
+	}
+	return matcher
 }

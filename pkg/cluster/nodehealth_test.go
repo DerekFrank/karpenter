@@ -32,28 +32,10 @@ import (
 	"k8s.io/utils/clock"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/cloudprovider"
-	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
-	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/state/statetest"
 	"sigs.k8s.io/karpenter/pkg/test"
 )
-
-// testMatcher returns a matcher of one policy: a Node whose BadNode condition is False needs replacing.
-func testMatcher(t *testing.T) *repair.RepairPolicyMatcher {
-	t.Helper()
-	cloudProvider := fake.NewCloudProvider()
-	cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
-		{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, Action: cloudprovider.ReplaceNode},
-		{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, ReasonRegex: "^Kernel$", Action: cloudprovider.ReplaceNode},
-	}
-	ctx := options.ToContext(context.Background(), test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeRepair: new(true)}}))
-	matcher, err := repair.NewRepairPolicyMatcher(ctx, cloudProvider)
-	if err != nil || matcher == nil {
-		t.Fatalf("building repair policy matcher: %v", err)
-	}
-	return matcher
-}
 
 func newNodeHealthCluster(t *testing.T) *NodeState {
 	t.Helper()
@@ -190,5 +172,12 @@ func TestNodeHealthConvergesAfterConcurrentChanges(t *testing.T) {
 	}
 	if got := mapOf(c.NodeHealth()); !reflect.DeepEqual(got, want) {
 		t.Errorf("node health = %v, want the recount %v", got, want)
+	}
+}
+
+func TestNodeCountsKeepTheContributionLaws(t *testing.T) {
+	for _, base := range []NodeCounts{{}, {Nodes: 3, Unhealthy: 1}} {
+		statetest.ExpectContribution(t, base, newNodeCount(false), newNodeCount(true))
+		statetest.ExpectContribution(t, base, newNodeCount(true), newNodeCount(false))
 	}
 }

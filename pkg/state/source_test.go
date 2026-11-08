@@ -149,3 +149,41 @@ func TestAfterDelaysAndFoldsChanges(t *testing.T) {
 		t.Fatalf("queued %v, want a once for its five changes", got)
 	}
 }
+
+func TestAccessorEnqueuesObjectsWhoseDerivedFieldsChange(t *testing.T) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	accessor, counts, _ := nodePoolAccessor(t, "a", "b", "c")
+	counts.Update("a", func(int) int { return 1 })
+	queue := newQueue(t)
+	must(t, accessor.Start(ctx, queue))
+	if got := drain(queue); len(got) != 1 || got[0] != "a" {
+		t.Fatalf("Start queued %v, want a, the one NodePool with derived fields", got)
+	}
+	counts.Update("b", func(int) int { return 2 })
+	counts.Update("b", func(int) int { return 3 })
+	counts.Update("a", func(int) int { return 0 })
+	counts.Update("c", func(int) int { return 0 })
+	if got := drain(queue); len(got) != 2 || got[0] != "b" || got[1] != "a" {
+		t.Fatalf("queued %v, want b once for its two changes, then a for its fields going away, and not c, which didn't change", got)
+	}
+}
+
+func TestAccessorStopsEnqueueingOnceItsContextIsDone(t *testing.T) {
+	ctx, cancel := context.WithCancel(ctx)
+	accessor, counts, _ := nodePoolAccessor(t, "a")
+	queue := newQueue(t)
+	must(t, accessor.Start(ctx, queue))
+	cancel()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		counts.Update("a", func(n int) int { return n + 1 })
+		if drain(queue) == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the accessor still queues changes after its context is done")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

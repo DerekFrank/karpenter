@@ -17,13 +17,13 @@ limitations under the License.
 package state
 
 import (
-	"context"
+	"slices"
 	"testing"
-	"time"
 
 	"github.com/samber/lo"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -92,40 +92,54 @@ func TestReaderObjectsAreTheAPIObjects(t *testing.T) {
 	}
 }
 
-func TestAccessorEnqueuesObjectsWhoseDerivedFieldsChange(t *testing.T) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	accessor, counts, _ := nodePoolAccessor(t, "a", "b", "c")
-	counts.Update("a", func(int) int { return 1 })
-	queue := newQueue(t)
-	must(t, accessor.Start(ctx, queue))
-	if got := drain(queue); len(got) != 1 || got[0] != "a" {
-		t.Fatalf("Start queued %v, want a, the one NodePool with derived fields", got)
+func TestJoinAccessorCopiesUnlessTheCallerOptsOut(t *testing.T) {
+	nodeClaims := NewObjectStore[*v1.NodeClaim](nil, nil)
+	nodeClaims.Observe(nodeClaim("a", "x", 1, "2"))
+	nodeClaims.Observe(nodeClaim("b", "y", 2, "2"))
+	accessor := NewJoinAccessor(nodeClaims, func(_ types.NamespacedName, nc *v1.NodeClaim) (*v1.NodeClaim, int, bool) { return nc, 1, nc != nil })
+	key := types.NamespacedName{Name: "a"}
+	got, ok := accessor.Get(key)
+	held, _ := nodeClaims.Get(key)
+	if !ok || got.Object == held || got.Object.Name != "a" || got.Derived != 1 {
+		t.Fatalf("Get = %+v, want a copy of a with its derived field", got)
 	}
-	counts.Update("b", func(int) int { return 2 })
-	counts.Update("b", func(int) int { return 3 })
-	counts.Update("a", func(int) int { return 0 })
-	counts.Update("c", func(int) int { return 0 })
-	if got := drain(queue); len(got) != 2 || got[0] != "b" || got[1] != "a" {
-		t.Fatalf("queued %v, want b once for its two changes, then a for its fields going away, and not c, which didn't change", got)
+	if shared, _ := accessor.Get(key, client.UnsafeDisableDeepCopy); shared.Object != held {
+		t.Fatal("Get with UnsafeDisableDeepCopy copied")
+	}
+	if views, err := accessor.List(client.MatchingLabels{v1.NodePoolLabelKey: "y"}); err != nil || len(views) != 1 || views[0].Object.Name != "b" {
+		t.Fatalf("List = %v, %v, want only b", views, err)
 	}
 }
 
-func TestAccessorStopsEnqueueingOnceItsContextIsDone(t *testing.T) {
-	ctx, cancel := context.WithCancel(ctx)
-	accessor, counts, _ := nodePoolAccessor(t, "a")
-	queue := newQueue(t)
-	must(t, accessor.Start(ctx, queue))
-	cancel()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		counts.Update("a", func(n int) int { return n + 1 })
-		if drain(queue) == nil {
-			break
+func TestJoinAccessorListsByAnIndexedField(t *testing.T) {
+	nodeClaims := NewObjectStore[*v1.NodeClaim](nil, nil)
+	accessor := NewJoinAccessor(nodeClaims, func(_ types.NamespacedName, nc *v1.NodeClaim) (*v1.NodeClaim, struct{}, bool) {
+		return nc, struct{}{}, nc != nil
+	}).
+		IndexField("pool", func(_ types.NamespacedName, nc *v1.NodeClaim) string { return nc.Labels[v1.NodePoolLabelKey] })
+	nodeClaims.Observe(nodeClaim("a", "x", 1, "2"))
+	nodeClaims.Observe(nodeClaim("b", "y", 2, "2"))
+	nodeClaims.Observe(nodeClaim("c", "x", 3, "2"))
+	names := func(views []View[*v1.NodeClaim, struct{}]) []string {
+		var out []string
+		for _, v := range views {
+			out = append(out, v.Object.Name)
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("the accessor still queues changes after its context is done")
-		}
-		time.Sleep(10 * time.Millisecond)
+		slices.Sort(out)
+		return out
+	}
+	views, err := accessor.List(client.MatchingFields{"pool": "x"})
+	if err != nil || !slices.Equal(names(views), []string{"a", "c"}) {
+		t.Fatalf("List = %v, %v, want a and c", names(views), err)
+	}
+	nodeClaims.Observe(nodeClaim("c", "y", 4, "2"))
+	if views, _ := accessor.List(client.MatchingFields{"pool": "x"}); !slices.Equal(names(views), []string{"a"}) {
+		t.Fatalf("List = %v once c moved, want a", names(views))
+	}
+	if views, err := accessor.List(client.MatchingFields{"pool": "none"}); err != nil || len(views) != 0 {
+		t.Fatalf("List = %v, %v for a value nothing indexes to, want nothing", names(views), err)
+	}
+	if _, err := accessor.List(client.MatchingFields{"unindexed": "x"}); err == nil {
+		t.Fatal("List by an unindexed field succeeded, want an error as the client returns")
 	}
 }

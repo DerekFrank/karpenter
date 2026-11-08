@@ -17,7 +17,6 @@ limitations under the License.
 package cluster
 
 import (
-	"cmp"
 	"context"
 	"maps"
 	"slices"
@@ -30,7 +29,6 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 	"sigs.k8s.io/karpenter/pkg/state"
-	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
@@ -149,62 +147,6 @@ func removeName(names []string, name string) []string {
 	return lo.Ternary(len(names) == 0, nil, names)
 }
 
-// nodePoolMembers count each NodePool's launched and unlaunched NodeClaims, keyed by the NodePool's name. The members
-// themselves are the sources of the Derives that feed it (NodeState.poolLaunched and NodeState.poolUnlaunched), which
-// index them in place: a set of every member in the fields would be copied on every change, so a NodePool's fields
-// would cost as much as its members to update.
-type nodePoolMembers struct {
-	// Launched counts the NodePool's NodeClaims with a providerID. A NodeClaim stops counting once it's gone or its
-	// label changes.
-	Launched int
-	// Unlaunched counts the NodePool's NodeClaims without a providerID. A NodeClaim stops counting once it has a
-	// providerID or a deletionTimestamp.
-	Unlaunched int
-}
-
-// launchedNodeClaim is a launched NodeClaim's contribution to its NodePool's members: one NodeClaim.
-type launchedNodeClaim int
-
-func (n launchedNodeClaim) Update(f nodePoolMembers, prev launchedNodeClaim) nodePoolMembers {
-	f.Launched += int(n - prev)
-	return f
-}
-
-func (n launchedNodeClaim) Delete(f nodePoolMembers) nodePoolMembers {
-	f.Launched -= int(n)
-	return f
-}
-
-// unlaunchedNodeClaim is an unlaunched NodeClaim's contribution to its NodePool's members: one NodeClaim.
-type unlaunchedNodeClaim int
-
-func (u unlaunchedNodeClaim) Update(f nodePoolMembers, prev unlaunchedNodeClaim) nodePoolMembers {
-	f.Unlaunched += int(u - prev)
-	return f
-}
-
-func (u unlaunchedNodeClaim) Delete(f nodePoolMembers) nodePoolMembers {
-	f.Unlaunched -= int(u)
-	return f
-}
-
-// nodePoolOfLaunched is the key a NodeClaim contributes to in nodePoolMembers while it's launched: its NodePool.
-func nodePoolOfLaunched(_ string, f NodeClaimFields) string {
-	if !f.launched() {
-		return ""
-	}
-	return f.NodeClaim.Labels[v1.NodePoolLabelKey]
-}
-
-// nodePoolOfUnlaunched is the key a NodeClaim contributes to in nodePoolMembers: its NodePool, while it has neither a
-// providerID nor a deletionTimestamp.
-func nodePoolOfUnlaunched(_ string, f NodeClaimFields) string {
-	if f.NodeClaim == nil || f.NodeClaim.Status.ProviderID != "" || !f.NodeClaim.DeletionTimestamp.IsZero() {
-		return ""
-	}
-	return f.NodeClaim.Labels[v1.NodePoolLabelKey]
-}
-
 // nodePoolCapacity is a NodeClaim's contribution to its NodePool's resources, counted against the NodePool's limits:
 // its node's capacity, as StateNode.Capacity reads it from the NodeClaim and the Node on its entry, and one
 // resources.Node.
@@ -266,93 +208,6 @@ func conditionTrue(nodeClaim *v1.NodeClaim, conditionType string) bool {
 	return false
 }
 
-// NodePoolDisruption counts a NodePool's nodes for its disruption budgets, from the NodeClaim store: each NodeClaim's
-// entry holds the Node its owner reference links, so one source decides all three counts.
-type NodePoolDisruption struct {
-	// Nodes counts the NodePool's launched NodeClaims that are initialized (their Initialized condition is true) or
-	// rebooting, until the instance is terminating. A NodeClaim still initializing has no pods scheduled to it yet and
-	// counts toward no budget, so that a replacement doesn't round a percentage budget up.
-	Nodes int
-	// Disrupting counts the NodeClaims among Nodes that are marked for deletion, deleting or rebooting, which every
-	// disruption budget subtracts.
-	Disrupting int
-	// NotReady counts the NodeClaims among Nodes that aren't Disrupting and whose linked Node isn't Ready or is missing,
-	// which every disruption budget but repair's subtracts.
-	NotReady int
-}
-
-func (d NodePoolDisruption) Update(f NodePoolDisruption, prev NodePoolDisruption) NodePoolDisruption {
-	f.Nodes += d.Nodes - prev.Nodes
-	f.Disrupting += d.Disrupting - prev.Disrupting
-	f.NotReady += d.NotReady - prev.NotReady
-	return f
-}
-
-func (d NodePoolDisruption) Delete(f NodePoolDisruption) NodePoolDisruption {
-	f.Nodes -= d.Nodes
-	f.Disrupting -= d.Disrupting
-	f.NotReady -= d.NotReady
-	return f
-}
-
-func (d NodePoolDisruption) Equal(o NodePoolDisruption) bool { return d == o }
-
-// nodePoolDisruptionOfNodeClaim returns the NodePool a NodeClaim counts toward for disruption budgets, or "" if it
-// counts toward none. A rebooting NodeClaim counts until its reboot completes, though it's uninitialized meanwhile. A
-// NodeClaim's instance is terminating only once the node is drained and the cloud provider deleted it.
-func nodePoolDisruptionOfNodeClaim(_ string, f NodeClaimFields) string {
-	if !f.launched() || conditionTrue(f.NodeClaim, v1.ConditionTypeInstanceTerminating) {
-		return ""
-	}
-	if !conditionTrue(f.NodeClaim, v1.ConditionTypeInitialized) && !rebooting(f.NodeClaim) {
-		return ""
-	}
-	return f.NodeClaim.Labels[v1.NodePoolLabelKey]
-}
-
-// nodeClaimDisruption returns a counted NodeClaim's contribution to its NodePool's disruption counts. A NodeClaim
-// without a linked Node reads as not Ready: an initialized NodeClaim's Node has registered, so it has the owner
-// reference that links it, and a missing one is gone.
-func nodeClaimDisruption(_ string, f NodeClaimFields) NodePoolDisruption {
-	if f.MarkedForDeletion || deleted(f.NodeClaim) || rebooting(f.NodeClaim) {
-		return NodePoolDisruption{Nodes: 1, Disrupting: 1}
-	}
-	if f.Node == nil || nodeutils.GetCondition(f.Node, corev1.NodeReady).Status != corev1.ConditionTrue {
-		return NodePoolDisruption{Nodes: 1, NotReady: 1}
-	}
-	return NodePoolDisruption{Nodes: 1}
-}
-
-// NodePoolNodes returns the StateNodes of the NodePool's launched NodeClaims, sorted by providerID, read from the
-// NodePool's index rather than a scan of every node. They share their Node, NodeClaim and usage with cluster state, so
-// they must not be modified.
-func (s *NodeState) NodePoolNodes(nodePoolName string) StateNodes {
-	names := s.poolLaunched.Sources(nodePoolName)
-	nodes := make(StateNodes, 0, len(names))
-	for _, name := range names {
-		// The index can lag the NodeClaims, so a NodeClaim it lists may have left or moved.
-		if f, ok := s.NodeClaimStore.Get(name); ok && nodePoolOfLaunched(name, f) == nodePoolName {
-			nodes = append(nodes, s.nodeClaimNode(f, false))
-		}
-	}
-	slices.SortFunc(nodes, func(a, b *StateNode) int { return cmp.Compare(a.ProviderID(), b.ProviderID()) })
-	return nodes
-}
-
-// UnlaunchedNodeClaims returns the NodePool's NodeClaims that have neither a providerID nor a deletionTimestamp, sorted
-// by name. They are shared with cluster state, so they must not be modified.
-func (s *NodeState) UnlaunchedNodeClaims(nodePoolName string) []*v1.NodeClaim {
-	names := s.poolUnlaunched.Sources(nodePoolName)
-	slices.Sort(names)
-	nodeClaims := make([]*v1.NodeClaim, 0, len(names))
-	for _, name := range names {
-		if f, ok := s.NodeClaimStore.Get(name); ok && nodePoolOfUnlaunched(name, f) == nodePoolName {
-			nodeClaims = append(nodeClaims, f.NodeClaim)
-		}
-	}
-	return nodeClaims
-}
-
 // NodeClaimForProviderID returns the name of the NodeClaim with the providerID, for a caller that only has the
 // providerID. A caller holding the NodeClaim should use its name.
 func (s *NodeState) NodeClaimForProviderID(providerID string) (string, bool) {
@@ -403,33 +258,6 @@ func (s *NodeState) UnmarkForDeletion(nodeClaimNames ...string) {
 	}
 }
 
-// UpdateBufferPodCounts replaces the buffer pod counts with counts, by NodeClaim name. The provisioner calls it after
-// each scheduling pass with the virtual buffer pods it placed on each node, counted from Results.ExistingNodes; a node
-// missing from counts no longer hosts any. When real pods consume buffer capacity, the virtual pods move to other
-// nodes or new NodeClaims, and the next pass's counts follow them.
-func (s *NodeState) UpdateBufferPodCounts(counts map[string]int) {
-	for name, f := range s.NodeClaimStore.List() {
-		if _, ok := counts[name]; !ok && f.BufferPods != 0 {
-			s.updateIntent(name, func(f NodeClaimFields) NodeClaimFields { f.BufferPods = 0; return f })
-		}
-	}
-	for name, count := range counts {
-		s.updateIntent(name, func(f NodeClaimFields) NodeClaimFields { f.BufferPods = count; return f })
-	}
-}
-
-// HasBufferPods returns true if the NodeClaim's node has at least one virtual buffer pod placed on it during the last
-// provisioning pass.
-func (s *NodeState) HasBufferPods(nodeClaimName string) bool {
-	return s.BufferPodCount(nodeClaimName) > 0
-}
-
-// BufferPodCount returns the number of virtual buffer pods on the NodeClaim's node.
-func (s *NodeState) BufferPodCount(nodeClaimName string) int {
-	f, _ := s.NodeClaimStore.Get(nodeClaimName)
-	return f.BufferPods
-}
-
 // updateIntent updates the intent kept about a NodeClaim cluster state holds; intent about a NodeClaim it doesn't hold
 // would outlive it, so it's dropped.
 func (s *NodeState) updateIntent(nodeClaimName string, update func(NodeClaimFields) NodeClaimFields) {
@@ -446,10 +274,4 @@ func (s *NodeState) updateIntent(nodeClaimName string, update func(NodeClaimFiel
 func (s *NodeState) NodePoolResourcesFor(nodePoolName string) corev1.ResourceList {
 	resources, _ := s.nodePoolCapacity.Get(nodePoolName)
 	return maps.Clone(resources)
-}
-
-// NodePoolDisruption returns the NodePool's nodes as its disruption budgets count them.
-func (s *NodeState) NodePoolDisruption(nodePoolName string) NodePoolDisruption {
-	d, _ := s.nodePoolDisruption.Get(nodePoolName)
-	return d
 }

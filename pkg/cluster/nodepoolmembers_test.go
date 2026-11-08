@@ -29,6 +29,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/state/statetest"
 	"sigs.k8s.io/karpenter/pkg/test"
 )
 
@@ -112,5 +113,12 @@ func expectNodePoolMembers(t *testing.T, s *NodeState, np string) {
 	}
 	if slices.Sort(want); !slices.Equal(got, want) {
 		t.Errorf("UnlaunchedNodeClaims(%q) = %v, want %v", np, got, want)
+	}
+}
+
+func TestNodePoolMembersKeepTheContributionLaws(t *testing.T) {
+	for _, base := range []nodePoolMembers{{}, {Launched: 3, Unlaunched: 2}} {
+		statetest.ExpectContribution(t, base, launchedNodeClaim(1), launchedNodeClaim(1))
+		statetest.ExpectContribution(t, base, unlaunchedNodeClaim(1), unlaunchedNodeClaim(1))
 	}
 }
