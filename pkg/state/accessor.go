@@ -19,7 +19,10 @@ package state
 import (
 	"context"
 
+	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 // View is an API object with the fields Karpenter derives about it. Object is the object as the client read it, so
@@ -34,19 +37,48 @@ type View[O client.Object, D any] struct {
 //
 // The object is a version the client holds, and each derived field is its store's at the time of the read, so a
 // derived field can lag the object or other derived fields.
+//
+// An Accessor is also a controller-runtime source: a controller that watches it with WatchesRawSource reconciles an
+// object whenever its derived fields change, and starts reconciling once the stores behind them are synced.
 type Accessor[O client.Object, L client.ObjectList, D any] struct {
 	client  client.Reader
 	newObj  func() O
 	newList func() L
 	items   func(L) []O
 	derive  func(O) D
+	sources []source.SyncingSource
 }
+
+var _ source.SyncingSource = &Accessor[client.Object, client.ObjectList, any]{}
 
 // NewAccessor returns an Accessor that reads objects through kubeClient into new objects from newObj, lists them with a
 // list from newList whose items are items, and derives their fields with derive, which reads the stores that keep them
-// and must not block.
-func NewAccessor[O client.Object, L client.ObjectList, D any](kubeClient client.Reader, newObj func() O, newList func() L, items func(L) []O, derive func(O) D) *Accessor[O, L, D] {
-	return &Accessor[O, L, D]{client: kubeClient, newObj: newObj, newList: newList, items: items, derive: derive}
+// and must not block. sources are the stores derive reads, as each store's Source, so that a change to them
+// reconciles the object.
+func NewAccessor[O client.Object, L client.ObjectList, D any](kubeClient client.Reader, newObj func() O, newList func() L, items func(L) []O, derive func(O) D, sources ...source.SyncingSource) *Accessor[O, L, D] {
+	return &Accessor[O, L, D]{client: kubeClient, newObj: newObj, newList: newList, items: items, derive: derive, sources: sources}
+}
+
+// Start enqueues each object whose derived fields change, until ctx is done, after enqueueing every object that has
+// derived fields, since they may have changed before Start.
+func (r *Accessor[O, L, D]) Start(ctx context.Context, queue workqueue.TypedRateLimitingInterface[reconcile.Request]) error {
+	for _, src := range r.sources {
+		if err := src.Start(ctx, queue); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// WaitForSync returns once every store the Accessor derives fields from is synced, so that a controller watching it
+// reconciles with complete fields.
+func (r *Accessor[O, L, D]) WaitForSync(ctx context.Context) error {
+	for _, src := range r.sources {
+		if err := src.WaitForSync(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Get returns the object named key with its derived fields.

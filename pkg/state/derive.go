@@ -26,10 +26,11 @@ import (
 // apply folds a change of that contribution into to's fields, as a Contributor's apply does. A zero key from target
 // means a key contributes to nothing.
 //
-// to follows from's changes after from's lock is released, so to can briefly lag from.
+// to follows from's changes after from's lock is released, so to can briefly lag from. to is synced once from is.
 func Derive[K1, K2 comparable, F1, F2, C any](from *Store[K1, F1], to *Store[K2, F2], target func(K1, F1) K2, contribution func(K1, F1) C, apply func(fields F2, prev, next C) F2) {
 	var mu sync.Mutex
 	contributions := map[K1]record[K2, C]{}
+	to.feedBy(from)
 	from.Subscribe(func(key K1, _, _ F1) {
 		var zero K2
 		mu.Lock()
