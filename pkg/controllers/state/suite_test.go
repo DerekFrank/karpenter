@@ -111,63 +111,6 @@ var _ = AfterEach(func() {
 	cluster.Reset()
 	cloudProvider.Reset()
 })
-var _ = Describe("Pod Healthy NodePool", func() {
-	It("should not store pod schedulable time if the nodePool that pod is scheduled to does not have NodeRegistrationHealthy=true", func() {
-		pod := test.Pod()
-		ExpectApplied(ctx, env.Client, pod, nodePool)
-		cluster.MarkPodSchedulingDecisions(ctx, nil, map[string][]*corev1.Pod{nodePool.Name: {pod}}, nil)
-		setTime := cluster.PodSchedulingSuccessTimeRegistrationHealthyCheck(client.ObjectKeyFromObject(pod))
-		Expect(setTime.IsZero()).To(BeTrue())
-	})
-	It("should store pod schedulable time if the nodePool that pod is scheduled to has NodeRegistrationHealthy=true", func() {
-		pod := test.Pod()
-		nodePool.StatusConditions().SetTrue(v1.ConditionTypeNodeRegistrationHealthy)
-		ExpectApplied(ctx, env.Client, pod, nodePool)
-
-		cluster.MarkPodSchedulingDecisions(ctx, nil, map[string][]*corev1.Pod{nodePool.Name: {pod}}, nil)
-		setTime := cluster.PodSchedulingSuccessTimeRegistrationHealthyCheck(client.ObjectKeyFromObject(pod))
-		Expect(setTime.IsZero()).To(BeFalse())
-	})
-	It("should not update the pod schedulable time if it is already stored for a pod", func() {
-		pod := test.Pod()
-		nodePool.StatusConditions().SetTrue(v1.ConditionTypeNodeRegistrationHealthy)
-		ExpectApplied(ctx, env.Client, pod, nodePool)
-
-		// This will store the pod schedulable time
-		cluster.MarkPodSchedulingDecisions(ctx, nil, map[string][]*corev1.Pod{nodePool.Name: {pod}}, nil)
-		setTime := cluster.PodSchedulingSuccessTimeRegistrationHealthyCheck(client.ObjectKeyFromObject(pod))
-		Expect(setTime.IsZero()).To(BeFalse())
-
-		env.Clock.Step(time.Minute)
-		// We try to update pod schedulable time, but it should not change as we have already stored it
-		cluster.MarkPodSchedulingDecisions(ctx, nil, map[string][]*corev1.Pod{nodePool.Name: {pod}}, nil)
-		Expect(cluster.PodSchedulingSuccessTimeRegistrationHealthyCheck(client.ObjectKeyFromObject(pod))).To(Equal(setTime))
-	})
-	It("should delete the pod schedulable time if the pod is deleted", func() {
-		pod := test.Pod()
-		nodePool.StatusConditions().SetTrue(v1.ConditionTypeNodeRegistrationHealthy)
-		ExpectApplied(ctx, env.Client, pod, nodePool)
-
-		// This will store the pod schedulable time
-		cluster.MarkPodSchedulingDecisions(ctx, nil, map[string][]*corev1.Pod{nodePool.Name: {pod}}, nil)
-		setTime := cluster.PodSchedulingSuccessTimeRegistrationHealthyCheck(client.ObjectKeyFromObject(pod))
-		Expect(setTime.IsZero()).To(BeFalse())
-
-		// Delete the pod
-		cluster.DeletePod(client.ObjectKeyFromObject(pod))
-		Expect(cluster.PodSchedulingSuccessTimeRegistrationHealthyCheck(client.ObjectKeyFromObject(pod)).IsZero()).To(BeTrue())
-	})
-	It("should not store scheduling times for pods that are already bound to a node", func() {
-		pod := test.Pod(test.PodOptions{NodeName: "test-node"})
-		nodePool.StatusConditions().SetTrue(v1.ConditionTypeNodeRegistrationHealthy)
-		ExpectApplied(ctx, env.Client, pod, nodePool)
-		cluster.MarkPodSchedulingDecisions(ctx, nil, map[string][]*corev1.Pod{nodePool.Name: {pod}}, nil)
-		nn := client.ObjectKeyFromObject(pod)
-		Expect(cluster.PodSchedulingSuccessTimeRegistrationHealthyCheck(nn).IsZero()).To(BeTrue())
-		Expect(cluster.PodSchedulingSuccessTime(nn).IsZero()).To(BeTrue())
-	})
-})
-
 var _ = Describe("Pod Ack", func() {
 	It("should only mark pods as schedulable once", func() {
 		pod := test.Pod()
@@ -219,6 +162,101 @@ var _ = Describe("Pod Ack", func() {
 		Expect(cluster.PodSchedulingSuccessTime(nn).IsZero()).To(BeTrue())
 		Expect(cluster.PodSchedulingDecisionTime(nn).IsZero()).To(BeTrue())
 		Expect(cluster.PodNodeClaimMapping(nn)).To(BeEquivalentTo(""))
+	})
+	It("should not store scheduling times for pods that are already bound to a node", func() {
+		pod := test.Pod(test.PodOptions{NodeName: "test-node"})
+		ExpectApplied(ctx, env.Client, pod)
+		cluster.MarkPodSchedulingDecisions(ctx, nil, map[string][]*corev1.Pod{nodePool.Name: {pod}}, nil)
+		nn := client.ObjectKeyFromObject(pod)
+		Expect(cluster.PodSchedulingSuccessTime(nn).IsZero()).To(BeTrue())
+		Expect(cluster.PodSchedulingDecisionTime(nn).IsZero()).To(BeTrue())
+	})
+	It("should keep each scheduling time from the first time it is set", func() {
+		pod := test.Pod()
+		nn := client.ObjectKeyFromObject(pod)
+		cluster.AckPods(pod)
+		ackedAt := cluster.PodAckTime(nn)
+		cluster.MarkPodSchedulingDecisions(ctx, nil, map[string][]*corev1.Pod{"np1": {pod}}, nil)
+		decidedAt, schedulableAt := cluster.PodSchedulingDecisionTime(nn), cluster.PodSchedulingSuccessTime(nn)
+		Expect(ackedAt.IsZero()).To(BeFalse())
+		Expect(decidedAt.IsZero()).To(BeFalse())
+		Expect(schedulableAt.IsZero()).To(BeFalse())
+
+		env.Clock.Step(time.Minute)
+		cluster.AckPods(pod)
+		cluster.MarkPodSchedulingDecisions(ctx, nil, map[string][]*corev1.Pod{"np1": {pod}}, nil)
+		Expect(cluster.PodAckTime(nn)).To(Equal(ackedAt))
+		Expect(cluster.PodSchedulingDecisionTime(nn)).To(Equal(decidedAt))
+		Expect(cluster.PodSchedulingSuccessTime(nn)).To(Equal(schedulableAt))
+
+		// A failed decision clears the schedulable time, and the next success sets it anew; the decision time stays.
+		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{pod: fmt.Errorf("ignoring pod")}, nil, nil)
+		Expect(cluster.PodSchedulingSuccessTime(nn).IsZero()).To(BeTrue())
+		env.Clock.Step(time.Minute)
+		cluster.MarkPodSchedulingDecisions(ctx, nil, map[string][]*corev1.Pod{"np1": {pod}}, nil)
+		Expect(cluster.PodSchedulingSuccessTime(nn)).To(Equal(env.Clock.Now()))
+		Expect(cluster.PodSchedulingDecisionTime(nn)).To(Equal(decidedAt))
+	})
+})
+
+var _ = Describe("Pods Mapped To NodeClaim", func() {
+	It("should look up the pods mapped to each NodeClaim, following a pod that moves", func() {
+		a, b, c := test.Pod(), test.Pod(), test.Pod()
+		cluster.UpdatePodToNodeClaimMapping(map[string][]*corev1.Pod{"nc1": {a, b}, "nc2": {c}})
+		Expect(cluster.PodsMappedToNodeClaim("nc1")).To(ConsistOf(client.ObjectKeyFromObject(a), client.ObjectKeyFromObject(b)))
+		Expect(cluster.PodsMappedToNodeClaim("nc2")).To(ConsistOf(client.ObjectKeyFromObject(c)))
+		Expect(cluster.PodsMappedToNodeClaim("nc3")).To(BeEmpty())
+
+		// The most recent scheduling decision for a pod moves it to its new NodeClaim.
+		cluster.MarkPodSchedulingDecisions(ctx, nil, map[string][]*corev1.Pod{"np1": {b}}, map[string][]*corev1.Pod{"nc2": {b}})
+		Expect(cluster.PodsMappedToNodeClaim("nc1")).To(ConsistOf(client.ObjectKeyFromObject(a)))
+		Expect(cluster.PodsMappedToNodeClaim("nc2")).To(ConsistOf(client.ObjectKeyFromObject(b), client.ObjectKeyFromObject(c)))
+
+		// A pod that fails to schedule maps to no NodeClaim.
+		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{a: fmt.Errorf("ignoring pod")}, nil, nil)
+		Expect(cluster.PodsMappedToNodeClaim("nc1")).To(BeEmpty())
+		Expect(cluster.PodNodeClaimMapping(client.ObjectKeyFromObject(a))).To(BeEmpty())
+	})
+	It("should drop every scheduling field of a deleted pod, and its NodeClaim mapping", func() {
+		pod, other := test.Pod(), test.Pod()
+		nn := client.ObjectKeyFromObject(pod)
+		cluster.AckPods(pod, other)
+		cluster.MarkPodSchedulingDecisions(ctx, nil, map[string][]*corev1.Pod{"np1": {pod, other}}, map[string][]*corev1.Pod{"nc1": {pod, other}})
+		Expect(cluster.PodsMappedToNodeClaim("nc1")).To(HaveLen(2))
+
+		cluster.DeletePod(nn)
+		Expect(cluster.PodAckTime(nn).IsZero()).To(BeTrue())
+		Expect(cluster.PodSchedulingDecisionTime(nn).IsZero()).To(BeTrue())
+		Expect(cluster.PodSchedulingSuccessTime(nn).IsZero()).To(BeTrue())
+		Expect(cluster.PodNodeClaimMapping(nn)).To(BeEmpty())
+		Expect(cluster.PodsMappedToNodeClaim("nc1")).To(ConsistOf(client.ObjectKeyFromObject(other)))
+		Expect(cluster.PodAckTime(client.ObjectKeyFromObject(other)).IsZero()).To(BeFalse())
+
+		cluster.ClearPodSchedulingMappings(client.ObjectKeyFromObject(other))
+		Expect(cluster.PodsMappedToNodeClaim("nc1")).To(BeEmpty())
+		Expect(cluster.PodAckTime(client.ObjectKeyFromObject(other)).IsZero()).To(BeTrue())
+	})
+})
+
+var _ = Describe("Reset", func() {
+	It("should clear the pod scheduling fields, the NodeClaim mappings and the buffer pod counts", func() {
+		pod := test.Pod()
+		nn := client.ObjectKeyFromObject(pod)
+		cluster.AckPods(pod)
+		cluster.MarkPodSchedulingDecisions(ctx, nil, map[string][]*corev1.Pod{"np1": {pod}}, map[string][]*corev1.Pod{"nc1": {pod}})
+		cluster.UpdateBufferPodCounts(map[string]int{"provider-a": 2})
+
+		cluster.Reset()
+		Expect(cluster.PodAckTime(nn).IsZero()).To(BeTrue())
+		Expect(cluster.PodSchedulingDecisionTime(nn).IsZero()).To(BeTrue())
+		Expect(cluster.PodSchedulingSuccessTime(nn).IsZero()).To(BeTrue())
+		Expect(cluster.PodNodeClaimMapping(nn)).To(BeEmpty())
+		Expect(cluster.PodsMappedToNodeClaim("nc1")).To(BeEmpty())
+		Expect(cluster.BufferPodCount("provider-a")).To(Equal(0))
+
+		// The derived store still follows its source after a Reset.
+		cluster.UpdatePodToNodeClaimMapping(map[string][]*corev1.Pod{"nc2": {pod}})
+		Expect(cluster.PodsMappedToNodeClaim("nc2")).To(ConsistOf(nn))
 	})
 })
 

@@ -28,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -75,6 +76,13 @@ func TestClusterContributionsKeepTheContributionLaws(t *testing.T) {
 	}
 	statetest.ExpectContribution(t, corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")}, capacity("2"), capacity("8"))
 	statetest.ExpectContributionWith(t, podFieldsEqual, podFields{}, nodeOnNode{&corev1.Node{}}, nodeOnNode{&corev1.Node{}})
+	podKey := func(name string) podOnNodeClaim {
+		return podOnNodeClaim{types.NamespacedName{Namespace: "default", Name: name}}
+	}
+	for _, base := range []map[types.NamespacedName]struct{}{nil, {podKey("other").pod: {}}} {
+		statetest.ExpectContribution(t, base, podKey("a"), podKey("a"))
+		statetest.ExpectContribution(t, base, podKey("a"), podKey("b"))
+	}
 }
 
 // podFieldsEqual compares pod fields as their readers do: a resource at zero is the resource absent, and host port
