@@ -593,3 +593,31 @@ func TestJoinAccessorListsByAnIndexedField(t *testing.T) {
 		t.Fatal("List by an unindexed field succeeded, want an error as the client returns")
 	}
 }
+
+// TestDeriveSweepStaysUnsyncedAndDropsAKeyDeletedDuringIt deletes a source key while a late Derive's sweep computes
+// its contribution, and checks that the derived store reports unsynced until the sweep ends and doesn't resurrect the
+// deleted key from the sweep's stale read.
+func TestDeriveSweepStaysUnsyncedAndDropsAKeyDeletedDuringIt(t *testing.T) {
+	nodeClaims := NewObjectStore[*v1.NodeClaim](nil, nil)
+	nodeClaims.Observe(nodeClaim("a", "x", 1, "2"))
+	nodeClaims.Observe(nodeClaim("b", "x", 2, "4"))
+	s := NewStore[string, poolFields]()
+	deleted, syncedDuringSweep := false, false
+	Derive(nodeClaims, s, poolOf, func(k types.NamespacedName, nc *v1.NodeClaim) usage {
+		syncedDuringSweep = syncedDuringSweep || s.Synced()
+		if k.Name == "a" && !deleted {
+			deleted = true
+			nodeClaims.Forget(named("a"))
+		}
+		return usageOf(k, nc)
+	})
+	if syncedDuringSweep {
+		t.Fatal("the derived store reported synced before its sweep finished")
+	}
+	if !s.Synced() {
+		t.Fatal("the derived store isn't synced once its sweep finished over a synced source")
+	}
+	if got := fields(s, "x"); got.CPU != 4 || got.Count != 1 {
+		t.Fatalf("x = %+v, want only b's 4 cpu: a was deleted while the sweep computed it", got)
+	}
+}
