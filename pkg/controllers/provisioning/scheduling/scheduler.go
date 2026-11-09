@@ -44,6 +44,7 @@ import (
 	autoscalingv1beta1 "sigs.k8s.io/karpenter/pkg/apis/autoscaling/v1beta1"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
@@ -146,7 +147,7 @@ func NewScheduler(
 	kubeClient client.Client,
 	nodePools []*v1.NodePool,
 	cluster *state.Cluster,
-	stateNodes []*state.StateNode,
+	stateNodes []*karpentercluster.StateNode,
 	topology *Topology,
 	instanceTypes map[string][]*cloudprovider.InstanceType,
 	daemonSetPods []*corev1.Pod,
@@ -207,8 +208,10 @@ func NewScheduler(
 		volumeReqsByPod:      volumeReqsByPod,          // Volume requirements per pod
 		recorder:             recorder,
 		preferences:          &Preferences{ToleratePreferNoSchedule: toleratePreferNoSchedule},
+		// What's held against a NodePool's limits is for NodeClaims whose launched capacity no node counts yet, so it
+		// starts out spent. The reservation is the admission; planning around it only avoids refusals.
 		remainingResources: lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, corev1.ResourceList) {
-			return np.Name, corev1.ResourceList(np.Spec.Limits)
+			return np.Name, resources.Subtract(corev1.ResourceList(np.Spec.Limits), cluster.NodePoolState.ReservedResources(np.Name))
 		}),
 		clock:                     clock,
 		reservationManager:        reservationManager,
@@ -229,7 +232,7 @@ func NewScheduler(
 		return np.Name, np
 	})
 
-	nodeToNodePool := lo.SliceToMap(stateNodes, func(n *state.StateNode) (string, *v1.NodePool) {
+	nodeToNodePool := lo.SliceToMap(stateNodes, func(n *karpentercluster.StateNode) (string, *v1.NodePool) {
 		return n.Name(), npByName[n.Labels()[v1.NodePoolLabelKey]]
 	})
 	// Build a set of node names that are marked for deletion so we can exempt their pods
@@ -241,6 +244,9 @@ func NewScheduler(
 		}
 	}
 	s.deletingNodeNames = deletingNodeNames
+	if karpopts.FromContext(ctx).FeatureGates.CapacityQuota {
+		s.quotaLimits, s.quotaMatches = newQuotaLimits(cluster, s.nodeClaimTemplates)
+	}
 	s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods, nodeToNodePool, resolved.enforceConsolidateAfter)
 	return s
 }
@@ -260,11 +266,15 @@ type PodData struct {
 }
 
 type Scheduler struct {
-	uuid                 types.UID // Unique UUID attached to this scheduling loop
-	newNodeClaims        []*NodeClaim
-	existingNodes        []*ExistingNode
-	nodeClaimTemplates   []*NodeClaimTemplate
-	remainingResources   map[string]corev1.ResourceList // (NodePool name) -> remaining resources for that NodePool
+	uuid               types.UID // Unique UUID attached to this scheduling loop
+	newNodeClaims      []*NodeClaim
+	existingNodes      []*ExistingNode
+	nodeClaimTemplates []*NodeClaimTemplate
+	remainingResources map[string]corev1.ResourceList // (NodePool name) -> remaining resources for that NodePool
+	// quotaLimits are what each CapacityQuota has left, and quotaMatches, for each NodeClaim template, the quotas each
+	// of its instance types may match.
+	quotaLimits          []*quotaLimit
+	quotaMatches         []map[string][]int
 	daemonOverheadGroups map[*NodeClaimTemplate][]DaemonOverheadGroup
 	cachedPodData        map[types.UID]*PodData                  // (Pod Namespace/Name) -> pre-computed data for pods to avoid re-computation and memory usage
 	volumeReqsByPod      map[types.UID][]scheduling.Requirements // Volume topology requirement alternatives per pod
@@ -327,7 +337,15 @@ type Results struct {
 // Record sends eventing and log messages back for the results that were produced from a scheduling run
 // It also nominates nodes in the cluster state based on the scheduling run to signal to other components
 // leveraging the cluster state that a previous scheduling run that was recorded is relying on these nodes
-func (r Results) Record(ctx context.Context, recorder events.Recorder, cluster *state.Cluster) {
+// nominate nominates the existing node for a pending pod. Nomination is intent kept with the NodeClaim, so an unmanaged
+// node has none to nominate.
+func nominate(ctx context.Context, nomination *karpentercluster.Nomination, existing *ExistingNode) {
+	if existing.NodeClaim != nil {
+		nomination.Nominate(ctx, existing.NodeClaim.Name)
+	}
+}
+
+func (r Results) Record(ctx context.Context, recorder events.Recorder, nomination *karpentercluster.Nomination) {
 	// Report failures and nominations
 	for p, err := range r.PodErrors {
 		if IsReservedOfferingError(err) {
@@ -352,7 +370,7 @@ func (r Results) Record(ctx context.Context, recorder events.Recorder, cluster *
 			return !isVirtualBufferPod(p)
 		})
 		if len(realPods) > 0 {
-			cluster.NominateNodeForPod(ctx, existing.ProviderID())
+			nominate(ctx, nomination, existing)
 		}
 		for _, p := range realPods {
 			recorder.Publish(NominatePodEvent(p, existing.Node, existing.NodeClaim))
@@ -770,6 +788,11 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod, volu
 					"total", len(s.nodeClaimTemplates[i].InstanceTypeOptions))
 			}
 		}
+		its, err := s.filterByQuotas(i, its, s.cachedPodData[pod.UID].Requirements)
+		if err != nil {
+			errs[i] = err
+			return true
+		}
 		nodeClaim := NewNodeClaim(s.nodeClaimTemplates[i], s.topology, s.daemonOverheadGroups[s.nodeClaimTemplates[i]], its, s.reservationManager, s.reservedOfferingMode, s.creditReservationCapacity)
 		r, its, ofs, result, err := nodeClaim.CanAdd(ctx, pod, s.cachedPodData[pod.UID], volumes, s.minValuesPolicy == karpopts.MinValuesPolicyBestEffort, s.allocator)
 		if err != nil {
@@ -829,12 +852,13 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod, volu
 		newNodeClaim.Add(ctx, pod, s.cachedPodData[pod.UID], updatedRequirements, updatedInstanceTypes, volumes, offeringsToReserve, allocationResult, s.allocator)
 		s.newNodeClaims = append(s.newNodeClaims, newNodeClaim)
 		s.remainingResources[newNodeClaim.NodePoolName] = subtractMax(s.remainingResources[newNodeClaim.NodePoolName], newNodeClaim.InstanceTypeOptions)
+		s.spendQuotas(newNodeClaim)
 		return nil
 	}
 	return multierr.Combine(errs...)
 }
 
-func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes []*state.StateNode, daemonSetPods []*corev1.Pod, nodePoolMap map[string]*v1.NodePool, enforceConsolidateAfter bool) {
+func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes []*karpentercluster.StateNode, daemonSetPods []*corev1.Pod, nodePoolMap map[string]*v1.NodePool, enforceConsolidateAfter bool) {
 	// create our existing nodes
 	for _, node := range stateNodes {
 		taints := node.Taints()
@@ -842,12 +866,13 @@ func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes 
 		isUnderConsolidateAfter := enforceConsolidateAfter && disruption.IsUnderConsolidateAfter(nodePoolMap[node.Name()], node.NodeClaim, s.clock)
 		s.existingNodes = append(s.existingNodes, NewExistingNode(node, s.topology, taints, resources.RequestsForPods(daemons...), s.instanceTypeForNode(node), isUnderConsolidateAfter))
 		s.updateRemainingResources(node)
+		s.spendQuotasForNode(node)
 	}
 	s.sortExistingNodes()
 }
 
 // getCompatibleDaemonPods filters daemon pods that can schedule to the given node
-func (s *Scheduler) getCompatibleDaemonPods(ctx context.Context, node *state.StateNode, taints []corev1.Taint, daemonSetPods []*corev1.Pod) []*corev1.Pod {
+func (s *Scheduler) getCompatibleDaemonPods(ctx context.Context, node *karpentercluster.StateNode, taints []corev1.Taint, daemonSetPods []*corev1.Pod) []*corev1.Pod {
 	var daemons []*corev1.Pod
 	for _, p := range daemonSetPods {
 		if s.shouldSkipDaemonPod(ctx, p) {
@@ -877,7 +902,7 @@ func (s *Scheduler) isDaemonPodCompatibleWithNode(p *corev1.Pod, taints []corev1
 }
 
 // updateRemainingResources updates the remaining resources for the node's nodepool
-func (s *Scheduler) updateRemainingResources(node *state.StateNode) {
+func (s *Scheduler) updateRemainingResources(node *karpentercluster.StateNode) {
 	// We don't use the status field and instead recompute the remaining resources to ensure we have a consistent view
 	// of the cluster during scheduling.  Depending on how node creation falls out, this will also work for cases where
 	// we don't create NodeClaim resources.

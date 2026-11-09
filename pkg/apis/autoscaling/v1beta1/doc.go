@@ -41,5 +41,7 @@ func init() {
 	scheme.Scheme.AddKnownTypes(gv,
 		&CapacityBuffer{},
 		&CapacityBufferList{},
+		&CapacityQuota{},
+		&CapacityQuotaList{},
 	)
 }
