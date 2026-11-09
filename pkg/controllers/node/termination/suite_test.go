@@ -29,8 +29,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/util/workqueue"
+	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/operator/logging"
@@ -38,9 +43,11 @@ import (
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
 	"sigs.k8s.io/karpenter/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
@@ -75,7 +82,7 @@ var _ = BeforeSuite(func() {
 	cloudProvider = fake.NewCloudProvider()
 	recorder = test.NewEventRecorder()
 	queue = terminator.NewQueue(env.Clock, env.Client, recorder)
-	terminationController = termination.NewController(env.Clock, env.Client, cloudProvider, terminator.NewTerminator(env.Clock, env.Client, queue, recorder), recorder)
+	terminationController = termination.NewController(env.Clock, env.Client, cloudProvider, terminator.NewTerminator(env.Clock, env.Client, queue, recorder), recorder, karpentercluster.New(ctx, env.Clock, nil, nil, cloudProvider).Nodes)
 })
 
 var _ = AfterSuite(func() {
@@ -1071,3 +1078,75 @@ func ExpectRequeued(result reconcile.Result) {
 	//nolint:staticcheck
 	Expect(result.Requeue || result.RequeueAfter != time.Duration(0)).To(BeTrue())
 }
+
+var _ = Describe("Termination Wakes", func() {
+	var nodes *karpentercluster.NodeState
+	var wakes workqueue.TypedRateLimitingInterface[reconcile.Request]
+	var node *corev1.Node
+	BeforeEach(func() {
+		ctx := options.ToContext(ctx, test.Options())
+		nodes = karpentercluster.New(ctx, env.Clock, nil, nil, cloudProvider).Nodes
+		c := termination.NewController(env.Clock, env.Client, cloudProvider, terminator.NewTerminator(env.Clock, env.Client, queue, recorder), recorder, nodes)
+		m, err := controllerruntime.NewManager(env.Config, controllerruntime.Options{
+			Scheme:     scheme.Scheme,
+			Metrics:    metricsserver.Options{BindAddress: "0"},
+			Controller: config.Controller{SkipNameValidation: new(true)},
+		})
+		Expect(err).ToNot(HaveOccurred())
+		Expect(c.Register(ctx, m)).To(Succeed())
+		wakes = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+		DeferCleanup(wakes.ShutDown)
+		started, stop := context.WithCancel(ctx)
+		DeferCleanup(stop)
+		Expect(c.Draining().Start(started, wakes)).To(Succeed())
+		_, node = test.NodeClaimAndNode()
+		node.Finalizers = []string{v1.TerminationFinalizer}
+		ExpectApplied(ctx, env.Client, node)
+		// The store holds what it's shown, which the client's writes of node would overwrite.
+		nodes.NodeStore.Observe(node.DeepCopy())
+		// A Node appearing is a change.
+		for wakes.Len() > 0 {
+			req, _ := wakes.Get()
+			wakes.Done(req)
+		}
+	})
+	AfterEach(func() { ExpectFinalizersRemoved(ctx, env.Client, node) })
+	drain := func() []string {
+		var names []string
+		for wakes.Len() > 0 {
+			req, _ := wakes.Get()
+			names = append(names, req.Name)
+			wakes.Done(req)
+		}
+		return names
+	}
+	bind := func() *corev1.Pod {
+		GinkgoHelper()
+		pod := test.Pod(test.PodOptions{NodeName: node.Name})
+		ExpectApplied(ctx, env.Client, pod)
+		nodes.PodStore.Observe(pod)
+		return pod
+	}
+	It("should not wake for pods on a Node that isn't deleting", func() {
+		bind()
+		Expect(drain()).To(BeEmpty())
+	})
+	It("should wake for a deleting Node whose pods bind or leave, and not when their status changes", func() {
+		pod := bind()
+		ExpectDeletionTimestampSet(ctx, env.Client, node)
+		node = ExpectExists(ctx, env.Client, node)
+		nodes.NodeStore.Observe(node)
+		Expect(drain()).To(Equal([]string{node.Name}), "want the Node once it's deleting")
+
+		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}}
+		Expect(env.Client.Status().Update(ctx, pod)).To(Succeed())
+		nodes.PodStore.Observe(pod)
+		Expect(drain()).To(BeEmpty(), "want nothing for the pod's status")
+
+		bind()
+		Expect(drain()).To(Equal([]string{node.Name}), "want the Node for a pod binding to it")
+		ExpectDeleted(ctx, env.Client, pod)
+		nodes.PodStore.Forget(client.ObjectKeyFromObject(pod))
+		Expect(drain()).To(Equal([]string{node.Name}), "want the Node for a pod leaving it")
+	})
+})
