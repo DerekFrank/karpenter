@@ -36,6 +36,7 @@ import (
 	"go.uber.org/multierr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/util/workqueue"
@@ -51,6 +52,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	scheduler "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -59,6 +61,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
+	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
 	"sigs.k8s.io/karpenter/pkg/utils/daemonset"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
@@ -94,12 +97,15 @@ type Provisioner struct {
 	deviceAllocationController *deviceallocation.Controller
 	virtualPodCache            *virtualpods.Cache
 	predictionStore            *prediction.Store
+	// nomination and bufferPods are the handles of the intents the provisioner writes on NodeClaims.
+	nomination *karpentercluster.Nomination
+	bufferPods *karpentercluster.BufferPods
 }
 
 func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 	cloudProvider cloudprovider.CloudProvider, cluster *state.Cluster,
 	clock clock.Clock, deviceAllocationController *deviceallocation.Controller, virtualPodCache *virtualpods.Cache,
-	predictionStore *prediction.Store,
+	predictionStore *prediction.Store, nomination *karpentercluster.Nomination, bufferPods *karpentercluster.BufferPods,
 ) *Provisioner {
 	p := &Provisioner{
 		batcher:                    NewBatcher[types.UID](clock),
@@ -113,6 +119,8 @@ func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 		deviceAllocationController: deviceAllocationController,
 		virtualPodCache:            virtualPodCache,
 		predictionStore:            predictionStore,
+		nomination:                 nomination,
+		bufferPods:                 bufferPods,
 	}
 	return p
 }
@@ -139,6 +147,7 @@ func (p *Provisioner) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(p.Name()).
 		WatchesRawSource(singleton.Source()).
+		WatchesRawSource(karpenterstate.Requires(p.cluster)).
 		Complete(singleton.AsReconciler(p))
 }
 
@@ -147,16 +156,15 @@ func (p *Provisioner) Reconcile(ctx context.Context) (result reconciler.Result, 
 
 	// Batch pods
 	if triggered := p.batcher.Wait(ctx); !triggered {
-		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
+		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil //storelint:deadline the batcher's loop runs again at once
 	}
-	// We need to ensure that our internal cluster state mechanism is synced before we proceed
-	// with making any scheduling decision off of our state nodes. Otherwise, we have the potential to make
-	// a scheduling decision based on a smaller subset of nodes in our cluster state than actually exist.
-	if !p.cluster.Synced(ctx) {
-		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
+	// A NodeClaim that's launching isn't a node in cluster state yet, so scheduling now would schedule pods off a smaller
+	// subset of nodes than actually exist, and provision for them again.
+	if !p.cluster.NodeClaimsLaunched(ctx) {
+		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil //storelint:deadline the batcher's loop runs again at once
 	}
 	if options.FromContext(ctx).FeatureGates.PredictionEnabled && !p.predictionStore.Hydrated(ctx) {
-		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
+		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil //storelint:deadline the batcher's loop runs again at once
 	}
 
 	// Schedule pods to potential nodes, exit if nothing to do
@@ -174,15 +182,15 @@ func (p *Provisioner) Reconcile(ctx context.Context) (result reconciler.Result, 
 		if err := p.updateBufferProvisioningStatus(ctx, results); err != nil {
 			log.FromContext(ctx).Error(err, "updating CapacityBuffer provisioning status")
 		}
-		p.cluster.UpdateBufferPodCounts(bufferPodCountsFromResults(results))
+		p.bufferPods.Replace(bufferPodCountsFromResults(results))
 	}
 	if len(results.NewNodeClaims) == 0 {
-		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
+		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil //storelint:deadline the batcher's loop runs again at once
 	}
 	if _, err = p.CreateNodeClaims(ctx, results.NewNodeClaims, WithReason(metrics.ProvisionedReason), RecordPodNomination); err != nil {
 		return reconciler.Result{}, err
 	}
-	return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
+	return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil //storelint:deadline the batcher's loop runs again at once
 }
 
 // CreateNodeClaims launches nodes passed into the function in parallel. It returns a slice of the successfully created node
@@ -191,22 +199,37 @@ func (p *Provisioner) CreateNodeClaims(ctx context.Context, nodeClaims []*schedu
 	// Create capacity and bind pods
 	errs := make([]error, len(nodeClaims))
 	nodeClaimNames := make([]string, len(nodeClaims))
+	attempted := make([]bool, len(nodeClaims))
 	workqueue.ParallelizeUntil(ctx, len(nodeClaims), len(nodeClaims), func(i int) {
+		attempted[i] = true
 		// create a new context to avoid a data race on the ctx variable
-		if name, err := p.Create(ctx, nodeClaims[i], opts...); err != nil {
+		name, err := p.Create(ctx, nodeClaims[i], opts...)
+		if err != nil {
 			errs[i] = fmt.Errorf("creating node claim, %w", err)
 		} else {
 			nodeClaimNames[i] = name
 		}
-
-		// Regardless of if we successfully created the NodeClaim or not, we should release the reservation. If the NodeClaim
-		// was successfully created, we've updated the active node count in Create already. If we failed, we should release
-		// the reservation and allow the provisioner to create new NodeClaims in a subsequent attempt.
-		// NOTE: Only applies to static NodePools since node limits are not supported for dynamic NodePools
-		if nodeClaims[i].IsStaticNodeClaim {
-			p.cluster.NodePoolState.ReleaseNodeCount(nodeClaims[i].NodePoolName, 1)
+		// A created NodeClaim's reservation is held until the NodeClaim counts against the limit. A create that failed
+		// releases it, unless it may have succeeded anyway, which leaves it to expire.
+		if reservation := nodeClaims[i].Reservation; reservation != nil {
+			switch {
+			case err == nil:
+				reservation.Bind(name)
+			case !ambiguous(err):
+				reservation.Release()
+			}
 		}
 	})
+	// ParallelizeUntil skips the NodeClaims it hadn't started once ctx is done, so they were never created.
+	for i, nodeClaim := range nodeClaims {
+		if attempted[i] {
+			continue
+		}
+		errs[i] = fmt.Errorf("creating node claim, %w", context.Cause(ctx))
+		if nodeClaim.Reservation != nil {
+			nodeClaim.Reservation.Release()
+		}
+	}
 	return nodeClaimNames, multierr.Combine(errs...)
 }
 
@@ -282,7 +305,7 @@ var ErrNodePoolsNotFound = errors.New("no nodepools found")
 func (p *Provisioner) NewScheduler(
 	ctx context.Context,
 	pods []*corev1.Pod,
-	stateNodes []*state.StateNode,
+	stateNodes []*karpentercluster.StateNode,
 	deletingPodUIDs sets.Set[types.UID],
 	opts ...scheduler.Options,
 ) (*scheduler.Scheduler, error) {
@@ -483,8 +506,15 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 		// Only passing existing nodes here and not new nodeClaims because
 		// these nodeClaims don't have a name until they are created
 		filterVirtualPodMapping(results.ExistingNodeToPodMapping()))
-	results.Record(ctx, p.recorder, p.cluster)
+	results.Record(ctx, p.recorder, p.nomination)
 	return results, nil
+}
+
+// RecordResults publishes the results' events and nominates the existing nodes they place pods on, for a caller that
+// schedules with the provisioner, such as the disruption queue for a command's replacements. The provisioner holds the
+// nominations' handle.
+func (p *Provisioner) RecordResults(ctx context.Context, recorder events.Recorder, results scheduler.Results) {
+	results.Record(ctx, recorder, p.nomination)
 }
 
 func (p *Provisioner) Create(ctx context.Context, n *scheduler.NodeClaim, opts ...option.Function[LaunchOptions]) (string, error) {
@@ -492,10 +522,19 @@ func (p *Provisioner) Create(ctx context.Context, n *scheduler.NodeClaim, opts .
 	options := option.Resolve(opts...)
 	latest := &v1.NodePool{}
 	if err := p.kubeClient.Get(ctx, types.NamespacedName{Name: n.NodePoolName}, latest); err != nil {
-		return "", fmt.Errorf("getting current resource usage, %w", err)
+		return "", notCreatedError{fmt.Errorf("getting nodepool, %w", err)}
 	}
-	if err := latest.Spec.Limits.ExceededBy(p.cluster.NodePoolResourcesFor(n.NodePoolName)); err != nil {
-		return "", err
+	// Reserve against the NodePool's limits unless the caller already has, as the disruption queue does before it marks
+	// its candidates. The caller binds or releases the reservation with the NodeClaim's others.
+	if !n.LimitsReserved {
+		reservations, err := p.reserveLimits(ctx, latest, n, nil)
+		if err != nil {
+			return "", notCreatedError{err}
+		}
+		n.LimitsReserved = true
+		for _, r := range reservations {
+			n.AddReservation(r)
+		}
 	}
 	nodeClaim := n.ToNodeClaim()
 
@@ -676,4 +715,18 @@ func validateNodeSelectorTerm(ctx context.Context, term corev1.NodeSelectorTerm)
 		}
 	}
 	return errs
+}
+
+// notCreatedError is an error Create returns before it sends the NodeClaim to the API server, so no NodeClaim exists
+// whatever the error, even a timeout.
+type notCreatedError struct{ error }
+
+func (e notCreatedError) Unwrap() error { return e.error }
+
+// ambiguous returns whether a create that returned err may have succeeded.
+func ambiguous(err error) bool {
+	if errors.As(err, &notCreatedError{}) {
+		return false
+	}
+	return errors.Is(err, context.DeadlineExceeded) || apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) || apierrors.IsUnexpectedServerError(err)
 }

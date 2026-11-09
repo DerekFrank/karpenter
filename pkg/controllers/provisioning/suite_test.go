@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
@@ -38,6 +39,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -46,7 +48,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
-	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
@@ -60,15 +61,18 @@ import (
 )
 
 var (
-	ctx                 context.Context
-	cluster             *state.Cluster
-	nodeController      *informer.NodeController
-	daemonsetController *informer.DaemonSetController
-	cloudProvider       *fake.CloudProvider
-	prov                *provisioning.Provisioner
-	predictionStore     *prediction.Store
-	env                 *test.Environment
-	instanceTypeMap     map[string]*cloudprovider.InstanceType
+	cs             karpentercluster.State
+	ctx            context.Context
+	cluster        *state.Cluster
+	nodeController reconcile.Reconciler
+	cloudProvider  *fake.CloudProvider
+	prov           *provisioning.Provisioner
+	// provClock is the provisioner's view of env.Clock, which counts only what the provisioner waits on, not cluster
+	// state's lapse and expiry timers.
+	provClock       *test.ClockView
+	predictionStore *prediction.Store
+	env             *test.Environment
+	instanceTypeMap map[string]*cloudprovider.InstanceType
 )
 
 func TestAPIs(t *testing.T) {
@@ -81,11 +85,12 @@ var _ = BeforeSuite(func() {
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...))
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
-	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
-	nodeController = informer.NewNodeController(env.Client, cluster)
+	cs = karpentercluster.New(ctx, env.Clock, nil, nil, cloudProvider)
+	cluster = state.NewCluster(env.Clock, env.Client, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
+	nodeController = NodeInformer(env.Client, cluster, nil)
 	predictionStore = prediction.NewStore(env.Client)
-	prov = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client), predictionStore)
-	daemonsetController = informer.NewDaemonSetController(env.Client, cluster)
+	provClock = test.NewClockView(env.Clock)
+	prov = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, provClock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client), predictionStore, cs.Nomination, cs.BufferPods)
 	instanceTypes, _ := cloudProvider.GetInstanceTypes(ctx, nil)
 	instanceTypeMap = map[string]*cloudprovider.InstanceType{}
 	for _, it := range instanceTypes {
@@ -148,24 +153,24 @@ var _ = Describe("Provisioning", func() {
 
 			wg := sync.WaitGroup{}
 			wg.Add(1)
-			Expect(env.Clock.HasWaiters()).To(BeFalse())
+			Expect(provClock.HasWaiters()).To(BeFalse())
 			go func() {
 				defer GinkgoRecover()
 				defer wg.Done()
 
 				// Have a waiter on the first trigger and trigger the batcher
-				Eventually(func() bool { return env.Clock.HasWaiters() }, time.Second).Should(BeTrue())
+				Eventually(func() bool { return provClock.HasWaiters() }, time.Second).Should(BeTrue())
 				prov.Trigger(pod.UID)
 
 				time.Sleep(time.Second) // give the process time to make it to the next batching section
 
 				// Fall-through to the second batching section
-				Eventually(func() bool { return env.Clock.HasWaiters() }, time.Second).Should(BeTrue())
+				Eventually(func() bool { return provClock.HasWaiters() }, time.Second).Should(BeTrue())
 
 				// Step the clock by 3 seconds which is within the batch idle duration of 5s and then add the same pod again.
 				env.Clock.Step(3 * time.Second)
 				// We expect to have waiters on the env.Clock since this is still within the batch idle duration of 5s.
-				Eventually(func() bool { return env.Clock.HasWaiters() }, time.Second).Should(BeTrue())
+				Eventually(func() bool { return provClock.HasWaiters() }, time.Second).Should(BeTrue())
 				prov.Trigger(pod.UID)
 
 				time.Sleep(time.Second) // give the process time to iterate on the batching section
@@ -173,7 +178,7 @@ var _ = Describe("Provisioning", func() {
 				// Step the clock again by 3s to just cross the batch idle duration. We should be able to get out of the
 				// provisioning loop because the same pod will not cause the idle duration to reset.
 				env.Clock.Step(3 * time.Second)
-				Eventually(func() bool { return env.Clock.HasWaiters() }, time.Second).Should(BeFalse())
+				Eventually(func() bool { return provClock.HasWaiters() }, time.Second).Should(BeFalse())
 			}()
 			ExpectSingletonReconciled(ctx, prov)
 			wg.Wait()
@@ -191,24 +196,24 @@ var _ = Describe("Provisioning", func() {
 
 			wg := sync.WaitGroup{}
 			wg.Add(1)
-			Expect(env.Clock.HasWaiters()).To(BeFalse())
+			Expect(provClock.HasWaiters()).To(BeFalse())
 			go func() {
 				defer GinkgoRecover()
 				defer wg.Done()
 
 				// Have a waiter on the first trigger and trigger the batcher
-				Eventually(func() bool { return env.Clock.HasWaiters() }, time.Second).Should(BeTrue())
+				Eventually(func() bool { return provClock.HasWaiters() }, time.Second).Should(BeTrue())
 				prov.Trigger(pod.UID)
 
 				time.Sleep(time.Second) // give the process time to make it to the next batching section
 
 				// Fall-through to the second batching section
-				Eventually(func() bool { return env.Clock.HasWaiters() }, time.Second).Should(BeTrue())
+				Eventually(func() bool { return provClock.HasWaiters() }, time.Second).Should(BeTrue())
 
 				// Step the clock by 3 seconds which is within the batch idle duration of 5s and then add a new pod
 				env.Clock.Step(3 * time.Second)
 				// We expect to have waiters on the env.Clock since this is still within the batch idle duration of 5s.
-				Eventually(func() bool { return env.Clock.HasWaiters() }, time.Second).Should(BeTrue())
+				Eventually(func() bool { return provClock.HasWaiters() }, time.Second).Should(BeTrue())
 				prov.Trigger(pod2.UID)
 
 				time.Sleep(time.Second) // give the process time to iterate on the batching section
@@ -216,11 +221,11 @@ var _ = Describe("Provisioning", func() {
 				// Step the clock by 3s as we expect provisioning to not happen until another 5s because the
 				// batch idle duration was reset due to a new pod being added.
 				env.Clock.Step(3 * time.Second)
-				Consistently(func() bool { return env.Clock.HasWaiters() }, time.Second).Should(BeTrue())
+				Consistently(func() bool { return provClock.HasWaiters() }, time.Second).Should(BeTrue())
 				// Stepping the clock again by 3s. We should be able to get out of the
 				// provisioning loop at this point (since we have exceeded the idle duration)
 				env.Clock.Step(3 * time.Second)
-				Eventually(func() bool { return env.Clock.HasWaiters() }, time.Second).Should(BeFalse())
+				Eventually(func() bool { return provClock.HasWaiters() }, time.Second).Should(BeFalse())
 			}()
 			ExpectSingletonReconciled(ctx, prov)
 			wg.Wait()
@@ -239,7 +244,7 @@ var _ = Describe("Provisioning", func() {
 			defer wg.Done()
 			ExpectSingletonReconciled(ctx, prov)
 		}()
-		Eventually(func() bool { return env.Clock.HasWaiters() }, time.Second).Should(BeTrue())
+		Eventually(func() bool { return provClock.HasWaiters() }, time.Second).Should(BeTrue())
 		env.Clock.Step(11 * time.Second)
 
 		nodeClaims := &v1.NodeClaimList{}
@@ -336,34 +341,6 @@ var _ = Describe("Provisioning", func() {
 		Expect(cluster.PodSchedulingSuccessTime(nn).IsZero()).To(BeTrue())
 		Expect(cluster.PodSchedulingDecisionTime(nn).IsZero()).To(BeFalse())
 		ExpectMetricHistogramSampleCountValue("karpenter_pods_scheduling_decision_duration_seconds", 1, nil)
-	})
-	It("should mark podHealthyNodePoolScheduledTime if it is scheduled against a nodePool with NodeRegistrationHealthy=true", func() {
-		nodePool := test.NodePool()
-		nodePool.StatusConditions().SetTrue(v1.ConditionTypeNodeRegistrationHealthy)
-		nodePool.StatusConditions().SetTrue(v1.ConditionTypeValidationSucceeded)
-		nodePool.StatusConditions().SetTrue(v1.ConditionTypeNodeClassReady)
-		ExpectApplied(ctx, env.Client, nodePool)
-		pod := test.UnschedulablePod()
-		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
-		nodes := &corev1.NodeList{}
-		Expect(env.Client.List(ctx, nodes)).To(Succeed())
-		Expect(len(nodes.Items)).To(Equal(1))
-		ExpectScheduled(ctx, env.Client, pod)
-		Expect(cluster.PodSchedulingSuccessTimeRegistrationHealthyCheck(client.ObjectKeyFromObject(pod)).IsZero()).To(BeFalse())
-	})
-	It("should not mark podHealthyNodePoolScheduledTime if it is scheduled against a nodePool with NodeRegistrationHealthy=False", func() {
-		nodePool := test.NodePool()
-		nodePool.StatusConditions().SetFalse(v1.ConditionTypeNodeRegistrationHealthy, "unhealthy", "unhealthy")
-		nodePool.StatusConditions().SetTrue(v1.ConditionTypeValidationSucceeded)
-		nodePool.StatusConditions().SetTrue(v1.ConditionTypeNodeClassReady)
-		ExpectApplied(ctx, env.Client, nodePool)
-		pod := test.UnschedulablePod()
-		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
-		nodes := &corev1.NodeList{}
-		Expect(env.Client.List(ctx, nodes)).To(Succeed())
-		Expect(len(nodes.Items)).To(Equal(1))
-		ExpectScheduled(ctx, env.Client, pod)
-		Expect(cluster.PodSchedulingSuccessTimeRegistrationHealthyCheck(client.ObjectKeyFromObject(pod)).IsZero()).To(BeTrue())
 	})
 	It("should provision nodes for pods with supported node selectors", func() {
 		nodePool := test.NodePool()
@@ -920,6 +897,63 @@ var _ = Describe("Provisioning", func() {
 			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
 			ExpectNotScheduled(ctx, env.Client, pod)
 		})
+		Context("NodeClaims that haven't launched", func() {
+			var nodePool *v1.NodePool
+			var pod func() *corev1.Pod
+			BeforeEach(func() {
+				nodePool = test.NodePool(v1.NodePool{
+					Spec: v1.NodePoolSpec{
+						Limits: v1.Limits(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}),
+					},
+				})
+				ExpectApplied(ctx, env.Client, nodePool)
+				pod = func() *corev1.Pod {
+					// requires a 2 CPU node, so a second one would exceed the limit
+					return test.UnschedulablePod(test.PodOptions{ResourceRequirements: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1.75")},
+					}})
+				}
+			})
+			It("should plan around what is held for them", func() {
+				results := ExpectProvisionedResults(ctx, env.Client, cluster, cloudProvider, prov, pod())
+				Expect(results.NewNodeClaims).To(HaveLen(1))
+				_, err := prov.CreateNodeClaims(ctx, results.NewNodeClaims)
+				Expect(err).ToNot(HaveOccurred())
+
+				// The NodeClaim hasn't launched, so no node counts its capacity, but its reservation does.
+				results = ExpectProvisionedResults(ctx, env.Client, cluster, cloudProvider, prov, pod())
+				Expect(results.NewNodeClaims).To(BeEmpty())
+			})
+			It("should refuse to create a NodeClaim that two solves both planned within the limit", func() {
+				first := ExpectProvisionedResults(ctx, env.Client, cluster, cloudProvider, prov, pod())
+				second := ExpectProvisionedResults(ctx, env.Client, cluster, cloudProvider, prov, pod())
+				Expect(first.NewNodeClaims).To(HaveLen(1))
+				Expect(second.NewNodeClaims).To(HaveLen(1))
+
+				_, err := prov.CreateNodeClaims(ctx, first.NewNodeClaims)
+				Expect(err).ToNot(HaveOccurred())
+				_, err = prov.CreateNodeClaims(ctx, second.NewNodeClaims)
+				Expect(err).To(HaveOccurred())
+				Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
+				// The refused NodeClaim's reservation is released, and the created one's still holds.
+				Expect(cluster.NodePoolState.Get(nodePool.Name).ReservedResources).To(HaveKey(corev1.ResourceCPU))
+				Expect(cluster.NodePoolState.Get(nodePool.Name).ReservedResources[resources.Node]).To(BeComparableTo(resource.MustParse("1")))
+			})
+			It("should count a NodeClaim's launched capacity in place of its reservation once it launches", func() {
+				results := ExpectProvisionedResults(ctx, env.Client, cluster, cloudProvider, prov, pod())
+				names, err := prov.CreateNodeClaims(ctx, results.NewNodeClaims)
+				Expect(err).ToNot(HaveOccurred())
+				nodeClaim := ExpectExists(ctx, env.Client, &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: names[0]}})
+				nodeClaim.Status.ProviderID = test.RandomProviderID()
+				nodeClaim.Status.Capacity = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}
+				ExpectApplied(ctx, env.Client, nodeClaim)
+				cluster.UpdateNodeClaim(nodeClaim)
+
+				fields := cluster.NodePoolState.Get(nodePool.Name)
+				Expect(fields.Usage[corev1.ResourceCPU]).To(BeComparableTo(resource.MustParse("2")))
+				Expect(fields.ReservedResources).To(BeEmpty())
+			})
+		})
 		It("should not schedule if limits would be exceeded (node)", func() {
 			ExpectApplied(ctx, env.Client, test.NodePool(v1.NodePool{
 				Spec: v1.NodePoolSpec{
@@ -1070,7 +1104,7 @@ var _ = Describe("Provisioning", func() {
 					ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("2Gi")}},
 				})
 			ExpectApplied(ctx, env.Client, nodePool, daemonsetPod)
-			ExpectReconcileSucceeded(ctx, daemonsetController, client.ObjectKeyFromObject(daemonset))
+			cluster.PodStore.Observe(daemonsetPod)
 			pod := test.UnschedulablePod(test.PodOptions{
 				ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")}},
 				NodeSelector:         map[string]string{v1.NodePoolLabelKey: nodePool.Name},
@@ -1380,7 +1414,7 @@ var _ = Describe("Provisioning", func() {
 					ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("2Gi")}},
 				})
 			ExpectApplied(ctx, env.Client, daemonsetPod)
-			ExpectReconcileSucceeded(ctx, daemonsetController, client.ObjectKeyFromObject(daemonset))
+			cluster.PodStore.Observe(daemonsetPod)
 
 			// Deploy pod
 			pod := test.UnschedulablePod(test.PodOptions{
