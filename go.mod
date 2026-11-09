@@ -23,8 +23,10 @@ require (
 	github.com/samber/lo v1.53.0
 	go.uber.org/multierr v1.11.0
 	go.uber.org/zap v1.28.0
+	golang.org/x/sync v0.24.0
 	golang.org/x/text v0.43.0
 	golang.org/x/time v0.15.0
+	golang.org/x/tools v0.51.0
 	k8s.io/api v0.36.1
 	k8s.io/apiextensions-apiserver v0.36.0
 	k8s.io/apimachinery v0.36.1
@@ -91,10 +93,8 @@ require (
 	golang.org/x/mod v0.41.0 // indirect
 	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
-	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/term v0.47.0 // indirect
-	golang.org/x/tools v0.51.0 // indirect
 	gomodules.xyz/jsonpatch/v2 v2.5.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260128011058-8636f8732409 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260128011058-8636f8732409 // indirect
@@ -116,3 +116,5 @@ retract (
 	v0.34.4 // accidentally published incomplete patch release
 	v0.27.7 // accidentally published incomplete patch release
 )
+
+replace sigs.k8s.io/controller-runtime => github.com/DerekFrank/controller-runtime v0.0.0-20261031000535-1b60e9f18b38

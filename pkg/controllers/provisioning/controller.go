@@ -74,7 +74,7 @@ func (c *PodController) Reconcile(ctx context.Context, p *corev1.Pod) (reconcile
 	// not be scheduled as expected if new pods are created while nodes are
 	// coming online. Even if a provisioning loop is successful, the pod may
 	// require another provisioning loop to become schedulable.
-	return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+	return reconcile.Result{RequeueAfter: 10 * time.Second}, nil //storelint:deadline retry for a pod another provisioning loop may make schedulable
 }
 
 func (c *PodController) Register(ctx context.Context, m manager.Manager) error {
@@ -121,7 +121,7 @@ func (c *NodeController) Reconcile(ctx context.Context, n *corev1.Node) (reconci
 	// not be scheduled as expected if new pods are created while nodes are
 	// coming online. Even if a provisioning loop is successful, the pod may
 	// require another provisioning loop to become schedulable.
-	return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+	return reconcile.Result{RequeueAfter: 10 * time.Second}, nil //storelint:deadline retry for a pod another provisioning loop may make schedulable
 }
 
 func (c *NodeController) Register(ctx context.Context, m manager.Manager) error {
