@@ -19,7 +19,6 @@ package nodepool
 import (
 	"context"
 	"strings"
-	"time"
 
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
@@ -115,8 +114,7 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return reconcile.Result{}, nil
 	}
 	c.metricStore.Update(req.String(), c.buildMetrics(nodePool))
-	// periodically update our metrics per nodepool even if nothing has changed
-	return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+	return reconcile.Result{}, nil
 }
 
 func (c *Controller) buildMetrics(nodePool *v1.NodePool) (res []*metrics.StoreMetric) {
@@ -160,8 +158,13 @@ func (c *Controller) Name() string {
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
-	return controllerruntime.NewControllerManagedBy(m).
+	b := controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
-		For(&v1.NodePool{}, builder.WithPredicates(nodepoolutils.IsManagedPredicateFuncs(c.cloudProvider))).
-		Complete(c)
+		// A NodePool's own events carry its usage, which nodepool.counter publishes to its status, and its limits.
+		For(&v1.NodePool{}, builder.WithPredicates(nodepoolutils.IsManagedPredicateFuncs(c.cloudProvider)))
+	// Its cost changes with its NodeClaims' offerings and their prices, which the cost stores keep by NodePool.
+	for _, src := range c.clusterCost.Sources() {
+		b = b.WatchesRawSource(src)
+	}
+	return b.Complete(c)
 }

@@ -25,7 +25,10 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -54,8 +57,8 @@ func TestAPIs(t *testing.T) {
 var _ = BeforeSuite(func() {
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...))
 	cp = fake.NewCloudProvider()
-	cc = cost.NewClusterCost(ctx, cp, env.Client)
-	nodePoolController = nodepool.NewController(env.Client, cp, cc)
+	cc = cost.NewClusterCost(ctx, cp, env.Overlay)
+	nodePoolController = nodepool.NewController(env.Overlay, cp, cc)
 })
 
 var _ = AfterSuite(func() {
@@ -163,5 +166,58 @@ var _ = Describe("Metrics", func() {
 			})
 			Expect(found).To(BeFalse())
 		}
+	})
+})
+
+var _ = Describe("NodePool Metrics Wakes", func() {
+	var queue workqueue.TypedRateLimitingInterface[reconcile.Request]
+	var nodePool *v1.NodePool
+	BeforeEach(func() {
+		cc.Reset()
+		cp.InstanceTypes = fake.InstanceTypesAssorted()
+		nodePool = test.NodePool()
+		ExpectApplied(ctx, env.Client, nodePool)
+		queue = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+		DeferCleanup(queue.ShutDown)
+		started, stop := context.WithCancel(ctx)
+		DeferCleanup(stop)
+		for _, src := range cc.Sources() {
+			Expect(src.Start(started, queue)).To(Succeed())
+		}
+	})
+	drain := func() []string {
+		var names []string
+		for queue.Len() > 0 {
+			req, _ := queue.Get()
+			names = append(names, req.Name)
+			queue.Done(req)
+		}
+		return names
+	}
+	It("should wake for a NodePool whose cost may change, and not for its NodeClaims' other changes", func() {
+		instanceType := cp.InstanceTypes[0]
+		offering := instanceType.Offerings[0]
+		nodeClaim := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+			v1.NodePoolLabelKey:            nodePool.Name,
+			corev1.LabelInstanceTypeStable: instanceType.Name,
+			v1.CapacityTypeLabelKey:        offering.CapacityType(),
+			corev1.LabelTopologyZone:       offering.Zone(),
+		}}})
+		ExpectApplied(ctx, env.Client, nodeClaim)
+		Expect(cc.UpdateNodeClaim(ctx, nodeClaim)).To(Succeed())
+		Expect(drain()).To(Equal([]string{nodePool.Name}), "want the NodePool for its NodeClaim's offering and its price")
+		Expect(cc.GetNodepoolCost(nodePool)).To(BeNumerically(">", 0))
+
+		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeInitialized)
+		ExpectApplied(ctx, env.Client, nodeClaim)
+		Expect(cc.UpdateNodeClaim(ctx, nodeClaim)).To(Succeed())
+		Expect(drain()).To(BeEmpty(), "want nothing for the NodeClaim's status")
+
+		ExpectDeleted(ctx, env.Client, nodeClaim)
+		Expect(drain()).To(Equal([]string{nodePool.Name}), "want the NodePool for its NodeClaim going away")
+	})
+	It("should update its metrics without a periodic requeue", func() {
+		ExpectApplied(ctx, env.Client, nodePool)
+		Expect(ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool)).RequeueAfter).To(BeZero())
 	})
 })
