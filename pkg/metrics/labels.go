@@ -81,11 +81,27 @@ const (
 	ConsolidationPolicyLabel = "consolidation_policy"
 	TerminationModeLabel     = "termination_mode"
 	ControllerLabel          = "controller"
+	ClaimStoreLabel          = "store"
+)
+
+// Names of the claim store dimension's values: the cluster state stores that hold claims.
+const (
+	nodePoolClaimStore      = "nodepool"
+	capacityQuotaClaimStore = "capacityquota"
 )
 
 // Shared core metric dimensions. Provider packages and core controllers should
 // reference these rather than redeclaring the same dimension.
 var (
+	// NodePoolClaimStore and CapacityQuotaClaimStore are the values of the ClaimStore dimension.
+	NodePoolClaimStore      = opmetrics.Value{Name: nodePoolClaimStore, Help: "NodePool limits: static node counts and resource limits."}
+	CapacityQuotaClaimStore = opmetrics.Value{Name: capacityQuotaClaimStore, Help: "CapacityQuota limits."}
+	// ClaimStore is the cluster state store a claim was held in.
+	ClaimStore = opmetrics.Label{
+		Name:   ClaimStoreLabel,
+		Help:   "The cluster state store the claim was held in.",
+		Values: []opmetrics.Value{NodePoolClaimStore, CapacityQuotaClaimStore},
+	}
 	NodePool = opmetrics.Label{
 		Name: NodePoolLabel,
 		Help: "The name of the NodePool that owns the resource.",
