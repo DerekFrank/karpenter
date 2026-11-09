@@ -36,10 +36,11 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
+	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
-	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
@@ -77,10 +78,10 @@ type Method interface {
 
 type CandidateFilter func(context.Context, *Candidate) bool
 
-// Candidate is a state.StateNode that we are considering for disruption along with extra information to be used in
+// Candidate is a karpentercluster.StateNode that we are considering for disruption along with extra information to be used in
 // making that determination
 type Candidate struct {
-	*state.StateNode
+	*karpentercluster.StateNode
 	instanceType      *cloudprovider.InstanceType
 	NodePool          *v1.NodePool
 	zone              string
@@ -102,7 +103,7 @@ type Candidate struct {
 	TerminationGracePeriod *time.Duration
 	// RepairPolicyResult is the policy decision for this candidate's current node snapshot. ShouldDisrupt populates it,
 	// so a repair pass evaluates each candidate once before sorting and constructing a command.
-	RepairPolicyResult health.RepairResult
+	RepairPolicyResult repair.RepairResult
 	// RebootEscalated reports that recent reboot history converted a reboot decision to replacement.
 	RebootEscalated bool
 }
@@ -148,11 +149,11 @@ func (c *Candidate) IsEmpty() bool {
 }
 
 //nolint:gocyclo // Candidate validation is clearer as one linear workflow.
-func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events.Recorder, clk clock.Clock, node *state.StateNode, pdbs pdb.Limits,
+func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events.Recorder, clk clock.Clock, node *karpentercluster.StateNode, pdbs pdb.Limits,
 	nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType, queue *Queue, disruptionClass string,
 ) (*Candidate, error) {
 	// If the orchestration queue is already considering a candidate we want to disrupt, don't consider it a candidate.
-	if queue.HasAny(node.ProviderID()) {
+	if queue.HasNode(node) {
 		return nil, fmt.Errorf("candidate is already being disrupted")
 	}
 	if disruptionClass == RepairDisruptionClass && node.NodeClaim != nil && node.Labels()[v1.NodePoolLabelKey] == "" {
@@ -161,12 +162,12 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 		return nil, serrors.Wrap(fmt.Errorf("repair requires a nodepool"), "NodeClaim", klog.KObj(node.NodeClaim))
 	}
 
-	err := node.ValidateNodeDisruptable(clk)
+	err := ValidateNodeDisruptable(node, clk)
 	if err != nil {
 		// Repair is voluntary but is NOT discretionary: do-not-disrupt was never intended to strand a broken node.
 		// Nor is a node that never initializes left stranded, since nothing else replaces it.
 		if disruptionClass == RepairDisruptionClass {
-			err = state.IgnoreNodeUninitializedError(state.IgnoreNodeDoNotDisruptError(err))
+			err = IgnoreNodeUninitializedError(IgnoreNodeDoNotDisruptError(err))
 		}
 		if err != nil {
 			// Only emit an event for Karpenter-managed nodes.
@@ -192,7 +193,7 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 	}
 	// We only care if instanceType in non-empty consolidation to do price-comparison.
 	instanceType := instanceTypeMap[node.Labels()[corev1.LabelInstanceTypeStable]]
-	pods, err := node.ValidatePodsDisruptable(ctx, kubeClient, pdbs, clk, recorder)
+	pods, err := ValidatePodsDisruptable(ctx, kubeClient, node, pdbs, clk, recorder)
 	hasPodBlockers := false
 	if err != nil {
 		// Repair resolves its policy deadline after candidate construction, so retain whether pod blockers were ignored
@@ -200,10 +201,10 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 		validationErr := err
 		switch {
 		case disruptionClass == RepairDisruptionClass:
-			validationErr = state.IgnorePodBlockEvictionError(err)
+			validationErr = IgnorePodBlockEvictionError(err)
 			hasPodBlockers = validationErr == nil
 		case disruptionClass == EventualDisruptionClass && node.NodeClaim.Spec.TerminationGracePeriod != nil:
-			validationErr = state.IgnorePodBlockEvictionError(err)
+			validationErr = IgnorePodBlockEvictionError(err)
 		}
 		if validationErr != nil {
 			recorder.Publish(disruptionevents.Blocked(node.Node, node.NodeClaim, pretty.Sentence(err.Error()))...)
