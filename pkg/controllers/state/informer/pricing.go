@@ -24,6 +24,7 @@ import (
 	"github.com/awslabs/operatorpkg/reconciler"
 	"github.com/awslabs/operatorpkg/singleton"
 	"go.uber.org/multierr"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -60,19 +61,19 @@ func (c *PricingController) Reconcile(ctx context.Context) (reconciler.Result, e
 	}
 
 	var errs error
+	names := sets.New[string]()
 	for _, np := range npl.Items {
-		newIts, err := c.cloudProvider.GetInstanceTypes(ctx, &np)
-		if err != nil {
+		names.Insert(np.Name)
+		if err := c.clusterCost.RefreshPrices(ctx, &np); err != nil {
 			errs = multierr.Append(errs, err)
-			continue
 		}
-		c.clusterCost.UpdateOfferings(ctx, &np, newIts)
 	}
+	c.clusterCost.RetainPrices(names)
 	if errs != nil {
 		return reconciler.Result{}, fmt.Errorf("refreshing pricing info, %w", errs)
 	}
 
-	return reconciler.Result{RequeueAfter: 1 * time.Hour}, nil
+	return reconciler.Result{RequeueAfter: 1 * time.Hour}, nil //storelint:deadline the price refresh period
 }
 
 func (c *PricingController) Name() string {

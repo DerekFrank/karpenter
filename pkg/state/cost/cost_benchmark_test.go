@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
+	"sigs.k8s.io/karpenter/pkg/state/statetest"
 )
 
 // freshCloudProvider returns a new instance type list on every call, like a provider that resolves offerings per
@@ -47,13 +48,16 @@ type costBenchmark struct {
 	nodePools  []*v1.NodePool
 	nodeClaims []*v1.NodeClaim
 	kubeClient client.Client
+	// source holds every NodeClaim, as the overlay's does in production, so that a cost tracker built over it
+	// counts them all as it's constructed, without the objects counting toward the heap it retains.
+	source *statetest.Objects
 }
 
 // newCostBenchmark creates wide-open NodePools with nodeClaimsPerNodePool NodeClaims each, spread over
 // instanceTypesPerNodePool instance types.
 func newCostBenchmark(nodePools, nodeClaimsPerNodePool, instanceTypesPerNodePool int) *costBenchmark {
 	instanceTypes := fake.InstanceTypesAssorted()
-	bm := &costBenchmark{}
+	bm := &costBenchmark{source: statetest.NewObjects()}
 	builder := fakecr.NewClientBuilder()
 	for i := range nodePools {
 		np := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("nodepool-%d", i)}}
@@ -73,12 +77,21 @@ func newCostBenchmark(nodePools, nodeClaimsPerNodePool, instanceTypesPerNodePool
 		}
 	}
 	bm.kubeClient = builder.Build()
+	for _, nodeClaim := range bm.nodeClaims {
+		bm.source.Put(nodeClaim)
+	}
 	return bm
 }
 
-func (bm *costBenchmark) track(ctx context.Context, b *testing.B, clusterCost *cost.ClusterCost) {
-	for _, nodeClaim := range bm.nodeClaims {
-		if err := clusterCost.UpdateNodeClaim(ctx, nodeClaim); err != nil {
+// newClusterCost returns a cost tracker counting every one of the benchmark's NodeClaims.
+func (bm *costBenchmark) newClusterCost(ctx context.Context, cloudProvider cloudprovider.CloudProvider) *cost.ClusterCost {
+	return cost.NewClusterCost(ctx, cloudProvider, bm.kubeClient, cost.WithNodeClaimSource(bm.source))
+}
+
+// price reads each NodePool's instance types and prices the offerings it counts with them.
+func (bm *costBenchmark) price(ctx context.Context, b *testing.B, clusterCost *cost.ClusterCost) {
+	for _, np := range bm.nodePools {
+		if err := clusterCost.RefreshPrices(ctx, np); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -103,11 +116,8 @@ func BenchmarkClusterCostRetained(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				before := heapInUse()
-				clusterCost := cost.NewClusterCost(ctx, provider, bm.kubeClient)
-				bm.track(ctx, b, clusterCost)
-				for _, np := range bm.nodePools {
-					clusterCost.UpdateOfferings(ctx, np, fake.InstanceTypesAssorted())
-				}
+				clusterCost := bm.newClusterCost(ctx, provider)
+				bm.price(ctx, b, clusterCost)
 				retained += heapInUse() - before
 				runtime.KeepAlive(clusterCost)
 			}
@@ -122,8 +132,7 @@ func BenchmarkClusterCostUpdateOfferings(b *testing.B) {
 	bm := newCostBenchmark(25, 40, 40)
 	provider := fake.NewCloudProvider()
 	provider.InstanceTypes = fake.InstanceTypesAssorted()
-	clusterCost := cost.NewClusterCost(ctx, provider, bm.kubeClient)
-	bm.track(ctx, b, clusterCost)
+	clusterCost := bm.newClusterCost(ctx, provider)
 	b.ReportAllocs()
 	for b.Loop() {
 		for _, np := range bm.nodePools {
