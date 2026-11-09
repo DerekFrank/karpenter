@@ -48,6 +48,52 @@ linters:
           deny:
             - pkg: github.com/avast/retry-go
               desc: use k8s.io/apimachinery/pkg/util/wait
+        # pkg/state holds kind-free primitives, pkg/cluster builds the cluster's state from them, and controllers read
+        # it; never the reverse. See pkg/state/AGENTS.md.
+        state:
+          files:
+            - "**/pkg/state/*.go"
+            - "**/pkg/state/**/*.go"
+            - "!$test"
+          deny:
+            - pkg: sigs.k8s.io/karpenter/pkg/controllers
+              desc: pkg/state never depends on controllers
+            - pkg: sigs.k8s.io/karpenter/pkg/cluster
+              desc: pkg/cluster builds on pkg/state, not the reverse
+        cluster:
+          files:
+            - "**/pkg/cluster/*.go"
+            - "**/pkg/cluster/**/*.go"
+            - "!$test"
+          deny:
+            - pkg: sigs.k8s.io/karpenter/pkg/controllers
+              desc: pkg/cluster never depends on controllers
+        # pkg/controllers/state is being emptied into pkg/cluster. These are its importers today; the list only shrinks.
+        controllers-state:
+          files:
+            - $all
+            - "!**/kwok/*.go"
+            - "!**/pkg/controllers/*.go"
+            - "!**/pkg/controllers/disruption/*.go"
+            - "!**/pkg/controllers/metrics/node/*.go"
+            - "!**/pkg/controllers/metrics/pod/*.go"
+            - "!**/pkg/controllers/nodeclaim/garbagecollection/*.go"
+            - "!**/pkg/controllers/nodeclaim/lifecycle/*.go"
+            - "!**/pkg/controllers/node/legacyrepair/*.go"
+            - "!**/pkg/controllers/nodeoverlay/*.go"
+            - "!**/pkg/controllers/pod/deletioncost/*.go"
+            - "!**/pkg/controllers/provisioning/*.go"
+            - "!**/pkg/controllers/provisioning/scheduling/*.go"
+            - "!**/pkg/controllers/state/*.go"
+            - "!**/pkg/controllers/state/**/*.go"
+            - "!**/pkg/controllers/static/deprovisioning/*.go"
+            - "!**/pkg/controllers/static/provisioning/*.go"
+            - "!**/pkg/state/cost/*_test.go"
+            - "!**/pkg/test/expectations/*.go"
+            - "!**/pkg/test/schedulingproperties/*.go"
+          deny:
+            - pkg: sigs.k8s.io/karpenter/pkg/controllers/state
+              desc: read cluster state through pkg/cluster; this list of importers only shrinks
     gocyclo:
       min-complexity: 11
     goheader:
