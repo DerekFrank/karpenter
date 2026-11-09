@@ -26,8 +26,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
 )
 
@@ -41,7 +41,7 @@ import (
 //
 // Ownership is determined via metadata.ownerReferences (Kind == "Node"), not spec.nodeName, which only indicates
 // accessibility. Slices with no Node owner reference (e.g. cluster-wide slices) are always included.
-func (p *Provisioner) gatherResourceSlices(ctx context.Context, stateNodes []*state.StateNode) ([]dynamicresources.ResourceSlice, error) {
+func (p *Provisioner) gatherResourceSlices(ctx context.Context, stateNodes []*karpentercluster.StateNode) ([]dynamicresources.ResourceSlice, error) {
 	sliceList := &resourcev1.ResourceSliceList{}
 	if err := p.kubeClient.List(ctx, sliceList); err != nil {
 		return nil, fmt.Errorf("listing resourceslices, %w", err)

@@ -56,6 +56,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpcluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -648,8 +649,9 @@ func solve(ctx context.Context, t *caseT, cfg Config, s scenario) (scheduling.Re
 		return c.Get(ctx, key, obj, opts...)
 	}}).Build()
 	cp := drawnInstanceTypes{CloudProvider: cfg.CloudProvider, its: s.its}
-	cluster := state.NewCluster(clock.RealClock{}, kubeClient, cp)
-	prov := provisioning.NewProvisioner(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cp, cluster, clock.RealClock{}, nil, nil, nil)
+	cs := karpcluster.New(ctx, clock.RealClock{}, nil, nil, cp)
+	cluster := state.NewCluster(clock.RealClock{}, kubeClient, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
+	prov := provisioning.NewProvisioner(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cp, cluster, clock.RealClock{}, nil, nil, nil, cs.Nomination, cs.BufferPods)
 	opts := *options.FromContext(ctx)
 	opts.MinValuesPolicy = s.minValuesPolicy
 	// Scheduling logs bury the failure report.

@@ -58,7 +58,7 @@ func (c *Controller) Name() string {
 }
 
 // Garbage collects unlaunched NodeClaim entries from cluster state that no longer exist on the API
-// server, so a create/delete race in the seed window can't hold Synced() false indefinitely as seen
+// server, so a create/delete race in the seed window can't hold NodeClaimsLaunched() false indefinitely as seen
 // in https://github.com/kubernetes-sigs/karpenter/issues/3176.
 func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())

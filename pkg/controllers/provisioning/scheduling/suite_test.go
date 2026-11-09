@@ -45,6 +45,7 @@ import (
 	"k8s.io/csi-translation-lib/plugins"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeClient "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 
@@ -52,6 +53,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
@@ -76,15 +78,17 @@ var env *test.Environment
 var clusterCost *cost.ClusterCost
 var cluster *state.Cluster
 var cloudProvider *fake.CloudProvider
-var nodeStateController *informer.NodeController
-var nodeClaimStateController *informer.NodeClaimController
-var podStateController *informer.PodController
+var nodeStateController reconcile.Reconciler
+var nodeClaimStateController reconcile.Reconciler
+var podStateController reconcile.Reconciler
 var podController *provisioning.PodController
 
 const csiProvider = "fake.csi.provider"
 const isDefaultStorageClassAnnotation = "storageclass.kubernetes.io/is-default-class"
 
 var podLabels = map[string]string{"pdb-test": "value"}
+
+var cs karpentercluster.State
 
 func TestScheduling(t *testing.T) {
 	ctx = TestContextWithLogger(t)
@@ -100,12 +104,13 @@ var _ = BeforeSuite(func() {
 	// set these on the cloud provider, so we can manipulate them if needed
 	cloudProvider.InstanceTypes = instanceTypes
 	clusterCost = cost.NewClusterCost(ctx, cloudProvider, env.Client)
-	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
-	nodeStateController = informer.NewNodeController(env.Client, cluster)
-	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
-	podStateController = informer.NewPodController(env.Client, cluster)
+	cs = karpentercluster.New(ctx, env.Clock, nil, nil, cloudProvider)
+	cluster = state.NewCluster(env.Clock, env.Client, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
+	nodeStateController = NodeInformer(env.Client, cluster, nil)
+	nodeClaimStateController = NodeClaimInformer(env.Client, cluster, informer.NewNodeClaimController(env.Client, cloudProvider, clusterCost))
+	podStateController = PodInformer(env.Client, cluster, informer.NewPodController(env.Client, cluster))
 	predictionStore = prediction.NewStore(env.Client)
-	prov = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client), predictionStore)
+	prov = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client), predictionStore, cs.Nomination, cs.BufferPods)
 	podController = provisioning.NewPodController(env.Client, prov, cluster)
 })
 
@@ -2049,8 +2054,8 @@ var _ = Context("Scheduling", func() {
 						return []string{o.(*corev1.Pod).Spec.NodeName}
 					},
 				).Build()
-				provisioner := provisioning.NewProvisioner(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(kubeClient), virtualpods.NewVirtualPodCache(kubeClient), nil)
-				controller := informer.NewNodeController(kubeClient, cluster)
+				provisioner := provisioning.NewProvisioner(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(kubeClient), virtualpods.NewVirtualPodCache(kubeClient), nil, cs.Nomination, cs.BufferPods)
+				controller := NodeInformer(kubeClient, cluster, nil)
 				// We try to provision a node for an initial unschedulable pod that will create nodeClaim and node bindings
 				ExpectApplied(ctx, kubeClient, nodePool)
 				initialPod := test.UnschedulablePod()
@@ -2756,7 +2761,8 @@ var _ = Context("Scheduling", func() {
 						},
 					}},
 				)
-				ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, ds)
+				ExpectApplied(ctx, env.Client, nodePool, ds)
+				node = ExpectRegistered(ctx, env.Client, nodeClaim, node)
 				ExpectMakeNodeClaimsInitialized(ctx, env.Client, env.Clock, nodeClaim)
 				ExpectMakeNodesInitialized(ctx, env.Client, env.Clock, node)
 
@@ -4317,7 +4323,7 @@ var _ = Context("Scheduling", func() {
 			Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("small-instance-type"))
 
 			// Mark for deletion so that we consider all pods on this node for reschedulability
-			cluster.MarkForDeletion(node.Spec.ProviderID)
+			cs.Deletion.Mark(ExpectStateNodeExists(cluster, node).NodeClaim.Name)
 
 			// Trigger a provisioning loop and expect another node to get created
 			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov)
@@ -4343,7 +4349,7 @@ var _ = Context("Scheduling", func() {
 			Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("small-instance-type"))
 
 			// Mark for deletion so that we consider all pods on this node for reschedulability
-			cluster.MarkForDeletion(node.Spec.ProviderID)
+			cs.Deletion.Mark(ExpectStateNodeExists(cluster, node).NodeClaim.Name)
 
 			// Trigger an eviction to set the deletion timestamp but not delete the pod
 			ExpectEvicted(ctx, env.Client, pod)
@@ -4400,7 +4406,7 @@ var _ = Context("Scheduling", func() {
 			ExpectManualBinding(ctx, env.Client, pod, node)
 
 			// Mark for deletion so that we consider all pods on this node for reschedulability
-			cluster.MarkForDeletion(node.Spec.ProviderID)
+			cs.Deletion.Mark(nodeClaim.Name)
 
 			// Trigger an eviction to set the deletion timestamp but not delete the pod
 			ExpectEvicted(ctx, env.Client, pod)
@@ -4444,7 +4450,7 @@ var _ = Context("Scheduling", func() {
 			Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("small-instance-type"))
 
 			// Mark for deletion so that we consider all pods on this node for reschedulability
-			cluster.MarkForDeletion(node.Spec.ProviderID)
+			cs.Deletion.Mark(ExpectStateNodeExists(cluster, node).NodeClaim.Name)
 
 			// Trigger an eviction to set the deletion timestamp but not delete the pod
 			ExpectEvicted(ctx, env.Client, pod)
@@ -4488,7 +4494,7 @@ var _ = Context("Scheduling", func() {
 			Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("small-instance-type"))
 
 			// Mark for deletion so that we consider all pods on this node for reschedulability
-			cluster.MarkForDeletion(node.Spec.ProviderID)
+			cs.Deletion.Mark(ExpectStateNodeExists(cluster, node).NodeClaim.Name)
 
 			// Trigger an eviction to set the deletion timestamp but not delete the pod
 			ExpectEvicted(ctx, env.Client, pod)
@@ -4524,7 +4530,7 @@ var _ = Context("Scheduling", func() {
 				Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("small-instance-type"))
 
 				// Mark for deletion so that we consider all pods on this node for reschedulability
-				cluster.MarkForDeletion(node.Spec.ProviderID)
+				cs.Deletion.Mark(ExpectStateNodeExists(cluster, node).NodeClaim.Name)
 
 				// Trigger a provisioning loop and expect that we don't create more nodes
 				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov)

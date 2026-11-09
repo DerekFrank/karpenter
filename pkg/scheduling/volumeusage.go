@@ -191,7 +191,9 @@ func driverFromVolume(ctx context.Context, kubeClient client.Client, volumeName 
 // which nodes.
 // +k8s:deepcopy-gen=true
 type VolumeUsage struct {
+	// volumes are the volumes of every pod: those Inserted without a pod, in existing, and those of podVolumes.
 	volumes          Volumes
+	existing         Volumes
 	podVolumes       map[types.NamespacedName]Volumes
 	limits           map[string]int
 	publishedDrivers sets.Set[string]
@@ -236,10 +238,19 @@ func (v *VolumeUsage) Add(pod *v1.Pod, volumes Volumes) {
 	v.volumes = v.volumes.Union(volumes)
 }
 
+// Insert adds volumes that pods already on the node mount, which DeletePod keeps.
+func (v *VolumeUsage) Insert(volumes Volumes) {
+	if v.existing == nil {
+		v.existing = Volumes{}
+	}
+	v.existing.Insert(volumes)
+	v.volumes.Insert(volumes)
+}
+
 func (v *VolumeUsage) DeletePod(key types.NamespacedName) {
 	delete(v.podVolumes, key)
 	// volume names could be duplicated, so we re-create our volumes
-	v.volumes = Volumes{}
+	v.volumes = v.existing.Union(nil)
 	for _, c := range v.podVolumes {
 		v.volumes.Insert(c)
 	}

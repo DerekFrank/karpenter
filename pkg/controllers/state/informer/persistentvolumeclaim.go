@@ -32,46 +32,37 @@ import (
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 )
 
-// NodeController reconciles nodes for the purpose of maintaining state regarding nodes that is expensive to compute.
-type NodeController struct {
+// PersistentVolumeClaimController keeps the CSI driver of each PersistentVolumeClaim in cluster state, which counts
+// the volumes of the pods that mount it against the driver's limit on their node.
+type PersistentVolumeClaimController struct {
 	kubeClient client.Client
 	cluster    *state.Cluster
 }
 
-// NewNodeController constructs a controller instance
-func NewNodeController(kubeClient client.Client, cluster *state.Cluster) *NodeController {
-	return &NodeController{
-		kubeClient: kubeClient,
-		cluster:    cluster,
-	}
+func NewPersistentVolumeClaimController(kubeClient client.Client, cluster *state.Cluster) *PersistentVolumeClaimController {
+	return &PersistentVolumeClaimController{kubeClient: kubeClient, cluster: cluster}
 }
 
-func (c *NodeController) Name() string {
-	return "state.node"
+func (c *PersistentVolumeClaimController) Name() string {
+	return "state.persistentvolumeclaim"
 }
 
-func (c *NodeController) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+func (c *PersistentVolumeClaimController) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
-
-	node := &v1.Node{}
-	if err := c.kubeClient.Get(ctx, req.NamespacedName, node); err != nil {
+	pvc := &v1.PersistentVolumeClaim{}
+	if err := c.kubeClient.Get(ctx, req.NamespacedName, pvc); err != nil {
 		if errors.IsNotFound(err) {
-			// notify cluster state of the node deletion
-			c.cluster.DeleteNode(req.Name)
+			c.cluster.DeletePersistentVolumeClaim(req.NamespacedName)
 		}
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
-	if err := c.cluster.UpdateNode(ctx, node); err != nil {
-		return reconcile.Result{}, err
-	}
-	// ensure it's aware of any nodes we discover, this is a no-op if the node is already known to our cluster state
-	return reconcile.Result{RequeueAfter: stateRetryPeriod}, nil
+	return reconcile.Result{}, c.cluster.UpdatePersistentVolumeClaim(ctx, pvc)
 }
 
-func (c *NodeController) Register(ctx context.Context, m manager.Manager) error {
+func (c *PersistentVolumeClaimController) Register(ctx context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
-		For(&v1.Node{}).
+		For(&v1.PersistentVolumeClaim{}).
 		WithOptions(controller.Options{MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), minReconciles, maxReconciles)}).
 		Complete(c)
 }

@@ -236,7 +236,7 @@ func (e *EmptinessValidator) validateCandidates(ctx context.Context, candidates 
 	}
 
 	if valid := lo.Filter(validatedCandidates, func(cn *Candidate, _ int) bool {
-		if e.cluster.IsNodeNominated(cn.ProviderID()) {
+		if e.cluster.IsNodeNominated(cn.NodeClaim.Name) {
 			FailedValidationsTotal.Inc(map[string]string{ConsolidationTypeLabel: e.validationType})
 			return false
 		}
@@ -280,7 +280,7 @@ func (c *ConsolidationValidator) validateCandidates(ctx context.Context, candida
 	//  a. A pod was nominated to the candidate
 	//  b. Disrupting the candidate would violate node disruption budgets
 	for _, vc := range validatedCandidates {
-		if c.cluster.IsNodeNominated(vc.ProviderID()) {
+		if c.cluster.IsNodeNominated(vc.NodeClaim.Name) {
 			FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: c.validationType})
 			return nil, NewBudgetValidationError(fmt.Errorf("a candidate was nominated during validation"))
 		}

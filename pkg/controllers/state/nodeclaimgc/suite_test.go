@@ -28,6 +28,7 @@ import (
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	nodeclaimgc "sigs.k8s.io/karpenter/pkg/controllers/state/nodeclaimgc"
@@ -46,7 +47,7 @@ var (
 	clusterCost         *cost.ClusterCost
 	cloudProvider       *fake.CloudProvider
 	gcController        *nodeclaimgc.Controller
-	nodeClaimController *informer.NodeClaimController
+	nodeClaimController reconcile.Reconciler
 )
 
 func TestAPIs(t *testing.T) {
@@ -59,10 +60,11 @@ var _ = BeforeSuite(func() {
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...))
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
-	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
+	cs := karpentercluster.New(ctx, env.Clock, nil, nil, cloudProvider)
+	cluster = state.NewCluster(env.Clock, env.Client, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
 	clusterCost = cost.NewClusterCost(ctx, cloudProvider, env.Client)
 	gcController = nodeclaimgc.NewController(env.Client, cluster)
-	nodeClaimController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
+	nodeClaimController = NodeClaimInformer(env.Client, cluster, informer.NewNodeClaimController(env.Client, cloudProvider, clusterCost))
 })
 
 var _ = AfterSuite(func() {
@@ -82,7 +84,7 @@ func request(name string) reconcile.Request {
 var _ = Describe("NodeClaim Cluster State GC", func() {
 	It("should heal the wedge caused by a seed landing after the informer's delete cleanup", func() {
 		// The informer observes the NotFound and cleans up first (a no-op against empty state),
-		// then the provisioner's seed lands and strands name -> "". Synced() is now stuck false
+		// then the provisioner's seed lands and strands name -> "". NodeClaimsLaunched() is now stuck false
 		// until state.nodeclaimgc reconciles.
 		nodeClaim := test.NodeClaim()
 		nodeClaim.Status.ProviderID = ""
@@ -91,15 +93,15 @@ var _ = Describe("NodeClaim Cluster State GC", func() {
 		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 		// The provisioner's post-create seed lands afterwards, stranding the ghost entry.
 		cluster.UpdateNodeClaim(nodeClaim)
-		Expect(cluster.Synced(ctx)).To(BeFalse())
+		Expect(cluster.NodeClaimsLaunched(ctx)).To(BeFalse())
 
 		// A later re-check of the NodeClaim (still gone) heals it.
 		ExpectReconciled(ctx, gcController, request(nodeClaim.Name))
 		Expect(cluster.NodeClaimExists(nodeClaim.Name)).To(BeFalse())
-		Expect(cluster.Synced(ctx)).To(BeTrue())
+		Expect(cluster.NodeClaimsLaunched(ctx)).To(BeTrue())
 	})
 	It("should not evict an unlaunched NodeClaim that still exists after the grace period", func() {
-		// A NodeClaim that is genuinely still launching (empty providerID) must keep Synced() false and must not be
+		// A NodeClaim that is genuinely still launching (empty providerID) must keep NodeClaimsLaunched() false and must not be
 		// evicted. Any later deletion lands after the seed, so the informer's normal cleanup handles it.
 		nodeClaim := test.NodeClaim()
 		nodeClaim.Status.ProviderID = ""
@@ -107,15 +109,15 @@ var _ = Describe("NodeClaim Cluster State GC", func() {
 		cluster.UpdateNodeClaim(nodeClaim)
 
 		Expect(cluster.UnlaunchedNodeClaimExists(nodeClaim.Name)).To(BeTrue())
-		Expect(cluster.Synced(ctx)).To(BeFalse())
+		Expect(cluster.NodeClaimsLaunched(ctx)).To(BeFalse())
 
 		ExpectReconciled(ctx, gcController, request(nodeClaim.Name))
 
 		Expect(cluster.UnlaunchedNodeClaimExists(nodeClaim.Name)).To(BeTrue())
-		Expect(cluster.Synced(ctx)).To(BeFalse())
+		Expect(cluster.NodeClaimsLaunched(ctx)).To(BeFalse())
 	})
 	It("should not evict a launched entry even if its NodeClaim no longer exists", func() {
-		// Launched entries (non-empty providerID) never hold Synced() false and are owned by the informer, not this
+		// Launched entries (non-empty providerID) never hold NodeClaimsLaunched() false and are owned by the informer, not this
 		// controller. Even with the NodeClaim is gone from cache, the controller must leave them untouched.
 		nodeClaim := test.NodeClaim()
 		nodeClaim.Status.ProviderID = test.RandomProviderID()
@@ -138,6 +140,6 @@ var _ = Describe("NodeClaim Cluster State GC", func() {
 		ExpectReconciled(ctx, gcController, request(nodeClaim.Name))
 
 		Expect(cluster.NodeClaimExists(nodeClaim.Name)).To(BeFalse())
-		Expect(cluster.Synced(ctx)).To(BeTrue())
+		Expect(cluster.NodeClaimsLaunched(ctx)).To(BeTrue())
 	})
 })

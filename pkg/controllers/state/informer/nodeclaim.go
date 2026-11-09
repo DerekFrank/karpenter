@@ -29,27 +29,25 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 )
 
-// NodeClaimController reconciles nodeclaim for the purpose of maintaining state.
+// NodeClaimController keeps the cluster cost of each managed NodeClaim. Cluster state's NodeClaim store follows the
+// NodeClaims itself.
 type NodeClaimController struct {
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
-	cluster       *state.Cluster
 	clusterCost   *cost.ClusterCost
 }
 
 // NewNodeClaimController constructs a controller instance
-func NewNodeClaimController(kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, cluster *state.Cluster, clusterCost *cost.ClusterCost) *NodeClaimController {
+func NewNodeClaimController(kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, clusterCost *cost.ClusterCost) *NodeClaimController {
 	return &NodeClaimController{
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
-		cluster:       cluster,
 		clusterCost:   clusterCost,
 	}
 }
@@ -64,8 +62,6 @@ func (c *NodeClaimController) Reconcile(ctx context.Context, req reconcile.Reque
 	nodeClaim := &v1.NodeClaim{}
 	if err := c.kubeClient.Get(ctx, req.NamespacedName, nodeClaim); err != nil {
 		if errors.IsNotFound(err) {
-			// notify cluster state of the node deletion
-			c.cluster.DeleteNodeClaim(req.Name)
 			if deleteErr := c.clusterCost.DeleteNodeClaim(ctx, req.NamespacedName); deleteErr != nil {
 				return reconcile.Result{}, deleteErr
 			}
@@ -75,12 +71,10 @@ func (c *NodeClaimController) Reconcile(ctx context.Context, req reconcile.Reque
 	if !nodeclaimutils.IsManaged(nodeClaim, c.cloudProvider) {
 		return reconcile.Result{}, nil
 	}
-	c.cluster.UpdateNodeClaim(nodeClaim)
 	if err := c.clusterCost.UpdateNodeClaim(ctx, nodeClaim); err != nil {
 		return reconcile.Result{}, err
 	}
-	// ensure it's aware of any nodes we discover, this is a no-op if the node is already known to our cluster state
-	return reconcile.Result{RequeueAfter: stateRetryPeriod}, nil
+	return reconcile.Result{RequeueAfter: stateRetryPeriod}, nil //storelint:deadline poll: cost reads NodeClaims outside cluster state (review 18)
 }
 
 func (c *NodeClaimController) Register(ctx context.Context, m manager.Manager) error {

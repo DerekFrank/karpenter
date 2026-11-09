@@ -110,6 +110,24 @@ func (in *VolumeUsage) DeepCopyInto(out *VolumeUsage) {
 			(*out)[key] = outVal
 		}
 	}
+	if in.existing != nil {
+		in, out := &in.existing, &out.existing
+		*out = make(Volumes, len(*in))
+		for key, val := range *in {
+			var outVal map[string]sets.Empty
+			if val == nil {
+				(*out)[key] = nil
+			} else {
+				inVal := (*in)[key]
+				in, out := &inVal, &outVal
+				*out = make(sets.Set[string], len(*in))
+				for key, val := range *in {
+					(*out)[key] = val
+				}
+			}
+			(*out)[key] = outVal
+		}
+	}
 	if in.podVolumes != nil {
 		in, out := &in.podVolumes, &out.podVolumes
 		*out = make(map[types.NamespacedName]Volumes, len(*in))

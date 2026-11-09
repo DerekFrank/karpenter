@@ -110,8 +110,9 @@ func ListManaged(ctx context.Context, c client.Client, cloudProvider cloudprovid
 	}), nil
 }
 
-// NodeEventHandler is a watcher on corev1.Node that maps Nodes to NodeClaims based on provider ids
-// and enqueues reconcile.Requests for the NodeClaims
+// NodeEventHandler is a watcher on corev1.Node that maps Nodes to NodeClaims based on provider ids, through the
+// cache's providerID index, and enqueues reconcile.Requests for the NodeClaims. Cluster state keys nothing by
+// providerID, so a controller that acts on a NodeClaim's Node before registration links them maps its events here.
 func NodeEventHandler(c client.Client, cloudProvider cloudprovider.CloudProvider) handler.EventHandler {
 	return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []reconcile.Request {
 		// Because we get so many NodeClaims from this response, we are not DeepCopying the cached data here

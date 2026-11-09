@@ -60,17 +60,18 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/apis/v1alpha1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
-	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	pscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
 	"sigs.k8s.io/karpenter/pkg/test"
 	testv1alpha1 "sigs.k8s.io/karpenter/pkg/test/v1alpha1"
+	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 )
 
 const (
@@ -358,7 +359,8 @@ func ExpectProvisioned(ctx context.Context, c client.Client, cluster *state.Clus
 			} else {
 				ExpectManualBinding(ctx, c, pod, binding.Node)
 			}
-			Expect(cluster.UpdatePod(ctx, pod)).To(Succeed()) // track pod bindings
+			cluster.PodStore.Observe(pod) // track pod bindings, as the pod informer would
+			Expect(cluster.ResolvePVCDrivers(ctx, pod)).To(Succeed())
 
 			if result.ResourceClaimAllocationMetadata != nil {
 				expectDRAClaimsAllocated(ctx, c, pod, binding, result.ResourceClaimAllocationMetadata)
@@ -390,12 +392,13 @@ func ExpectProvisionedNoBinding(ctx context.Context, c client.Client, cluster *s
 	}
 	for _, m := range results.NewNodeClaims {
 		// TODO: Check the error on the provisioner launch
-		nodeClaimName, err := provisioner.Create(ctx, m, provisioning.WithReason(metrics.ProvisionedReason))
+		// CreateNodeClaims binds or releases the NodeClaim's reservations, as the provisioner does.
+		nodeClaimNames, err := provisioner.CreateNodeClaims(ctx, []*scheduling.NodeClaim{m}, provisioning.WithReason(metrics.ProvisionedReason))
 		if err != nil {
 			return result
 		}
 		nodeClaim := &v1.NodeClaim{}
-		Expect(c.Get(ctx, types.NamespacedName{Name: nodeClaimName}, nodeClaim)).To(Succeed())
+		Expect(c.Get(ctx, types.NamespacedName{Name: nodeClaimNames[0]}, nodeClaim)).To(Succeed())
 		nodeClaim, node := ExpectNodeClaimDeployedAndStateUpdated(ctx, c, cluster, cloudProvider, nodeClaim)
 		if nodeClaim != nil && node != nil {
 			for _, pod := range m.Pods {
@@ -460,6 +463,8 @@ func ExpectNodeClaimDeployed(ctx context.Context, c client.Client, cloudProvider
 	node := test.NodeClaimLinkedNode(nc)
 	node.Spec.Taints = lo.Reject(node.Spec.Taints, func(t corev1.Taint, _ int) bool { return t.MatchTaint(&v1.UnregisteredNoExecuteTaint) })
 	node.Labels = lo.Assign(node.Labels, map[string]string{v1.NodeRegisteredLabelKey: "true"})
+	// Registration links the Node to its NodeClaim by owner reference, which cluster state reads the Node by.
+	node = nodeclaimutils.UpdateNodeOwnerReferences(nc, node)
 	nc.Status.NodeName = node.Name
 	ExpectApplied(ctx, c, nc, node)
 	expectResourceSlicesCreated(ctx, c, cloudProvider, nc, node)
@@ -728,7 +733,7 @@ func ExpectNodeClaimDeployedAndStateUpdated(ctx context.Context, c client.Client
 	if err != nil {
 		return nc, nil
 	}
-	Expect(cluster.UpdateNode(ctx, node)).To(Succeed())
+	ExpectNodeObserved(ctx, c, cluster, node)
 	return nc, node
 }
 
@@ -991,11 +996,11 @@ func ExpectNodeClaims(ctx context.Context, c client.Client) []*v1.NodeClaim {
 	return lo.ToSlicePtr(nodeClaims.Items)
 }
 
-func ExpectStateNodeExists(cluster *state.Cluster, node *corev1.Node) *state.StateNode {
+func ExpectStateNodeExists(cluster *state.Cluster, node *corev1.Node) *karpentercluster.StateNode {
 	GinkgoHelper()
-	var ret *state.StateNode
+	var ret *karpentercluster.StateNode
 	for n := range cluster.Nodes() {
-		if n.Node.Name == node.Name {
+		if n.Node != nil && n.Node.Name == node.Name {
 			ret = n.DeepCopy()
 			break
 		}
@@ -1004,11 +1009,11 @@ func ExpectStateNodeExists(cluster *state.Cluster, node *corev1.Node) *state.Sta
 	return ret
 }
 
-func ExpectStateNodeExistsForNodeClaim(cluster *state.Cluster, nodeClaim *v1.NodeClaim) *state.StateNode {
+func ExpectStateNodeExistsForNodeClaim(cluster *state.Cluster, nodeClaim *v1.NodeClaim) *karpentercluster.StateNode {
 	GinkgoHelper()
-	var ret *state.StateNode
+	var ret *karpentercluster.StateNode
 	for n := range cluster.Nodes() {
-		if n.NodeClaim.Status.ProviderID == nodeClaim.Status.ProviderID {
+		if n.NodeClaim != nil && n.NodeClaim.Status.ProviderID == nodeClaim.Status.ProviderID {
 			ret = n.DeepCopy()
 			break
 		}
@@ -1017,11 +1022,31 @@ func ExpectStateNodeExistsForNodeClaim(cluster *state.Cluster, nodeClaim *v1.Nod
 	return ret
 }
 
-func ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx context.Context, c client.Client, clk clock.Clock, nodeStateController *informer.NodeController, nodeClaimStateController *informer.NodeClaimController, nodes []*corev1.Node, nodeClaims []*v1.NodeClaim) {
+// ExpectRegistered applies the NodeClaim, then its Node with the owner reference registration sets, which links the
+// Node to the NodeClaim in cluster state, and returns the Node as applied.
+func ExpectRegistered(ctx context.Context, c client.Client, nodeClaim *v1.NodeClaim, node *corev1.Node) *corev1.Node {
+	GinkgoHelper()
+	ExpectApplied(ctx, c, nodeClaim)
+	node = nodeclaimutils.UpdateNodeOwnerReferences(nodeClaim, node)
+	ExpectApplied(ctx, c, node)
+	return node
+}
+
+func ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx context.Context, c client.Client, clk clock.Clock, nodeStateController, nodeClaimStateController reconcile.Reconciler, nodes []*corev1.Node, nodeClaims []*v1.NodeClaim) {
 	GinkgoHelper()
 
 	ExpectMakeNodesInitialized(ctx, c, clk, nodes...)
 	ExpectMakeNodeClaimsInitialized(ctx, c, clk, nodeClaims...)
+	// Registration links each Node to its NodeClaim by owner reference, which cluster state reads the Node by.
+	for i := range nodes {
+		for _, nodeClaim := range nodeClaims {
+			if nodeClaim.Status.ProviderID != "" && nodeClaim.Status.ProviderID == nodes[i].Spec.ProviderID {
+				nodes[i] = ExpectExists(ctx, c, nodes[i])
+				nodes[i] = nodeclaimutils.UpdateNodeOwnerReferences(nodeClaim, nodes[i])
+				ExpectApplied(ctx, c, nodes[i])
+			}
+		}
+	}
 
 	// Inform cluster state about node and nodeclaim readiness
 	for _, n := range nodes {
@@ -1083,11 +1108,11 @@ func ExpectParallelized(fs ...func()) {
 	wg.Wait()
 }
 
-func ExpectStateNodePoolCount(cluster *state.Cluster, npName string, r, d, pd int) {
+func ExpectStateNodePoolCount(cluster *state.Cluster, npName string, r, d, reservedNodes int) {
 	GinkgoHelper()
 
-	running, deleting, pendingdisruption := cluster.NodePoolState.GetNodeCount(npName)
+	running, deleting, reserved := cluster.NodePoolState.GetNodeCount(npName)
 	Expect(running).To(Equal(r))
 	Expect(deleting).To(Equal(d))
-	Expect(pendingdisruption).To(Equal(pd))
+	Expect(reserved).To(Equal(reservedNodes))
 }

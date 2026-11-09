@@ -46,16 +46,16 @@ var _ = Describe("Suite Clock Wiring", func() {
 
 		// nominationWindow is max(2*BatchMaxDuration, 10s), so 20s at the suite's
 		// default BatchMaxDuration of 10s.
-		cluster.NominateNodeForPod(ctx, node.Spec.ProviderID)
+		cs.Nomination.Nominate(ctx, nodeClaim.Name)
 
-		Expect(cluster.IsNodeNominated(node.Spec.ProviderID)).To(BeTrue())
+		Expect(cluster.IsNodeNominated(nodeClaim.Name)).To(BeTrue())
 
 		env.Clock.Step(10 * time.Second)
-		Expect(cluster.IsNodeNominated(node.Spec.ProviderID)).To(BeTrue(),
+		Expect(cluster.IsNodeNominated(nodeClaim.Name)).To(BeTrue(),
 			"10s is inside the 20s nomination window")
 
 		env.Clock.Step(11 * time.Second)
-		Expect(cluster.IsNodeNominated(node.Spec.ProviderID)).To(BeFalse(),
+		Expect(cluster.IsNodeNominated(nodeClaim.Name)).To(BeFalse(),
 			"21s is past the 20s nomination window; a cluster holding a second clock would still report nominated")
 	})
 })

@@ -28,6 +28,7 @@ import (
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/test"
@@ -45,7 +46,8 @@ func BenchmarkNewTopology(b *testing.B) {
 
 			client := fakecr.NewFakeClient()
 			clk := &clock.RealClock{}
-			cl := state.NewCluster(clk, client, cp)
+			cs := karpentercluster.New(ctx, clk, nil, nil, cp)
+			cl := state.NewCluster(clk, client, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
 
 			nodePools := benchNodePools(np)
 			itsByNP := map[string][]*cloudprovider.InstanceType{}
