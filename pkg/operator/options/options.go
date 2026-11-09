@@ -67,10 +67,12 @@ type FeatureGates struct {
 	NodeOverlay               bool
 	StaticCapacity            bool
 	CapacityBuffer            bool
+	CapacityQuota             bool
 	TerminateFirstDrift       bool
 	TerminateFirstRepair      bool
 	PodDeletionCostManagement bool
 	PredictionEnabled         bool
+	ReadAfterWriteOverlay     bool
 }
 
 // FeatureGate is the source-of-truth description of a feature gate. Declaring gates as FeatureGates keeps each gate's
@@ -128,6 +130,13 @@ var (
 		Help: "Enables the CapacityBuffer API (autoscaling.x-k8s.io). Karpenter provisions and keeps the spare " +
 			"capacity CapacityBuffers describe.",
 	}
+	CapacityQuotaFeatureGate = FeatureGate{
+		Name:    "CapacityQuota",
+		Default: false,
+		Stage:   docs.Alpha,
+		Help: "Enables the CapacityQuota API (autoscaling.x-k8s.io). Karpenter launches a node only if it fits " +
+			"every CapacityQuota whose selector may match it, as well as its NodePool's limits.",
+	}
 	TerminateFirstDriftFeatureGate = FeatureGate{
 		Name:    "TerminateFirstDrift",
 		Default: false,
@@ -157,6 +166,13 @@ var (
 			"predicted by a registered prediction source, and waits for that source to hydrate before scheduling. " +
 			"Requires a registered prediction source.",
 	}
+	ReadAfterWriteOverlayFeatureGate = FeatureGate{
+		Name:    "ReadAfterWriteOverlay",
+		Default: false,
+		Stage:   docs.Alpha,
+		Help: "Karpenter's reads of NodeClaims, NodePools, Nodes and Pods from its cache include its own writes as " +
+			"soon as they return, rather than once the informer delivers them, without waiting for the informer.",
+	}
 )
 
 // KarpenterFeatureGates are the feature gates Karpenter supports, in the order --feature-gates lists them.
@@ -167,10 +183,12 @@ var KarpenterFeatureGates = []FeatureGate{
 	NodeOverlayFeatureGate,
 	StaticCapacityFeatureGate,
 	CapacityBufferFeatureGate,
+	CapacityQuotaFeatureGate,
 	TerminateFirstDriftFeatureGate,
 	TerminateFirstRepairFeatureGate,
 	PodDeletionCostManagementFeatureGate,
 	PredictionEnabledFeatureGate,
+	ReadAfterWriteOverlayFeatureGate,
 }
 
 // Options contains all CLI flags / env vars for karpenter-core. It adheres to the options.Injectable interface.
@@ -294,10 +312,12 @@ func DefaultFeatureGates() FeatureGates {
 		NodeOverlay:               NodeOverlayFeatureGate.Default,
 		StaticCapacity:            StaticCapacityFeatureGate.Default,
 		CapacityBuffer:            CapacityBufferFeatureGate.Default,
+		CapacityQuota:             CapacityQuotaFeatureGate.Default,
 		TerminateFirstDrift:       TerminateFirstDriftFeatureGate.Default,
 		TerminateFirstRepair:      TerminateFirstRepairFeatureGate.Default,
 		PodDeletionCostManagement: PodDeletionCostManagementFeatureGate.Default,
 		PredictionEnabled:         PredictionEnabledFeatureGate.Default,
+		ReadAfterWriteOverlay:     ReadAfterWriteOverlayFeatureGate.Default,
 	}
 }
 
@@ -329,6 +349,9 @@ func ParseFeatureGates(gateStr string) (FeatureGates, error) {
 	if val, ok := gateMap[CapacityBufferFeatureGate.Name]; ok {
 		gates.CapacityBuffer = val
 	}
+	if val, ok := gateMap[CapacityQuotaFeatureGate.Name]; ok {
+		gates.CapacityQuota = val
+	}
 	if val, ok := gateMap[TerminateFirstDriftFeatureGate.Name]; ok {
 		gates.TerminateFirstDrift = val
 	}
@@ -340,6 +363,9 @@ func ParseFeatureGates(gateStr string) (FeatureGates, error) {
 	}
 	if val, ok := gateMap[PredictionEnabledFeatureGate.Name]; ok {
 		gates.PredictionEnabled = val
+	}
+	if val, ok := gateMap[ReadAfterWriteOverlayFeatureGate.Name]; ok {
+		gates.ReadAfterWriteOverlay = val
 	}
 
 	return gates, nil
