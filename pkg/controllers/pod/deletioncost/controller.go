@@ -19,6 +19,7 @@ package deletioncost
 import (
 	"context"
 	"fmt"
+	"iter"
 	"math"
 	"strconv"
 	"time"
@@ -35,10 +36,12 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 )
 
@@ -79,6 +82,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		WatchesRawSource(singleton.Source()).
+		WatchesRawSource(karpenterstate.Requires(c.cluster)).
 		Complete(singleton.AsReconciler(c))
 }
 
@@ -91,26 +95,17 @@ func (c *Controller) Name() string {
 func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
 
-	if !c.cluster.Synced(ctx) {
-		return reconciler.Result{RequeueAfter: time.Second}, nil
-	}
-
 	// Assigned only after enqueueing succeeds, so a mid-reconcile error retries
 	// against the same state. Do not hoist the assignment up here.
 	currentState := c.cluster.ConsolidationState()
 	if currentState.Equal(c.lastConsolidationState) {
 		log.FromContext(ctx).V(1).Info("no changes detected, skipping pod deletion cost update")
-		return reconciler.Result{RequeueAfter: reconcileInterval}, nil
+		return reconciler.Result{RequeueAfter: reconcileInterval}, nil //storelint:deadline poll: until deletioncost wakes on disruption's sources (review 21)
 	}
 
-	// Pointer aliases, not deep copies. Torn reads are acceptable: the writes are
-	// best-effort and the next reconcile picks up any drift.
-	var nodes []*state.StateNode
-	for n := range c.cluster.Nodes() {
-		nodes = append(nodes, n)
-	}
-	if len(nodes) == 0 {
-		return reconciler.Result{RequeueAfter: reconcileInterval}, nil
+	// RankNodes reads the nodes from cluster state; skip the NodePool lookups when there are none.
+	if _, ok := first(c.cluster.Nodes()); !ok {
+		return reconciler.Result{RequeueAfter: reconcileInterval}, nil //storelint:deadline poll: until deletioncost wakes on disruption's sources (review 21)
 	}
 
 	// Shared with consolidation so both resolve instance types identically.
@@ -119,7 +114,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return reconciler.Result{}, fmt.Errorf("building node pool map, %w", err)
 	}
 
-	groupA, groupBC, groupD, err := RankNodes(ctx, c.kubeClient, c.clock, nodes, nodePoolMap, nodePoolToInstanceTypesMap)
+	groupA, groupBC, groupD, err := RankNodes(ctx, c.kubeClient, c.clock, c.cluster, nodePoolMap, nodePoolToInstanceTypesMap)
 	if err != nil {
 		return reconciler.Result{}, fmt.Errorf("ranking nodes, %w", err)
 	}
@@ -138,12 +133,12 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	if total > 0 {
 		log.FromContext(ctx).V(1).WithValues("nodeCount", total).Info("enqueued pod deletion cost annotation writes")
 	}
-	return reconciler.Result{RequeueAfter: reconcileInterval}, nil
+	return reconciler.Result{RequeueAfter: reconcileInterval}, nil //storelint:deadline poll: until deletioncost wakes on disruption's sources (review 21)
 }
 
 // Group A bypasses the per-cycle cap so nodes already being torn down always
 // annotate promptly. Returns per-nodepool counts of nodes annotated.
-func (c *Controller) enqueueAnnotationWrites(ctx context.Context, groupA, groupBC, groupD []*state.StateNode) map[string]int {
+func (c *Controller) enqueueAnnotationWrites(ctx context.Context, groupA, groupBC, groupD []*karpentercluster.StateNode) map[string]int {
 	perNodePool := map[string]int{}
 	for _, node := range groupA {
 		c.tryEnqueueNode(ctx, node, math.MinInt32, false, perNodePool)
@@ -158,7 +153,7 @@ func (c *Controller) enqueueAnnotationWrites(ctx context.Context, groupA, groupB
 	return perNodePool
 }
 
-func (c *Controller) tryEnqueueNode(ctx context.Context, node *state.StateNode, rank int, cleanup bool, perNodePool map[string]int) bool {
+func (c *Controller) tryEnqueueNode(ctx context.Context, node *karpentercluster.StateNode, rank int, cleanup bool, perNodePool map[string]int) bool {
 	pods, _ := node.Pods(ctx, c.kubeClient)
 	// kube-controller-manager's ReplicaSet controller is the only in-tree consumer
 	// of corev1.PodDeletionCost, so writing it on a pod controlled by any other
@@ -175,7 +170,7 @@ func (c *Controller) tryEnqueueNode(ctx context.Context, node *state.StateNode, 
 	return true
 }
 
-func (c *Controller) enqueueCapped(ctx context.Context, nodes []*state.StateNode, budget int, perNodePool map[string]int, rankAt func(i int) (int, bool)) int {
+func (c *Controller) enqueueCapped(ctx context.Context, nodes []*karpentercluster.StateNode, budget int, perNodePool map[string]int, rankAt func(i int) (int, bool)) int {
 	if budget <= 0 {
 		return 0
 	}
@@ -209,4 +204,13 @@ func podHasDesiredAnnotation(pod *corev1.Pod, rank int, cleanup bool) bool {
 		return !has
 	}
 	return pod.Annotations[corev1.PodDeletionCost] == strconv.Itoa(rank)
+}
+
+// first returns the first value of seq, and whether it has one.
+func first[V any](seq iter.Seq[V]) (V, bool) {
+	for v := range seq {
+		return v, true
+	}
+	var zero V
+	return zero, false
 }

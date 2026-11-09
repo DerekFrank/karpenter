@@ -22,17 +22,17 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/clock"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
+
 	"sigs.k8s.io/karpenter/pkg/test"
 )
 
 var _ = Describe("StateNode Reboot", func() {
 	// stateNode builds an initialized, registered, managed StateNode. rebootStatus, when non-empty, sets
 	// the Rebooting condition to that status; taints are placed on the Node.
-	stateNode := func(rebootStatus metav1.ConditionStatus, taints ...corev1.Taint) *state.StateNode {
+	stateNode := func(rebootStatus metav1.ConditionStatus, taints ...corev1.Taint) *karpentercluster.StateNode {
 		nc := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: "default"}}})
 		n := test.Node(test.NodeOptions{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
 			v1.NodePoolLabelKey:        "default",
@@ -46,7 +46,7 @@ var _ = Describe("StateNode Reboot", func() {
 		case metav1.ConditionFalse:
 			nc.StatusConditions().SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "done")
 		}
-		return &state.StateNode{Node: n, NodeClaim: nc}
+		return &karpentercluster.StateNode{Node: n, NodeClaim: nc}
 	}
 
 	Context("RebootInProgress", func() {
@@ -60,17 +60,7 @@ var _ = Describe("StateNode Reboot", func() {
 			Expect(stateNode("").RebootInProgress()).To(BeFalse())
 		})
 		It("is false when the StateNode has no NodeClaim", func() {
-			Expect((&state.StateNode{Node: test.Node()}).RebootInProgress()).To(BeFalse())
-		})
-	})
-
-	Context("ValidateNodeDisruptable", func() {
-		It("rejects a rebooting node so other disruption skips it", func() {
-			err := stateNode(metav1.ConditionTrue).ValidateNodeDisruptable(clock.RealClock{})
-			Expect(err).To(MatchError(ContainSubstring("node is rebooting")))
-		})
-		It("does not reject a node that is not rebooting", func() {
-			Expect(stateNode(metav1.ConditionFalse).ValidateNodeDisruptable(clock.RealClock{})).To(Succeed())
+			Expect((&karpentercluster.StateNode{Node: test.Node()}).RebootInProgress()).To(BeFalse())
 		})
 	})
 
