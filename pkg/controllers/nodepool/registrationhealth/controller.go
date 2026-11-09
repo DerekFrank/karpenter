@@ -24,8 +24,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/utils/clock"
 
-	"sigs.k8s.io/karpenter/pkg/state/nodepoolhealth"
-
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 
 	controllerruntime "sigs.k8s.io/controller-runtime"
@@ -33,24 +31,30 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/cluster"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 )
 
-// Controller for the resource
+// Controller derives each NodePool's NodeRegistrationHealthy condition from the launch outcomes the NodeClaim
+// lifecycle controller records for the NodePool's current spec. It's the condition's one writer, and writes nothing
+// to the recorded outcomes.
 type Controller struct {
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
-	npState       *nodepoolhealth.State
-	clock         clock.Clock
+	// npState holds each NodePool's recorded launch outcomes, which go once the NodePool does.
+	npState *cluster.NodePoolState
+	clock   clock.Clock
 }
 
-// NewController will create a controller to reset NodePool's registration health when there is an update to NodePool/NodeClass spec
-func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, npState *nodepoolhealth.State) *Controller {
+// NewController returns the controller that sets each NodePool's NodeRegistrationHealthy condition.
+func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, npState *cluster.NodePoolState) *Controller {
 	return &Controller{
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
@@ -63,7 +67,6 @@ func (c *Controller) Name() string {
 	return "nodepool.registrationhealth"
 }
 
-//nolint:gocyclo
 func (c *Controller) Reconcile(ctx context.Context, nodePool *v1.NodePool) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
 
@@ -77,26 +80,24 @@ func (c *Controller) Reconcile(ctx context.Context, nodePool *v1.NodePool) (reco
 	}
 	stored := nodePool.DeepCopy()
 
-	// If Karpenter restarts i.e. if the buffer for the nodePool is empty and the NodeRegistrationHealthy status condition
-	// is set to either true/false then we pre-hydrate the buffer with the existing state of the status condition
-	if c.npState.Status(nodePool.UID) == nodepoolhealth.StatusUnknown {
-		if nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy).IsTrue() {
-			c.npState.SetStatus(nodePool.UID, nodepoolhealth.StatusHealthy)
-		}
-		if nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy).IsFalse() {
-			c.npState.SetStatus(nodePool.UID, nodepoolhealth.StatusUnhealthy)
+	// The outcomes count only for the spec they were recorded against, so a new NodePool or NodeClass spec has none.
+	health := c.npState.RegistrationHealth(nodePool, nodeClass.GetGeneration())
+	switch health.Status {
+	case cluster.RegistrationHealthy:
+		nodePool.StatusConditions(status.WithClock(c.clock)).SetTrue(v1.ConditionTypeNodeRegistrationHealthy)
+	case cluster.RegistrationUnhealthy:
+		nodePool.StatusConditions(status.WithClock(c.clock)).SetFalse(v1.ConditionTypeNodeRegistrationHealthy, health.Reason, health.Message)
+	default:
+		// Without outcomes for the current spec, such as after a restart, a condition observed for the current spec
+		// stands. A condition observed for an earlier spec, or none, is Unknown.
+		if cond := nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy); cond == nil ||
+			nodePool.Status.NodeClassObservedGeneration != nodeClass.GetGeneration() ||
+			nodePool.Generation != cond.ObservedGeneration {
+			nodePool.StatusConditions(status.WithClock(c.clock)).SetUnknown(v1.ConditionTypeNodeRegistrationHealthy)
 		}
 	}
-
-	// If NodeClass/NodePool have been updated then NodeRegistrationHealthy = Unknown and reset the buffer
-	if nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy) == nil ||
-		nodePool.Status.NodeClassObservedGeneration != nodeClass.GetGeneration() ||
-		nodePool.Generation != nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy).ObservedGeneration {
-		nodePool.StatusConditions(status.WithClock(c.clock)).SetUnknown(v1.ConditionTypeNodeRegistrationHealthy)
-		c.npState.SetStatus(nodePool.UID, nodepoolhealth.StatusUnknown)
-	}
-
 	nodePool.Status.NodeClassObservedGeneration = nodeClass.GetGeneration()
+
 	if !equality.Semantic.DeepEqual(stored, nodePool) {
 		// We use client.MergeFromWithOptimisticLock because patching a list with a JSON merge patch
 		// can cause races due to the fact that it fully replaces the list on a change
@@ -111,13 +112,32 @@ func (c *Controller) Reconcile(ctx context.Context, nodePool *v1.NodePool) (reco
 	return reconcile.Result{}, nil
 }
 
+// registration is what this controller reads of a NodePool's entry: the NodePool's generation, and the spec and health
+// of its recorded launch outcomes.
+type registration struct {
+	Generation int64
+	Key        cluster.RegistrationKey
+	Health     cluster.RegistrationHealth
+}
+
+// registrations is the NodePool store narrowed to registration: it reconciles each NodePool at startup, on a NodePool
+// spec change, and when a recorded outcome changes its health, and not on the NodePool's every status update. A
+// NodePool that's gone takes its outcomes with it, and needs no reconcile.
+func (c *Controller) registrations() source.SyncingSource {
+	return c.npState.SourceOn(func(_ string, e cluster.NodePoolEntry) any {
+		r := e.Intent.Registration.Value
+		return registration{Generation: e.Object.Generation, Key: r.RegistrationKey, Health: r.Health()}
+	})
+}
+
 func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 	b := controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
-		For(&v1.NodePool{}, builder.WithPredicates(nodepoolutils.IsManagedPredicateFuncs(c.cloudProvider))).
+		WatchesRawSource(c.registrations()).
 		WithOptions(controller.Options{MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), 10, 1000)})
 	for _, nodeClass := range c.cloudProvider.GetSupportedNodeClasses() {
-		b.Watches(nodeClass, nodepoolutils.NodeClassEventHandler(c.kubeClient))
+		// A NodeClass spec change starts its NodePools' health over.
+		b.Watches(nodeClass, nodepoolutils.NodeClassEventHandler(c.kubeClient), builder.WithPredicates(predicate.GenerationChangedPredicate{}))
 	}
 	return b.Complete(reconcile.AsReconciler(m.GetClient(), c))
 }
