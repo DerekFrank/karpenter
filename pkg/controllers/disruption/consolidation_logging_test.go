@@ -20,15 +20,18 @@ import (
 	"errors"
 	"testing"
 
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+
 	"sigs.k8s.io/karpenter/pkg/events"
 	pkgscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
@@ -479,7 +482,7 @@ func TestCommand_String(t *testing.T) {
 
 func mockCandidate(name string) *Candidate {
 	return &Candidate{
-		StateNode: &state.StateNode{
+		StateNode: &karpentercluster.StateNode{
 			Node: &corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: name,
@@ -532,7 +535,7 @@ func TestConsolidationCandidateEvent(t *testing.T) {
 
 	// Create a mock candidate with Node and NodeClaim
 	candidate := &Candidate{
-		StateNode: &state.StateNode{
+		StateNode: &karpentercluster.StateNode{
 			Node: &corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "test-node",
@@ -569,33 +572,24 @@ func TestConsolidationCandidateEvent(t *testing.T) {
 	}
 }
 
-func TestLaunchCapacityType(t *testing.T) {
+var _ = Describe("launchCapacityType", func() {
 	const onDemandAlt = "on-demand-alt"
-	if err := cloudprovider.SetCapacityTypeClassResolver(cloudprovider.DefaultCapacityTypeClasses.With(cloudprovider.CapacityTypeClasses{
-		onDemandAlt: cloudprovider.CapacityTypeClassOnDemand,
-	})); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(test.ResetCapacityTypeClasses)
-
-	tests := []struct {
-		name     string
-		allowed  []string
-		expected string
-	}{
-		{name: "reserved first", allowed: []string{v1.CapacityTypeReserved, v1.CapacityTypeSpot, v1.CapacityTypeOnDemand}, expected: v1.CapacityTypeReserved},
-		{name: "spot before on-demand", allowed: []string{v1.CapacityTypeSpot, v1.CapacityTypeOnDemand}, expected: v1.CapacityTypeSpot},
-		{name: "on-demand only", allowed: []string{v1.CapacityTypeOnDemand}, expected: v1.CapacityTypeOnDemand},
-		{name: "an additional on-demand class capacity type", allowed: []string{onDemandAlt}, expected: onDemandAlt},
-		{name: "more than one on-demand class capacity type", allowed: []string{v1.CapacityTypeOnDemand, onDemandAlt}, expected: string(cloudprovider.CapacityTypeClassOnDemand)},
-		{name: "spot before an additional on-demand class capacity type", allowed: []string{v1.CapacityTypeSpot, onDemandAlt}, expected: v1.CapacityTypeSpot},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			requirement := pkgscheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, tt.allowed...)
-			if got := launchCapacityType(requirement); got != tt.expected {
-				t.Errorf("launchCapacityType() = %v, want %v", got, tt.expected)
-			}
-		})
-	}
-}
+	BeforeEach(func() {
+		Expect(cloudprovider.SetCapacityTypeClassResolver(cloudprovider.DefaultCapacityTypeClasses.With(cloudprovider.CapacityTypeClasses{
+			onDemandAlt: cloudprovider.CapacityTypeClassOnDemand,
+		}))).To(Succeed())
+		DeferCleanup(test.ResetCapacityTypeClasses)
+	})
+	DescribeTable("should pick the launch capacity type",
+		func(allowed []string, expected string) {
+			requirement := pkgscheduling.NewRequirement(v1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, allowed...)
+			Expect(launchCapacityType(requirement)).To(Equal(expected))
+		},
+		Entry("reserved first", []string{v1.CapacityTypeReserved, v1.CapacityTypeSpot, v1.CapacityTypeOnDemand}, v1.CapacityTypeReserved),
+		Entry("spot before on-demand", []string{v1.CapacityTypeSpot, v1.CapacityTypeOnDemand}, v1.CapacityTypeSpot),
+		Entry("on-demand only", []string{v1.CapacityTypeOnDemand}, v1.CapacityTypeOnDemand),
+		Entry("an additional on-demand class capacity type", []string{onDemandAlt}, onDemandAlt),
+		Entry("more than one on-demand class capacity type", []string{v1.CapacityTypeOnDemand, onDemandAlt}, string(cloudprovider.CapacityTypeClassOnDemand)),
+		Entry("spot before an additional on-demand class capacity type", []string{v1.CapacityTypeSpot, onDemandAlt}, v1.CapacityTypeSpot),
+	)
+})

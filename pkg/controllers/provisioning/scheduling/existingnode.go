@@ -23,14 +23,15 @@ import (
 	v1 "k8s.io/api/core/v1"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
+
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
 type ExistingNode struct {
-	*state.StateNode
+	*karpentercluster.StateNode
 	cachedAvailable v1.ResourceList // Cache so we don't have to re-subtract resources on the StateNode every time
 	cachedTaints    []v1.Taint      // Cache so we don't hae to re-construct the taints each time we attempt to schedule a pod
 
@@ -44,7 +45,7 @@ type ExistingNode struct {
 	instanceType *cloudprovider.InstanceType
 }
 
-func NewExistingNode(n *state.StateNode, topology *Topology, taints []v1.Taint, daemonResources v1.ResourceList, instanceType *cloudprovider.InstanceType, isUnderConsolidateAfter bool) *ExistingNode {
+func NewExistingNode(n *karpentercluster.StateNode, topology *Topology, taints []v1.Taint, daemonResources v1.ResourceList, instanceType *cloudprovider.InstanceType, isUnderConsolidateAfter bool) *ExistingNode {
 	// The state node passed in here must be a deep copy from cluster state as we modify it
 	if instanceType != nil {
 		for driver, limit := range instanceType.VolumeAttachmentLimits {

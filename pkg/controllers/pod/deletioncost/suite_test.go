@@ -26,9 +26,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	coreapis "sigs.k8s.io/karpenter/pkg/apis"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/pod/deletioncost"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
@@ -48,7 +50,9 @@ type nodeRankInfo struct {
 
 // rankInfoFor folds the three RankNodes slices into a per-node lookup: RankForBC
 // for B/C, math.MinInt32 for A, cleanup=true for D.
-func rankInfoFor(name string, groupA, groupBC, groupD []*state.StateNode) nodeRankInfo {
+var cs karpentercluster.State
+
+func rankInfoFor(name string, groupA, groupBC, groupD []*karpentercluster.StateNode) nodeRankInfo {
 	for _, n := range groupA {
 		if n.Node != nil && n.Node.Name == name {
 			return nodeRankInfo{rank: math.MinInt32, cleanup: false, found: true}
@@ -67,7 +71,7 @@ func rankInfoFor(name string, groupA, groupBC, groupD []*state.StateNode) nodeRa
 	return nodeRankInfo{}
 }
 
-func totalRanked(groupA, groupBC, groupD []*state.StateNode) int {
+func totalRanked(groupA, groupBC, groupD []*karpentercluster.StateNode) int {
 	return len(groupA) + len(groupBC) + len(groupD)
 }
 
@@ -75,8 +79,8 @@ var ctx context.Context
 var env *test.Environment
 var cluster *state.Cluster
 var cloudProvider *fake.CloudProvider
-var nodeStateController *informer.NodeController
-var nodeClaimStateController *informer.NodeClaimController
+var nodeStateController reconcile.Reconciler
+var nodeClaimStateController reconcile.Reconciler
 var queue *deletioncost.Queue
 
 func TestAPIs(t *testing.T) {
@@ -94,10 +98,11 @@ var _ = BeforeSuite(func() {
 
 	ctx = options.ToContext(ctx, opts)
 	cloudProvider = fake.NewCloudProvider()
-	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
-	nodeStateController = informer.NewNodeController(env.Client, cluster)
+	cs = karpentercluster.New(ctx, env.Clock, nil, nil, cloudProvider)
+	cluster = state.NewCluster(env.Clock, env.Client, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
+	nodeStateController = NodeInformer(env.Client, cluster, nil)
 	clusterCost := cost.NewClusterCost(ctx, cloudProvider, env.Client)
-	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
+	nodeClaimStateController = NodeClaimInformer(env.Client, cluster, informer.NewNodeClaimController(env.Client, cloudProvider, clusterCost))
 })
 
 var _ = AfterSuite(func() {

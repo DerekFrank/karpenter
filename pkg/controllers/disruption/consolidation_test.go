@@ -3143,7 +3143,7 @@ var _ = Describe("Consolidation", func() {
 				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nc))
 			}
 			// Reset the disruption controller so consolidation methods are not cached as consolidated
-			*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov))
+			*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov, cs.Deletion))
 			disruptionController = disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
 				disruption.WithMethods(NewMethodsWithNopValidator()...))
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -3350,7 +3350,8 @@ var _ = Describe("Consolidation", func() {
 					},
 				})
 				m.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
-				ExpectApplied(ctx, env.Client, pods[i], m, n)
+				ExpectApplied(ctx, env.Client, pods[i])
+				n = ExpectRegistered(ctx, env.Client, m, n)
 				ExpectManualBinding(ctx, env.Client, pods[i], n)
 
 				if i == elem {
@@ -3666,7 +3667,7 @@ var _ = Describe("Consolidation", func() {
 				},
 				func() {
 					// wait for the controller to block on the validation timeout
-					Eventually(env.Clock.HasWaiters, time.Second*10).Should(BeTrue())
+					Eventually(validationClock.HasWaiters, time.Second*10).Should(BeTrue())
 					// controller should be blocking during the timeout
 					Expect(finished.Load()).To(BeFalse())
 					// and the node should not be deleted yet
@@ -3735,7 +3736,7 @@ var _ = Describe("Consolidation", func() {
 				},
 				func() {
 					// wait for the disruptionController to block on the validation timeout
-					Eventually(env.Clock.HasWaiters, time.Second*10).Should(BeTrue())
+					Eventually(validationClock.HasWaiters, time.Second*10).Should(BeTrue())
 					// controller should be blocking during the timeout
 					Expect(finished.Load()).To(BeFalse())
 
@@ -3797,7 +3798,7 @@ var _ = Describe("Consolidation", func() {
 				},
 				func() {
 					// wait for the disruptionController to block on the validation timeout
-					Eventually(env.Clock.HasWaiters, time.Second*10).Should(BeTrue())
+					Eventually(validationClock.HasWaiters, time.Second*10).Should(BeTrue())
 					// controller should be blocking during the timeout
 					Expect(finished.Load()).To(BeFalse())
 					// and the node should not be deleted yet
@@ -3837,7 +3838,7 @@ var _ = Describe("Consolidation", func() {
 					ExpectSingletonReconciled(ctx, disruptionController)
 				},
 				func() {
-					Eventually(env.Clock.HasWaiters, time.Second*10).Should(BeTrue())
+					Eventually(validationClock.HasWaiters, time.Second*10).Should(BeTrue())
 					doNotDisruptPod := test.Pod(test.PodOptions{
 						ObjectMeta: metav1.ObjectMeta{
 							Annotations: map[string]string{
@@ -3872,7 +3873,7 @@ var _ = Describe("Consolidation", func() {
 					ExpectSingletonReconciled(ctx, disruptionController)
 				},
 				func() {
-					Eventually(env.Clock.HasWaiters, time.Second*10).Should(BeTrue())
+					Eventually(validationClock.HasWaiters, time.Second*10).Should(BeTrue())
 					blockingPDBPod := test.Pod(test.PodOptions{
 						ObjectMeta: metav1.ObjectMeta{
 							Labels: labels,
@@ -3910,7 +3911,7 @@ var _ = Describe("Consolidation", func() {
 					ExpectSingletonReconciled(ctx, disruptionController)
 				},
 				func() {
-					Eventually(env.Clock.HasWaiters, time.Second*10).Should(BeTrue())
+					Eventually(validationClock.HasWaiters, time.Second*10).Should(BeTrue())
 					doNotDisruptPods := test.Pods(2, test.PodOptions{
 						ObjectMeta: metav1.ObjectMeta{
 							Annotations: map[string]string{
@@ -3948,7 +3949,7 @@ var _ = Describe("Consolidation", func() {
 					ExpectSingletonReconciled(ctx, disruptionController)
 				},
 				func() {
-					Eventually(env.Clock.HasWaiters, time.Second*10).Should(BeTrue())
+					Eventually(validationClock.HasWaiters, time.Second*10).Should(BeTrue())
 					blockingPDBPods := test.Pods(2, test.PodOptions{
 						ObjectMeta: metav1.ObjectMeta{
 							Labels: labels,
@@ -4242,7 +4243,7 @@ var _ = Describe("Consolidation", func() {
 					},
 					func() {
 						// wait for the controller to block on the validation timeout
-						Eventually(env.Clock.HasWaiters, time.Second*5).Should(BeTrue())
+						Eventually(validationClock.HasWaiters, time.Second*5).Should(BeTrue())
 						// controller should be blocking during the timeout
 						Expect(finished.Load()).To(BeFalse())
 						// and the node should not be deleted yet
@@ -4308,7 +4309,7 @@ var _ = Describe("Consolidation", func() {
 					},
 					func() {
 						// wait for the controller to block on the validation timeout (multi-node)
-						Eventually(env.Clock.HasWaiters, time.Second*5).Should(BeTrue())
+						Eventually(validationClock.HasWaiters, time.Second*5).Should(BeTrue())
 						// controller should be blocking during the timeout
 						Expect(finished.Load()).To(BeFalse())
 						// and the node should not be deleted yet
@@ -4379,7 +4380,7 @@ var _ = Describe("Consolidation", func() {
 					},
 					func() {
 						// wait for the controller to block on the validation timeout
-						Eventually(env.Clock.HasWaiters, time.Second*5).Should(BeTrue())
+						Eventually(validationClock.HasWaiters, time.Second*5).Should(BeTrue())
 						// controller should be blocking during the timeout
 						Expect(finished.Load()).To(BeFalse())
 
@@ -4410,7 +4411,7 @@ var _ = Describe("Consolidation", func() {
 						env.Clock.Step(31 * time.Second)
 
 						// wait for the controller to block on the validation timeout for single nodeclaim consolidation
-						Eventually(env.Clock.HasWaiters, time.Second*5).Should(BeTrue())
+						Eventually(validationClock.HasWaiters, time.Second*5).Should(BeTrue())
 						// advance the clock so that the timeout expires for single nodeclaim consolidation
 						env.Clock.Step(31 * time.Second)
 
@@ -4787,7 +4788,7 @@ var _ = Describe("Consolidation", func() {
 
 			// Mark the node for deletion and re-trigger reconciliation
 			oldNodeName := nodes[0].Name
-			cluster.MarkForDeletion(nodes[0].Spec.ProviderID)
+			cs.Deletion.Mark(nodeClaims[0].Name)
 			ExpectProvisionedNoBinding(ctx, env.Client, cluster, cloudProvider, prov, lo.Map(pods, func(p *corev1.Pod, _ int) *corev1.Pod { return p.DeepCopy() })...)
 
 			// Make sure that the cluster state is aware of the current node state
@@ -5191,8 +5192,8 @@ var _ = Describe("Consolidation", func() {
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
-			cluster.UpdateBufferPodCounts(map[string]int{
-				node.Spec.ProviderID: 5,
+			cs.BufferPods.Replace(map[string]int{
+				nodeClaim.Name: 5,
 			})
 
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -5217,8 +5218,8 @@ var _ = Describe("Consolidation", func() {
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 			// Node hosts buffer pods (but also has a real pod making it a consolidation candidate)
-			cluster.UpdateBufferPodCounts(map[string]int{
-				node.Spec.ProviderID: 2,
+			cs.BufferPods.Replace(map[string]int{
+				nodeClaim.Name: 2,
 			})
 
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -5264,9 +5265,9 @@ var _ = Describe("Consolidation", func() {
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 
 			// node1 has only buffer pods, node2 has real pod + buffer pods
-			cluster.UpdateBufferPodCounts(map[string]int{
-				nodes[0].Spec.ProviderID: 4,
-				nodes[1].Spec.ProviderID: 2,
+			cs.BufferPods.Replace(map[string]int{
+				nodeClaims[0].Name: 4,
+				nodeClaims[1].Name: 2,
 			})
 
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -5290,14 +5291,14 @@ var _ = Describe("Consolidation", func() {
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 			// First pass: buffer pods present → protected
-			cluster.UpdateBufferPodCounts(map[string]int{
-				node.Spec.ProviderID: 3,
+			cs.BufferPods.Replace(map[string]int{
+				nodeClaim.Name: 3,
 			})
 			ExpectSingletonReconciled(ctx, disruptionController)
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
 
 			// Second pass: buffer deleted → counts cleared
-			cluster.UpdateBufferPodCounts(map[string]int{})
+			cs.BufferPods.Replace(map[string]int{})
 			ExpectSingletonReconciled(ctx, disruptionController)
 			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)

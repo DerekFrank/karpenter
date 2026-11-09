@@ -732,7 +732,7 @@ var _ = Describe("Emptiness", func() {
 			},
 			func() {
 				// wait for the controller to block on the validation timeout
-				Eventually(env.Clock.HasWaiters, time.Second*10).Should(BeTrue())
+				Eventually(validationClock.HasWaiters, time.Second*10).Should(BeTrue())
 				// controller should be blocking during the timeout
 				Expect(finished.Load()).To(BeFalse())
 				// and the node should not be deleted yet
@@ -810,8 +810,8 @@ var _ = Describe("Emptiness", func() {
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 			// Mark the node as hosting buffer pods
-			cluster.UpdateBufferPodCounts(map[string]int{
-				node.Spec.ProviderID: 3,
+			cs.BufferPods.Replace(map[string]int{
+				nodeClaim.Name: 3,
 			})
 
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -827,15 +827,15 @@ var _ = Describe("Emptiness", func() {
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 			// First: mark node as hosting buffer pods
-			cluster.UpdateBufferPodCounts(map[string]int{
-				node.Spec.ProviderID: 2,
+			cs.BufferPods.Replace(map[string]int{
+				nodeClaim.Name: 2,
 			})
 
 			ExpectSingletonReconciled(ctx, disruptionController)
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
 
 			// Now: buffer consumed (real pods took the space, or buffer deleted)
-			cluster.UpdateBufferPodCounts(map[string]int{})
+			cs.BufferPods.Replace(map[string]int{})
 
 			ExpectSingletonReconciled(ctx, disruptionController)
 			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
@@ -851,8 +851,8 @@ var _ = Describe("Emptiness", func() {
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node, node2}, []*v1.NodeClaim{nodeClaim, nodeClaim2})
 
 			// Only node1 hosts buffer pods
-			cluster.UpdateBufferPodCounts(map[string]int{
-				node.Spec.ProviderID: 1,
+			cs.BufferPods.Replace(map[string]int{
+				nodeClaim.Name: 1,
 			})
 
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -872,8 +872,8 @@ var _ = Describe("Emptiness", func() {
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 			// Node has both real pods and buffer pods
-			cluster.UpdateBufferPodCounts(map[string]int{
-				node.Spec.ProviderID: 2,
+			cs.BufferPods.Replace(map[string]int{
+				nodeClaim.Name: 2,
 			})
 
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -888,9 +888,9 @@ var _ = Describe("Emptiness", func() {
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node, node2}, []*v1.NodeClaim{nodeClaim, nodeClaim2})
 
 			// Both nodes host buffer pods
-			cluster.UpdateBufferPodCounts(map[string]int{
-				node.Spec.ProviderID:  2,
-				node2.Spec.ProviderID: 3,
+			cs.BufferPods.Replace(map[string]int{
+				nodeClaim.Name:  2,
+				nodeClaim2.Name: 3,
 			})
 
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -906,8 +906,8 @@ var _ = Describe("Emptiness", func() {
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 			// Buffer pods were cleared (count = 0 explicitly)
-			cluster.UpdateBufferPodCounts(map[string]int{
-				node.Spec.ProviderID: 0,
+			cs.BufferPods.Replace(map[string]int{
+				nodeClaim.Name: 0,
 			})
 
 			ExpectSingletonReconciled(ctx, disruptionController)

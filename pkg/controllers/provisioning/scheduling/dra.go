@@ -30,7 +30,8 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
+
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
 )
@@ -127,7 +128,7 @@ func templateSlicesForInstanceType(it *cloudprovider.InstanceType) []dynamicreso
 
 // instanceTypeForNode resolves the cloud provider instance type backing a node from the scheduler's per-NodePool
 // instance type set. Returns nil when the node is unmanaged or its instance type is not in the current set.
-func (s *Scheduler) instanceTypeForNode(n *state.StateNode) *cloudprovider.InstanceType {
+func (s *Scheduler) instanceTypeForNode(n *karpentercluster.StateNode) *cloudprovider.InstanceType {
 	itName := n.Labels()[corev1.LabelInstanceTypeStable]
 	nodePoolName := n.Labels()[v1.NodePoolLabelKey]
 	if itName == "" || nodePoolName == "" {

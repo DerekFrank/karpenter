@@ -40,7 +40,8 @@ const (
 
 var stateRetryPeriod = 1 * time.Minute
 
-// PodController reconciles pods for the purpose of maintaining state regarding pods that is expensive to compute.
+// PodController resolves the CSI drivers of the PVCs each pod mounts, and drops what the provisioner decided about a pod
+// once it's gone. Cluster state's pod store follows the pods itself.
 type PodController struct {
 	kubeClient client.Client
 	cluster    *state.Cluster
@@ -61,21 +62,21 @@ func (c *PodController) Reconcile(ctx context.Context, req reconcile.Request) (r
 	ctx = injection.WithControllerName(ctx, c.Name())
 
 	pod := &v1.Pod{}
-	if err := c.kubeClient.Get(ctx, req.NamespacedName, pod); err != nil {
+	if err := c.kubeClient.Get(ctx, req.NamespacedName, pod, client.UnsafeDisableDeepCopy); err != nil {
 		if errors.IsNotFound(err) {
-			// notify cluster state of the node deletion
-			c.cluster.DeletePod(req.NamespacedName)
+			c.cluster.ClearPodSchedulingMappings(req.NamespacedName)
+			c.cluster.MarkUnconsolidated()
 		}
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
-	if err := c.cluster.UpdatePod(ctx, pod); err != nil {
-		// We requeue here since the NotFound error is from finding the node for the binding
+	if err := c.cluster.ResolvePVCDrivers(ctx, pod); err != nil {
+		// A PVC's volume or StorageClass may not exist yet.
 		if errors.IsNotFound(err) {
 			return reconcile.Result{Requeue: true}, nil
 		}
 		return reconcile.Result{}, err
 	}
-	return reconcile.Result{RequeueAfter: stateRetryPeriod}, nil
+	return reconcile.Result{}, nil
 }
 
 func (c *PodController) Register(ctx context.Context, m manager.Manager) error {

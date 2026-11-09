@@ -29,24 +29,13 @@ const (
 )
 
 var (
-	ClusterStateNodesCount = opmetrics.NewPrometheusGauge(
-		crmetrics.Registry,
-		prometheus.GaugeOpts{
-			Namespace: metrics.Namespace,
-			Subsystem: stateSubsystem,
-			Name:      "node_count",
-			Help:      "Current count of nodes in cluster state",
-		},
-		[]opmetrics.Label{},
-		opmetrics.GA,
-	)
 	ClusterStateSynced = opmetrics.NewPrometheusGauge(
 		crmetrics.Registry,
 		prometheus.GaugeOpts{
 			Namespace: metrics.Namespace,
 			Subsystem: stateSubsystem,
 			Name:      "synced",
-			Help:      "Returns 1 if cluster state is synced and 0 otherwise. Synced checks that nodeclaims and nodes that are stored in the APIServer have the same representation as Karpenter's cluster state",
+			Help:      "Returns 1 if cluster state is synced and 0 otherwise. Cluster state is synced once its stores have listed the nodeclaims, nodes and pods in the APIServer and every nodeclaim has launched",
 		},
 		[]opmetrics.Label{},
 		opmetrics.GA,

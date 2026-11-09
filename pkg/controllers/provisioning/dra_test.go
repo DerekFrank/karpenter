@@ -136,7 +136,7 @@ var _ = Describe("Dynamic Resource Allocation", func() {
 		// allocated-device tracking state. The controller must be reconciled (hydrated) before a provisioning round
 		// that relies on the in-cluster allocated-device set — see provisionDRA.
 		draController = deviceallocation.NewController(env.Client)
-		draProvisioner = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client), nil)
+		draProvisioner = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client), nil, cs.Nomination, cs.BufferPods)
 	})
 
 	// provisionDRA reconciles the deviceallocation controller (so the allocator sees the current in-cluster allocated
@@ -153,10 +153,11 @@ var _ = Describe("Dynamic Resource Allocation", func() {
 	// published slices can target it via a NodeSelector).
 	existingNode := func(instanceType string, initialized bool, capacity corev1.ResourceList) *corev1.Node {
 		GinkgoHelper()
+		// The node is unmanaged: without a NodeClaim, a Node with the NodePool label would be orphaned, which cluster
+		// state doesn't read as a node.
 		node := test.Node(test.NodeOptions{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels: map[string]string{
-					v1.NodePoolLabelKey:            nodePool.Name,
 					corev1.LabelInstanceTypeStable: instanceType,
 					v1.NodeRegisteredLabelKey:      "true",
 				},

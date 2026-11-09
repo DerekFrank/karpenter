@@ -27,15 +27,23 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-func GetPersistentVolumeClaim(ctx context.Context, kubeClient client.Client, pod *v1.Pod, volume v1.Volume) (*v1.PersistentVolumeClaim, error) {
-	var pvcName string
+// PersistentVolumeClaimName returns the name of the PersistentVolumeClaim of a pod's volume, or "" for a volume
+// without one.
+func PersistentVolumeClaimName(pod *v1.Pod, volume v1.Volume) string {
 	switch {
 	case volume.PersistentVolumeClaim != nil:
-		pvcName = volume.PersistentVolumeClaim.ClaimName
+		return volume.PersistentVolumeClaim.ClaimName
 	case volume.Ephemeral != nil:
 		// generated name per https://kubernetes.io/docs/concepts/storage/ephemeral-volumes/#persistentvolumeclaim-naming
-		pvcName = fmt.Sprintf("%s-%s", pod.Name, volume.Name)
+		return fmt.Sprintf("%s-%s", pod.Name, volume.Name)
 	default:
+		return ""
+	}
+}
+
+func GetPersistentVolumeClaim(ctx context.Context, kubeClient client.Client, pod *v1.Pod, volume v1.Volume) (*v1.PersistentVolumeClaim, error) {
+	pvcName := PersistentVolumeClaimName(pod, volume)
+	if pvcName == "" {
 		return nil, nil
 	}
 
