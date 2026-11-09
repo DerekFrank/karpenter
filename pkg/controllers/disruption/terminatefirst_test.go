@@ -231,7 +231,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 				ExpectMetricCounterValue(disruption.TerminateFirstDecisionsTotal, 1, map[string]string{metrics.NodePoolLabel: nodePool.Name, metrics.ReasonLabel: "drifted", disruption.TerminateFirstReasonDim.Name: string(disruption.TerminateFirstNoReservedCapacity)})
 				Expect(cmds[0].Replacements).To(HaveLen(0))
 				// The delete-only path must not hold the limits.nodes slot it never uses.
-				Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(BeEquivalentTo(int64(1)))
+				Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(HaveLen(1))
 			})
 
 			// One NodePool's lookup failure must neither stop drift for the others nor leak the limits.nodes slots they reserve.

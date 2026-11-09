@@ -928,7 +928,7 @@ var _ = Describe("Repair", func() {
 		})
 		injectedErr := errors.New("injected termination timestamp patch failure")
 		failingClient := &terminationTimestampPatchErrorClient{Client: env.Client, err: injectedErr, failNext: true}
-		failingQueue := disruption.NewQueue(failingClient, recorder, cluster, env.Clock, prov)
+		failingQueue := disruption.NewQueue(failingClient, recorder, cluster, env.Clock, prov, cs.Deletion)
 		failingRepair := disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, failingClient, prov, cloudProvider, recorder, failingQueue))
 		failingController := disruption.NewController(ctx, env.Clock, failingClient, prov, cloudProvider, recorder, cluster, failingQueue, clusterCost,
 			disruption.WithMethods(failingRepair))
@@ -1141,15 +1141,16 @@ var _ = Describe("Repair", func() {
 		Expect(commands).To(HaveLen(1))
 
 		queue.Lock()
-		queue.ProviderIDToCommand[candidates[0].ProviderID()] = &commands[0]
+		queue.NodeClaimToCommand[candidates[0].NodeClaim.Name] = &commands[0]
 		queue.Unlock()
 		Expect(queue.StartCommand(ctx, &commands[0])).To(MatchError("candidate is being disrupted"))
 		queue.Lock()
-		delete(queue.ProviderIDToCommand, candidates[0].ProviderID())
+		delete(queue.NodeClaimToCommand, candidates[0].NodeClaim.Name)
 		queue.Unlock()
 
-		Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 6, 1)).To(Equal(int64(1)))
-		cluster.NodePoolState.ReleaseNodeCount(nodePool.Name, 1)
+		reservations := cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 6, 1)
+		Expect(reservations).To(HaveLen(1))
+		reservations.Release()
 	})
 
 	It("should propagate replacement simulation errors", func() {
@@ -1171,6 +1172,8 @@ var _ = Describe("Repair", func() {
 			deviceallocation.NewController(failingClient),
 			virtualpods.NewVirtualPodCache(failingClient),
 			store,
+			cs.Nomination,
+			cs.BufferPods,
 		)
 		failingRepair := disruption.NewRepair(disruption.MakeConsolidation(
 			env.Clock,
@@ -1240,7 +1243,7 @@ var _ = Describe("Repair", func() {
 			n.Labels = lo.Assign(n.Labels, map[string]string{v1.NodeRegisteredLabelKey: "true", corev1.LabelInstanceTypeStable: "default-instance-type"})
 			nc.StatusConditions().SetTrue(v1.ConditionTypeLaunched)
 			nc.StatusConditions().SetTrue(v1.ConditionTypeRegistered)
-			ExpectApplied(ctx, env.Client, nc, n)
+			*n = *ExpectRegistered(ctx, env.Client, nc, n)
 			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(n))
 			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nc))
 		}
@@ -1267,7 +1270,8 @@ var _ = Describe("Repair", func() {
 		It("should not repair a node that never registered", func() {
 			node.Labels = lo.Assign(node.Labels, map[string]string{corev1.LabelInstanceTypeStable: "default-instance-type"})
 			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeLaunched)
-			ExpectApplied(ctx, env.Client, nodeClaim, node)
+			// Linked by its owner reference, without the registered label.
+			node = ExpectRegistered(ctx, env.Client, nodeClaim, node)
 			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
 			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim))
 			markUnhealthy(node, "BadNode")
@@ -1353,7 +1357,7 @@ var _ = Describe("Repair", func() {
 			registerNode(nodeClaim, node)
 			markUnhealthy(node, "BadNode")
 			env.Clock.Step(31 * time.Minute)
-			cluster.NominateNodeForPod(ctx, node.Spec.ProviderID)
+			cs.Nomination.Nominate(ctx, nodeClaim.Name)
 
 			ExpectSingletonReconciled(ctx, repairController)
 			Expect(queue.GetCommands()).To(HaveLen(1))

@@ -141,11 +141,12 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		}})
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
-		// Simulate an outstanding reservation (an in-flight replacement from another command) consuming the only spare
-		// slot under the limit. A naive active-node count (1 < 2) would wrongly see headroom and replace-first.
-		Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(BeEquivalentTo(int64(1)))
 		markUnhealthy(node)
 		env.Clock.Step(31 * time.Minute)
+		// Simulate an outstanding reservation (an in-flight replacement from another command) consuming the only spare
+		// slot under the limit. A naive active-node count (1 < 2) would wrongly see headroom and replace-first. It's
+		// taken after the clock step, which would otherwise expire it.
+		Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(HaveLen(1))
 
 		ExpectSingletonReconciled(ctx, repairController)
 
@@ -610,7 +611,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			ExpectMetricCounterValue(disruption.TerminateFirstDecisionsTotal, 1, map[string]string{metrics.NodePoolLabel: nodePool.Name, metrics.ReasonLabel: "unhealthy", disruption.TerminateFirstReasonDim.Name: string(disruption.TerminateFirstNoReservedCapacity)})
 			Expect(cmds[0].Replacements).To(HaveLen(0))
 			// The delete-only path must not hold the limits.nodes slot it never uses.
-			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(BeEquivalentTo(int64(1)))
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(HaveLen(1))
 		})
 
 		// A node whose reservation is no longer offered frees no slot a refill could launch into, so terminating it first
