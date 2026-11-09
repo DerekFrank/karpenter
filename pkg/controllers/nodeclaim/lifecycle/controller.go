@@ -41,9 +41,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	terminatorevents "sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
-	"sigs.k8s.io/karpenter/pkg/state/nodepoolhealth"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -70,7 +70,6 @@ type Controller struct {
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
 	recorder      events.Recorder
-	nodePoolState *nodepoolhealth.State
 
 	launch         *Launch
 	registration   *Registration
@@ -78,18 +77,17 @@ type Controller struct {
 	liveness       *Liveness
 }
 
-func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, cluster *state.Cluster, nodePoolState *nodepoolhealth.State, registrationHooks []cloudprovider.NodeLifecycleHook) *Controller {
+func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, cluster *state.Cluster, registrations *karpentercluster.Registrations, registrationHooks []cloudprovider.NodeLifecycleHook) *Controller {
 	return &Controller{
 		clock:         clk,
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
 		recorder:      recorder,
-		nodePoolState: nodePoolState,
 
 		launch:         &Launch{kubeClient: kubeClient, cloudProvider: cloudProvider, cluster: cluster, cache: cache.New(time.Hour, time.Minute), recorder: recorder, clock: clk},
-		registration:   &Registration{kubeClient: kubeClient, recorder: recorder, npState: nodePoolState, registrationHooks: registrationHooks, clock: clk},
+		registration:   &Registration{kubeClient: kubeClient, cloudProvider: cloudProvider, recorder: recorder, registrations: registrations, registrationHooks: registrationHooks, clock: clk},
 		initialization: &Initialization{kubeClient: kubeClient, clock: clk},
-		liveness:       &Liveness{clock: clk, kubeClient: kubeClient, npState: nodePoolState},
+		liveness:       &Liveness{clock: clk, kubeClient: kubeClient, cloudProvider: cloudProvider, registrations: registrations},
 	}
 }
 
@@ -100,10 +98,9 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 	b := controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		For(&v1.NodeClaim{}, builder.WithPredicates(nodeclaimutils.IsManagedPredicateFuncs(c.cloudProvider))).
-		Watches(
-			&corev1.Node{},
-			nodeclaimutils.NodeEventHandler(c.kubeClient, c.cloudProvider),
-		)
+		// A Node wakes the NodeClaim with its providerID, before registration links them and after, through the cache's
+		// providerID index.
+		Watches(&corev1.Node{}, nodeclaimutils.NodeEventHandler(c.kubeClient, c.cloudProvider))
 	// When DRA is enabled, watch ResourceSlices so a NodeClaim is re-evaluated for initialization as its DRA drivers
 	// publish their pools. The watch (and its resource.k8s.io RBAC) is only wired up when DRA support is on.
 	if !options.FromContext(ctx).IgnoreDRARequests {
@@ -253,7 +250,7 @@ func (c *Controller) finalize(ctx context.Context, nodeClaim *v1.NodeClaim) (rec
 			}
 		}
 		if !cloudprovider.IsNodeClaimNotFoundError(deleteErr) {
-			return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
+			return reconcile.Result{RequeueAfter: 5 * time.Second}, nil //storelint:deadline retry backoff for a failed instance delete
 		}
 		InstanceTerminationDurationSeconds.Observe(time.Since(nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).LastTransitionTime.Time).Seconds(), map[string]string{
 			metrics.NodePoolLabel: nodeClaim.Labels[v1.NodePoolLabelKey],
