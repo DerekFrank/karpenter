@@ -23,6 +23,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/clock"
@@ -50,14 +51,20 @@ const MinInstanceTypesForSpotToSpotConsolidation = 15
 // consolidation provides common functionality for single-node and multi-node consolidation.
 type consolidation struct {
 	// Consolidation needs to be aware of the queue for validation
-	queue                  *Queue
-	clock                  clock.Clock
-	cluster                *state.Cluster
-	kubeClient             client.Client
-	provisioner            *provisioning.Provisioner
-	cloudProvider          cloudprovider.CloudProvider
-	recorder               events.Recorder
-	lastConsolidationState time.Time
+	queue         *Queue
+	clock         clock.Clock
+	cluster       *state.Cluster
+	kubeClient    client.Client
+	provisioner   *provisioning.Provisioner
+	cloudProvider cloudprovider.CloudProvider
+	recorder      events.Recorder
+	// changes counts the changes that can make consolidation possible. marked, markedChanges and markedAt record the
+	// count, and the time, at which the method last found nothing to do, and seen the count IsConsolidated last read.
+	changes       *changes
+	marked        bool
+	markedChanges uint64
+	markedAt      time.Time
+	seen          uint64
 	// evaluator is initialized non-nil at construction. SetNodePoolTotals
 	// replaces it with a balancedEvaluator carrying the new totals.
 	evaluator Evaluator
@@ -86,14 +93,24 @@ func MakeConsolidation(clock clock.Clock, cluster *state.Cluster, kubeClient cli
 	}
 }
 
-// IsConsolidated returns true if nothing has changed since markConsolidated was called.
+// trackChanges makes the method skip its work while changes counts no change since it last found nothing to do. The
+// disruption controller's Register calls it; a method it isn't called on never skips.
+func (c *consolidation) trackChanges(changes *changes) { c.changes = changes }
+
+// IsConsolidated returns true if the method found nothing to do within the last revalidationPeriod, and the cluster
+// hasn't changed since in a way that can change what it decides. It records the changes it sees, which markConsolidated
+// marks, so that a change while the method runs isn't marked as seen.
 func (c *consolidation) IsConsolidated() bool {
-	return c.lastConsolidationState.Equal(c.cluster.ConsolidationState())
+	if c.changes == nil {
+		return false
+	}
+	c.seen = c.changes.count()
+	return c.marked && c.seen == c.markedChanges && c.clock.Since(c.markedAt) < revalidationPeriod
 }
 
-// markConsolidated records the current state of the cluster.
+// markConsolidated records that the method found nothing to do as of the changes IsConsolidated last saw.
 func (c *consolidation) markConsolidated() {
-	c.lastConsolidationState = c.cluster.ConsolidationState()
+	c.marked, c.markedChanges, c.markedAt = true, c.seen, c.clock.Now()
 }
 
 // ShouldDisrupt is a predicate used to filter candidates
@@ -132,7 +149,7 @@ func (c *consolidation) ShouldDisrupt(ctx context.Context, cn *Candidate) bool {
 		c.recorder.Publish(disruptionevents.Unconsolidatable(cn.Node, cn.NodeClaim, fmt.Sprintf("NodePool %q has consolidation policy WhenEmpty, but node is not empty", cn.NodePool.Name))...)
 		return false
 	}
-	return cn.NodeClaim.StatusConditions().Get(v1.ConditionTypeConsolidatable).IsTrue()
+	return cn.NodeClaim.StatusConditions(status.WithObservedOnly()).Get(v1.ConditionTypeConsolidatable).IsTrue()
 }
 
 // sortCandidates sorts candidates by price/disruption ratio descending.
