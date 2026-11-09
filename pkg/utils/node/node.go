@@ -229,6 +229,9 @@ func IsManagedPredicateFuncs(cp cloudprovider.CloudProvider) predicate.Funcs {
 	})
 }
 
+// NodeClaimEventHandler is a watcher on NodeClaims that enqueues the Nodes with each NodeClaim's providerID.
+//
+// Deprecated: unused by Karpenter and will be removed in v1.18.
 func NodeClaimEventHandler(c client.Client) handler.EventHandler {
 	return handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, o client.Object) []reconcile.Request {
 		providerID := o.(*v1.NodeClaim).Status.ProviderID
