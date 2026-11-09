@@ -31,8 +31,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -115,12 +117,29 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 		Named(c.Name()).
 		For(&v1.NodeClaim{}, builder.WithPredicates(nodeclaimutils.IsManagedPredicateFuncs(c.cloudProvider))).
 		WithOptions(controller.Options{MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), 10, 1000)}).
-		Watches(&v1.NodePool{}, nodeclaimutils.NodePoolEventHandler(c.kubeClient, c.cloudProvider))
+		Watches(&v1.NodePool{}, nodeclaimutils.NodePoolEventHandler(c.kubeClient, c.cloudProvider), builder.WithPredicates(NodePoolChangedPredicate()))
 
+	// Drift reads the NodeClass's status as well as its spec, such as the images, subnets and security groups it
+	// resolves, so every NodeClass update wakes its NodeClaims.
 	for _, nodeClass := range c.cloudProvider.GetSupportedNodeClasses() {
 		b.Watches(nodeClass, nodeclaimutils.NodeClassEventHandler(c.kubeClient))
 	}
 	return b.Complete(reconcile.AsReconciler(m.GetClient(), c))
+}
+
+// NodePoolChangedPredicate passes the NodePool updates that change what drift and consolidation read from a NodePool:
+// its spec, through its generation, and its hash annotations, which nodepool.hash sets after a spec change or a hash
+// version bump. A status update, such as nodepool.counter's on every NodeClaim change, doesn't wake the NodePool's
+// NodeClaims. Creates and deletes pass.
+func NodePoolChangedPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			before, after := e.ObjectOld.GetAnnotations(), e.ObjectNew.GetAnnotations()
+			return e.ObjectOld.GetGeneration() != e.ObjectNew.GetGeneration() ||
+				before[v1.NodePoolHashAnnotationKey] != after[v1.NodePoolHashAnnotationKey] ||
+				before[v1.NodePoolHashVersionAnnotationKey] != after[v1.NodePoolHashVersionAnnotationKey]
+		},
+	}
 }
 
 func (c *Controller) Reset() {
