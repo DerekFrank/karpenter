@@ -23,9 +23,11 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -181,4 +183,52 @@ var _ = Describe("Disruption", func() {
 		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeDrifted)).To(BeNil())
 		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeConsolidatable)).To(BeNil())
 	})
+})
+
+var _ = Describe("NodePoolChangedPredicate", func() {
+	var nodePool, stored *v1.NodePool
+	BeforeEach(func() {
+		nodePool = test.NodePool(v1.NodePool{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+			v1.NodePoolHashAnnotationKey:        "hash",
+			v1.NodePoolHashVersionAnnotationKey: "v1",
+		}}})
+		ExpectApplied(ctx, env.Client, nodePool)
+		stored = nodePool.DeepCopy()
+	})
+	updated := func() bool {
+		return nodeclaimdisruption.NodePoolChangedPredicate().Update(event.UpdateEvent{ObjectOld: stored, ObjectNew: nodePool})
+	}
+	It("should pass NodePool creates and deletes", func() {
+		Expect(nodeclaimdisruption.NodePoolChangedPredicate().Create(event.CreateEvent{Object: nodePool})).To(BeTrue())
+		Expect(nodeclaimdisruption.NodePoolChangedPredicate().Delete(event.DeleteEvent{Object: nodePool})).To(BeTrue())
+	})
+	It("should not pass NodePool status updates", func() {
+		nodePool.Status.Nodes = new(int64(3))
+		nodePool.Status.Resources = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")}
+		nodePool.StatusConditions().SetTrue(v1.ConditionTypeNodeRegistrationHealthy)
+		ExpectApplied(ctx, env.Client, nodePool)
+		Expect(nodePool.Generation).To(Equal(stored.Generation))
+		Expect(updated()).To(BeFalse())
+	})
+	It("should not pass NodePool metadata updates that leave its hash", func() {
+		nodePool.Labels = lo.Assign(nodePool.Labels, map[string]string{"test": "label"})
+		ExpectApplied(ctx, env.Client, nodePool)
+		Expect(updated()).To(BeFalse())
+	})
+	It("should pass NodePool spec updates", func() {
+		nodePool.Spec.Disruption.ConsolidateAfter = v1.MustParseNillableDuration("5m")
+		ExpectApplied(ctx, env.Client, nodePool)
+		Expect(nodePool.Generation).ToNot(Equal(stored.Generation))
+		Expect(updated()).To(BeTrue())
+	})
+	DescribeTable("should pass NodePool hash annotation updates",
+		func(key string) {
+			nodePool.Annotations[key] = "changed"
+			ExpectApplied(ctx, env.Client, nodePool)
+			Expect(nodePool.Generation).To(Equal(stored.Generation))
+			Expect(updated()).To(BeTrue())
+		},
+		Entry("hash", v1.NodePoolHashAnnotationKey),
+		Entry("hash version", v1.NodePoolHashVersionAnnotationKey),
+	)
 })
