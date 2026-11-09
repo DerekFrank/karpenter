@@ -25,13 +25,17 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
+	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
-	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
+	"sigs.k8s.io/karpenter/pkg/state/statetest"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -50,7 +54,11 @@ var _ = Describe("Repair Method Registration", func() {
 	})
 
 	It("panics when repair is enabled on cluster state built without a matcher", func() {
-		withoutMatcher := state.NewCluster(env.Clock, env.Client, cloudProvider)
+		// Cluster state the spec builds itself holds nothing, and follows no API server.
+		srcs := statetest.NewSources()
+		cs := karpentercluster.New(ctx, env.Clock, nil, cloudProvider,
+			karpentercluster.WithSources(func(obj client.Object) karpenterstate.Newest { return srcs.For(obj) }))
+		withoutMatcher := state.NewCluster(env.Clock, env.Client, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
 		Expect(func() {
 			disruption.NewMethods(enabledCtx, env.Clock, withoutMatcher, env.Client, prov, cloudProvider, recorder, queue)
 		}).To(PanicWith("node repair requires cluster state built with a repair policy matcher"))
@@ -63,16 +71,16 @@ var _ = Describe("Repair Method Registration", func() {
 
 	It("builds no matcher when the feature gate is disabled", func() {
 		cloudProvider.RepairPolicy = nil
-		Expect(health.NewRepairPolicyMatcher(disabledCtx, cloudProvider)).To(BeNil())
+		Expect(repair.NewRepairPolicyMatcher(disabledCtx, cloudProvider)).To(BeNil())
 	})
 
 	It("builds a matcher when the feature gate is enabled and policies are valid", func() {
-		Expect(health.NewRepairPolicyMatcher(enabledCtx, cloudProvider)).NotTo(BeNil())
+		Expect(repair.NewRepairPolicyMatcher(enabledCtx, cloudProvider)).NotTo(BeNil())
 	})
 
 	It("fails when repair is enabled without any policies", func() {
 		cloudProvider.RepairPolicy = nil
-		_, err := health.NewRepairPolicyMatcher(enabledCtx, cloudProvider)
+		_, err := repair.NewRepairPolicyMatcher(enabledCtx, cloudProvider)
 		Expect(err).To(MatchError("node repair requires the cloud provider to define RepairPolicies, but it defines none"))
 	})
 
@@ -81,7 +89,7 @@ var _ = Describe("Repair Method Registration", func() {
 			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, ReasonRegex: "[", Action: cloudprovider.ReplaceNode},
 			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, Action: cloudprovider.ReplaceNode},
 		}
-		_, err := health.NewRepairPolicyMatcher(enabledCtx, cloudProvider)
+		_, err := repair.NewRepairPolicyMatcher(enabledCtx, cloudProvider)
 		Expect(err).To(MatchError(ContainSubstring("node repair requires valid RepairPolicies")))
 	})
 })
@@ -97,7 +105,7 @@ func repairMethodCount(methods []disruption.Method) int {
 }
 
 func NewMethodsWithRealValidator() []disruption.Method {
-	return disruption.NewMethods(ctx, env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue)
+	return disruption.NewMethods(ctx, validationClock, cluster, env.Client, prov, cloudProvider, recorder, queue)
 }
 
 type NopValidator struct{}
@@ -107,13 +115,13 @@ func (n NopValidator) Validate(_ context.Context, command disruption.Command, _ 
 }
 
 func NewMethodsWithNopValidator() []disruption.Method {
-	c := disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue)
+	c := disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue)
 	emptiness := disruption.NewEmptiness(c, disruption.WithValidator(NopValidator{}))
 	multiNodeConsolidation := disruption.NewMultiNodeConsolidation(c, disruption.WithValidator(NopValidator{}))
 	singleNodeConsolidation := disruption.NewSingleNodeConsolidation(c, disruption.WithValidator(NopValidator{}))
 	return []disruption.Method{
 		disruption.NewStaticDrift(cluster, prov, cloudProvider, recorder),
-		disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+		disruption.NewDrift(env.Overlay, cluster, prov, recorder, env.Clock),
 		emptiness,
 		multiNodeConsolidation,
 		singleNodeConsolidation,
@@ -155,7 +163,7 @@ func NewTestEmptinessValidator(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim,
 		nodes:      nodes,
 		nodeClaims: nodeClaims,
 		nodePool:   nodePool,
-		emptiness:  disruption.NewEmptinessValidator(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue)),
+		emptiness:  disruption.NewEmptinessValidator(disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue)),
 	}
 	for _, opt := range opts {
 		opt(v)
@@ -206,11 +214,11 @@ func WithUnderutilizedNodeNomination() TestConsolidationValidatorOption {
 }
 
 func NewTestSingleConsolidationValidator(nodePool *v1.NodePool, opts ...TestConsolidationValidatorOption) disruption.Validator {
-	return newTestConsolidationValidator(nodePool, disruption.NewSingleConsolidationValidator(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue)), opts...)
+	return newTestConsolidationValidator(nodePool, disruption.NewSingleConsolidationValidator(disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue)), opts...)
 }
 
 func NewTestMultiConsolidationValidator(nodePool *v1.NodePool, opts ...TestConsolidationValidatorOption) disruption.Validator {
-	return newTestConsolidationValidator(nodePool, disruption.NewMultiConsolidationValidator(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue)), opts...)
+	return newTestConsolidationValidator(nodePool, disruption.NewMultiConsolidationValidator(disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue)), opts...)
 }
 
 func newTestConsolidationValidator(nodePool *v1.NodePool, c *disruption.ConsolidationValidator, opts ...TestConsolidationValidatorOption) disruption.Validator {
@@ -247,7 +255,7 @@ func (t *TestConsolidationValidator) Validate(ctx context.Context, cmd disruptio
 
 func churn(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim) {
 	var pods []*corev1.Pod
-	ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+	ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 	rs := test.ReplicaSet()
 	ExpectApplied(ctx, env.Client, rs)
 	pods = test.Pods(1, test.PodOptions{
@@ -271,12 +279,16 @@ func churn(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim) {
 			}}})
 	ExpectApplied(ctx, env.Client, pods[0])
 	ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
-	cluster.NominateNodeForPod(ctx, nodes[0].Spec.ProviderID)
-	Expect(cluster.UpdateNode(ctx, nodes[0])).To(Succeed())
+	// The callers may order nodes and nodeClaims differently, so find the NodeClaim of nodes[0] by its providerID.
+	for _, nodeClaim := range nodeClaims {
+		if nodeClaim.Status.ProviderID == nodes[0].Spec.ProviderID {
+			cs.Nomination.Nominate(ctx, nodeClaim.Name)
+		}
+	}
 }
 
 func blockingBudget(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim, nodePool *v1.NodePool) {
-	ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+	ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 	nodePool.Spec.Disruption.Budgets = []v1.Budget{{
 		Nodes: "0%",
 	}}
@@ -284,10 +296,9 @@ func blockingBudget(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim, nodePool *
 }
 
 func nominated(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim) {
-	ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+	ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 	for i := range nodes {
-		cluster.NominateNodeForPod(ctx, nodes[i].Spec.ProviderID)
-		cluster.NominateNodeForPod(ctx, nodes[i].Spec.ProviderID)
-		Expect(cluster.UpdateNode(ctx, nodes[i])).To(Succeed())
+		cs.Nomination.Nominate(ctx, nodeClaims[i].Name)
+		cs.Nomination.Nominate(ctx, nodeClaims[i].Name)
 	}
 }

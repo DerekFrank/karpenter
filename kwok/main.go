@@ -23,8 +23,9 @@ import (
 	kwok "sigs.k8s.io/karpenter/kwok/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/overlay"
+	"sigs.k8s.io/karpenter/pkg/cluster"
+	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 	"sigs.k8s.io/karpenter/pkg/controllers"
-	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator"
 )
@@ -40,8 +41,10 @@ func main() {
 
 	overlayUndecoratedCloudProvider := kwok.NewCloudProvider(ctx, op.GetClient(), instanceTypes)
 	cloudProvider := overlay.Decorate(overlayUndecoratedCloudProvider, op.GetClient(), op.InstanceTypeStore)
-	repairPolicyMatcher := lo.Must(health.NewRepairPolicyMatcher(ctx, cloudProvider))
-	clusterState := state.NewCluster(op.Clock, op.GetClient(), cloudProvider, state.WithRepairPolicyMatcher(repairPolicyMatcher))
+	repairPolicyMatcher := lo.Must(repair.NewRepairPolicyMatcher(ctx, cloudProvider))
+	s := cluster.New(ctx, op.Clock, op.GetClient(), cloudProvider, cluster.WithRepairPolicyMatcher(repairPolicyMatcher))
+	lo.Must0(s.Register(op.Manager))
+	clusterState := state.NewCluster(op.Clock, op.GetClient(), s.Nodes, s.NodePoolState, s.CapacityQuotaState, s.PodScheduling)
 	op.
 		WithControllers(ctx, controllers.NewControllers(
 			ctx,
@@ -51,6 +54,7 @@ func main() {
 			op.EventRecorder,
 			cloudProvider,
 			overlayUndecoratedCloudProvider,
+			s,
 			clusterState,
 			op.InstanceTypeStore,
 			op.PredictionStore,

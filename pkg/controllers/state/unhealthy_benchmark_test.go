@@ -30,23 +30,27 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	clock "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakecr "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
-	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
+	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/state/statetest"
 	"sigs.k8s.io/karpenter/pkg/test"
 )
 
 const benchmarkAcceleratorCondition corev1.NodeConditionType = "AcceleratedHardwareReady"
 
-var benchmarkRepairResult health.RepairResult
+var benchmarkRepairResult repair.RepairResult
 
 // benchmarkRepairPolicies resembles a production provider policy set: kubelet readiness, reason-specific accelerator
 // policies, a few node-agent conditions and the default fallback.
@@ -75,7 +79,9 @@ func benchmarkNode(i int, unhealthy bool, acceleratorReason string, now, heartbe
 	accelerator.LastTransitionTime = metav1.NewTime(now.Add(-time.Hour))
 	name := fmt.Sprintf("node-%d", i)
 	return &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{Name: name, CreationTimestamp: created, Labels: map[string]string{
+		ObjectMeta: metav1.ObjectMeta{Name: name, CreationTimestamp: created, OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: apis.Group + "/v1", Kind: "NodeClaim", Name: name, UID: types.UID(name), BlockOwnerDeletion: new(true),
+		}}, Labels: map[string]string{
 			v1.NodePoolLabelKey:            "default",
 			v1.NodeInitializedLabelKey:     "true",
 			v1.NodeRegisteredLabelKey:      "true",
@@ -108,19 +114,35 @@ func benchmarkAcceleratorReason(unhealthy bool, variant int) string {
 	return []string{"AcceleratedHardwareIsHealthy", "DriverReloaded"}[variant]
 }
 
-// benchmarkCluster returns cluster state holding n Nodes matched by matcher, the first unhealthy of which are unhealthy.
-func benchmarkCluster(ctx context.Context, b *testing.B, provider *fake.CloudProvider, matcher *health.RepairPolicyMatcher, n, unhealthy int, now time.Time) *state.Cluster {
+// benchmarkNodeClaim returns the registered NodeClaim that the Node benchmarkNode returns for i is owned by.
+func benchmarkNodeClaim(i int, now time.Time) *v1.NodeClaim {
+	name := fmt.Sprintf("node-%d", i)
+	nodeClaim := &v1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(name), CreationTimestamp: metav1.NewTime(now.Add(-24 * time.Hour)), Labels: map[string]string{v1.NodePoolLabelKey: "default"}},
+		Spec:       v1.NodeClaimSpec{NodeClassRef: test.NodeClaim().Spec.NodeClassRef},
+		Status:     v1.NodeClaimStatus{ProviderID: "fake:///" + name, NodeName: name},
+	}
+	nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeLaunched)
+	nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeRegistered)
+	nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeInitialized)
+	return nodeClaim
+}
+
+// benchmarkCluster returns cluster state holding n Nodes matched by matcher, each with its NodeClaim, the first
+// unhealthy of which are unhealthy.
+func benchmarkCluster(ctx context.Context, b *testing.B, provider *fake.CloudProvider, matcher *repair.RepairPolicyMatcher, n, unhealthy int, now time.Time) (*state.Cluster, *statetest.Sources) {
 	b.Helper()
 	kubeClient := fakecr.NewClientBuilder().WithIndex(&corev1.Pod{}, "spec.nodeName", func(o client.Object) []string {
 		return []string{o.(*corev1.Pod).Spec.NodeName}
 	}).Build()
-	clusterState := state.NewCluster(clock.NewFakeClock(now), kubeClient, provider, state.WithRepairPolicyMatcher(matcher))
+	clk := clock.NewFakeClock(now)
+	cs, srcs := inMemory(ctx, clk, provider, karpentercluster.WithRepairPolicyMatcher(matcher))
+	clusterState := state.NewCluster(clk, kubeClient, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
 	for i := range n {
-		if err := clusterState.UpdateNode(ctx, benchmarkNode(i, i < unhealthy, benchmarkAcceleratorReason(i < unhealthy, 0), now, now)); err != nil {
-			b.Fatal(err)
-		}
+		observe(srcs, benchmarkNodeClaim(i, now))
+		observe(srcs, benchmarkNode(i, i < unhealthy, benchmarkAcceleratorReason(i < unhealthy, 0), now, now))
 	}
-	return clusterState
+	return clusterState, srcs
 }
 
 // benchmarkContext enables node repair and carries an Info-level logger, as the controller runs with, so debug logging
@@ -131,11 +153,11 @@ func benchmarkContext() context.Context {
 	return options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeRepair: new(true)}}))
 }
 
-func benchmarkMatcher(ctx context.Context, b *testing.B) (*fake.CloudProvider, *health.RepairPolicyMatcher) {
+func benchmarkMatcher(ctx context.Context, b *testing.B) (*fake.CloudProvider, *repair.RepairPolicyMatcher) {
 	b.Helper()
 	provider := fake.NewCloudProvider()
 	provider.RepairPolicy = benchmarkRepairPolicies()
-	matcher, err := health.NewRepairPolicyMatcher(ctx, provider)
+	matcher, err := repair.NewRepairPolicyMatcher(ctx, provider)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -154,7 +176,7 @@ func BenchmarkClusterUpdateNode(b *testing.B) {
 				b.Run(fmt.Sprintf("Nodes=%d/Unhealthy=%d%%/Update=%s", n, unhealthyPercent, update), func(b *testing.B) {
 					now := time.Now()
 					unhealthy := n * unhealthyPercent / 100
-					clusterState := benchmarkCluster(ctx, b, provider, matcher, n, unhealthy, now)
+					_, srcs := benchmarkCluster(ctx, b, provider, matcher, n, unhealthy, now)
 					// Two prebuilt versions per Node, alternated so every update differs from the one cluster state holds.
 					versions := [2][]*corev1.Node{}
 					for v := range versions {
@@ -167,9 +189,7 @@ func BenchmarkClusterUpdateNode(b *testing.B) {
 					b.ReportAllocs()
 					b.ResetTimer()
 					for i := 0; i < b.N; i++ {
-						if err := clusterState.UpdateNode(ctx, versions[(i/n)%2][i%n]); err != nil {
-							b.Fatal(err)
-						}
+						observe(srcs, versions[(i/n)%2][i%n])
 					}
 				})
 			}
@@ -187,12 +207,12 @@ func BenchmarkRepairDecision(b *testing.B) {
 			b.Run(fmt.Sprintf("Nodes=%d/Unhealthy=%d%%", n, unhealthyPercent), func(b *testing.B) {
 				now := time.Now()
 				unhealthy := n * unhealthyPercent / 100
-				clusterState := benchmarkCluster(ctx, b, provider, matcher, n, unhealthy, now)
-				var nodes []*state.StateNode
+				clusterState, _ := benchmarkCluster(ctx, b, provider, matcher, n, unhealthy, now)
+				var nodes []*karpentercluster.StateNode
 				for node := range clusterState.Nodes() {
 					nodes = append(nodes, node)
 				}
-				if repairable := lo.CountBy(nodes, func(node *state.StateNode) bool {
+				if repairable := lo.CountBy(nodes, func(node *karpentercluster.StateNode) bool {
 					return node.GetRepairResult(now).Action != ""
 				}); repairable != unhealthy {
 					b.Fatalf("expected %d repairable nodes, got %d", unhealthy, repairable)

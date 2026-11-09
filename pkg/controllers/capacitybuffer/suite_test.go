@@ -58,7 +58,10 @@ var _ = BeforeSuite(func() {
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(testv1alpha1.CRDs...), test.WithFieldIndexers(func(c cache.Cache) error {
 		return indexFields(ctx, c)
 	}))
-	cbController = NewController(env.Client, &fakeTrigger{}, virtualpods.NewVirtualPodCache(env.Client))
+	// The controller writes through the overlay, as in production. A CapacityBuffer isn't a kind the overlay follows,
+	// so a read of one the controller wrote lags with the cache: the virtual pod cache, whose hydration lists the
+	// buffers the controller resolved, reads the API server, as do the specs' read-backs of a buffer's status.
+	cbController = NewController(env.Overlay, &fakeTrigger{}, virtualpods.NewVirtualPodCache(env.APIServer))
 })
 
 var _ = AfterEach(func() {
@@ -108,7 +111,7 @@ var _ = Describe("CapacityBuffer Controller", func() {
 			ExpectApplied(ctx, env.Client, pt, cb)
 			ExpectReconcileSucceeded(ctx, cbController, client.ObjectKeyFromObject(cb))
 
-			cb = ExpectExists(ctx, env.Client, cb)
+			cb = ExpectExists(ctx, env.APIServer, cb)
 			cond := findCondition(cb.Status.Conditions, autoscalingv1beta1.ReadyForProvisioningCondition)
 			Expect(cond).ToNot(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
@@ -135,7 +138,7 @@ var _ = Describe("CapacityBuffer Controller", func() {
 			ExpectApplied(ctx, env.Client, cb)
 			ExpectReconcileSucceeded(ctx, cbController, client.ObjectKeyFromObject(cb))
 
-			cb = ExpectExists(ctx, env.Client, cb)
+			cb = ExpectExists(ctx, env.APIServer, cb)
 			cond := findCondition(cb.Status.Conditions, autoscalingv1beta1.ReadyForProvisioningCondition)
 			Expect(cond).ToNot(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
@@ -187,7 +190,7 @@ var _ = Describe("CapacityBuffer Controller", func() {
 			ExpectApplied(ctx, env.Client, deploy, cb)
 			ExpectReconcileSucceeded(ctx, cbController, client.ObjectKeyFromObject(cb))
 
-			cb = ExpectExists(ctx, env.Client, cb)
+			cb = ExpectExists(ctx, env.APIServer, cb)
 			cond := findCondition(cb.Status.Conditions, autoscalingv1beta1.ReadyForProvisioningCondition)
 			Expect(cond).ToNot(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
@@ -216,7 +219,7 @@ var _ = Describe("CapacityBuffer Controller", func() {
 			ExpectApplied(ctx, env.Client, cb)
 			ExpectReconcileSucceeded(ctx, cbController, client.ObjectKeyFromObject(cb))
 
-			cb = ExpectExists(ctx, env.Client, cb)
+			cb = ExpectExists(ctx, env.APIServer, cb)
 			cond := findCondition(cb.Status.Conditions, autoscalingv1beta1.ReadyForProvisioningCondition)
 			Expect(cond).ToNot(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
@@ -265,7 +268,7 @@ var _ = Describe("CapacityBuffer Controller", func() {
 			ExpectApplied(ctx, env.Client, sts, cb)
 			ExpectReconcileSucceeded(ctx, cbController, client.ObjectKeyFromObject(cb))
 
-			cb = ExpectExists(ctx, env.Client, cb)
+			cb = ExpectExists(ctx, env.APIServer, cb)
 			cond := findCondition(cb.Status.Conditions, autoscalingv1beta1.ReadyForProvisioningCondition)
 			Expect(cond).ToNot(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
@@ -353,7 +356,7 @@ var _ = Describe("CapacityBuffer Controller", func() {
 			ExpectApplied(ctx, env.Client, deploy, cb)
 			ExpectReconcileSucceeded(ctx, cbController, client.ObjectKeyFromObject(cb))
 
-			cb = ExpectExists(ctx, env.Client, cb)
+			cb = ExpectExists(ctx, env.APIServer, cb)
 			cond := findCondition(cb.Status.Conditions, autoscalingv1beta1.ReadyForProvisioningCondition)
 			Expect(cond).ToNot(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
@@ -370,7 +373,7 @@ var _ = Describe("CapacityBuffer Controller", func() {
 			func(backing client.Object, cb *autoscalingv1beta1.CapacityBuffer, expected int32) {
 				ExpectApplied(ctx, env.Client, backing, cb)
 				ExpectReconcileSucceeded(ctx, cbController, client.ObjectKeyFromObject(cb))
-				Expect(ExpectExists(ctx, env.Client, cb).Status.Replicas).To(HaveValue(Equal(expected)))
+				Expect(ExpectExists(ctx, env.APIServer, cb).Status.Replicas).To(HaveValue(Equal(expected)))
 			},
 			// podTemplateRef: replicas and limits only (percentage requires a scalableRef).
 			Entry("fixed replicas only",
@@ -502,7 +505,7 @@ var _ = Describe("CapacityBuffer Controller", func() {
 			ExpectApplied(ctx, env.Client, pt, cb)
 			ExpectReconcileSucceeded(ctx, cbController, client.ObjectKeyFromObject(cb))
 
-			cb = ExpectExists(ctx, env.Client, cb)
+			cb = ExpectExists(ctx, env.APIServer, cb)
 			Expect(cb.Status.PodTemplateGeneration).ToNot(BeNil())
 			originalGen := *cb.Status.PodTemplateGeneration
 
@@ -515,7 +518,7 @@ var _ = Describe("CapacityBuffer Controller", func() {
 
 			// Reconcile the buffer again; podTemplateGeneration in status should update.
 			ExpectReconcileSucceeded(ctx, cbController, client.ObjectKeyFromObject(cb))
-			cb = ExpectExists(ctx, env.Client, cb)
+			cb = ExpectExists(ctx, env.APIServer, cb)
 			Expect(cb.Status.PodTemplateGeneration).ToNot(BeNil())
 			// Generation must have advanced OR stayed the same (envtest behavior varies);
 			// the stored template image must reflect v2.
@@ -528,7 +531,7 @@ var _ = Describe("CapacityBuffer Controller", func() {
 	Context("Provisioner trigger", func() {
 		It("should trigger the provisioner after a successful reconcile", func() {
 			trigger := &fakeTrigger{}
-			ctrl := NewController(env.Client, trigger, virtualpods.NewVirtualPodCache(env.Client))
+			ctrl := NewController(env.Overlay, trigger, virtualpods.NewVirtualPodCache(env.APIServer))
 
 			pt := &v1.PodTemplate{
 				ObjectMeta: metav1.ObjectMeta{Name: "trig-template", Namespace: "default"},
@@ -546,13 +549,13 @@ var _ = Describe("CapacityBuffer Controller", func() {
 			ExpectApplied(ctx, env.Client, pt, cb)
 			ExpectReconcileSucceeded(ctx, ctrl, client.ObjectKeyFromObject(cb))
 
-			cb = ExpectExists(ctx, env.Client, cb)
+			cb = ExpectExists(ctx, env.APIServer, cb)
 			Expect(trigger.calls).To(ContainElement(cb.UID))
 		})
 
 		It("should trigger the provisioner when resolution fails so stale cluster state is refreshed", func() {
 			trigger := &fakeTrigger{}
-			ctrl := NewController(env.Client, trigger, virtualpods.NewVirtualPodCache(env.Client))
+			ctrl := NewController(env.Overlay, trigger, virtualpods.NewVirtualPodCache(env.APIServer))
 
 			cb := &autoscalingv1beta1.CapacityBuffer{
 				ObjectMeta: metav1.ObjectMeta{Name: "no-trig-buffer", Namespace: "default"},
@@ -568,13 +571,13 @@ var _ = Describe("CapacityBuffer Controller", func() {
 			// the provisioner must still be triggered to refresh cluster state
 			// (e.g. bufferPodCounts) so empty nodes can scale down on an idle
 			// cluster.
-			cb = ExpectExists(ctx, env.Client, cb)
+			cb = ExpectExists(ctx, env.APIServer, cb)
 			Expect(trigger.calls).To(ContainElement(cb.UID))
 		})
 
 		It("should trigger the provisioner when the buffer is deleted so empty nodes can scale down", func() {
 			trigger := &fakeTrigger{}
-			ctrl := NewController(env.Client, trigger, virtualpods.NewVirtualPodCache(env.Client))
+			ctrl := NewController(env.Overlay, trigger, virtualpods.NewVirtualPodCache(env.APIServer))
 
 			pt := &v1.PodTemplate{
 				ObjectMeta: metav1.ObjectMeta{Name: "del-trig-template", Namespace: "default"},
@@ -604,8 +607,8 @@ var _ = Describe("CapacityBuffer Controller", func() {
 
 	Context("Virtual pod cache", func() {
 		It("should populate the cache after a successful reconcile", func() {
-			cache := virtualpods.NewVirtualPodCache(env.Client)
-			ctrl := NewController(env.Client, &fakeTrigger{}, cache)
+			cache := virtualpods.NewVirtualPodCache(env.APIServer)
+			ctrl := NewController(env.Overlay, &fakeTrigger{}, cache)
 
 			pt := &v1.PodTemplate{
 				ObjectMeta: metav1.ObjectMeta{Name: "cache-template", Namespace: "default"},
@@ -627,8 +630,8 @@ var _ = Describe("CapacityBuffer Controller", func() {
 		})
 
 		It("should remove the cache entry when resolution fails with NotFound", func() {
-			cache := virtualpods.NewVirtualPodCache(env.Client)
-			ctrl := NewController(env.Client, &fakeTrigger{}, cache)
+			cache := virtualpods.NewVirtualPodCache(env.APIServer)
+			ctrl := NewController(env.Overlay, &fakeTrigger{}, cache)
 
 			pt := &v1.PodTemplate{
 				ObjectMeta: metav1.ObjectMeta{Name: "gone-template", Namespace: "default"},
@@ -656,8 +659,8 @@ var _ = Describe("CapacityBuffer Controller", func() {
 		})
 
 		It("should evict the cache entry when the buffer is deleted", func() {
-			cache := virtualpods.NewVirtualPodCache(env.Client)
-			ctrl := NewController(env.Client, &fakeTrigger{}, cache)
+			cache := virtualpods.NewVirtualPodCache(env.APIServer)
+			ctrl := NewController(env.Overlay, &fakeTrigger{}, cache)
 
 			pt := &v1.PodTemplate{
 				ObjectMeta: metav1.ObjectMeta{Name: "del-template", Namespace: "default"},
@@ -685,8 +688,8 @@ var _ = Describe("CapacityBuffer Controller", func() {
 		})
 
 		It("should not touch the cache when a buffer has neither ref set", func() {
-			cache := virtualpods.NewVirtualPodCache(env.Client)
-			ctrl := NewController(env.Client, &fakeTrigger{}, cache)
+			cache := virtualpods.NewVirtualPodCache(env.APIServer)
+			ctrl := NewController(env.Overlay, &fakeTrigger{}, cache)
 
 			cb := &autoscalingv1beta1.CapacityBuffer{
 				ObjectMeta: metav1.ObjectMeta{Name: "no-ref-buffer", Namespace: "default"},

@@ -35,16 +35,29 @@ import (
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
+	autoscalingv1beta1 "sigs.k8s.io/karpenter/pkg/apis/autoscaling/v1beta1"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/state/overlay"
 	"sigs.k8s.io/karpenter/pkg/utils/env"
 )
 
 type Environment struct {
 	envtest.Environment
 
-	Client              client.Client
+	// Client is the suite's client, the third party: it reads through the cache and the overlay, writes to the API
+	// server directly, and waits until the cache and every store following the overlay have seen each write.
+	Client client.Client
+	// APIServer reads the API server without the cache. The overlay records only the writes of the kinds cluster state
+	// follows, so a controller's write to a kind it doesn't, such as a NodeOverlay, a node class or a
+	// PersistentVolumeClaim, reaches a suite's cached reads only through the informer, which lags the write: read one
+	// the controller under test wrote back from APIServer.
+	APIServer client.Client
+	// Overlay is the controller under test's client, as the manager's is in production: its reads include its own
+	// writes as soon as they return, and every store following it sees each write before the write returns.
+	Overlay             *overlay.Client
 	Clock               *clocktesting.FakeClock
 	KubernetesInterface kubernetes.Interface
 	Version             *version.Version
@@ -65,10 +78,8 @@ func WithCRDs(crds ...*apiextensionsv1.CustomResourceDefinition) option.Function
 	}
 }
 
-// WithFieldIndexers expects a function that indexes fields against the cache such as cache.IndexField(...).
-//
-// Note: Only use when necessary, the use of field indexers in functional tests requires the use of the cache syncing
-// client, which can have significant drawbacks for test performance.
+// WithFieldIndexers expects a function that indexes fields against the cache such as cache.IndexField(...). Each index
+// is registered with the overlay too, so a List with a field selector on it includes the overlay's writes.
 func WithFieldIndexers(fieldIndexers ...func(cache.Cache) error) option.Function[EnvironmentOptions] {
 	return func(o *EnvironmentOptions) {
 		o.fieldIndexers = append(o.fieldIndexers, fieldIndexers...)
@@ -166,38 +177,58 @@ func NewEnvironment(options ...option.Function[EnvironmentOptions]) *Environment
 		option(environment.Config)
 	}
 
-	// We use a modified client if we need field indexers
-	var c client.Client
-	if len(opts.fieldIndexers) > 0 {
-		cache := lo.Must(cache.New(environment.Config, cache.Options{Scheme: scheme.Scheme}))
-		for _, index := range opts.fieldIndexers {
-			lo.Must0(index(cache))
-		}
-		lo.Must0(cache.IndexField(ctx, &corev1.Pod{}, "spec.nodeName", func(o client.Object) []string {
-			pod := o.(*corev1.Pod)
-			return []string{pod.Spec.NodeName}
-		}))
-		c = &CacheSyncingClient{
-			Client: lo.Must(client.New(environment.Config, client.Options{Scheme: scheme.Scheme, Cache: &client.CacheOptions{Reader: cache}})),
-		}
-		go func() {
-			lo.Must0(cache.Start(ctx))
-		}()
-		if !cache.WaitForCacheSync(ctx) {
-			log.Fatalf("cache failed to sync")
-		}
-	} else {
-		c = lo.Must(client.New(environment.Config, client.Options{Scheme: scheme.Scheme}))
+	// Every suite reads through the informer cache and the overlay, as the manager does, and cluster state follows each
+	// kind's newest version through the overlay.
+	c := lo.Must(cache.New(environment.Config, cache.Options{Scheme: scheme.Scheme}))
+	cached := lo.Must(client.New(environment.Config, client.Options{Scheme: scheme.Scheme, Cache: &client.CacheOptions{Reader: c}}))
+	overlaid := lo.Must(overlay.New(ctx, cached, c, overlaidKinds(environment.Config)...))
+	indexer := overlaid.FieldIndexer(c)
+	for _, index := range opts.fieldIndexers {
+		lo.Must0(index(indexingCache{Cache: c, indexer: indexer}))
 	}
+	lo.Must0(indexer.IndexField(ctx, &corev1.Pod{}, "spec.nodeName", func(o client.Object) []string {
+		return []string{o.(*corev1.Pod).Spec.NodeName}
+	}))
+	go func() {
+		lo.Must0(c.Start(ctx))
+	}()
+	if !c.WaitForCacheSync(ctx) {
+		log.Fatalf("cache failed to sync")
+	}
+	apiServer := lo.Must(client.New(environment.Config, client.Options{Scheme: scheme.Scheme}))
 	return &Environment{
 		Environment:         environment,
-		Client:              c,
+		Client:              NewSyncingClient(overlaid, cached, apiServer),
+		APIServer:           apiServer,
+		Overlay:             overlaid,
 		Clock:               clocktesting.NewFakeClock(time.Now()),
 		KubernetesInterface: kubernetes.NewForConfigOrDie(environment.Config),
 		Version:             version,
 		Done:                make(chan struct{}),
 		Cancel:              cancel,
 	}
+}
+
+// overlaidKinds are the kinds cluster state follows (cluster.Kinds), which the overlay overlays, among those the API
+// server serves.
+func overlaidKinds(config *rest.Config) []client.Object {
+	mapper := lo.Must(apiutil.NewDynamicRESTMapper(config, lo.Must(rest.HTTPClientFor(config))))
+	return lo.Filter([]client.Object{&v1.NodeClaim{}, &v1.NodePool{}, &corev1.Node{}, &corev1.Pod{}, &storagev1.CSINode{}, &autoscalingv1beta1.CapacityQuota{}},
+		func(obj client.Object, _ int) bool {
+			gvk := lo.Must(apiutil.GVKForObject(obj, scheme.Scheme))
+			_, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+			return err == nil
+		})
+}
+
+// indexingCache registers a suite's field indexes with the cache and the overlay.
+type indexingCache struct {
+	cache.Cache
+	indexer client.FieldIndexer
+}
+
+func (c indexingCache) IndexField(ctx context.Context, obj client.Object, field string, extractValue client.IndexerFunc) error {
+	return c.indexer.IndexField(ctx, obj, field, extractValue)
 }
 
 func (e *Environment) Stop() error {

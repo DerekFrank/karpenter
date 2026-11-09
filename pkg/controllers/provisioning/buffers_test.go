@@ -27,8 +27,10 @@ import (
 	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 
 	autoscalingv1beta1 "sigs.k8s.io/karpenter/pkg/apis/autoscaling/v1beta1"
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	scheduler "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+
 	"sigs.k8s.io/karpenter/pkg/test"
 )
 
@@ -208,7 +210,7 @@ var _ = Describe("computeProvisioningCondition", func() {
 })
 
 var _ = Describe("bufferPodCountsFromResults", func() {
-	It("should count virtual pods per providerID on existing nodes", func() {
+	It("should count virtual pods per NodeClaim on existing nodes", func() {
 		cbA := test.ReadyBuffer("a", 3)
 		cbB := test.ReadyBuffer("b", 2)
 		spec := corev1.PodTemplateSpec{}
@@ -369,10 +371,12 @@ var _ = Describe("filterVirtualPodMapping", func() {
 	})
 })
 
-func makeExistingNode(providerID string) *scheduler.ExistingNode {
-	sn := state.NewNode()
+// makeExistingNode returns an existing node whose NodeClaim is named nodeClaimName, which keys its buffer pod counts.
+func makeExistingNode(nodeClaimName string) *scheduler.ExistingNode {
+	sn := karpentercluster.NewNode()
+	sn.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: nodeClaimName}}
 	sn.Node = &corev1.Node{
-		Spec: corev1.NodeSpec{ProviderID: providerID},
+		Spec: corev1.NodeSpec{ProviderID: "fake://" + nodeClaimName},
 	}
 	return &scheduler.ExistingNode{StateNode: sn}
 }

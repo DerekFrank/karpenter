@@ -27,7 +27,8 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
+
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
@@ -137,7 +138,7 @@ func draExistingNodeForTest(initialized bool, it *cloudprovider.InstanceType) *d
 	}
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: labels}}
 	nodeClaim := &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels}}
-	en := &ExistingNode{StateNode: &state.StateNode{Node: node, NodeClaim: nodeClaim}, instanceType: it}
+	en := &ExistingNode{StateNode: &karpentercluster.StateNode{Node: node, NodeClaim: nodeClaim}, instanceType: it}
 	en.requirements = scheduling.NewLabelRequirements(labels)
 	return &draExistingNode{en: en, instanceType: it}
 }

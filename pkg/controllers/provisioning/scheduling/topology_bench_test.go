@@ -45,7 +45,8 @@ func BenchmarkNewTopology(b *testing.B) {
 
 			client := fakecr.NewFakeClient()
 			clk := &clock.RealClock{}
-			cl := state.NewCluster(clk, client, cp)
+			cs := emptyState(ctx, clk, cp)
+			cl := state.NewCluster(clk, client, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
 
 			nodePools := benchNodePools(np)
 			itsByNP := map[string][]*cloudprovider.InstanceType{}

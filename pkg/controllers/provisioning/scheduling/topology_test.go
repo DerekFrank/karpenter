@@ -425,9 +425,6 @@ var _ = Describe("Topology", func() {
 				MaxSkew:           1,
 			}}
 			ExpectApplied(ctx, env.Client, nodePool, firstNode, secondNode, thirdNode, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: wrongNamespace}})
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(firstNode))
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(secondNode))
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(thirdNode))
 			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov,
 				test.Pod(test.PodOptions{NodeName: firstNode.Name}),                                                                                               // ignored, missing labels
 				test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: labels}}),                                                                          // ignored, pending
@@ -760,9 +757,6 @@ var _ = Describe("Topology", func() {
 				MaxSkew:           1,
 			}}
 			ExpectApplied(ctx, env.Client, nodePool, firstNode, secondNode, thirdNode, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: wrongNamespace}})
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(firstNode))
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(secondNode))
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(thirdNode))
 			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov,
 				test.Pod(test.PodOptions{NodeName: firstNode.Name}),                                                                                               // ignored, missing labels
 				test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: labels}}),                                                                          // ignored, pending
@@ -1287,9 +1281,6 @@ var _ = Describe("Topology", func() {
 				}})
 			ExpectApplied(ctx, env.Client, nodePool, node1, node2)
 
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node1))
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node2))
-
 			// there are now three domains for spreadLabel that Karpenter should know about, foo/bar from the two existing
 			// nodes and baz from the node pool
 			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov)
@@ -1356,9 +1347,6 @@ var _ = Describe("Topology", func() {
 					corev1.ResourceCPU: resource.MustParse("100m"),
 				}})
 			ExpectApplied(ctx, env.Client, nodePool, node1, node2)
-
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node1))
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node2))
 
 			// since two of the nodes are tainted, Karpenter should not consider them for topology domain discovery
 			// purposes
@@ -1612,9 +1600,6 @@ var _ = Describe("Topology", func() {
 				}})
 			ExpectApplied(ctx, env.Client, nodePool, node1, node2)
 
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node1))
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node2))
-
 			// there are now three domains for spreadLabel that Karpenter should know about since we are ignoring the
 			// fact that the pod can't schedule to two of them because of a required node affinity. foo/bar from the two
 			// existing nodes with an affinityLabel=affinityMismatch label and baz from the node pool
@@ -1678,9 +1663,6 @@ var _ = Describe("Topology", func() {
 					corev1.ResourceCPU: resource.MustParse("100m"),
 				}})
 			ExpectApplied(ctx, env.Client, nodePool, node1, node2)
-
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node1))
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node2))
 
 			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov)
 			topology := []corev1.TopologySpreadConstraint{{
@@ -2610,13 +2592,10 @@ var _ = Describe("Topology", func() {
 			// then try to schedule
 			ExpectApplied(ctx, env.Client, nodePool)
 			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, zone1Pod, zone2Pod, zone3Pod)
-			node1 := ExpectScheduled(ctx, env.Client, zone1Pod)
-			node2 := ExpectScheduled(ctx, env.Client, zone2Pod)
-			node3 := ExpectScheduled(ctx, env.Client, zone3Pod)
+			ExpectScheduled(ctx, env.Client, zone1Pod)
+			ExpectScheduled(ctx, env.Client, zone2Pod)
+			ExpectScheduled(ctx, env.Client, zone3Pod)
 
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node1))
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node2))
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node3))
 			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(zone1Pod))
 			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(zone2Pod))
 			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(zone3Pod))
@@ -2665,13 +2644,10 @@ var _ = Describe("Topology", func() {
 			// then try to schedule
 			ExpectApplied(ctx, env.Client, nodePool)
 			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, zone1Pod, zone2Pod, zone3Pod)
-			node1 := ExpectScheduled(ctx, env.Client, zone1Pod)
-			node2 := ExpectScheduled(ctx, env.Client, zone2Pod)
-			node3 := ExpectScheduled(ctx, env.Client, zone3Pod)
+			ExpectScheduled(ctx, env.Client, zone1Pod)
+			ExpectScheduled(ctx, env.Client, zone2Pod)
+			ExpectScheduled(ctx, env.Client, zone3Pod)
 
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node1))
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node2))
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node3))
 			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(zone1Pod))
 			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(zone2Pod))
 			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(zone3Pod))
@@ -3211,7 +3187,6 @@ var _ = Describe("Topology", func() {
 				Labels: map[string]string{corev1.LabelTopologyZone: "test-zone-1"},
 			}})
 			ExpectApplied(ctx, env.Client, nodePool, existingNode)
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(existingNode))
 			owner := ownerReferenceFor(replicaSet)
 			ExpectApplied(ctx, env.Client,
 				test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Labels: labels, OwnerReferences: []metav1.OwnerReference{owner}}, NodeName: existingNode.Name}),

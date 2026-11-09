@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package health
+package repair
 
 import (
 	"context"
@@ -365,6 +365,18 @@ func Resolve(matches []RepairPolicyMatch, now, notBefore time.Time) RepairResult
 func (p *RepairPolicyMatcher) Matches(condition corev1.NodeCondition) bool {
 	_, ok := p.groups[policyKey{conditionType: condition.Type, conditionStatus: condition.Status}]
 	return ok
+}
+
+// MatchesAny returns true when Match would return a match for the Node: one of its conditions is covered by the
+// policy set, since a covered condition always matches a reason-specific policy or the fallback. It doesn't allocate.
+func (p *RepairPolicyMatcher) MatchesAny(node *corev1.Node) bool {
+	return slices.ContainsFunc(node.Status.Conditions, p.Matches)
+}
+
+// Equal returns true when both matches resolve the same way at any time.
+func (m RepairPolicyMatch) Equal(o RepairPolicyMatch) bool {
+	return m.rank == o.rank && m.eligibleAt.Equal(o.eligibleAt) && m.policy.RepairPolicy == o.policy.RepairPolicy &&
+		m.policy.reasonRegex == o.policy.reasonRegex && m.policy.Condition == o.policy.Condition
 }
 
 func (r *RepairResult) mergePolicy(policy compiledPolicy, rank int, eligibleAt, now time.Time) {

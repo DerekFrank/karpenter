@@ -35,12 +35,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/karpenter/pkg/operator/logging"
-	"sigs.k8s.io/karpenter/pkg/state/nodepoolhealth"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	nodeclaimlifecycle "sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
+	"sigs.k8s.io/karpenter/pkg/controllers/nodepool/registrationhealth"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
@@ -60,7 +61,10 @@ var (
 	cloudProvider       *fake.CloudProvider
 	cluster             *state.Cluster
 	recorder            *test.EventRecorder
-	npState             *nodepoolhealth.State
+	npState             *karpentercluster.NodePoolState
+	registrations       *karpentercluster.Registrations
+	// registrationHealthController derives the NodeRegistrationHealthy condition from the outcomes lifecycle records.
+	registrationHealthController *registrationhealth.Controller
 )
 
 func TestAPIs(t *testing.T) {
@@ -87,10 +91,36 @@ var _ = BeforeSuite(func() {
 	ctx = options.ToContext(ctx, test.Options())
 
 	cloudProvider = fake.NewCloudProvider()
-	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
-	npState = nodepoolhealth.NewState()
-	nodeClaimController = nodeclaimlifecycle.NewController(env.Clock, env.Client, cloudProvider, recorder, cluster, npState, nil)
+	cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
+	cluster = state.NewCluster(env.Clock, env.Overlay, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
+	npState = cluster.NodePoolState
+	registrations = cs.Registrations
+	nodeClaimController = nodeclaimlifecycle.NewController(env.Clock, env.Overlay, cloudProvider, recorder, cluster, registrations, nil)
+	registrationHealthController = registrationhealth.NewController(env.Clock, env.Overlay, cloudProvider, npState)
 })
+
+// registrationNodeClass returns the NodeClass the NodePool references, which launch outcomes are recorded against.
+func registrationNodeClass(nodePool *v1.NodePool) *v1alpha1.TestNodeClass {
+	return test.NodeClass(v1alpha1.TestNodeClass{ObjectMeta: metav1.ObjectMeta{Name: nodePool.Spec.Template.Spec.NodeClassRef.Name}})
+}
+
+// expectNodeRegistrationHealthy derives the NodePool's NodeRegistrationHealthy condition from the launch outcomes the
+// lifecycle controller recorded, as the registration health controller does, and expects it to be want.
+func expectNodeRegistrationHealthy(nodePool *v1.NodePool, want metav1.ConditionStatus) {
+	GinkgoHelper()
+	ExpectObjectReconciled(ctx, env.Client, registrationHealthController, nodePool)
+	cond := ExpectExists(ctx, env.Client, nodePool).StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy)
+	Expect(cond).ToNot(BeNil(), "NodeRegistrationHealthy is unset")
+	Expect(cond.Status).To(Equal(want), "NodeRegistrationHealthy = %+v", cond)
+}
+
+// expectRegistrationHealth expects the launch outcomes recorded for the NodePool's current spec to give want.
+func expectRegistrationHealth(nodePool *v1.NodePool, want karpentercluster.RegistrationStatus) {
+	GinkgoHelper()
+	nodePool = ExpectExists(ctx, env.Client, nodePool)
+	nodeClass := ExpectExists(ctx, env.Client, registrationNodeClass(nodePool))
+	Expect(npState.RegistrationHealth(nodePool, nodeClass.GetGeneration()).Status).To(Equal(want))
+}
 
 var _ = AfterSuite(func() {
 	Expect(env.Stop()).To(Succeed(), "Failed to stop environment")

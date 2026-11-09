@@ -37,6 +37,7 @@ import (
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -65,6 +66,8 @@ func TestVPA(t *testing.T) {
 
 var _ = BeforeSuite(func() {
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(testcrds.CRDs...))
+	cs := karpentercluster.New(ctx, env.Clock, env.Overlay, fake.NewCloudProvider())
+	cluster = state.NewCluster(env.Clock, env.Overlay, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
 })
 
 var _ = AfterSuite(func() {
@@ -72,10 +75,10 @@ var _ = AfterSuite(func() {
 })
 
 var _ = BeforeEach(func() {
-	store = prediction.NewStore(env.Client)
-	cluster = state.NewCluster(env.Clock, env.Client, fake.NewCloudProvider())
+	store = prediction.NewStore(env.Overlay)
+	cluster.Reset()
 	recorder = test.NewEventRecorder()
-	controller = informer.NewVPAController(env.Client, store, cluster, recorder)
+	controller = informer.NewVPAController(env.Overlay, store, cluster, recorder)
 
 	dep = test.Deployment(test.DeploymentOptions{
 		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "default"},

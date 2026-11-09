@@ -96,14 +96,14 @@ var _ = Describe("Balanced Consolidation", func() {
 			ExpectApplied(ctx, env.Client, rs, pod, node, nodeClaim, nodePool)
 			ExpectManualBinding(ctx, env.Client, pod, node)
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
 
 			// Replace should create a cheaper node
-			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
+			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cloudProvider, cmds[0])
 			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 
@@ -170,7 +170,7 @@ var _ = Describe("Balanced Consolidation", func() {
 				ExpectManualBinding(ctx, env.Client, p, node)
 			}
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			cmds := queue.GetCommands()
@@ -228,14 +228,14 @@ var _ = Describe("Balanced Consolidation", func() {
 				ExpectManualBinding(ctx, env.Client, pods[i], nodes[i])
 			}
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
 			Expect(len(cmds[0].Candidates)).To(BeNumerically(">=", 2))
 
-			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmds[0])
+			ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cloudProvider, cmds[0])
 			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims...)
 
@@ -290,7 +290,7 @@ var _ = Describe("Balanced Consolidation", func() {
 			ExpectApplied(ctx, env.Client, rs, pod, node, nodeClaim, nodePool)
 			ExpectManualBinding(ctx, env.Client, pod, node)
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// Budget of 0% should block all disruption even though balanced scoring would approve
@@ -372,7 +372,7 @@ var _ = Describe("Balanced Consolidation", func() {
 			ExpectApplied(ctx, env.Client, rs, nodePool, emptyNodeClaim, emptyNode, underutilizedNodeClaim, underutilizedNode, pod)
 			ExpectManualBinding(ctx, env.Client, pod, underutilizedNode)
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController,
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock,
 				[]*corev1.Node{emptyNode, underutilizedNode},
 				[]*v1.NodeClaim{emptyNodeClaim, underutilizedNodeClaim})
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -469,7 +469,7 @@ var _ = Describe("Balanced Consolidation", func() {
 				ExpectManualBinding(ctx, env.Client, p, nodeB)
 			}
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController,
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock,
 				[]*corev1.Node{nodeA, nodeB},
 				[]*v1.NodeClaim{nodeClaimA, nodeClaimB})
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -534,7 +534,7 @@ var _ = Describe("Balanced Consolidation", func() {
 			ExpectApplied(ctx, env.Client, rs, nodePool, nodeClaimA, nodeA, podA)
 			ExpectManualBinding(ctx, env.Client, podA, nodeA)
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController,
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock,
 				[]*corev1.Node{nodeA},
 				[]*v1.NodeClaim{nodeClaimA})
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -665,7 +665,7 @@ var _ = Describe("Balanced Consolidation", func() {
 				ExpectManualBinding(ctx, env.Client, p, nodeC)
 			}
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController,
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock,
 				[]*corev1.Node{nodeA, nodeB, nodeC},
 				[]*v1.NodeClaim{nodeClaimA, nodeClaimB, nodeClaimC})
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -781,7 +781,7 @@ var _ = Describe("Balanced Consolidation", func() {
 			ExpectManualBinding(ctx, env.Client, balancedPod, balancedNode)
 			ExpectManualBinding(ctx, env.Client, defaultPod, defaultNode)
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController,
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock,
 				[]*corev1.Node{balancedNode, defaultNode},
 				[]*v1.NodeClaim{balancedNodeClaim, defaultNodeClaim})
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -790,7 +790,7 @@ var _ = Describe("Balanced Consolidation", func() {
 			Expect(cmds).ToNot(BeEmpty(), "expected at least one consolidation command")
 
 			for _, cmd := range cmds {
-				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmd)
+				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cloudProvider, cmd)
 				ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
 			}
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, balancedNodeClaim, defaultNodeClaim)
