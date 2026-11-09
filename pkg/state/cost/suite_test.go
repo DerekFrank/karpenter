@@ -37,6 +37,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/apis/v1alpha1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/nodeoverlay"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
@@ -70,11 +71,12 @@ var _ = BeforeSuite(func() {
 	}))
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
-	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
+	cs := karpentercluster.New(ctx, env.Clock, nil, nil, cloudProvider)
+	cluster = state.NewCluster(env.Clock, env.Client, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
 	nodeOverlayStore = nodeoverlay.NewInstanceTypeStore()
 	nodeOverlayController = nodeoverlay.NewController(env.Clock, env.Client, cloudProvider, nodeOverlayStore, cluster)
-	pricingController = informer.NewPricingController(env.Client, cloudProvider, clusterCost)
 	clusterCost = cost.NewClusterCost(ctx, cloudProvider, env.Client)
+	pricingController = informer.NewPricingController(env.Client, cloudProvider, clusterCost)
 })
 
 var _ = AfterSuite(func() {
@@ -83,7 +85,7 @@ var _ = AfterSuite(func() {
 
 var _ = AfterEach(func() {
 	ExpectCleanedUp(ctx, env.Client)
-	clusterCost = cost.NewClusterCost(ctx, cloudProvider, env.Client)
+	clusterCost.Reset()
 	cluster.Reset()
 	cloudProvider.Reset()
 })
@@ -444,6 +446,110 @@ var _ = Describe("ClusterCost", func() {
 			costAfterRefresh := clusterCost.GetClusterCost()
 			Expect(costAfterRefresh).To(BeNumerically("~", 4.50, 0.001),
 				fmt.Sprintf("cost should still be 4.50 after UpdateOfferings recomputes from counts, got %v — indicates count was not incremented on re-add", costAfterRefresh))
+		})
+	})
+
+	Context("Label changes", func() {
+		It("should move a NodeClaim's cost when its offering changes", func() {
+			nodeClaim := createTestNodeClaim(testNodePool, testInstanceType.Name, spotOffering.CapacityType(), spotOffering.Zone())
+			Expect(clusterCost.UpdateNodeClaim(ctx, nodeClaim)).To(Succeed())
+			Expect(clusterCost.GetNodepoolCost(testNodePool)).To(BeNumerically("~", 1.50, 0.001))
+
+			// The store keeps the NodeClaim it observes, so a new version is a copy, as a reconciler's Get returns.
+			nodeClaim = nodeClaim.DeepCopy()
+			nodeClaim.Labels[v1.CapacityTypeLabelKey] = onDemandOffering.CapacityType()
+			Expect(clusterCost.UpdateNodeClaim(ctx, nodeClaim)).To(Succeed())
+			Expect(clusterCost.GetNodepoolCost(testNodePool)).To(BeNumerically("~", 3.00, 0.001))
+			Expect(clusterCost.GetClusterCost()).To(BeNumerically("~", 3.00, 0.001))
+		})
+		It("should move a NodeClaim's cost when its NodePool changes", func() {
+			nodeClaim := createTestNodeClaim(testNodePool, testInstanceType.Name, spotOffering.CapacityType(), spotOffering.Zone())
+			Expect(clusterCost.UpdateNodeClaim(ctx, nodeClaim)).To(Succeed())
+
+			nodeClaim = nodeClaim.DeepCopy()
+			nodeClaim.Labels[v1.NodePoolLabelKey] = testNodePool2.Name
+			Expect(clusterCost.UpdateNodeClaim(ctx, nodeClaim)).To(Succeed())
+			Expect(clusterCost.GetNodepoolCost(testNodePool)).To(BeNumerically("==", 0))
+			Expect(clusterCost.GetNodepoolCost(testNodePool2)).To(BeNumerically("~", 1.50, 0.001))
+			Expect(clusterCost.GetClusterCost()).To(BeNumerically("~", 1.50, 0.001))
+		})
+		It("should stop counting a NodeClaim that loses a necessary label, and count it again once it's back", func() {
+			nodeClaim := createTestNodeClaim(testNodePool, testInstanceType.Name, spotOffering.CapacityType(), spotOffering.Zone())
+			Expect(clusterCost.UpdateNodeClaim(ctx, nodeClaim)).To(Succeed())
+
+			nodeClaim = nodeClaim.DeepCopy()
+			delete(nodeClaim.Labels, corev1.LabelTopologyZone)
+			Expect(clusterCost.UpdateNodeClaim(ctx, nodeClaim)).To(Succeed())
+			Expect(clusterCost.GetClusterCost()).To(BeNumerically("==", 0))
+
+			nodeClaim = nodeClaim.DeepCopy()
+			nodeClaim.Labels[corev1.LabelTopologyZone] = spotOffering.Zone()
+			Expect(clusterCost.UpdateNodeClaim(ctx, nodeClaim)).To(Succeed())
+			Expect(clusterCost.GetClusterCost()).To(BeNumerically("~", 1.50, 0.001))
+		})
+		It("should count a NodeClaim once however often it's observed", func() {
+			nodeClaim := createTestNodeClaim(testNodePool, testInstanceType.Name, spotOffering.CapacityType(), spotOffering.Zone())
+			for range 3 {
+				Expect(clusterCost.UpdateNodeClaim(ctx, nodeClaim)).To(Succeed())
+			}
+			Expect(clusterCost.GetNodepoolCost(testNodePool)).To(BeNumerically("~", 1.50, 0.001))
+		})
+	})
+
+	Context("DeleteNodePool", func() {
+		It("should drop a deleted NodePool's prices and count nothing once its NodeClaims are gone", func() {
+			nodeClaim := createTestNodeClaim(testNodePool, testInstanceType.Name, spotOffering.CapacityType(), spotOffering.Zone())
+			other := createTestNodeClaim(testNodePool2, testInstanceType.Name, onDemandOffering.CapacityType(), onDemandOffering.Zone())
+			Expect(clusterCost.UpdateNodeClaim(ctx, nodeClaim)).To(Succeed())
+			Expect(clusterCost.UpdateNodeClaim(ctx, other)).To(Succeed())
+
+			clusterCost.DeleteNodePool(ctx, testNodePool.Name)
+			Expect(clusterCost.GetNodepoolCost(testNodePool)).To(BeNumerically("==", 0))
+			Expect(clusterCost.GetNodepoolCost(testNodePool2)).To(BeNumerically("~", 3.00, 0.001))
+
+			Expect(clusterCost.DeleteNodeClaim(ctx, client.ObjectKeyFromObject(nodeClaim))).To(Succeed())
+			Expect(clusterCost.GetClusterCost()).To(BeNumerically("~", 3.00, 0.001))
+		})
+		It("should drop the prices of a NodePool the pricing refresh doesn't find", func() {
+			nodeClaim := createTestNodeClaim(testNodePool, testInstanceType.Name, spotOffering.CapacityType(), spotOffering.Zone())
+			Expect(clusterCost.UpdateNodeClaim(ctx, nodeClaim)).To(Succeed())
+			ExpectDeleted(ctx, env.Client, testNodePool)
+
+			ExpectSingletonReconciled(ctx, pricingController)
+			Expect(clusterCost.GetNodepoolCost(testNodePool)).To(BeNumerically("==", 0))
+		})
+	})
+
+	Context("Pricing refresh", func() {
+		It("should reprice every NodePool's NodeClaims from the cloud provider", func() {
+			spot := createTestNodeClaim(testNodePool, testInstanceType.Name, spotOffering.CapacityType(), spotOffering.Zone())
+			onDemand := createTestNodeClaim(testNodePool2, testInstanceType.Name, onDemandOffering.CapacityType(), onDemandOffering.Zone())
+			Expect(clusterCost.UpdateNodeClaim(ctx, spot)).To(Succeed())
+			Expect(clusterCost.UpdateNodeClaim(ctx, onDemand)).To(Succeed())
+			Expect(clusterCost.GetClusterCost()).To(BeNumerically("~", 4.50, 0.001))
+
+			spotOffering.Price = 2.00
+			onDemandOffering.Price = 5.00
+			// Observing a NodeClaim of an offering already priced doesn't read prices again.
+			Expect(clusterCost.UpdateNodeClaim(ctx, spot)).To(Succeed())
+			Expect(clusterCost.GetClusterCost()).To(BeNumerically("~", 4.50, 0.001))
+
+			ExpectSingletonReconciled(ctx, pricingController)
+			Expect(clusterCost.GetNodepoolCost(testNodePool)).To(BeNumerically("~", 2.00, 0.001))
+			Expect(clusterCost.GetNodepoolCost(testNodePool2)).To(BeNumerically("~", 5.00, 0.001))
+			Expect(clusterCost.GetClusterCost()).To(BeNumerically("~", 7.00, 0.001))
+		})
+		It("should count an offering the cloud provider doesn't have at nothing until a refresh finds it", func() {
+			nodeClaim := createTestNodeClaim(testNodePool, "unknown-instance", spotOffering.CapacityType(), spotOffering.Zone())
+			Expect(clusterCost.UpdateNodeClaim(ctx, nodeClaim)).To(Succeed())
+			Expect(clusterCost.GetNodepoolCost(testNodePool)).To(BeNumerically("==", 0))
+
+			cloudProvider.InstanceTypes = append(cloudProvider.InstanceTypes, &cloudprovider.InstanceType{
+				Name:      "unknown-instance",
+				Offerings: []*cloudprovider.Offering{spotOffering},
+			})
+			ExpectSingletonReconciled(ctx, pricingController)
+			Expect(clusterCost.GetNodepoolCost(testNodePool)).To(BeNumerically("~", 1.50, 0.001))
 		})
 	})
 
