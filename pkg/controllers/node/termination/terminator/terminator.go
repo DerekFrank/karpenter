@@ -156,15 +156,35 @@ func (t *Terminator) Drain(ctx context.Context, node *corev1.Node, nodeGracePeri
 			} else {
 				t.evictionQueue.Add(nodeGracePeriodExpirationTime, group...)
 			}
-			return NewNodeDrainError(fmt.Errorf("%d pods are waiting to be evicted", len(waiting)))
+			return t.drainError(waiting, nodeGracePeriodExpirationTime, o)
 		}
 	}
 	// No graceful candidates remain, but we may still be waiting on the
 	// delete-eligible batch to finish being removed.
 	if len(deleteEligible) > 0 {
-		return NewNodeDrainError(fmt.Errorf("%d pods are waiting to be evicted", len(waiting)))
+		return t.drainError(waiting, nodeGracePeriodExpirationTime, o)
 	}
 	return nil
+}
+
+// drainError is the NodeDrainError for the pods waiting on drain. It retries at the earliest time one of them changes
+// with time alone: it becomes stuck terminating, which stops it waiting, or due for force deletion.
+func (t *Terminator) drainError(waiting []*corev1.Pod, nodeGracePeriodExpirationTime *time.Time, o *drainOptions) *NodeDrainError {
+	err := NewNodeDrainError(fmt.Errorf("%d pods are waiting to be evicted", len(waiting)))
+	now := t.clock.Now()
+	retryAt := func(at time.Time) {
+		if at.After(now) && (err.RetryAt.IsZero() || at.Before(err.RetryAt)) {
+			err.RetryAt = at
+		}
+	}
+	for _, p := range waiting {
+		if podutil.IsTerminating(p) {
+			retryAt(p.DeletionTimestamp.Add(podutil.StuckTerminatingTimeout))
+		} else if !o.leaveResidualPods && nodeGracePeriodExpirationTime != nil && p.Spec.TerminationGracePeriodSeconds != nil {
+			retryAt(nodeGracePeriodExpirationTime.Add(-time.Duration(*p.Spec.TerminationGracePeriodSeconds) * time.Second))
+		}
+	}
+	return err
 }
 
 func (t *Terminator) groupPodsByPriority(pods []*corev1.Pod) [][]*corev1.Pod {

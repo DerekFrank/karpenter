@@ -152,12 +152,15 @@ func IsTerminating(pod *corev1.Pod) bool {
 	return pod.DeletionTimestamp != nil
 }
 
+// StuckTerminatingTimeout is how long past its DeletionTimestamp a terminating pod becomes stuck terminating.
+const StuckTerminatingTimeout = time.Minute
+
 func IsStuckTerminating(pod *corev1.Pod, clk clock.Clock) bool {
 	// The pod DeletionTimestamp will be set to the time the pod was deleted plus its
 	// grace period in seconds. We give an additional minute as a buffer to allow
 	// pods to force delete off the node before we actually go and terminate the node
 	// so that we get less pod leaking on the cluster.
-	return IsTerminating(pod) && clk.Since(pod.DeletionTimestamp.Time) > time.Minute
+	return IsTerminating(pod) && clk.Since(pod.DeletionTimestamp.Time) > StuckTerminatingTimeout
 }
 
 func IsOwnedByStatefulSet(pod *corev1.Pod) bool {

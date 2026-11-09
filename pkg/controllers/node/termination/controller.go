@@ -18,6 +18,7 @@ package termination
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
@@ -38,14 +40,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
 	terminatorevents "sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator/events"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -60,6 +65,12 @@ const (
 	minReconciles = 100
 	maxReconciles = 5000
 	MinDrainTime  = 5 * time.Second
+	// recheckInterval bounds how long a node waits on its pods or VolumeAttachments without reconciling. Their changes
+	// wake the controller, but a change no store or watch sees, such as a PodDisruptionBudget allowing an eviction the
+	// eviction queue is retrying, shows only as the pod going.
+	recheckInterval = 30 * time.Second
+	// minRequeue is the shortest wait on a time-based change, which batches the reconciles of changes close in time.
+	minRequeue = time.Second
 )
 
 // Controller for the resource
@@ -69,16 +80,21 @@ type Controller struct {
 	cloudProvider cloudprovider.CloudProvider
 	terminator    *terminator.Terminator
 	recorder      events.Recorder
+	nodes         *karpentercluster.NodeState
+	// draining is the Node store as a source narrowed to the pod count of each deleting managed Node, built in Register.
+	draining source.SyncingSource
 }
 
-// NewController constructs a controller instance
-func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, terminator *terminator.Terminator, recorder events.Recorder) *Controller {
+// NewController constructs a controller instance. It reconciles a deleting Node when it changes, when a pod binds to it
+// or leaves it, as the node state's pod store sees them, and when a VolumeAttachment of it changes.
+func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, terminator *terminator.Terminator, recorder events.Recorder, nodes *karpentercluster.NodeState) *Controller {
 	return &Controller{
 		clock:         clk,
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
 		terminator:    terminator,
 		recorder:      recorder,
+		nodes:         nodes,
 	}
 }
 
@@ -205,11 +221,13 @@ func (c *Controller) awaitDrain(
 		nodeClaim.StatusConditions(status.WithClock(c.clock)).SetUnknownWithReason(v1.ConditionTypeDrained, "Draining", "Draining")
 	}
 	if err := c.terminator.Drain(ctx, node, nodeTerminationTime); err != nil {
-		if !terminator.IsNodeDrainError(err) {
+		var drainErr *terminator.NodeDrainError
+		if !stderrors.As(err, &drainErr) {
 			return reconcile.Result{}, fmt.Errorf("draining node, %w", err)
 		}
 		c.recorder.Publish(terminatorevents.NodeFailedToDrain(node, err))
-		return reconcile.Result{RequeueAfter: 1 * time.Second}, nil
+		// Pods binding to or leaving the node wake the controller, so it only waits on the pods' time-based changes.
+		return reconcile.Result{RequeueAfter: c.requeueBy(lo.Ternary(drainErr.RetryAt.IsZero(), nil, &drainErr.RetryAt))}, nil //storelint:deadline the drain's retry time or termination grace period
 	}
 
 	// If the nodeclaim exists, check if minDrainTime has elapsed. If it hasn't we should requeue.
@@ -217,8 +235,11 @@ func (c *Controller) awaitDrain(
 	// can occur when the scheduler has not seen the taint yet.
 	if nodeClaim != nil {
 		cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeDrained)
-		if cond == nil || (cond.IsUnknown() && c.clock.Since(cond.LastTransitionTime.Time) < MinDrainTime) {
-			return reconcile.Result{RequeueAfter: 1 * time.Second}, nil
+		if cond == nil {
+			return reconcile.Result{RequeueAfter: MinDrainTime}, nil //storelint:deadline the minimum drain time
+		}
+		if remaining := MinDrainTime - c.clock.Since(cond.LastTransitionTime.Time); cond.IsUnknown() && remaining > 0 {
+			return reconcile.Result{RequeueAfter: remaining}, nil //storelint:deadline the minimum drain time
 		}
 	}
 
@@ -264,7 +285,8 @@ func (c *Controller) awaitVolumeDetachment(
 		if nodeClaim != nil {
 			nodeClaim.StatusConditions(status.WithClock(c.clock)).SetUnknownWithReason(v1.ConditionTypeVolumesDetached, "AwaitingVolumeDetachment", "AwaitingVolumeDetachment")
 		}
-		return reconcile.Result{RequeueAfter: 1 * time.Second}, nil
+		// VolumeAttachments changing wake the controller, so it only waits on the termination grace period elapsing.
+		return reconcile.Result{RequeueAfter: c.requeueBy(nodeTerminationTime)}, nil //storelint:deadline the termination grace period
 	}
 
 	// There are volume attachments blocking instance termination remaining, but the nodeclaim's TGP has expired. In this
@@ -294,9 +316,17 @@ func (c *Controller) awaitInstanceTermination(
 	}
 	nodeClaim.StatusConditions(status.WithClock(c.clock)).SetTrue(v1.ConditionTypeInstanceTerminating)
 	if !cloudprovider.IsNodeClaimNotFoundError(deleteErr) {
-		return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
+		return reconcile.Result{RequeueAfter: 5 * time.Second}, nil //storelint:deadline retry backoff for a failed instance delete
 	}
 	return reconcile.Result{}, nil
+}
+
+// requeueBy is how long to wait to reconcile by at, if set, within minRequeue and recheckInterval.
+func (c *Controller) requeueBy(at *time.Time) time.Duration {
+	if at == nil {
+		return recheckInterval
+	}
+	return max(minRequeue, min(recheckInterval, at.Sub(c.clock.Now())))
 }
 
 func (c *Controller) hasTerminationGracePeriodElapsed(nodeTerminationTime *time.Time) bool {
@@ -412,9 +442,21 @@ func (c *Controller) Name() string {
 func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 	maxConcurrentReconciles := utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), minReconciles, maxReconciles)
 	qps, bucketSize := utilscontroller.GetTypedBucketConfigs(10, minReconciles, maxConcurrentReconciles)
+	// draining narrows each Node's entry to its pod count while it's a deleting managed Node, so a pod binding to or
+	// leaving any other Node, or a pod's status changing, doesn't wake the controller.
+	c.draining = c.nodes.NodeStore.SourceOn(func(_ string, e karpentercluster.NodeEntry) any {
+		if e.Object.DeletionTimestamp.IsZero() || !nodeutils.IsManaged(e.Object, c.cloudProvider) {
+			return nil
+		}
+		return e.Derived.Usage.Pods
+	})
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		For(&corev1.Node{}, builder.WithPredicates(nodeutils.IsManagedPredicateFuncs(c.cloudProvider))).
+		WatchesRawSource(c.draining).
+		Watches(&storagev1.VolumeAttachment{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, o client.Object) []reconcile.Request {
+			return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: o.(*storagev1.VolumeAttachment).Spec.NodeName}}}
+		})).
 		WithOptions(
 			controller.Options{
 				RateLimiter: workqueue.NewTypedMaxOfRateLimiter[reconcile.Request](
