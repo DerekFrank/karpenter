@@ -37,18 +37,24 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/clock"
 	controllerruntime "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
@@ -66,10 +72,10 @@ type Controller struct {
 	methods       []Method
 	mu            sync.Mutex
 	lastRun       map[string]time.Time
-}
 
-// pollingPeriod that we inspect cluster to look for opportunities to disrupt
-const pollingPeriod = 10 * time.Second
+	// changes counts the changes of what the controller wakes on, and the NodePools'.
+	changes *changes
+}
 
 type ControllerOptions struct {
 	methods []Method
@@ -95,6 +101,7 @@ func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Clien
 		cloudProvider: cp,
 		clusterCost:   clusterCost,
 		lastRun:       map[string]time.Time{},
+		changes:       &changes{},
 		methods:       o.methods,
 	}
 }
@@ -126,10 +133,37 @@ func (c *Controller) Name() string {
 	return "disruption"
 }
 
+// Register wakes the controller on the changes that can open a disruption decision, and has the consolidation methods
+// skip their work until one comes, in place of a poll:
+//   - the NodeClaim store, narrowed to nodeClaimInputs: a NodeClaim coming, launching, linking its Node, starting to
+//     delete or going; being marked for deletion; its Drifted or Consolidatable condition or its do-not-disrupt
+//     annotation changing; or its buffer pods coming or going. Its nomination, status heartbeats and other conditions
+//     don't wake it.
+//   - the Node store, narrowed to nodeInputs: a Node initializing, its do-not-disrupt annotation or its repair policy
+//     matches changing in number; and its pods' usage, as a pod binds to it or leaves it, starts to terminate, or gains
+//     or loses the do-not-disrupt annotation. A pod's status, its other metadata, pods waiting to schedule, which have
+//     no Node, and the Node's heartbeat don't wake it.
+//   - a managed NodePool's spec changing, through its generation.
+//   - the NodeClaim store's UnlaunchedSource: a NodeClaim launching, which can end the wait on NodeClaimsLaunched. It
+//     doesn't count as a change for consolidation, since a launch also changes the NodeClaim's inputs.
+//
+// The controller still runs every revalidationPeriod for what shows only with time.
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
+	for _, method := range c.methods {
+		if t, ok := method.(changeTracker); ok {
+			t.trackChanges(c.changes)
+		}
+	}
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		WatchesRawSource(singleton.Source()).
+		WatchesRawSource(karpenterstate.Requires(c.cluster)).
+		// Every source enqueues the same empty request, so the controller runs once for each burst of changes.
+		WatchesRawSource(c.wakes()).
+		Watches(&v1.NodePool{}, handler.EnqueueRequestsFromMapFunc(func(context.Context, client.Object) []reconcile.Request {
+			c.changes.add()
+			return []reconcile.Request{{}}
+		}), builder.WithPredicates(predicate.GenerationChangedPredicate{}, nodepoolutils.IsManagedPredicateFuncs(c.cloudProvider))).
 		Complete(singleton.AsReconciler(c))
 }
 
@@ -146,34 +180,33 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	// Only validate the first reason, since CEL validation will catch invalid disruption reasons
 	c.logInvalidBudgets(ctx)
 
-	// We need to ensure that our internal cluster state mechanism is synced before we proceed
-	// with making any scheduling decision off of our state nodes. Otherwise, we have the potential to make
-	// a scheduling decision based on a smaller subset of nodes in our cluster state than actually exist.
-	if !c.cluster.Synced(ctx) {
-		return reconciler.Result{RequeueAfter: time.Second}, nil
+	// A NodeClaim that's launching isn't a node in cluster state yet, so a decision made now would be made off a
+	// smaller subset of nodes than actually exist. The unlaunched NodeClaims wake the controller once they launch.
+	if !c.cluster.NodeClaimsLaunched(ctx) {
+		return reconciler.Result{}, nil
 	}
 
 	// Karpenter taints nodes with a karpenter.sh/disruption taint as part of the disruption process while it progresses in memory.
 	// If Karpenter restarts or fails with an error during a disruption action, some nodes can be left tainted.
 	// Idempotently remove this taint from candidates that are not in the orchestration queue before continuing.
 	// Reboot bypasses the queue, so preserve its DisruptionReason during drain.
-	outdatedNodes := lo.Reject(c.cluster.DeepCopyNodes(), func(s *state.StateNode, _ int) bool {
-		return c.queue.HasAny(s.ProviderID()) || s.MarkedForDeletion() || s.RebootInProgress()
+	outdatedNodes := lo.Reject(c.cluster.DeepCopyNodes(), func(s *karpentercluster.StateNode, _ int) bool {
+		return c.queue.HasNode(s) || s.MarkedForDeletion() || s.RebootInProgress()
 	})
-	if err := state.RequireNoScheduleTaint(ctx, c.kubeClient, false, outdatedNodes...); err != nil {
+	if err := RequireNoScheduleTaint(ctx, c.kubeClient, false, outdatedNodes...); err != nil {
 		if errors.IsConflict(err) {
 			return reconciler.Result{Requeue: true}, nil
 		}
 		return reconciler.Result{}, serrors.Wrap(fmt.Errorf("removing taint from nodes, %w", err), "taint", pretty.Taint(v1.DisruptedNoScheduleTaint))
 	}
-	if err := state.ClearNodeClaimsCondition(ctx, c.kubeClient, c.clock, v1.ConditionTypeDisruptionReason, outdatedNodes...); err != nil {
+	if err := ClearNodeClaimsCondition(ctx, c.kubeClient, c.clock, v1.ConditionTypeDisruptionReason, outdatedNodes...); err != nil {
 		if errors.IsConflict(err) {
 			return reconciler.Result{Requeue: true}, nil
 		}
 		return reconciler.Result{}, serrors.Wrap(fmt.Errorf("removing condition from nodeclaims, %w", err), "condition", v1.ConditionTypeDisruptionReason)
 	}
 	if options.FromContext(ctx).FeatureGates.PredictionEnabled && !c.provisioner.PredictionStoreHydrated(ctx) {
-		return reconciler.Result{RequeueAfter: time.Second}, nil
+		return reconciler.Result{RequeueAfter: time.Second}, nil //storelint:deadline poll: the prediction store hydrates without a source
 	}
 
 	// Attempt different disruption methods. We'll only let one method perform an action
@@ -187,12 +220,12 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 			return reconciler.Result{}, serrors.Wrap(fmt.Errorf("disrupting, %w", err), strings.ToLower(string(m.Reason())), "reason")
 		}
 		if success {
-			return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil
+			return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil //storelint:deadline the singleton runs again at once after a command
 		}
 	}
 
-	// All methods did nothing, so return nothing to do
-	return reconciler.Result{RequeueAfter: pollingPeriod}, nil
+	// All methods did nothing, so wait for a change, or for the revalidation period
+	return reconciler.Result{RequeueAfter: revalidationPeriod}, nil //storelint:deadline revalidation period, for what shows only with time
 }
 
 func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, error) {
@@ -223,15 +256,35 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 	// Determine the disruption action
 	cmds, err := disruption.ComputeCommands(ctx, disruptionBudgetMapping, candidates...)
 	if err != nil {
+		// A method may have reserved for commands it returns with its error; nothing will start them.
+		for i := range cmds {
+			releaseReservations(&cmds[i])
+		}
 		return false, fmt.Errorf("computing disruption decision, %w", err)
 	}
-	cmds = lo.Filter(cmds, func(c Command, _ int) bool { return c.Decision() != NoOpDecision })
+	cmds = lo.Filter(cmds, func(c Command, _ int) bool {
+		if c.Decision() == NoOpDecision {
+			releaseReservations(&c)
+			return false
+		}
+		return true
+	})
 	if len(cmds) == 0 {
 		return false, nil
 	}
 
 	errs := make([]error, len(cmds))
+	attempted := make([]bool, len(cmds))
+	// ParallelizeUntil skips the commands it hadn't started once ctx is done, so nothing will start them.
+	defer func() {
+		for i := range cmds {
+			if !attempted[i] {
+				releaseReservations(&cmds[i])
+			}
+		}
+	}()
 	workqueue.ParallelizeUntil(ctx, len(cmds), len(cmds), func(i int) {
+		attempted[i] = true
 		cmd := cmds[i]
 
 		// Assign common fields
