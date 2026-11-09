@@ -35,7 +35,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/pod/deletioncost"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -106,9 +106,9 @@ var _ = Describe("Ranking", func() {
 					pods[i] = rsOwnedPod(opts)
 					ExpectApplied(ctx, env.Client, pods[i])
 				}
-				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-				controller := deletioncost.NewController(env.Clock, env.Client, cloudProvider, cluster, queue)
+				controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, queue)
 				_, err := controller.Reconcile(ctx)
 				Expect(err).ToNot(HaveOccurred())
 
@@ -140,9 +140,9 @@ var _ = Describe("Ranking", func() {
 				pods[i] = rsOwnedPod(test.PodOptions{NodeName: n.Name})
 				ExpectApplied(ctx, env.Client, pods[i])
 			}
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			controller := deletioncost.NewController(env.Clock, env.Client, cloudProvider, cluster, queue)
+			controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, queue)
 			_, err := controller.Reconcile(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -177,9 +177,9 @@ var _ = Describe("Ranking", func() {
 			})
 			normalPod := rsOwnedPod(test.PodOptions{NodeName: nodes[1].Name})
 			ExpectApplied(ctx, env.Client, stsPod, normalPod)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			controller := deletioncost.NewController(env.Clock, env.Client, cloudProvider, cluster, queue)
+			controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, queue)
 			_, err := controller.Reconcile(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -213,9 +213,9 @@ var _ = Describe("Ranking", func() {
 				Status: policyv1.PodDisruptionBudgetStatus{DisruptionsAllowed: 0},
 			}
 			ExpectApplied(ctx, env.Client, pdb)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			controller := deletioncost.NewController(env.Clock, env.Client, cloudProvider, cluster, queue)
+			controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, queue)
 			_, err := controller.Reconcile(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -239,14 +239,9 @@ var _ = Describe("Ranking", func() {
 			taintedPod := rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name})
 			normalPod := rsOwnedPod(test.PodOptions{NodeName: nodes[1].Name})
 			ExpectApplied(ctx, env.Client, taintedPod, normalPod)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			var stateNodes []*state.StateNode
-			for n := range cluster.Nodes() {
-				stateNodes = append(stateNodes, n)
-			}
-
-			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, stateNodes, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
+			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Overlay, env.Clock, cluster, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(totalRanked(groupA, groupBC, groupD)).To(Equal(2))
 
@@ -298,9 +293,9 @@ var _ = Describe("Ranking", func() {
 			})
 			ExpectApplied(ctx, env.Client, pod1, pod2, dndPod)
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			controller := deletioncost.NewController(env.Clock, env.Client, cloudProvider, cluster, queue)
+			controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, queue)
 			_, err := controller.Reconcile(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -348,9 +343,9 @@ var _ = Describe("Ranking", func() {
 			normalPod := rsOwnedPod(test.PodOptions{NodeName: nodes[2].Name})
 			ExpectApplied(ctx, env.Client, normalPod)
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			controller := deletioncost.NewController(env.Clock, env.Client, cloudProvider, cluster, queue)
+			controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, queue)
 			_, err := controller.Reconcile(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -372,13 +367,12 @@ var _ = Describe("Ranking", func() {
 
 			// No NodeClaim is ever created for this node, so Managed() is false.
 			ExpectDeletionTimestampSet(ctx, env.Client, node)
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
 
 			stateNode := ExpectStateNodeExists(cluster, node)
 			Expect(stateNode.Managed()).To(BeFalse())
 			Expect(stateNode.Deleted()).To(BeTrue())
 
-			controller := deletioncost.NewController(env.Clock, env.Client, cloudProvider, cluster, queue)
+			controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, queue)
 			_, err := controller.Reconcile(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -412,9 +406,9 @@ var _ = Describe("Ranking", func() {
 			podA := rsOwnedPod(test.PodOptions{NodeName: nA.Name})
 			podB := rsOwnedPod(test.PodOptions{NodeName: nB.Name})
 			ExpectApplied(ctx, env.Client, podA, podB)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{nA, nB}, []*v1.NodeClaim{ncA, ncB})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{nA, nB}, []*v1.NodeClaim{ncA, ncB})
 
-			controller := deletioncost.NewController(env.Clock, env.Client, cloudProvider, cluster, queue)
+			controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, queue)
 			_, err := controller.Reconcile(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -443,9 +437,9 @@ var _ = Describe("Ranking", func() {
 			podFirst := rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name})
 			podSecond := rsOwnedPod(test.PodOptions{NodeName: nodes[1].Name})
 			ExpectApplied(ctx, env.Client, podFirst, podSecond)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			controller := deletioncost.NewController(env.Clock, env.Client, cloudProvider, cluster, queue)
+			controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, queue)
 			_, err := controller.Reconcile(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -496,9 +490,9 @@ var _ = Describe("Ranking", func() {
 			podNil := rsOwnedPod(test.PodOptions{NodeName: nNil.Name})
 			podActive := rsOwnedPod(test.PodOptions{NodeName: nActive.Name})
 			ExpectApplied(ctx, env.Client, podNil, podActive)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{nNil, nActive}, []*v1.NodeClaim{ncNil, ncActive})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{nNil, nActive}, []*v1.NodeClaim{ncNil, ncActive})
 
-			controller := deletioncost.NewController(env.Clock, env.Client, cloudProvider, cluster, queue)
+			controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, queue)
 			_, err := controller.Reconcile(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -522,9 +516,9 @@ var _ = Describe("Ranking", func() {
 			ExpectApplied(ctx, env.Client, nc, node)
 			pod := rsOwnedPod(test.PodOptions{NodeName: node.Name})
 			ExpectApplied(ctx, env.Client, pod)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nc})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nc})
 
-			controller := deletioncost.NewController(env.Clock, env.Client, cloudProvider, cluster, queue)
+			controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, queue)
 			_, err := controller.Reconcile(ctx)
 			Expect(err).ToNot(HaveOccurred())
 			ExpectObjectReconciled(ctx, env.Client, queue, pod)
@@ -556,9 +550,9 @@ var _ = Describe("Ranking", func() {
 			podActive := rsOwnedPod(test.PodOptions{NodeName: nodeActive.Name})
 			podStatic := rsOwnedPod(test.PodOptions{NodeName: nodeStatic.Name})
 			ExpectApplied(ctx, env.Client, podActive, podStatic)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{nodeActive, nodeStatic}, []*v1.NodeClaim{ncActive, ncStatic})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{nodeActive, nodeStatic}, []*v1.NodeClaim{ncActive, ncStatic})
 
-			nodePoolMap, nodePoolToInstanceTypesMap, err := disruption.BuildNodePoolMap(ctx, env.Client, cloudProvider)
+			nodePoolMap, nodePoolToInstanceTypesMap, err := disruption.BuildNodePoolMap(ctx, env.Overlay, cloudProvider)
 			Expect(err).ToNot(HaveOccurred())
 			staticPool := &v1.NodePool{
 				ObjectMeta: metav1.ObjectMeta{Name: staticName},
@@ -570,11 +564,7 @@ var _ = Describe("Ranking", func() {
 			nodePoolMap[staticName] = staticPool
 			nodePoolToInstanceTypesMap[staticName] = nodePoolToInstanceTypesMap[activePool.Name]
 
-			var stateNodes []*state.StateNode
-			for n := range cluster.Nodes() {
-				stateNodes = append(stateNodes, n)
-			}
-			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, stateNodes, nodePoolMap, nodePoolToInstanceTypesMap)
+			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Overlay, env.Clock, cluster, nodePoolMap, nodePoolToInstanceTypesMap)
 			Expect(err).ToNot(HaveOccurred())
 
 			infoActive := rankInfoFor(nodeActive.Name, groupA, groupBC, groupD)
@@ -611,9 +601,9 @@ var _ = Describe("Ranking", func() {
 				pods[i] = rsOwnedPod(test.PodOptions{NodeName: nodes[i].Name})
 				ExpectApplied(ctx, env.Client, pods[i])
 			}
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			controller := deletioncost.NewController(env.Clock, env.Client, cloudProvider, cluster, queue)
+			controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, queue)
 			_, err := controller.Reconcile(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -667,9 +657,9 @@ var _ = Describe("Ranking", func() {
 				groupCPods[i] = rsOwnedPod(test.PodOptions{NodeName: nodes[idx].Name})
 				ExpectApplied(ctx, env.Client, groupCPods[i])
 			}
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			controller := deletioncost.NewController(env.Clock, env.Client, cloudProvider, cluster, queue)
+			controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, queue)
 			_, err := controller.Reconcile(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -721,9 +711,9 @@ var _ = Describe("Ranking", func() {
 				groupCPods[i] = rsOwnedPod(test.PodOptions{NodeName: nodes[idx].Name})
 				ExpectApplied(ctx, env.Client, groupCPods[i])
 			}
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			controller := deletioncost.NewController(env.Clock, env.Client, cloudProvider, cluster, queue)
+			controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, queue)
 			_, err := controller.Reconcile(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -780,9 +770,9 @@ var _ = Describe("Ranking", func() {
 				groupCPods[i] = rsOwnedPod(test.PodOptions{NodeName: nodes[idx].Name})
 				ExpectApplied(ctx, env.Client, groupCPods[i])
 			}
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			controller := deletioncost.NewController(env.Clock, env.Client, cloudProvider, cluster, queue)
+			controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, queue)
 			_, err := controller.Reconcile(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -798,7 +788,7 @@ var _ = Describe("Ranking", func() {
 
 	Context("Edge: direct-helper partition checks", func() {
 		It("should _Edge_ leave RankNodes a no-op on empty node list", func() {
-			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, nil, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
+			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Overlay, env.Clock, cluster, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(totalRanked(groupA, groupBC, groupD)).To(Equal(0))
 		})
@@ -822,14 +812,9 @@ var _ = Describe("Ranking", func() {
 			normalPod := rsOwnedPod(test.PodOptions{NodeName: nodes[1].Name})
 			ExpectApplied(ctx, env.Client, normalPod)
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			var stateNodes []*state.StateNode
-			for n := range cluster.Nodes() {
-				stateNodes = append(stateNodes, n)
-			}
-
-			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, stateNodes, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
+			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Overlay, env.Clock, cluster, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(totalRanked(groupA, groupBC, groupD)).To(Equal(2))
 
@@ -882,14 +867,9 @@ var _ = Describe("Ranking", func() {
 
 			ExpectApplied(ctx, env.Client, rsOwnedPod(test.PodOptions{NodeName: nodes[2].Name}))
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			var stateNodes []*state.StateNode
-			for n := range cluster.Nodes() {
-				stateNodes = append(stateNodes, n)
-			}
-
-			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, stateNodes, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
+			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Overlay, env.Clock, cluster, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(totalRanked(groupA, groupBC, groupD)).To(Equal(3))
 
@@ -925,14 +905,9 @@ var _ = Describe("Ranking", func() {
 
 				ExpectApplied(ctx, env.Client, rsOwnedPod(test.PodOptions{NodeName: nodes[1].Name}))
 
-				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-				var stateNodes []*state.StateNode
-				for n := range cluster.Nodes() {
-					stateNodes = append(stateNodes, n)
-				}
-
-				groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, stateNodes, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
+				groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Overlay, env.Clock, cluster, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(totalRanked(groupA, groupBC, groupD)).To(Equal(2))
 
@@ -994,7 +969,7 @@ var _ = Describe("Ranking", func() {
 				ExpectApplied(ctx, env.Client, allNodeClaims[i], allNodes[i])
 				ExpectApplied(ctx, env.Client, rsOwnedPod(test.PodOptions{NodeName: allNodes[i].Name}))
 			}
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, allNodes, allNodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, allNodes, allNodeClaims)
 
 			// unmappedPool is deliberately absent from itMap, and nodePool's entry
 			// deliberately omits absentIT.
@@ -1013,11 +988,7 @@ var _ = Describe("Ranking", func() {
 			}
 			nodePoolMap := map[string]*v1.NodePool{nodePool.Name: nodePool, unmappedPool.Name: unmappedPool}
 
-			var stateNodes []*state.StateNode
-			for n := range cluster.Nodes() {
-				stateNodes = append(stateNodes, n)
-			}
-			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, stateNodes, nodePoolMap, itMap)
+			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Overlay, env.Clock, cluster, nodePoolMap, itMap)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(totalRanked(groupA, groupBC, groupD)).To(Equal(3))
 
@@ -1061,9 +1032,9 @@ var _ = Describe("Ranking", func() {
 				Status: policyv1.PodDisruptionBudgetStatus{DisruptionsAllowed: 0},
 			}
 			ExpectApplied(ctx, env.Client, pdb)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			controller := deletioncost.NewController(env.Clock, env.Client, cloudProvider, cluster, queue)
+			controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, queue)
 			_, err := controller.Reconcile(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -1104,7 +1075,7 @@ var _ = Describe("Ranking", func() {
 			livePod := rsOwnedPod(test.PodOptions{NodeName: nodes[1].Name})
 			ExpectApplied(ctx, env.Client, livePod)
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 			// Fake instance-type map so ResolveOfferingPrice returns a positive
 			// price for both nodes; otherwise Price=0 collapses both ratios to 0
@@ -1123,11 +1094,7 @@ var _ = Describe("Ranking", func() {
 				}},
 			}
 
-			var stateNodes []*state.StateNode
-			for n := range cluster.Nodes() {
-				stateNodes = append(stateNodes, n)
-			}
-			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, stateNodes, map[string]*v1.NodePool{nodePool.Name: nodePool}, itMap)
+			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Overlay, env.Clock, cluster, map[string]*v1.NodePool{nodePool.Name: nodePool}, itMap)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(totalRanked(groupA, groupBC, groupD)).To(Equal(2))
 
@@ -1156,14 +1123,9 @@ var _ = Describe("Ranking", func() {
 			}))
 			ExpectApplied(ctx, env.Client, rsOwnedPod(test.PodOptions{NodeName: nodes[1].Name}))
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			var stateNodes []*state.StateNode
-			for n := range cluster.Nodes() {
-				stateNodes = append(stateNodes, n)
-			}
-
-			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Client, env.Clock, stateNodes, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
+			groupA, groupBC, groupD, err := deletioncost.RankNodes(ctx, env.Overlay, env.Clock, cluster, map[string]*v1.NodePool{nodePool.Name: nodePool}, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(totalRanked(groupA, groupBC, groupD)).To(Equal(2))
 			Expect(groupA).To(BeEmpty(), "kube-system bare pods must not push a node to Group A")
@@ -1172,7 +1134,7 @@ var _ = Describe("Ranking", func() {
 
 	Context("Edge: Reconcile early-return paths", func() {
 		It("should _Edge_ short-circuit cleanly when the cluster has no nodes", func() {
-			controller := deletioncost.NewController(env.Clock, env.Client, cloudProvider, cluster, queue)
+			controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, queue)
 			result, err := controller.Reconcile(ctx)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result.RequeueAfter).ToNot(BeZero())
