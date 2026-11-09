@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"time"
 
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
@@ -34,13 +33,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
+	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
 	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -56,6 +58,20 @@ type Controller struct {
 	cloudProvider cloudprovider.CloudProvider
 	provisioner   *provisioning.Provisioner
 	cluster       *state.Cluster
+	// counts wakes the controller on each NodePool's nodeCounts, built in Register.
+	counts source.SyncingSource
+}
+
+// nodeCounts are the counts that decide how many NodeClaims a static NodePool is short of: its active and deleting
+// NodeClaims, both of which count against its node limit, and the nodes reserved for NodeClaims being created. They
+// come from NodePoolState, which counts a NodeClaim until it's gone.
+type nodeCounts struct {
+	NodeClaims karpentercluster.NodeClaimCounts
+	Reserved   int64
+}
+
+func nodeCountsOf(_ string, e karpentercluster.NodePoolEntry) any {
+	return nodeCounts{NodeClaims: e.Derived.NodeClaims, Reserved: e.Derived.Reserved}
 }
 
 func NewController(kubeClient client.Client, cluster *state.Cluster, recorder events.Recorder, cloudProvider cloudprovider.CloudProvider, provisioner *provisioning.Provisioner, clock clock.Clock, deviceAllocationController *deviceallocation.Controller, virtualPodCache *virtualpods.Cache) *Controller {
@@ -63,12 +79,12 @@ func NewController(kubeClient client.Client, cluster *state.Cluster, recorder ev
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
 		cluster:       cluster,
-		provisioner:   provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, cluster, clock, deviceAllocationController, virtualPodCache, nil),
+		// The controller creates NodeClaims and schedules no pods, so its provisioner writes neither nominations nor buffer
+		// pod counts.
+		provisioner: provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, cluster, clock, deviceAllocationController, virtualPodCache, nil, nil, nil),
 	}
 }
 
-// Reconcile the resource
-// Requeue after computing Static NodePool to ensure we don't miss any events
 func (c *Controller) Name() string {
 	return "static.provisioning"
 }
@@ -80,53 +96,60 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 		return reconcile.Result{}, nil
 	}
 
-	// We need to wait until our representation of cluster is populated accurately with what we have in api-server or else
-	// we would end up over provisioning due to misrepresentation of NodePoolState in our cluster state.
-	// This usually happens when there is controller crash, so we check if the cluster has synced atleast once.
-	if !c.cluster.HasSynced() && !c.cluster.Synced(ctx) {
-		return reconcile.Result{RequeueAfter: time.Second}, nil
-	}
-
-	runningNodeClaims, _, nodesPendingDisruptionCount := c.cluster.NodePoolState.GetNodeCount(np.Name)
+	runningNodeClaims, _, reservedNodes := c.cluster.NodePoolState.GetNodeCount(np.Name)
 	desiredReplicas := lo.FromPtr(np.Spec.Replicas)
-	// Size down of replicas will be handled in deprovisioning controller to drain nodes and delete NodeClaims
-	// If there are drifting NodeClaims we need to count them as Active as disruption controller is in the process of creating replacements
-	if int64(runningNodeClaims)+int64(nodesPendingDisruptionCount) >= desiredReplicas {
-		return reconcile.Result{RequeueAfter: time.Minute}, nil
+	// Size down of replicas will be handled in deprovisioning controller to drain nodes and delete NodeClaims.
+	// Reserved nodes are NodeClaims being created that the counts don't include yet: this controller's own from an
+	// earlier reconcile, held until their NodeClaims count (or, for a create that failed ambiguously, until the
+	// reservation expires), and replacements the disruption controller is creating. The counts, including a reservation
+	// expiring, and the node limit wake the controller when they change.
+	if int64(runningNodeClaims)+int64(reservedNodes) >= desiredReplicas {
+		return reconcile.Result{}, nil
 	}
 
 	limit, ok := np.Spec.Limits[resources.Node]
 	nodeLimit := lo.Ternary(ok, limit.Value(), int64(math.MaxInt64))
-	countNodeClaimsToProvision := c.cluster.NodePoolState.ReserveNodeCount(np.Name, nodeLimit, desiredReplicas-int64(runningNodeClaims))
+	// The shortfall read above can be stale by the time it reserves, such as once the disruption controller reserves a
+	// replacement, so the reservation admits against replicas as well as the node limit.
+	reservations := c.cluster.NodePoolState.ReserveReplicas(np.Name, desiredReplicas, nodeLimit)
+	countNodeClaimsToProvision := len(reservations)
 
 	if countNodeClaimsToProvision <= 0 {
-		log.FromContext(ctx).Info("nodepool node limit reached")
-		return reconcile.Result{RequeueAfter: time.Second * 30}, nil
+		if running, _, reserved := c.cluster.NodePoolState.GetNodeCount(np.Name); int64(running+reserved) < desiredReplicas {
+			log.FromContext(ctx).Info("nodepool node limit reached")
+		}
+		return reconcile.Result{}, nil
 	}
 
 	log.FromContext(ctx).WithValues("current", runningNodeClaims, "desired", desiredReplicas, "provision-count", countNodeClaimsToProvision).
 		Info("provisioning nodeclaims to satisfy replica count")
 
 	nodeClaims := make([]*scheduling.NodeClaim, 0, countNodeClaimsToProvision)
-	for range countNodeClaimsToProvision {
+	for _, reservation := range reservations {
 		nct := scheduling.NewNodeClaimTemplate(np)
 		nodeClaims = append(nodeClaims, &scheduling.NodeClaim{
 			NodeClaimTemplate: *nct,
+			Reservation:       reservation,
 		})
 	}
 
+	// CreateNodeClaims binds each created NodeClaim's reservation, and releases the reservation of every NodeClaim it
+	// didn't create, unless its create may have succeeded anyway, which leaves the reservation to expire.
 	_, err := c.provisioner.CreateNodeClaims(ctx, nodeClaims, provisioning.WithReason(metrics.ProvisionedReason))
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("creating nodeclaims, %w", err)
 	}
-
-	return reconcile.Result{RequeueAfter: time.Minute}, nil
+	return reconcile.Result{}, nil
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
+	// counts narrows the NodePool fields to the ones this controller decides on, so it reconciles a NodePool that may be
+	// short of its replicas, or have room under its node limit again, and not one whose usage, capacity or health changed.
+	c.counts = c.cluster.NodePoolState.SourceOn(nodeCountsOf)
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
-		// Reoncile on NodePool Create and Update (when replicas change or when NodePool status moves from NotReady to Ready)
+		// Reconcile on NodePool Create and Update (when replicas or the node limit change, or when NodePool status moves
+		// from NotReady to Ready)
 		For(&v1.NodePool{}, builder.WithPredicates(nodepoolutils.IsManagedPredicateFuncs(c.cloudProvider), nodepoolutils.IsStaticPredicateFuncs(),
 			predicate.Funcs{
 				CreateFunc: func(e event.CreateEvent) bool {
@@ -144,27 +167,22 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 					return false
 				},
 			})).
-		// We care about Static NodeClaims Deleting (Delete and Update event that has DeletionTimeStamp newly set) as we might have to provision
-		Watches(&v1.NodeClaim{}, nodepoolutils.NodeClaimEventHandler(nodepoolutils.WithClient(c.kubeClient), nodepoolutils.WithStaticOnly), builder.WithPredicates(predicate.Funcs{
-			CreateFunc: func(e event.CreateEvent) bool {
-				return false
-			},
-			UpdateFunc: func(e event.UpdateEvent) bool {
-				return e.ObjectOld.GetDeletionTimestamp().IsZero() && !e.ObjectNew.GetDeletionTimestamp().IsZero()
-			},
-			DeleteFunc: func(e event.DeleteEvent) bool {
-				return true
-			},
-			GenericFunc: func(e event.GenericEvent) bool {
-				return false
-			},
-		})).
+		// A NodeClaim starting to delete, going away or being created, and a reservation ending, change the counts.
+		WatchesRawSource(c.counts).
+		// Cluster state's NodePoolState counts the NodePool's NodeClaims only once it has synced; before, it would count
+		// fewer than exist and provision too many.
+		WatchesRawSource(karpenterstate.Requires(c.cluster)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 10}).
 		Complete(reconcile.AsReconciler(m.GetClient(), c))
 }
 
 func HasNodePoolReplicaOrStatusChanged(oldNP, newNP *v1.NodePool) bool {
 	if lo.FromPtr(oldNP.Spec.Replicas) != lo.FromPtr(newNP.Spec.Replicas) {
+		return true
+	}
+	oldLimit, oldOK := oldNP.Spec.Limits[resources.Node]
+	newLimit, newOK := newNP.Spec.Limits[resources.Node]
+	if oldOK != newOK || oldLimit.Cmp(newLimit) != 0 {
 		return true
 	}
 	// np.StatusConditions.Root() may mutate the np which is unsafe when operating directly against the informer cache
