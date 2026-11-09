@@ -21,10 +21,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/samber/lo"
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 
+	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -85,7 +88,77 @@ var _ = Describe("Queue", func() {
 		node1.Spec.Taints = append(node1.Spec.Taints, v1.DisruptedNoScheduleTaint)
 		node2.Spec.Taints = append(node2.Spec.Taints, v1.DisruptedNoScheduleTaint)
 	})
+	Context("Limits", func() {
+		var stateNode *karpentercluster.StateNode
+		var command func() *disruption.Command
+		BeforeEach(func() {
+			node1.Spec.Taints = nil
+			nodeClaim1.Status.Capacity = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("32")}
+			command = func() *disruption.Command {
+				nct := scheduling.NewNodeClaimTemplate(nodePool)
+				nct.InstanceTypeOptions = append([]*cloudprovider.InstanceType{}, cloudProvider.InstanceTypes...)
+				return &disruption.Command{
+					Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+					CreationTimestamp: env.Clock.Now(),
+					ID:                uuid.New(),
+					Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
+					Replacements:      []*disruption.Replacement{{NodeClaim: &scheduling.NodeClaim{NodeClaimTemplate: *nct}}},
+				}
+			}
+		})
+		setup := func(cpuLimit resource.Quantity) {
+			nodePool.Spec.Limits = v1.Limits{corev1.ResourceCPU: cpuLimit}
+			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
+			stateNode = ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+		}
+		// fitsInPlace is a CPU limit the candidate and the largest replacement don't fit together, but the replacement
+		// fits in the candidate's place.
+		fitsInPlace := func() resource.Quantity {
+			largest := provisioning.MaxCapacity(cloudProvider.InstanceTypes)[corev1.ResourceCPU]
+			return lo.Ternary(largest.Cmp(resource.MustParse("32")) > 0, largest, resource.MustParse("32"))
+		}
+		It("should start a command whose replacement fits once its candidate stops counting", func() {
+			setup(fitsInPlace())
+			Expect(queue.StartCommand(ctx, command())).To(Succeed())
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(2))
+		})
+		It("should refuse a command whose replacement doesn't fit before marking its candidate", func() {
+			largest := provisioning.MaxCapacity(cloudProvider.InstanceTypes)[corev1.ResourceCPU]
+			largest.Sub(resource.MustParse("1"))
+			setup(largest)
+			Expect(queue.StartCommand(ctx, command())).ToNot(Succeed())
+
+			Expect(ExpectNodeExists(ctx, env.Client, node1.Name).Spec.Taints).ToNot(ContainElement(v1.DisruptedNoScheduleTaint))
+			Expect(ExpectExists(ctx, env.Client, nodeClaim1).StatusConditions().Get(v1.ConditionTypeDisruptionReason)).To(BeNil())
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
+			Expect(cluster.NodePoolState.Get(nodePool.Name).ReservedResources).To(BeEmpty())
+		})
+	})
 	Context("Reconcile", func() {
+		It("should delete a candidate's NodeClaim without writing the NodeClaim cluster state holds", func() {
+			// The finalizer keeps the NodeClaim in storage after the delete, so the client decodes the server's response
+			// into the object it deletes. In a running controller, cluster state holds the informer's own NodeClaim.
+			nodeClaim1.Finalizers = []string{v1.TerminationFinalizer}
+			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
+			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+			held := stateNode.NodeClaim
+			want := held.DeepCopy()
+
+			cmd := &disruption.Command{
+				Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+				CreationTimestamp: env.Clock.Now(),
+				ID:                uuid.New(),
+				Results:           scheduling.Results{},
+				Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
+			}
+			Expect(queue.StartCommand(ctx, cmd)).To(BeNil())
+			ExpectObjectReconciled(ctx, env.Client, queue, want)
+
+			Expect(ExpectExists(ctx, env.Client, nodeClaim1).DeletionTimestamp.IsZero()).To(BeFalse())
+			Expect(held).To(Equal(want))
+		})
 		It("should keep nodes tainted when replacements haven't finished initialization", func() {
 			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
@@ -143,7 +216,7 @@ var _ = Describe("Queue", func() {
 			}
 			Expect(queue.StartCommand(ctx, cmd)).To(BeNil())
 			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
-			Expect(queue.HasAny(stateNode.ProviderID())).To(BeTrue()) // Expect the command to still be in the queue
+			Expect(queue.HasAny(stateNode.NodeClaim.Name)).To(BeTrue()) // Expect the command to still be in the queue
 		})
 		It("should not return an error when the NodeClaim doesn't exist but the NodeCliam is in cluster state", func() {
 			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
@@ -174,7 +247,7 @@ var _ = Describe("Queue", func() {
 
 			cluster.UpdateNodeClaim(replacementNodeClaim)
 			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
-			Expect(queue.HasAny(stateNode.ProviderID())).To(BeTrue()) // Expect the command to still be in the queue
+			Expect(queue.HasAny(stateNode.NodeClaim.Name)).To(BeTrue()) // Expect the command to still be in the queue
 		})
 		It("should untaint nodes when a command times out", func() {
 			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
@@ -459,10 +532,10 @@ var _ = Describe("Queue", func() {
 		Context("CalculateRetryDuration", func() {
 			DescribeTable("should calculate correct timeout based on queue length",
 				func(numCommands int, expectedDuration time.Duration) {
-					q := disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov)
+					q := disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov, cs.Deletion)
 					q.Lock()
 					for i := range numCommands {
-						q.ProviderIDToCommand[strconv.Itoa(i)] = &disruption.Command{}
+						q.NodeClaimToCommand[strconv.Itoa(i)] = &disruption.Command{}
 					}
 					q.Unlock()
 					actualDuration := q.GetMaxRetryDuration()
