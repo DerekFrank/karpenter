@@ -28,9 +28,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	nodeclaimlifecycle "sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -302,8 +304,11 @@ var _ = Describe("Liveness", func() {
 	})
 
 	It("should update NodeRegistrationHealthy status condition to False if it was previously set to True and there are >=2 registration failures", func() {
-		ExpectApplied(ctx, env.Client, nodePool)
 		nodePool.StatusConditions().SetTrue(v1.ConditionTypeNodeRegistrationHealthy)
+		nodePool.Status.NodeClassObservedGeneration = 1
+		ExpectApplied(ctx, env.Client, nodePool, registrationNodeClass(nodePool))
+		npState.Observe(ExpectExists(ctx, env.Client, nodePool))
+		expectNodeRegistrationHealthy(nodePool, metav1.ConditionTrue)
 		nodeClaim1 := test.NodeClaim(v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels: map[string]string{
@@ -340,19 +345,29 @@ var _ = Describe("Liveness", func() {
 		ExpectApplied(ctx, env.Client, nodeClaim1, nodeClaim2)
 		_ = ExpectObjectReconcileFailed(ctx, env.Client, nodeClaimController, nodeClaim1)
 		_ = ExpectObjectReconcileFailed(ctx, env.Client, nodeClaimController, nodeClaim2)
+		launched := ExpectExists(ctx, env.Client, nodeClaim2).StatusConditions().Get(v1.ConditionTypeLaunched)
+		stored := ExpectExists(ctx, env.Client, nodePool)
 
 		// If the node hasn't registered in the registration timeframe, then we deprovision the nodeClaim
 		env.Clock.Step(time.Minute * 6)
 		_ = ExpectObjectReconcileFailed(ctx, env.Client, nodeClaimController, nodeClaim1)
 		_ = ExpectObjectReconcileFailed(ctx, env.Client, nodeClaimController, nodeClaim2)
 
+		// The lifecycle controller records the failures, and leaves the NodePool's status to the registration health
+		// controller.
+		Expect(ExpectExists(ctx, env.Client, nodePool).ResourceVersion).To(Equal(stored.ResourceVersion), "the lifecycle controller wrote the NodePool")
+		expectRegistrationHealth(nodePool, karpentercluster.RegistrationUnhealthy)
 		// NodeClaim registration failed twice which is greater than our threshold so update the NodeRegistrationHealthy status condition
-		operatorpkg.ExpectStatusConditions(ctx, env.Client, 1*time.Minute, nodePool, status.Condition{Type: v1.ConditionTypeNodeRegistrationHealthy, Status: metav1.ConditionFalse})
+		expectNodeRegistrationHealthy(nodePool, metav1.ConditionFalse)
+		cond := ExpectExists(ctx, env.Client, nodePool).StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy)
+		Expect(cond.Reason).To(Equal(launched.Reason), "want the launch failure's reason")
+		Expect(cond.Message).To(Equal(launched.Message), "want the launch failure's message")
 		ExpectFinalizersRemoved(ctx, env.Client, nodeClaim1, nodeClaim2)
 		ExpectNotFound(ctx, env.Client, nodeClaim1, nodeClaim2)
 	})
 	It("should update NodeRegistrationHealthy status condition to False if it was previously set to Unknown and there are >=2 registration failures", func() {
-		ExpectApplied(ctx, env.Client, nodePool)
+		ExpectApplied(ctx, env.Client, nodePool, registrationNodeClass(nodePool))
+		npState.Observe(ExpectExists(ctx, env.Client, nodePool))
 		nodeClaim1 := test.NodeClaim(v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels: map[string]string{
@@ -396,7 +411,7 @@ var _ = Describe("Liveness", func() {
 		_ = ExpectObjectReconcileFailed(ctx, env.Client, nodeClaimController, nodeClaim2)
 
 		// NodeClaim registration failed twice which is greater than our threshold so update the NodeRegistrationHealthy status condition
-		operatorpkg.ExpectStatusConditions(ctx, env.Client, 1*time.Minute, nodePool, status.Condition{Type: v1.ConditionTypeNodeRegistrationHealthy, Status: metav1.ConditionFalse})
+		expectNodeRegistrationHealthy(nodePool, metav1.ConditionFalse)
 		ExpectFinalizersRemoved(ctx, env.Client, nodeClaim1, nodeClaim2)
 		ExpectNotFound(ctx, env.Client, nodeClaim1, nodeClaim2)
 	})
@@ -409,6 +424,7 @@ var _ = Describe("Liveness", func() {
 			},
 		)
 		ExpectApplied(ctx, env.Client, nodePool)
+		npState.Observe(ExpectExists(ctx, env.Client, nodePool))
 		nodeClaim := test.NodeClaim(v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels: map[string]string{
@@ -439,13 +455,18 @@ var _ = Describe("Liveness", func() {
 				},
 			},
 		)
-		ExpectApplied(ctx, env.Client, nodePool)
-		operatorpkg.ExpectStatusConditions(ctx, env.Client, 1*time.Minute, nodePool, status.Condition{Type: v1.ConditionTypeNodeRegistrationHealthy, Status: metav1.ConditionUnknown})
+		ExpectApplied(ctx, env.Client, nodePool, registrationNodeClass(nodePool))
+		npState.Observe(ExpectExists(ctx, env.Client, nodePool))
+		expectNodeRegistrationHealthy(nodePool, metav1.ConditionUnknown)
 
 		// If the node hasn't registered in the registration timeframe, then we deprovision the nodeClaim
 		env.Clock.Step(time.Minute * 20)
 		_ = ExpectObjectReconcileFailed(ctx, env.Client, nodeClaimController, nodeClaim)
-		operatorpkg.ExpectStatusConditions(ctx, env.Client, 1*time.Minute, nodePool, status.Condition{Type: v1.ConditionTypeNodeRegistrationHealthy, Status: metav1.ConditionUnknown})
+		// The failure is the deleted NodePool's, so the recreated one records none.
+		recorded, err := karpentercluster.NewNodePools(env.Client, npState).Get(ctx, client.ObjectKeyFromObject(nodePool))
+		Expect(err).ToNot(HaveOccurred())
+		Expect(recorded.Intent.Registration.Value).To(BeZero(), "recorded a launch outcome for the recreated NodePool")
+		expectNodeRegistrationHealthy(nodePool, metav1.ConditionUnknown)
 		ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
 		ExpectNotFound(ctx, env.Client, nodeClaim)
 	})

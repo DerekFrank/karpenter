@@ -26,7 +26,6 @@ import (
 
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/klog/v2"
@@ -35,8 +34,9 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
+	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
-	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
@@ -54,12 +54,12 @@ const (
 // terminating workload-bearing nodes, orders candidates by rank + age/τ, and is vetoed by do-not-repair.
 type Repair struct {
 	consolidation
-	policyMatcher *health.RepairPolicyMatcher
+	policyMatcher *repair.RepairPolicyMatcher
 	rebootHistory *RebootHistory
 }
 
 // NewRepair constructs the repair method around the matcher cluster state matches Nodes with. It panics when cluster
-// state has none, since health.NewRepairPolicyMatcher only returns nil when node repair is disabled or replaced by --legacy-node-repair.
+// state has none, since repair.NewRepairPolicyMatcher only returns nil when node repair is disabled or replaced by --legacy-node-repair.
 func NewRepair(c consolidation) *Repair {
 	policyMatcher := c.cluster.RepairPolicyMatcher()
 	if policyMatcher == nil {
@@ -139,12 +139,8 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 		}
 		return candidates[i].Name() < candidates[j].Name()
 	})
-	trippedPools, err := r.breakerTrippedPools(ctx)
-	if err != nil {
-		return []Command{}, err
-	}
 	for _, candidate := range candidates {
-		if trippedPools[candidate.NodePool.Name] {
+		if r.breakerTripped(candidate.NodePool.Name) {
 			r.recorder.Publish(disruptionevents.NodeRepairBlocked(candidate.Node, candidate.NodeClaim, candidate.NodePool,
 				fmt.Sprintf("more than %s of nodes in nodepool %q are unhealthy", repairUnhealthyThreshold, candidate.NodePool.Name))...)
 			continue
@@ -177,10 +173,10 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 		// Static NodePools aren't reactively scheduled, so repair can't simulate a replacement — it mirrors StaticDrift.
 		if candidate.OwnedByStaticNodePool() {
 			np := candidate.NodePool
-			active, _, pendingDisruption := r.cluster.NodePoolState.GetNodeCount(np.Name)
+			active, _, _ := r.cluster.NodePoolState.GetNodeCount(np.Name)
 
 			// Skip until scale-down completes: a replacement would just be surplus the deprovisioner deletes.
-			if int64(active+pendingDisruption) > lo.FromPtr(np.Spec.Replicas) {
+			if int64(active) > lo.FromPtr(np.Spec.Replicas) {
 				continue
 			}
 
@@ -208,7 +204,11 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 			// past limits.nodes when commands race. A zero result reserves nothing, so the delete-only path leaks no
 			// reservation; a non-zero result's slot is consumed by the replacement staged below. Full reservations are
 			// checked first so the delete-only path never takes a slot.
-			if reservationsFull || r.cluster.NodePoolState.ReserveNodeCount(np.Name, nodeLimit, 1) == 0 {
+			var reservations karpentercluster.Reservations
+			if !reservationsFull {
+				reservations = r.cluster.NodePoolState.ReserveNodeCount(np.Name, nodeLimit, 1)
+			}
+			if len(reservations) == 0 {
 				// Static provisioning refuses NotReady or deleting NodePools, so terminating first there would strand
 				// the workload with no replacement.
 				refillable := np.StatusConditions().Root().IsTrue() && np.DeletionTimestamp.IsZero()
@@ -224,7 +224,7 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 					TerminateFirstReason: lo.Ternary(reservationsFull, TerminateFirstNoReservedCapacity, TerminateFirstStaticAtLimit),
 				}}, nil
 			}
-			result := pscheduling.Results{NewNodeClaims: []*pscheduling.NodeClaim{{NodeClaimTemplate: *nct}}}
+			result := pscheduling.Results{NewNodeClaims: []*pscheduling.NodeClaim{{NodeClaimTemplate: *nct, Reservation: reservations[0]}}}
 			return []Command{{
 				Candidates:          []*Candidate{candidate},
 				Replacements:        replacementsFromNodeClaims(result.NewNodeClaims...),
@@ -308,37 +308,14 @@ func (r *Repair) commitReboot(ctx context.Context, candidate *Candidate) (bool, 
 	return true, nil
 }
 
-// breakerTrippedPools returns the NodePools whose unhealthy-node fraction exceeds repairUnhealthyThreshold. A node
-// counts as unhealthy as soon as one of its current conditions matches the provider policy set, regardless of policy
-// toleration. The threshold rounds up so one unhealthy node does not halt repair in small pools.
-func (r *Repair) breakerTrippedPools(ctx context.Context) (map[string]bool, error) {
-	// TODO: cache unhealthy node counts by NodePool from Node updates instead of recalculating them on every repair pass.
-	nodeList := &corev1.NodeList{}
-	if err := r.kubeClient.List(ctx, nodeList, client.UnsafeDisableDeepCopy); err != nil {
-		return nil, err
-	}
-	total := map[string]int{}
-	unhealthy := map[string]int{}
-	for i := range nodeList.Items {
-		node := &nodeList.Items[i]
-		nodePool := node.Labels[v1.NodePoolLabelKey]
-		if nodePool == "" {
-			continue
-		}
-		total[nodePool]++
-		if lo.SomeBy(node.Status.Conditions, r.policyMatcher.Matches) {
-			unhealthy[nodePool]++
-		}
-	}
-	tripped := map[string]bool{}
+// breakerTripped returns whether the NodePool's unhealthy-node fraction exceeds repairUnhealthyThreshold. It counts the
+// Nodes labeled with the NodePool that cluster state holds, with or without a NodeClaim, and a Node counts as unhealthy
+// as soon as one of its current conditions matches the provider policy set, regardless of policy toleration. The
+// threshold rounds up so one unhealthy node does not halt repair in small pools.
+func (r *Repair) breakerTripped(nodePool string) bool {
+	counts := r.cluster.NodePoolState.NodeHealth(nodePool)
 	thresholdValue := intstr.FromString(repairUnhealthyThreshold)
-	for nodePool, count := range total {
-		threshold := lo.Must(intstr.GetScaledValueFromIntOrPercent(&thresholdValue, count, true))
-		if unhealthy[nodePool] > threshold {
-			tripped[nodePool] = true
-		}
-	}
-	return tripped, nil
+	return counts.Unhealthy > lo.Must(intstr.GetScaledValueFromIntOrPercent(&thresholdValue, counts.Nodes, true))
 }
 
 // effectiveDrainBound returns the drain bound for the candidate, carried on the Command and applied by the queue
@@ -347,7 +324,7 @@ func (r *Repair) breakerTrippedPools(ctx context.Context) (map[string]bool, erro
 // behavior).
 // TODO: the termination-timestamp deadline is a stopgap — replace once the termination flow has a formal contract
 // (kubernetes-sigs/karpenter#3029, Formalize Node Termination Contract).
-func effectiveDrainBound(c *Candidate, result health.RepairResult) *time.Duration {
+func effectiveDrainBound(c *Candidate, result repair.RepairResult) *time.Duration {
 	if result.TerminationGracePeriod == nil {
 		return nil // inherit the NodeClaim's own TerminationGracePeriod
 	}
