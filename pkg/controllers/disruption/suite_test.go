@@ -135,6 +135,7 @@ func useRepairPolicies(policies []cloudprovider.RepairPolicy) {
 }
 
 var _ = AfterSuite(func() {
+	stopKubeScheduler()
 	Expect(env.Stop()).To(Succeed(), "Failed to stop environment")
 })
 

@@ -103,9 +103,25 @@ type options struct {
 	// disruption candidate will free when it is terminated. Used by the terminate-first "would the pods fit once the
 	// slot is freed?" pass.
 	creditReservationCapacity map[string]int
+	// pins restricts where pods may schedule, by UID. See Pin.
+	pins map[types.UID]PinTarget
 }
 
 type Options = option.Function[options]
+
+// PinTarget is where a pinned pod may schedule: the existing node named Node, or, with Node empty, a new NodeClaim.
+type PinTarget struct {
+	Node string
+}
+
+// Pin restricts each pod in pins to its target: a pod pinned to an existing node schedules only to that node, and a pod
+// pinned to a new NodeClaim schedules only to in-flight or new NodeClaims. Pods not in pins schedule as usual. It
+// replays a placement found by an earlier simulation against current state, without searching for another.
+var Pin = func(pins map[types.UID]PinTarget) Options {
+	return func(opts *options) {
+		opts.pins = pins
+	}
+}
 
 var DisableReservedCapacityFallback = func(opts *options) {
 	opts.reservedOfferingMode = ReservedOfferingModeStrict
@@ -217,6 +233,7 @@ func NewScheduler(
 		reservationManager:        reservationManager,
 		reservedOfferingMode:      resolved.reservedOfferingMode,
 		creditReservationCapacity: resolved.creditReservationCapacity,
+		pins:                      resolved.pins,
 		preferencePolicy:          resolved.preferencePolicy,
 		minValuesPolicy:           minValuesPolicy,
 		numConcurrentReconciles:   lo.Ternary(resolved.numConcurrentReconciles > 0, resolved.numConcurrentReconciles, 1),
@@ -291,6 +308,7 @@ type Scheduler struct {
 	// rather than full — the ReservationManager capacity alone can't distinguish a genuinely-full reservation from one
 	// pessimistically drained this pass, so the offering's static capacity plus this credit is the source of truth.
 	creditReservationCapacity map[string]int
+	pins                      map[types.UID]PinTarget
 	preferencePolicy          PreferencePolicy
 	minValuesPolicy           karpopts.MinValuesPolicy
 	numConcurrentReconciles   int
@@ -658,9 +676,15 @@ func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
 	if err != nil {
 		return err
 	}
+	target, pinned := s.pins[pod.UID]
 	// first try to schedule against an in-flight real node
-	if err := s.addToExistingNode(ctx, pod, volumes); err == nil {
-		return nil
+	if !pinned || target.Node != "" {
+		if err := s.addToExistingNode(ctx, pod, volumes, target.Node); err == nil {
+			return nil
+		}
+		if pinned {
+			return fmt.Errorf("failed scheduling pod to its pinned node %q", target.Node)
+		}
 	}
 	// Consider using https://pkg.go.dev/container/heap
 	sort.Slice(s.newNodeClaims, func(a, b int) bool { return len(s.newNodeClaims[a].Pods) < len(s.newNodeClaims[b].Pods) })
@@ -679,7 +703,8 @@ func (s *Scheduler) add(ctx context.Context, pod *corev1.Pod) error {
 	return err
 }
 
-func (s *Scheduler) addToExistingNode(ctx context.Context, p *corev1.Pod, volumes scheduling.Volumes) error {
+// addToExistingNode schedules the pod to the first existing node it fits, or only to the node named pinnedNode, if set.
+func (s *Scheduler) addToExistingNode(ctx context.Context, p *corev1.Pod, volumes scheduling.Volumes, pinnedNode string) error {
 	idx := math.MaxInt
 	var mu sync.Mutex
 
@@ -688,6 +713,9 @@ func (s *Scheduler) addToExistingNode(ctx context.Context, p *corev1.Pod, volume
 	var allocationResult *dynamicresources.AllocationResult
 
 	parallelizeUntil(s.numConcurrentReconciles, len(s.existingNodes), func(i int) bool {
+		if pinnedNode != "" && s.existingNodes[i].Name() != pinnedNode {
+			return true
+		}
 		if s.existingNodes[i].isUnderConsolidateAfter && (!pod.IsPending(p) && !s.deletingNodeNames.Has(p.Spec.NodeName)) {
 			// We shouldn't try to schedule candidate pods onto nodes that are under consolidate after.
 			// Pending pods and pods from deleting nodes are exempt.
