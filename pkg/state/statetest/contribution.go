@@ -56,3 +56,18 @@ func ExpectContributionWith[F any, C Contribution[F, C]](t TB, equal func(a, b F
 		t.Errorf("%+v replacing %+v: Update = %+v, want what Delete then Update from zero gives, %+v", next, prev, got, want)
 	}
 }
+
+// ExpectContributionEach checks the laws per key for a DeriveEach source whose contributions change from prev to next,
+// each a map from a key to what the source contributes there: a key in one map and not the other is one the source is
+// new to, or leaving, and checks against the zero contribution.
+func ExpectContributionEach[K comparable, F any, C Contribution[F, C]](t TB, base F, prev, next map[K]C) {
+	t.Helper()
+	for k, c := range prev {
+		ExpectContribution(t, base, c, next[k])
+	}
+	for k, c := range next {
+		if _, ok := prev[k]; !ok {
+			ExpectContribution(t, base, prev[k], c)
+		}
+	}
+}

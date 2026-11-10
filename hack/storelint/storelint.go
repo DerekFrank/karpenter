@@ -60,11 +60,11 @@ const (
 // builders are the pkg/state functions that build a store, a Derive, Claims or an intent handle.
 var builders = map[string]bool{
 	"NewObjectStore": true, "NewObjectStoreBy": true, "NewFedStore": true, "NewSyntheticStore": true,
-	"Derive": true, "DeriveObject": true, "NewClaims": true, "NewIntent": true,
+	"Derive": true, "DeriveObject": true, "DeriveEach": true, "DeriveEachObject": true, "NewClaims": true, "NewIntent": true,
 }
 
 // derives are the builders whose second argument is the target they write.
-var derives = map[string]bool{"Derive": true, "DeriveObject": true}
+var derives = map[string]bool{"Derive": true, "DeriveObject": true, "DeriveEach": true, "DeriveEachObject": true}
 
 // writes are the client methods that write the object they're passed with the server's response.
 var writes = map[string]bool{"Create": true, "Update": true, "Patch": true, "Delete": true}

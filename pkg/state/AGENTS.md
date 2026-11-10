@@ -28,7 +28,8 @@ in `Derived`. See [Claims](#claims).
 - **`pkg/state`** holds the primitives, which know no object kinds: `Entry`,
   `Store` and `Reader` (`NewObjectStore`, `NewObjectStoreBy`, `NewFedStore`,
   `NewSyntheticStore`), `Derive` and `DeriveObject` (`Derivation`,
-  `Contribution`, `Equaler`), `Intent` and `Intended`, `Claims`, `Accessor`,
+  `Contribution`, `Equaler`), `DeriveEach` and `DeriveEachObject`
+  (`EachDerivation`), `Intent` and `Intended`, `Claims`, `Accessor`,
   `StoreAccessor`, `View`, and the sources `Reader.Source`, `Reader.SourceOn`,
   `Requires`, `Wake`, `WakeCounting` and `After`.
 - **`pkg/state/statetest`** checks a `Contribution`'s laws in tests.
@@ -173,6 +174,18 @@ only the source's object, such as a Node's NodePool label: it recomputes only
 when the object changes, so a change of the entry's `Derived`, such as a pod
 binding to the Node, costs a comparison.
 
+**`DeriveEach(from, to, keys, value)`** is a `Derive` whose source contributes
+to a set of keys, such as a pod to each PVC it mounts: `value(k, entry, key)`
+goes to each key in `keys(k, entry)`. Each key dispatches as a `Derive`'s
+does: a key new to the set gets `Update(fields, zero)`, a key that left gets
+`prev.Delete(fields)`, and a key that stays gets `Update(fields, prev)`, or
+nothing if equal. The laws hold per key (`statetest.ExpectContributionEach`),
+and `Sources(key)` lists the sources whose set holds `key`. One change applies
+all its keys under the target's lock, so `Sources` and the target's
+subscribers see all of it or none; two lock-free `Get`s may not. A key set is
+small. `DeriveEachObject` is to `DeriveEach` what `DeriveObject` is to
+`Derive`. An `EachDerivation` takes no `Claims`.
+
 ### Writing a contribution
 
 - **Each contribution is a named type**, such as `podContribution` or
@@ -215,8 +228,8 @@ request behind them.
   index, a `Derive` keyed by the dependency whose `Sources` are the
   dependents, plus a subscriber that `Touch`es the dependents when the
   dependency changes. A pod's volume usage reads its PVCs' drivers from
-  `PVCs`, which index the pods that mount PVCs by namespace and `Touch` them
-  when a driver resolves (`pvc.go`). A NodeClaim's NodePool capacity reads its
+  `PVCs`, which count each pod on every PVC it mounts with a `DeriveEach` and
+  `Touch` a PVC's pods when its driver resolves (`pvc.go`). A NodeClaim's NodePool capacity reads its
   Node's entry, and a Node's change `Touch`es the NodeClaim its owner
   reference names.
 
@@ -447,7 +460,7 @@ op.WithControllers(ctx, controllers.NewControllers(ctx, mgr, ..., s, ...)...).St
 
 - a write of a `Derive` or `Claims` target (`Store.Feed`, `FeedAll`, `Observe`,
   `Clear`) outside `pkg/state`;
-- a `Subscribe`, `Derive`, `DeriveObject` or store constructor in a `New*`
+- a `Subscribe`, `Derive`, `DeriveObject`, `DeriveEach`, `DeriveEachObject` or store constructor in a `New*`
   function outside `pkg/state` and `pkg/cluster`;
 - a store built anywhere but `pkg/state` itself, `pkg/cluster`, a
   `Register(context.Context, manager.Manager) error` method or a test;
