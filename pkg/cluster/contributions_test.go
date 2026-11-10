@@ -59,7 +59,7 @@ var _ = Describe("Contributions", func() {
 			statetest.ExpectContribution(GinkgoT(), b, daemonSetPod(1), daemonSetPod(1))
 		}
 		for _, b := range []int{0, 5} {
-			statetest.ExpectContribution(GinkgoT(), b, mountsPVCs(1), mountsPVCs(1))
+			statetest.ExpectContribution(GinkgoT(), b, mountsPVC(1), mountsPVC(1))
 			statetest.ExpectContribution(GinkgoT(), b, podOnNodeClaim(1), podOnNodeClaim(1))
 		}
 	})

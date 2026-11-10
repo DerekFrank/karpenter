@@ -30,17 +30,17 @@ import (
 type PVCDriver struct{ Driver string }
 
 // PVCs are the resolved CSI drivers of the PersistentVolumeClaims, by namespaced name: a fed store. A pod's
-// contribution to its Node's usage reads its PVCs' drivers, so the pods are indexed by the namespace their PVCs are
-// in, and a PVC's change Touches the pods of its namespace that mount it.
+// contribution to its Node's usage reads its PVCs' drivers, so each PVC's entry counts the pods that mount it, and a
+// change of its driver Touches them.
 type PVCs struct {
-	state.Reader[types.NamespacedName, PVCDriver, struct{}, struct{}]
-	store *state.Store[types.NamespacedName, PVCDriver, struct{}, struct{}]
-	// mounts indexes the pods that mount a PVC by namespace: its Sources are the dependents of a namespace's PVCs.
-	mounts *state.Derivation[types.NamespacedName, string, int, mountsPVCs]
+	state.Reader[types.NamespacedName, PVCDriver, int, struct{}]
+	store *state.Store[types.NamespacedName, PVCDriver, int, struct{}]
+	// mounts counts each pod on every PVC it mounts: its Sources are the dependents of a PVC's driver.
+	mounts *state.EachDerivation[types.NamespacedName, types.NamespacedName, int, mountsPVC]
 }
 
 func newPVCs() *PVCs {
-	store := state.NewFedStore[types.NamespacedName, PVCDriver, struct{}, struct{}]()
+	store := state.NewFedStore[types.NamespacedName, PVCDriver, int, struct{}]()
 	return &PVCs{Reader: store.Reader, store: store}
 }
 
@@ -65,45 +65,34 @@ func (p *PVCs) driver(pvc types.NamespacedName) string {
 	return e.Object.Driver
 }
 
-// mountsPVCs is a pod that mounts a PVC's contribution to its namespace's count in the index. The pods themselves are
-// the index Derive's sources.
-type mountsPVCs int
+// mountsPVC is a pod's contribution to the count of the pods that mount a PVC, on the PVC's entry. The pods
+// themselves are the index's sources.
+type mountsPVC int
 
-func (m mountsPVCs) Update(f int, prev mountsPVCs) int { return f + int(m-prev) }
-func (m mountsPVCs) Delete(f int) int                  { return f - int(m) }
+func (m mountsPVC) Update(f int, prev mountsPVC) int { return f + int(m-prev) }
+func (m mountsPVC) Delete(f int) int                 { return f - int(m) }
 
-// index keeps the pods that mount a PVC current with the PVCs' drivers: a Derive keyed by the namespace whose
-// Sources are the pods, and a subscriber that Touches the pods that mount a PVC when its driver changes.
+// index keeps the pods that mount a PVC current with its driver: a DeriveEach onto each PVC a pod mounts, whose
+// Sources are the pods, and a subscriber that Touches them when the PVC's driver changes.
 func (p *PVCs) index(pods *Pods) {
-	namespaces := state.NewSyntheticStore[string, string, int, struct{}](func(ns string) string { return ns })
-	p.mounts = state.DeriveObject(pods.Reader, namespaces,
-		func(_ types.NamespacedName, pod *corev1.Pod) string {
+	p.mounts = state.DeriveEachObject(pods.Reader, p.store,
+		func(_ types.NamespacedName, pod *corev1.Pod) []types.NamespacedName {
+			var pvcs []types.NamespacedName
 			for _, v := range pod.Spec.Volumes {
-				if volumeutil.PersistentVolumeClaimName(pod, v) != "" {
-					return pod.Namespace
+				if name := volumeutil.PersistentVolumeClaimName(pod, v); name != "" {
+					pvcs = append(pvcs, types.NamespacedName{Namespace: pod.Namespace, Name: name})
 				}
 			}
-			return ""
+			return pvcs
 		},
-		func(types.NamespacedName, *corev1.Pod) mountsPVCs { return 1 })
-	p.Subscribe(func(c state.Change[types.NamespacedName, PVCDriver, struct{}, struct{}]) {
-		for _, name := range p.mounts.Sources(c.Key.Namespace) {
-			if e, ok := pods.Get(name); ok && mounts(e.Object, c.Key) {
-				pods.store.Touch(name)
-			}
+		func(types.NamespacedName, *corev1.Pod, types.NamespacedName) mountsPVC { return 1 })
+	p.Subscribe(func(c state.Change[types.NamespacedName, PVCDriver, int, struct{}]) {
+		// A change of the count alone is a pod starting or stopping to mount the PVC, which no pod's contribution reads.
+		if c.Existed == c.Exists && c.Old.Object == c.New.Object {
+			return
+		}
+		for _, name := range p.mounts.Sources(c.Key) {
+			pods.store.Touch(name)
 		}
 	})
-}
-
-// mounts returns whether the pod mounts the PVC.
-func mounts(pod *corev1.Pod, pvc types.NamespacedName) bool {
-	if pod.Namespace != pvc.Namespace {
-		return false
-	}
-	for _, v := range pod.Spec.Volumes {
-		if volumeutil.PersistentVolumeClaimName(pod, v) == pvc.Name {
-			return true
-		}
-	}
-	return false
 }
