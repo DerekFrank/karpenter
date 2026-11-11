@@ -65,8 +65,10 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	candidateNames := sets.New[string](lo.Map(candidates, func(t *Candidate, i int) string { return t.Name() })...)
 	nodes := cluster.DeepCopyNodes()
 	deletingNodes := nodes.Deleting()
+	// A rebooting node isn't a destination: its capacity only exists once it returns, and planning onto it would hide the
+	// alternatives (e.g. a replacement) behind a plan that can't proceed.
 	stateNodes := lo.Filter(nodes.Active(), func(n *state.StateNode, _ int) bool {
-		return !candidateNames.Has(n.Name())
+		return !candidateNames.Has(n.Name()) && !n.RebootInProgress()
 	})
 
 	// We do one final check to ensure that the node that we are attempting to consolidate isn't

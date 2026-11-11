@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
@@ -33,15 +34,18 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
+	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
 type Initialization struct {
 	kubeClient client.Client
+	recorder   events.Recorder
 	clock      clock.Clock
 }
 
@@ -93,6 +97,29 @@ func (i *Initialization) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim)
 	} else if !ok {
 		nodeClaim.StatusConditions(status.WithClock(i.clock)).SetUnknownWithReason(v1.ConditionTypeInitialized, "DRADriverPoolsNotPublished", fmt.Sprintf("DRA driver %q has not published a complete resource pool", driver))
 		return reconcile.Result{}, nil
+	}
+	// A rebooted node re-initializes once the pods its reboot deleted have finished terminating: if kubelet was down, it
+	// finishes them only after the node returns, and until then they still hold their resources (e.g. an allocated DRA
+	// claim). Only pods whose deletion was requested before the reboot succeeded count; a pod deleted afterward isn't
+	// the reboot's. Like the other checks this is unbounded.
+	if cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting); cond != nil && cond.IsFalse() && cond.Reason == v1.RebootReasonSucceeded {
+		pods, err := nodeutils.GetPods(ctx, i.kubeClient, node.Name)
+		if err != nil {
+			return reconcile.Result{}, fmt.Errorf("listing pods on node, %w", err)
+		}
+		if pod, ok := lo.Find(pods, func(p *corev1.Pod) bool {
+			if !podutils.IsTerminating(p) || podutils.IsTerminal(p) {
+				return false
+			}
+			// The deletion timestamp is when the pod's grace period runs out, so step back by it to when it was deleted.
+			deleted := p.DeletionTimestamp.Add(-time.Duration(lo.FromPtr(p.DeletionGracePeriodSeconds)) * time.Second)
+			return deleted.Before(cond.LastTransitionTime.Time)
+		}); ok {
+			nodeClaim.StatusConditions(status.WithClock(i.clock)).SetUnknownWithReason(v1.ConditionTypeInitialized, events.RebootDepartingPodsTerminating, fmt.Sprintf("Pod %q deleted before the reboot is still terminating", client.ObjectKeyFromObject(pod)))
+			i.recorder.Publish(RebootDepartingPodsTerminatingEvent(nodeClaim, pod))
+			// A pod finishing termination changes neither the NodeClaim nor the Node, so poll.
+			return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
+		}
 	}
 	stored := node.DeepCopy()
 	node.Labels = lo.Assign(node.Labels, map[string]string{v1.NodeInitializedLabelKey: "true"})
@@ -164,6 +191,12 @@ func (i *Initialization) draDriverPoolsPublished(ctx context.Context, node *core
 	slices, err := i.resourceSlicesForNode(ctx, node)
 	if err != nil {
 		return "", false, err
+	}
+	// Kubelet wipes a node's slices when it starts and the drivers publish new ones, so after a reboot only slices
+	// created since it was issued, when Initialized went Unknown, count; until the wipe lands the old ones still show.
+	if cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting); cond != nil && cond.IsFalse() && cond.Reason == v1.RebootReasonSucceeded {
+		issued := nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).LastTransitionTime
+		slices = lo.Filter(slices, func(s resourcev1.ResourceSlice, _ int) bool { return issued.Before(&s.CreationTimestamp) })
 	}
 	driver, ok := DRADriversPublished(nodeClaim, slices)
 	return driver, ok, nil

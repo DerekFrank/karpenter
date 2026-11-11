@@ -384,6 +384,32 @@ var _ = Describe("DRA Initialization Gating", func() {
 		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue()).To(BeTrue())
 	})
 
+	It("ignores slices published before a reboot until the drivers publish new ones (f)", func() {
+		nodeClaim, node := registeredReadyNodeClaim(driverA)
+		old := nodeSlice(node, driverA, "pool-a", 1, 1, "dev-0")
+		ExpectApplied(ctx, env.Client, old)
+		nodeClaim = reconcile(nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue()).To(BeTrue())
+
+		// The reboot is issued after the old slice was published, and kubelet hasn't wiped it yet. Timestamps are
+		// second-granular and the API server stamps slices with real time, so issue a second after the old slice.
+		issued := ExpectExists(ctx, env.Client, old).CreationTimestamp.Add(time.Second)
+		env.Clock.SetTime(issued)
+		ExpectRebooting(ctx, env.Client, env.Clock, v1.RebootReasonIssued, nodeClaim, node)
+		ExpectRebootSucceeded(ctx, env.Client, env.Clock, nodeClaim, node)
+		nodeClaim = reconcile(nodeClaim)
+		cond := nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized)
+		Expect(cond.IsUnknown()).To(BeTrue())
+		Expect(cond.Reason).To(Equal("DRADriverPoolsNotPublished"))
+
+		// Kubelet wipes the old slice and the driver publishes a new one.
+		ExpectDeleted(ctx, env.Client, old)
+		Eventually(func() bool { return time.Now().After(issued.Add(time.Second)) }).WithTimeout(5 * time.Second).Should(BeTrue())
+		ExpectApplied(ctx, env.Client, nodeSlice(node, driverA, "pool-a", 2, 1, "dev-0-new"))
+		nodeClaim = reconcile(nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue()).To(BeTrue())
+	})
+
 	It("initializes a NodeClaim with no requested-dra-drivers annotation (d)", func() {
 		nodeClaim, _ := registeredReadyNodeClaim("")
 		nodeClaim = reconcile(nodeClaim)
