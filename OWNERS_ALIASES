@@ -11,9 +11,6 @@ aliases:
   # https://github.com/kubernetes/test-infra/blob/master/config/jobs/kubernetes-sigs/karpenter/OWNERS
   karpenter-maintainers:
     - ellistarn
-    - jonathan-innis
-    - tzneal
-    - njtran
     - jmdeal
     - DerekFrank
     - engedaam
@@ -24,3 +21,6 @@ aliases:
     - AndrewSirenko
   emeritus-karpenter-maintainers:
     - bwagner5
+    - jonathan-innis
+    - tzneal
+    - njtran
