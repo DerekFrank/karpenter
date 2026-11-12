@@ -62,7 +62,7 @@ var _ = Describe("Claim expiry", func() {
 		nodeClaim := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}}})
 		nodeClaim.Status = v1.NodeClaimStatus{}
 		ExpectApplied(ctx, env.Client, nodeClaim)
-		cluster.UpdateNodeClaim(nodeClaim)
+		cluster.NodeClaimStore.Observe(nodeClaim)
 		reservation := cluster.NodePoolState.ReserveResources(nodePool.Name, limits, held, nil)
 		Expect(reservation).ToNot(BeNil())
 		reservation.Bind(nodeClaim.Name)
@@ -74,7 +74,7 @@ var _ = Describe("Claim expiry", func() {
 		_, expired := FindMetricWithLabelValues("karpenter_cluster_state_claims_expired_total", map[string]string{metrics.ClaimStoreLabel: metrics.NodePoolClaimStore.Name})
 		Expect(expired).To(BeFalse(), "counted an expiry")
 
-		cluster.DeleteNodeClaim(nodeClaim.Name)
+		cluster.NodeClaimStore.Forget(nodeClaim.Name)
 		Expect(cluster.NodePoolState.ReservedResources(nodePool.Name)).To(BeEmpty())
 	})
 	It("should expire a reservation bound to a NodeClaim that went before cluster state saw it", func() {

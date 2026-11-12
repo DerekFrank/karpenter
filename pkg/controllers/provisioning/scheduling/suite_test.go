@@ -2580,7 +2580,7 @@ var _ = Context("Scheduling", func() {
 				} else {
 					var err error
 					nc, err = ExpectNodeClaimDeployedNoNode(ctx, env.Client, cloudProvider, nc)
-					cluster.UpdateNodeClaim(nc)
+					cluster.NodeClaimStore.Observe(nc)
 					Expect(err).ToNot(HaveOccurred())
 				}
 				nodeClaims = append(nodeClaims, nc)
@@ -3108,7 +3108,7 @@ var _ = Context("Scheduling", func() {
 						var err error
 						nodeClaim, err = ExpectNodeClaimDeployedNoNode(ctx, env.Client, cloudProvider, nodeClaim)
 						Expect(err).ToNot(HaveOccurred())
-						cluster.UpdateNodeClaim(nodeClaim)
+						cluster.NodeClaimStore.Observe(nodeClaim)
 					}
 
 					var pods []*corev1.Pod

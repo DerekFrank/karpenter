@@ -170,8 +170,9 @@ var (
 		Name:    "ReadAfterWriteOverlay",
 		Default: false,
 		Stage:   docs.Alpha,
-		Help: "Karpenter's reads of NodeClaims, NodePools, Nodes and Pods from its cache include its own writes as " +
-			"soon as they return, rather than once the informer delivers them, without waiting for the informer.",
+		Help: "Karpenter's reads of NodePools, Nodes and Pods from its cache include its own writes as soon as they " +
+			"return, rather than once the informer delivers them, without waiting for the informer. Reads of NodeClaims " +
+			"always do.",
 	}
 )
 

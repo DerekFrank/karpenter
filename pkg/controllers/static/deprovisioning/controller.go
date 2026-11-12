@@ -128,12 +128,6 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 		}
 
 		log.FromContext(ctx).WithValues("NodeClaim", klog.KObj(candidate)).V(1).Info("deleting nodeclaim")
-
-		// A manual seed: it shows cluster state the delete before the informer does, so the next reconcile counts the
-		// NodeClaim as deleting rather than deprovisioning another. It's one of the seeds that writing through the
-		// accessors removes: a write through the overlay client shows the NodeClaim store the delete as soon as it
-		// returns.
-		c.cluster.UpdateNodeClaim(candidate)
 	})
 
 	if scaleDownErr := multierr.Combine(scaleDownErrs...); scaleDownErr != nil {

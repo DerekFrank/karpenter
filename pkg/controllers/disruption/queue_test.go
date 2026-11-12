@@ -245,7 +245,7 @@ var _ = Describe("Queue", func() {
 			Expect(env.Client.Get(ctx, types.NamespacedName{Name: cmd.Replacements[0].Name}, replacementNodeClaim))
 			replacementNodeClaim, _ = ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cluster, cloudProvider, replacementNodeClaim)
 
-			cluster.UpdateNodeClaim(replacementNodeClaim)
+			cluster.NodeClaimStore.Observe(replacementNodeClaim)
 			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
 			Expect(queue.HasAny(stateNode.NodeClaim.Name)).To(BeTrue()) // Expect the command to still be in the queue
 		})

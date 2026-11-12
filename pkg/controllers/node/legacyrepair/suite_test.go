@@ -63,7 +63,7 @@ func expectApplied(objects ...client.Object) {
 		case *corev1.Node:
 			cluster.NodeStore.Observe(o)
 		case *v1.NodeClaim:
-			cluster.UpdateNodeClaim(o)
+			cluster.NodeClaimStore.Observe(o)
 		}
 	}
 }

@@ -30,9 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/util/workqueue"
-	"sigs.k8s.io/controller-runtime/pkg/cache/informertest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllertest"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -42,6 +40,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/nodepool/counter"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/state/overlay"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
@@ -51,7 +50,7 @@ import (
 
 var nodePoolController *counter.Controller
 var nodePools *cluster.NodePools
-var nodeClaimInformer *controllertest.FakeInformer
+var nodeClaimInformer *test.StoredInformer
 var ctx context.Context
 var env *test.Environment
 var cloudProvider *fake.CloudProvider
@@ -104,12 +103,14 @@ func deleteNodeClaims(nodeClaims ...*v1.NodeClaim) {
 
 var _ = Describe("Counter", func() {
 	BeforeEach(func() {
-		informers := &informertest.FakeInformers{Scheme: scheme.Scheme}
+		informers := test.NewStoredInformers(scheme.Scheme)
+		nodeClaimInformer = informers.Stored(ctx, &v1.NodeClaim{})
 		// FakeInformers makes informers unsafely, so make them before the stores start.
 		for _, obj := range []client.Object{&v1.NodeClaim{}, &v1.NodePool{}, &corev1.Node{}, &corev1.Pod{}, &storagev1.CSINode{}} {
 			lo.Must(informers.FakeInformerFor(ctx, obj))
 		}
-		s := cluster.New(ctx, env.Clock, env.Client, informers, cloudProvider)
+		// Cluster state reads NodeClaims through the overlay, over the NodeClaim informer's store.
+		s := cluster.New(ctx, env.Clock, lo.Must(overlay.New(ctx, env.Client, informers, &v1.NodeClaim{})), informers, cloudProvider)
 		nodePools = s.NodePools
 		nodePoolController = counter.NewController(env.Client, cloudProvider, nodePools)
 		m := &runnables{}
@@ -121,7 +122,6 @@ var _ = Describe("Counter", func() {
 		}
 		// The first List against the test environment can take about a second.
 		Eventually(s.NodePoolState.Synced).WithTimeout(10 * time.Second).Should(BeTrue())
-		nodeClaimInformer = lo.Must(informers.FakeInformerFor(ctx, &v1.NodeClaim{}))
 
 		cloudProvider.InstanceTypes = fake.InstanceTypesAssorted()
 		nodePool = test.NodePool()

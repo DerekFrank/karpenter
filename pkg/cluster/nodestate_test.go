@@ -26,6 +26,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,6 +41,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	cpfake "sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/state/overlay"
 	"sigs.k8s.io/karpenter/pkg/test"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 )
@@ -65,6 +67,19 @@ func startNodeState(t interface {
 			t.Fatal("node state didn't sync")
 		}
 	}
+}
+
+// overlaid returns kubeClient in the overlay that node state reads NodeClaims through, over informers whose NodeClaim
+// informer stores the NodeClaims among objs, as the informer cache's would once synced.
+func overlaid(ctx context.Context, kubeClient client.Client, informers *test.StoredInformers, objs ...client.Object) client.Client {
+	GinkgoHelper()
+	nodeClaims := informers.Stored(ctx, &v1.NodeClaim{})
+	for _, obj := range objs {
+		if nodeClaim, ok := obj.(*v1.NodeClaim); ok {
+			Expect(nodeClaims.Store.Add(nodeClaim)).To(Succeed())
+		}
+	}
+	return lo.Must(overlay.New(ctx, kubeClient, informers, &v1.NodeClaim{}))
 }
 
 // listSynced is the check cluster state's Synced made against the API server before node state's stores followed it:
@@ -131,10 +146,10 @@ var _ = Describe("NodeState", func() {
 					objs = append(objs, test.Node(test.NodeOptions{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("unmanaged-%d", i)}}))
 				}
 				kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(objs...).Build()
-				informers := &informertest.FakeInformers{Scheme: scheme.Scheme}
-				s := NewNodeState(ctx, clock.RealClock{}, kubeClient, informers, cloudProvider, nil)
+				informers := test.NewStoredInformers(scheme.Scheme)
+				s := NewNodeState(ctx, clock.RealClock{}, overlaid(ctx, kubeClient, informers, objs...), informers, cloudProvider, nil)
 				Expect(s.Synced()).To(BeFalse(), "round %d: node state is synced before its stores listed", round)
-				startNodeState(GinkgoT(), ctx, s, informers)
+				startNodeState(GinkgoT(), ctx, s, informers.FakeInformers)
 				launched := !s.HasUnlaunchedNodeClaims()
 				Expect(listSynced(ctx, kubeClient, cloudProvider, s)).To(Equal(launched),
 					"round %d: synced stores with every NodeClaim launched = %t, but the List check = %t", round, launched, !launched)
@@ -177,14 +192,14 @@ func BenchmarkPodStoreRetained(b *testing.B) {
 			}
 			var retained float64
 			for b.Loop() {
-				informers := &informertest.FakeInformers{Scheme: scheme.Scheme}
+				informers := test.NewStoredInformers(scheme.Scheme)
 				informer, err := informers.FakeInformerFor(ctx, &corev1.Pod{})
 				if err != nil {
 					b.Fatal(err)
 				}
 				before := heapInUse()
-				s := NewNodeState(ctx, clock.RealClock{}, fake.NewClientBuilder().WithScheme(scheme.Scheme).Build(), informers, cpfake.NewCloudProvider(), nil)
-				startNodeState(b, ctx, s, informers)
+				s := NewNodeState(ctx, clock.RealClock{}, overlaid(ctx, fake.NewClientBuilder().WithScheme(scheme.Scheme).Build(), informers), informers, cpfake.NewCloudProvider(), nil)
+				startNodeState(b, ctx, s, informers.FakeInformers)
 				for _, pod := range cache {
 					feed.feed(s, informer, pod)
 				}

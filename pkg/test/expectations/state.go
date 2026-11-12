@@ -135,3 +135,70 @@ func observeNode(ctx context.Context, kubeClient client.Client, cluster *state.C
 	cluster.PodStore.Resync(listed, cluster.PodsOnNodes.Sources(node.Name))
 	return nil
 }
+
+// NodeClaimWrites returns kubeClient with the NodeClaims its writes return shown to cluster state as each write
+// returns, as the overlay client's write notifications show them to the NodeClaim store under the manager. A suite
+// gives it to the controller under test, whose writes the controller then reads back through cluster state.
+func NodeClaimWrites(kubeClient client.Client, cluster *state.Cluster) client.Client {
+	return nodeClaimWrites{Client: kubeClient, cluster: cluster}
+}
+
+type nodeClaimWrites struct {
+	client.Client
+	cluster *state.Cluster
+}
+
+func (w nodeClaimWrites) show(obj client.Object, err error) error {
+	if nodeClaim, ok := obj.(*v1.NodeClaim); ok && err == nil {
+		if nodeClaim.DeletionTimestamp != nil && len(nodeClaim.Finalizers) == 0 {
+			w.cluster.NodeClaimStore.Forget(nodeClaim.Name)
+		} else {
+			w.cluster.NodeClaimStore.Observe(nodeClaim.DeepCopy())
+		}
+	}
+	return err
+}
+
+func (w nodeClaimWrites) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	return w.show(obj, w.Client.Create(ctx, obj, opts...))
+}
+
+func (w nodeClaimWrites) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	return w.show(obj, w.Client.Update(ctx, obj, opts...))
+}
+
+func (w nodeClaimWrites) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	return w.show(obj, w.Client.Patch(ctx, obj, patch, opts...))
+}
+
+// Delete shows cluster state the terminating NodeClaim a finalizer holds, or that the NodeClaim is gone.
+func (w nodeClaimWrites) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	rv := obj.GetResourceVersion()
+	if err := w.Client.Delete(ctx, obj, opts...); err != nil {
+		return err
+	}
+	if nodeClaim, ok := obj.(*v1.NodeClaim); ok && nodeClaim.ResourceVersion == rv {
+		w.cluster.NodeClaimStore.Forget(nodeClaim.Name)
+		return nil
+	}
+	return w.show(obj, nil)
+}
+
+func (w nodeClaimWrites) Status() client.SubResourceWriter { return w.SubResource("status") }
+
+func (w nodeClaimWrites) SubResource(subResource string) client.SubResourceClient {
+	return nodeClaimSubResourceWrites{SubResourceClient: w.Client.SubResource(subResource), parent: w}
+}
+
+type nodeClaimSubResourceWrites struct {
+	client.SubResourceClient
+	parent nodeClaimWrites
+}
+
+func (s nodeClaimSubResourceWrites) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	return s.parent.show(obj, s.SubResourceClient.Update(ctx, obj, opts...))
+}
+
+func (s nodeClaimSubResourceWrites) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	return s.parent.show(obj, s.SubResourceClient.Patch(ctx, obj, patch, opts...))
+}

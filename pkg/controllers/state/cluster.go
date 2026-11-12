@@ -30,7 +30,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	volumeutil "sigs.k8s.io/karpenter/pkg/utils/volume"
@@ -115,17 +114,6 @@ func (c *Cluster) NodeClaimsLaunched(ctx context.Context) bool {
 // A controller that reads cluster state declares it in Register, with WatchesRawSource(state.Requires(cluster)).
 func (c *Cluster) Synced() bool {
 	return c.NodeState.Synced() && c.NodePoolState.Synced()
-}
-
-// UpdateNodeClaim applies a version of the NodeClaim that a caller just wrote, before the NodeClaim store sees it.
-func (c *Cluster) UpdateNodeClaim(nodeClaim *v1.NodeClaim) {
-	c.NodeClaimStore.Observe(nodeClaim)
-}
-
-// DeleteNodeClaim drops the NodeClaim, for a caller that finds an entry the NodeClaim store will never see deleted,
-// such as one a seed applied after the NodeClaim's delete.
-func (c *Cluster) DeleteNodeClaim(name string) {
-	c.NodeClaimStore.Forget(name)
 }
 
 // ResolvePVCDrivers resolves the drivers of the PVCs the pods mount that cluster state doesn't hold, for a PVC cluster

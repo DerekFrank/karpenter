@@ -130,8 +130,8 @@ func useRepairPolicies(policies []cloudprovider.RepairPolicy) {
 	cluster = state.NewCluster(env.Clock, env.Client, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
 	nodeStateController = NodeInformer(env.Client, cluster, nil)
 	nodeClaimStateController = NodeClaimInformer(env.Client, cluster, informer.NewNodeClaimController(env.Client, cloudProvider, clusterCost))
-	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client), store, cs.Nomination, cs.BufferPods)
-	*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov, cs.Deletion))
+	prov = provisioning.NewProvisioner(NodeClaimWrites(env.Client, cluster), recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client), store, cs.Nomination, cs.BufferPods)
+	*queue = lo.FromPtr(disruption.NewQueue(NodeClaimWrites(env.Client, cluster), recorder, cluster, env.Clock, prov, cs.Deletion))
 }
 
 var _ = AfterSuite(func() {
@@ -156,13 +156,13 @@ var _ = BeforeEach(func() {
 	metaScheme := runtime.NewScheme()
 	Expect(metav1.AddMetaToScheme(metaScheme)).To(Succeed())
 	Expect(store.RegisterTargetKinds(ctx, &informertest.FakeInformers{Scheme: metaScheme}, prediction.SupportedTargets.UnsortedList()...)).To(Succeed())
-	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client), store, cs.Nomination, cs.BufferPods)
+	prov = provisioning.NewProvisioner(NodeClaimWrites(env.Client, cluster), recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client), store, cs.Nomination, cs.BufferPods)
 
 	// Ensure that we reset the disruption controller's methods after each test run
-	disruptionController = disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost, disruption.WithMethods(NewMethodsWithNopValidator()...))
+	disruptionController = disruption.NewController(ctx, env.Clock, NodeClaimWrites(env.Client, cluster), prov, cloudProvider, recorder, cluster, queue, clusterCost, disruption.WithMethods(NewMethodsWithNopValidator()...))
 	env.Clock.SetTime(time.Now())
 	cluster.Reset()
-	*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov, cs.Deletion))
+	*queue = lo.FromPtr(disruption.NewQueue(NodeClaimWrites(env.Client, cluster), recorder, cluster, env.Clock, prov, cs.Deletion))
 	cluster.MarkUnconsolidated()
 
 	// Reset Feature Flags to test defaults
@@ -693,7 +693,7 @@ var _ = Describe("Disruption Taints", func() {
 		ExpectDeleted(ctx, env.Client, createdNodeClaim[0])
 		ExpectNodeClaimsCascadeDeletion(ctx, env.Client, createdNodeClaim[0])
 		ExpectNotFound(ctx, env.Client, createdNodeClaim[0])
-		cluster.DeleteNodeClaim(createdNodeClaim[0].Name)
+		cluster.NodeClaimStore.Forget(createdNodeClaim[0].Name)
 
 		ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
 

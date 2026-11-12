@@ -66,6 +66,7 @@ There are two kinds of store. They differ only in where the object comes from:
 | Store | Made with | Object | Written by |
 |---|---|---|---|
 | object store | `NewObjectStore[S, D, I](kubeClient, informers)`, `NewObjectStoreBy(kubeClient, informers, key)` | an API object of kind `S`, by namespaced name or the key `key` returns | the informer and the overlay's writes, or `Observe`, `Forget` and `Resync` |
+| level store | `NewLevelStore[K, S, D, I](from, key, in)` | the newest version of each object of kind `S` that `from` holds and `in` accepts, under `key(name)` | `from`: `overlay.Source`, or `state.Objects` in a suite |
 | synthetic store | `NewFedStore[K, O, D, I]()` | a Go type, reported by a feed | `Feed` and `FeedAll` |
 | | `NewSyntheticStore(build)` | `build(key)`, while the entry has a contribution | `Derive`s and `Claims` |
 
@@ -86,7 +87,23 @@ There are two kinds of store. They differ only in where the object comes from:
 - **A store's entries never change once stored.** A reader takes no lock and
   can keep what `Get` and `List` return. Every write takes the store's one
   lock, and notifies once the lock is released.
-- **An object store orders each object's versions** by UID and
+- **Every entry carries a version**, the store's count of its writes, stamped
+  on each write, `Touch` included. A `Derive` records the version of each
+  source entry it computed a contribution from, and commits a recompute only
+  from a newer version, so an older recompute loses. A source entry that's gone
+  has no version: its removal commits only while it's still gone, and a
+  contribution only while it still exists.
+- **A level store applies the newest version of an object on each
+  notification** (`NewLevelStore`, used for NodeClaims). On every key its
+  `Newest` notifies, from an informer event, a write or a delete, it reads that
+  object's newest version and holds it, or drops the entry once it's gone. It
+  keeps no versions or tombstones of its own: a version the informer skips,
+  repeats or delivers late never reaches it, because `overlay.Source` already
+  returns the newer of the cache's object and the client's own write, and
+  hides an object the client deleted until the informer's store drops it. An
+  older read loses to the object held; a read from before a removal is undone
+  by the re-read that follows each commit.
+- **Any other object store orders each object's versions** by UID and
   resourceVersion: an older version arriving after a newer one is dropped, a
   delete leaves a tombstone until the informer's delete, and a newer object
   under a name another UID holds replaces it.
@@ -104,13 +121,17 @@ There are two kinds of store. They differ only in where the object comes from:
   object named `name`, and `state.Resync(store, objs, scope)` makes `objs` the
   objects among those named in `scope`, which heals missed events. `scope`
   comes from an index, such as `Derivation.Sources(key)`.
+  A level store without a kubeClient reads a suite's `state.Objects`, which
+  `Put` and `Remove` fill as the informer's store; `cluster.NodeClaims`'s
+  `Observe` and `Forget` do it for NodeClaims.
 - **A feed replaces a set of entries in one write.** `FeedAll(in, objects)`
   makes `objects` the store's objects among the keys `in` accepts, such as one
   NodeClass's instance types, so a reader sees the old set or the new one.
 - **`Reader`** is a store's read-only handle: `Get`, `List`, `Subscribe`,
   `Synced`, `Source` and `SourceOn`. `pkg/cluster` exports Readers.
 - **`Synced`** is true once an object store following an informer has applied
-  its first List, and every `Derive` into a store has applied its source. A
+  its first List, a level store's `Newest` has synced and it has applied every
+  key the `Newest` held then, and every `Derive` into a store has applied its source. A
   store fed by a caller is synced from the start.
 - **`Subscribe(fn)`** calls `fn` with each `Change{Key, Old, New, Existed,
   Exists}` after the lock is released, and returns a func that stops it.
@@ -404,6 +425,11 @@ op.WithControllers(ctx, controllers.NewControllers(ctx, mgr, ..., s, ...)...).St
   NodeClaim is launching" may never hold, so the provisioner and disruption
   check `NodeClaimsLaunched`, and disruption wakes on
   `NodeClaims.UnlaunchedSource`.
+- **NodeClaims read through the overlay, always.** The operator overlays
+  NodeClaims whatever the `ReadAfterWriteOverlay` gate, which overlays the
+  other kinds. A suite gives the controller under test
+  `expectations.NodeClaimWrites(kubeClient, cluster)`, which shows the NodeClaim
+  store each NodeClaim write as it returns, as the overlay does.
 - **A suite's cluster state has no informers.** It reconciles the informer
   stand-ins in `pkg/test/expectations` (`NodeClaimInformer`, `NodeInformer`,
   `PodInformer`), which show cluster state an object as the informer would.

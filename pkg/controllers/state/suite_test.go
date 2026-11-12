@@ -1352,14 +1352,14 @@ var _ = Describe("Cluster State Sync", func() {
 		nodeClaim := test.NodeClaim()
 		nodeClaim.Status.ProviderID = ""
 
-		cluster.UpdateNodeClaim(nodeClaim)
+		cluster.NodeClaimStore.Observe(nodeClaim)
 		Expect(cluster.NodeClaimsLaunched(ctx)).To(BeFalse())
 	})
 	It("shouldn't consider the cluster state synced if a nodeclaim without a providerID is deleted", func() {
 		nodeClaim := test.NodeClaim(v1.NodeClaim{})
 		nodeClaim.Status.ProviderID = ""
 
-		cluster.UpdateNodeClaim(nodeClaim)
+		cluster.NodeClaimStore.Observe(nodeClaim)
 		Expect(cluster.NodeClaimsLaunched(ctx)).To(BeFalse())
 		ExpectMetricGaugeValue(state.ClusterStateSynced, 0, nil)
 

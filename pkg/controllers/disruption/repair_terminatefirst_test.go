@@ -67,8 +67,8 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		useRepairPolicies([]cloudprovider.RepairPolicy{
 			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, TerminationGracePeriod: lo.ToPtr(repairTGP), Action: cloudprovider.ReplaceNode},
 		})
-		repairController = disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
-			disruption.WithMethods(disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue))))
+		repairController = disruption.NewController(ctx, env.Clock, NodeClaimWrites(env.Client, cluster), prov, cloudProvider, recorder, cluster, queue, clusterCost,
+			disruption.WithMethods(disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, NodeClaimWrites(env.Client, cluster), prov, cloudProvider, recorder, queue))))
 	})
 
 	// staticNodePoolAtLimit: limit == replicas, so the pool is at its limit and can't stage a replacement.
@@ -656,8 +656,8 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			markUnhealthy(dynamicNode)
 			env.Clock.Step(31 * time.Minute)
 			erroring := &instanceTypesErrorCloudProvider{CloudProvider: cloudProvider, nodePools: []string{staticPool.Name}}
-			repairController = disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
-				disruption.WithMethods(disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, erroring, recorder, queue))))
+			repairController = disruption.NewController(ctx, env.Clock, NodeClaimWrites(env.Client, cluster), prov, cloudProvider, recorder, cluster, queue, clusterCost,
+				disruption.WithMethods(disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, NodeClaimWrites(env.Client, cluster), prov, erroring, recorder, queue))))
 
 			ExpectSingletonReconciled(ctx, repairController)
 

@@ -111,7 +111,7 @@ var _ = Describe("NodePoolStats", func() {
 			nodePool := nodePools[r.IntN(len(nodePools))]
 			switch op := r.IntN(12); {
 			case op == 0:
-				c.DeleteNodeClaim(name)
+				c.NodeClaimStore.Forget(name)
 				delete(uids, "nc"+name)
 			case op == 1:
 				c.NodeStore.Forget(name)
@@ -140,7 +140,7 @@ var _ = Describe("NodePoolStats", func() {
 				if r.IntN(3) != 0 {
 					nc.Status.Conditions = append(nc.Status.Conditions, status.Condition{Type: v1.ConditionTypeInitialized, Status: metav1.ConditionTrue})
 				}
-				c.UpdateNodeClaim(nc)
+				c.NodeClaimStore.Observe(nc)
 			default:
 				labels := map[string]string{corev1.LabelInstanceTypeStable: "default-instance-type"}
 				// Some Nodes are unmanaged: they carry no NodePool label and no NodeClaim joins them, unless a

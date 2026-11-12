@@ -53,7 +53,7 @@ var _ = Describe("NodePoolState Recount", func() {
 			name := fmt.Sprintf("nc-%d", r.IntN(50))
 			switch op := r.IntN(10); {
 			case op == 0:
-				c.DeleteNodeClaim(name)
+				c.NodeClaimStore.Forget(name)
 				delete(latest, name)
 			case op == 1 && latest[name] != nil:
 				// A stale version arriving after a newer one doesn't count.
@@ -62,7 +62,7 @@ var _ = Describe("NodePoolState Recount", func() {
 					stale := latest[name].DeepCopy()
 					stale.ResourceVersion = strconv.FormatUint(1+r.Uint64N(current-1), 10)
 					stale.Labels[v1.NodePoolLabelKey] = "stale"
-					c.UpdateNodeClaim(stale)
+					c.NodeClaimStore.Observe(stale)
 				}
 			default:
 				rv++
@@ -83,7 +83,7 @@ var _ = Describe("NodePoolState Recount", func() {
 				if r.IntN(3) == 0 {
 					nc.Status.Conditions = []status.Condition{{Type: v1.ConditionTypeDisruptionReason, Status: metav1.ConditionTrue}}
 				}
-				c.UpdateNodeClaim(nc)
+				c.NodeClaimStore.Observe(nc)
 				latest[name] = nc
 			}
 			want := map[string]karpentercluster.NodeClaimCounts{}

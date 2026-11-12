@@ -959,7 +959,7 @@ var _ = Describe("Drift", func() {
 			})
 			Expect(ok).To(BeTrue())
 			ExpectDeleted(ctx, env.Client, newNodeClaim)
-			cluster.DeleteNodeClaim(newNodeClaim.Name)
+			cluster.NodeClaimStore.Forget(newNodeClaim.Name)
 
 			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
 			// We should have tried to create a new nodeClaim but failed to do so; therefore, we untainted the existing node

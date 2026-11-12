@@ -332,7 +332,6 @@ func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, 
 			errs[i] = client.IgnoreNotFound(err)
 			return
 		}
-		q.cluster.UpdateNodeClaim(nodeClaim)
 	})
 	var markedCandidates []*Candidate
 	for i := range errs {

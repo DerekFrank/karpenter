@@ -21,18 +21,20 @@ import (
 	"slices"
 	"time"
 
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
+
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/state"
+	"sigs.k8s.io/karpenter/pkg/state/overlay"
 )
 
 // NodeClaimDerived are the fields derived about a NodeClaim from other stores.
@@ -59,40 +61,50 @@ type NodeClaimEntry = state.Entry[*v1.NodeClaim, NodeClaimDerived, NodeClaimInte
 
 type nodeClaimStore = state.Store[string, *v1.NodeClaim, NodeClaimDerived, NodeClaimIntent]
 
-// NodeClaims are the NodeClaims of the cloud provider's node classes, by name: an object store. The NodeClaim is the
-// source of truth for Karpenter's view of the nodes it manages, so the intent about a node lives on its NodeClaim's
-// entry and drops with it.
+// NodeClaims are the NodeClaims of the cloud provider's node classes, by name: a level store over the overlay client's
+// newest version of each NodeClaim. The NodeClaim is the source of truth for Karpenter's view of the nodes it manages,
+// so the intent about a node lives on its NodeClaim's entry and drops with it.
 type NodeClaims struct {
 	state.Reader[string, *v1.NodeClaim, NodeClaimDerived, NodeClaimIntent]
 	store *nodeClaimStore
+	// objects stand in for the informer's store in a suite, which builds cluster state without a kubeClient.
+	objects *state.Objects
 }
 
-func newNodeClaims(kubeClient client.Client, informers cache.Informers, managed []schema.GroupKind) *NodeClaims {
-	store := state.NewObjectStoreBy[string, *v1.NodeClaim, NodeClaimDerived, NodeClaimIntent](kubeClient, informers, func(nodeClaim *v1.NodeClaim) string {
-		if nodeClaim.Spec.NodeClassRef == nil || !slices.Contains(managed, nodeClaim.Spec.NodeClassRef.GroupKind()) {
-			return ""
+// newNodeClaims reads the NodeClaims through kubeClient, which must be an overlay.Client that overlays them, or from
+// the objects a suite shows it with Observe and Forget when kubeClient is nil.
+func newNodeClaims(kubeClient client.Client, managed []schema.GroupKind) *NodeClaims {
+	n := &NodeClaims{}
+	var from state.Newest
+	if kubeClient == nil {
+		n.objects = state.NewObjects()
+		from = n.objects
+	} else {
+		overlaid, ok := kubeClient.(*overlay.Client)
+		if !ok {
+			panic("NodeClaims read through an overlay.Client")
 		}
-		return nodeClaim.Name
-	})
-	return &NodeClaims{Reader: store.Reader, store: store}
+		from = lo.Must(overlaid.Source(&v1.NodeClaim{}))
+	}
+	n.store = state.NewLevelStore[string, *v1.NodeClaim, NodeClaimDerived, NodeClaimIntent](from,
+		func(name types.NamespacedName) string { return name.Name },
+		func(nodeClaim *v1.NodeClaim) bool {
+			return nodeClaim.Spec.NodeClassRef != nil && slices.Contains(managed, nodeClaim.Spec.NodeClassRef.GroupKind())
+		})
+	n.Reader = n.store.Reader
+	return n
 }
 
-// Observe applies a version of a NodeClaim a caller just wrote or saw, before the informer delivers it.
-func (n *NodeClaims) Observe(nodeClaim *v1.NodeClaim) { n.store.Observe(nodeClaim) }
+// Observe shows a suite's NodeClaims a version of a NodeClaim, as the informer would.
+func (n *NodeClaims) Observe(nodeClaim *v1.NodeClaim) { n.objects.Put(nodeClaim) }
 
-// Forget drops the NodeClaim named name, for a caller that learns it's gone by its name alone.
-func (n *NodeClaims) Forget(name string) { state.Forget(n.store, types.NamespacedName{Name: name}) }
+// Forget shows a suite's NodeClaims that the NodeClaim named name is gone, as the informer would.
+func (n *NodeClaims) Forget(name string) { n.objects.Remove(types.NamespacedName{Name: name}) }
 
 // Exists returns whether cluster state holds the NodeClaim.
 func (n *NodeClaims) Exists(name string) bool {
 	_, ok := n.Get(name)
 	return ok
-}
-
-// Unlaunched returns whether cluster state holds the NodeClaim, and it hasn't launched.
-func (n *NodeClaims) Unlaunched(name string) bool {
-	e, ok := n.Get(name)
-	return ok && !Launched(e)
 }
 
 // UnlaunchedSource is the NodeClaims as a source that wakes on a NodeClaim appearing, going, or launching, for a

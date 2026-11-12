@@ -491,8 +491,8 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 				ExpectApplied(ctx, env.Client, unresolvedNodeClaim1, unresolvedNodeClaim2)
 
 				// Force Cluster State Update as provisioning controller updates after creating the NodeClaim
-				cluster.UpdateNodeClaim(unresolvedNodeClaim1)
-				cluster.UpdateNodeClaim(unresolvedNodeClaim2)
+				cluster.NodeClaimStore.Observe(unresolvedNodeClaim1)
+				cluster.NodeClaimStore.Observe(unresolvedNodeClaim2)
 
 				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeController, nodeClaimStateController, nodes, nodeClaims)
 				Expect(cluster.Nodes()).To(HaveLen(2))
@@ -703,8 +703,8 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 					}
 					// nodes[1] runs an application pod; every other node is empty.
 					ExpectApplied(ctx, env.Client, test.Pod(test.PodOptions{NodeName: nodes[1].Name}))
-					cluster.UpdateNodeClaim(unresolved)
-					cluster.UpdateNodeClaim(otherUnresolved)
+					cluster.NodeClaimStore.Observe(unresolved)
+					cluster.NodeClaimStore.Observe(otherUnresolved)
 					ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeController, nodeClaimStateController,
 						append(nodes, otherNodes...), append(nodeClaims, otherNodeClaims...))
 					ExpectStateNodePoolCount(cluster, nodePool.Name, 3, 0, 0)

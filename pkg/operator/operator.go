@@ -263,29 +263,29 @@ func NewOperator(o ...option.Function[Options]) (context.Context, *Operator) {
 			"/debug/pprof/threadcreate": pprof.Handler("threadcreate"),
 		})
 	}
-	var overlayClient *overlay.Client
+	// NodeClaims are always overlaid: cluster state's NodeClaim store reads each NodeClaim's newest version through the
+	// overlay. The feature gate overlays the other kinds.
+	overlaid := []client.Object{&v1.NodeClaim{}}
 	if options.FromContext(ctx).FeatureGates.ReadAfterWriteOverlay {
-		mgrOpts.NewClient = func(config *rest.Config, opts client.Options) (client.Client, error) {
-			c, err := client.New(config, opts)
-			if err != nil {
-				return nil, err
-			}
-			informers, ok := opts.Cache.Reader.(cache.Informers)
-			if !ok {
-				return c, nil
-			}
-			overlayClient, err = overlay.New(ctx, c, informers, &v1.NodeClaim{}, &v1.NodePool{}, &corev1.Node{}, &corev1.Pod{})
-			return overlayClient, err
+		overlaid = append(overlaid, &v1.NodePool{}, &corev1.Node{}, &corev1.Pod{})
+	}
+	var overlayClient *overlay.Client
+	mgrOpts.NewClient = func(config *rest.Config, opts client.Options) (client.Client, error) {
+		c, err := client.New(config, opts)
+		if err != nil {
+			return nil, err
 		}
+		informers, ok := opts.Cache.Reader.(cache.Informers)
+		if !ok {
+			return nil, fmt.Errorf("overlaying a client whose cache reader has no informers")
+		}
+		overlayClient, err = overlay.New(ctx, c, informers, overlaid...)
+		return overlayClient, err
 	}
 	mgr, err := ctrl.NewManager(config, mgrOpts)
 	mgr = lo.Must(mgr, err, "failed to setup manager")
 
-	fieldIndexer := mgr.GetFieldIndexer()
-	if overlayClient != nil {
-		fieldIndexer = overlayClient.FieldIndexer(fieldIndexer)
-	}
-	setupIndexers(ctx, fieldIndexer)
+	setupIndexers(ctx, overlayClient.FieldIndexer(mgr.GetFieldIndexer()))
 
 	lo.Must0(mgr.AddReadyzCheck("manager", func(req *http.Request) error {
 		return lo.Ternary(mgr.GetCache().WaitForCacheSync(req.Context()), nil, fmt.Errorf("failed to sync caches"))

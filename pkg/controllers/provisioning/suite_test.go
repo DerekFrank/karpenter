@@ -755,7 +755,7 @@ var _ = Describe("Provisioning", func() {
 				},
 			})
 			ExpectApplied(ctx, env.Client, nodePool)
-			cluster.UpdateNodeClaim(test.NodeClaim(v1.NodeClaim{
+			cluster.NodeClaimStore.Observe(test.NodeClaim(v1.NodeClaim{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
 						v1.NodePoolLabelKey: nodePool.Name,
@@ -947,7 +947,7 @@ var _ = Describe("Provisioning", func() {
 				nodeClaim.Status.ProviderID = test.RandomProviderID()
 				nodeClaim.Status.Capacity = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}
 				ExpectApplied(ctx, env.Client, nodeClaim)
-				cluster.UpdateNodeClaim(nodeClaim)
+				cluster.NodeClaimStore.Observe(nodeClaim)
 
 				fields := cluster.NodePoolState.Get(nodePool.Name)
 				Expect(fields.Usage[corev1.ResourceCPU]).To(BeComparableTo(resource.MustParse("2")))

@@ -80,7 +80,7 @@ func NewNodeState(ctx context.Context, clk clock.Clock, kubeClient client.Client
 	s := &NodeState{
 		clock:          clk,
 		matcher:        matcher,
-		NodeClaimStore: newNodeClaims(kubeClient, informers, managed),
+		NodeClaimStore: newNodeClaims(kubeClient, managed),
 		NodeStore:      newNodes(kubeClient, informers),
 		PodStore:       pods,
 		CSINodeStore:   newCSINodes(kubeClient, informers),
@@ -211,11 +211,6 @@ func (s *NodeState) withNode(n *StateNode, e NodeEntry, copyUsage bool) *StateNo
 // NodeClaimExists returns whether cluster state holds the NodeClaim.
 func (s *NodeState) NodeClaimExists(nodeClaimName string) bool {
 	return s.NodeClaimStore.Exists(nodeClaimName)
-}
-
-// UnlaunchedNodeClaimExists returns whether cluster state holds the NodeClaim, and it hasn't launched.
-func (s *NodeState) UnlaunchedNodeClaimExists(nodeClaimName string) bool {
-	return s.NodeClaimStore.Unlaunched(nodeClaimName)
 }
 
 // HasUnlaunchedNodeClaims returns whether any NodeClaim is waiting on its launch to resolve its instance. A decision

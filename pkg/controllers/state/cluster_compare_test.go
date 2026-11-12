@@ -211,7 +211,7 @@ func (c *cacheClient) List(ctx context.Context, list client.ObjectList, opts ...
 
 func (f *fixture) ingest() {
 	for i := range f.nodes {
-		f.cluster.UpdateNodeClaim(f.nodeClaims[i])
+		f.cluster.NodeClaimStore.Observe(f.nodeClaims[i])
 		f.cluster.NodeStore.Observe(f.nodes[i])
 		for _, pod := range f.pods[i] {
 			f.cluster.PodStore.Observe(pod)
@@ -245,6 +245,20 @@ func BenchmarkClusterNodeUpdate(b *testing.B) {
 		node.Status.Conditions[0].LastHeartbeatTime = metav1.NewTime(time.Unix(int64(i), 0))
 		f.version(node)
 		f.cluster.NodeStore.Observe(node)
+	}
+}
+
+// BenchmarkClusterNodeClaimUpdate applies a new version of a NodeClaim, as its informer delivers one.
+func BenchmarkClusterNodeClaimUpdate(b *testing.B) {
+	f := newFixture(1000, 30)
+	f.ingest()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		nc := f.nodeClaims[i%len(f.nodeClaims)].DeepCopy()
+		nc.Labels["churn"] = strconv.Itoa(i % 2)
+		f.version(nc)
+		f.cluster.NodeClaimStore.Observe(nc)
 	}
 }
 
@@ -380,7 +394,7 @@ var _ = Describe("Cluster Compare", func() {
 					f.cluster.NodeStore.Observe(node)
 					nc := f.nodeClaims[n].DeepCopy()
 					f.version(nc)
-					f.cluster.UpdateNodeClaim(nc)
+					f.cluster.NodeClaimStore.Observe(nc)
 					f.cs.Deletion.Mark(nc.Name)
 					f.cs.Deletion.Unmark(nc.Name)
 					f.cs.Nomination.Nominate(compareCtx, nc.Name)
@@ -422,7 +436,7 @@ var _ = Describe("Cluster Compare", func() {
 		for _, pod := range f.pods[0] {
 			f.cluster.PodStore.Observe(pod)
 		}
-		f.cluster.UpdateNodeClaim(f.nodeClaims[0])
+		f.cluster.NodeClaimStore.Observe(f.nodeClaims[0])
 		f.cluster.NodeStore.Observe(f.nodes[0])
 		nodes := f.cluster.DeepCopyNodes()
 		requests := nodes[0].PodRequests()
@@ -462,7 +476,7 @@ var _ = Describe("Cluster Compare", func() {
 		nc := f.nodeClaims[0].DeepCopy()
 		nc.Labels["updated"] = "true"
 		f.version(nc)
-		f.cluster.UpdateNodeClaim(nc)
+		f.cluster.NodeClaimStore.Observe(nc)
 		Expect(f.cluster.DeepCopyNodes()[0].DisruptionCost()).To(Equal(before), "disruption cost after a NodeClaim update")
 	})
 

@@ -567,12 +567,6 @@ func (p *Provisioner) Create(ctx context.Context, n *scheduler.NodeClaim, opts .
 			metrics.MinValuesRelaxedLabel: "false",
 		})
 	}
-	// Update the nodeclaim manually in state to avoid eventual consistency delay races with our watcher.
-	// This is essential to avoiding races where disruption can create a replacement node, then immediately
-	// requeue. This can race with controller-runtime's internal cache as it watches events on the cluster
-	// to then trigger cluster state updates. Triggering it manually ensures that Karpenter waits for the
-	// internal cache to sync before moving onto another disruption loop.
-	p.cluster.UpdateNodeClaim(nodeClaim)
 	if option.Resolve(opts...).RecordPodNomination {
 		for _, pod := range n.Pods {
 			p.recorder.Publish(scheduler.NominatePodEvent(pod, nil, nodeClaim))

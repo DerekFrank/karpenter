@@ -159,8 +159,8 @@ var _ = Describe("Repair", func() {
 	// newRepairController builds an isolated repair-only disruption controller around the suite's repair policy matcher,
 	// so specs that change policies with useRepairPolicies must call this again.
 	newRepairController := func() {
-		repair = disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue))
-		repairController = disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
+		repair = disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, NodeClaimWrites(env.Client, cluster), prov, cloudProvider, recorder, queue))
+		repairController = disruption.NewController(ctx, env.Clock, NodeClaimWrites(env.Client, cluster), prov, cloudProvider, recorder, cluster, queue, clusterCost,
 			disruption.WithMethods(repair))
 	}
 
@@ -748,7 +748,7 @@ var _ = Describe("Repair", func() {
 		// Make both nodes the same age, so at any one moment they have the same time left and the same cost.
 		stored := ExpectExists(ctx, env.Client, nodeClaims[1])
 		stored.CreationTimestamp = ExpectExists(ctx, env.Client, nodeClaims[0]).CreationTimestamp
-		cluster.UpdateNodeClaim(stored)
+		cluster.NodeClaimStore.Observe(stored)
 		// Use a clock that moves forward every time it's read, like a real clock does.
 		clk := tickingClock{FakeClock: clocktesting.NewFakeClock(env.Clock.Now())}
 

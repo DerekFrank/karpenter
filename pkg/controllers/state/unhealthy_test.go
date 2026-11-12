@@ -190,7 +190,7 @@ var _ = Describe("Unhealthy Nodes", func() {
 		cs := karpentercluster.New(ctx, env.Clock, nil, nil, cloudProvider, karpentercluster.WithRepairPolicyMatcher(matcher))
 		fresh := state.NewCluster(env.Clock, env.Client, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
 
-		fresh.UpdateNodeClaim(ExpectExists(ctx, env.Client, nodeClaim))
+		fresh.NodeClaimStore.Observe(ExpectExists(ctx, env.Client, nodeClaim))
 		ExpectNodeObserved(ctx, env.Client, fresh, ExpectExists(ctx, env.Client, node))
 		Expect(lo.SomeBy(fresh.DeepCopyNodes(), func(n *karpentercluster.StateNode) bool {
 			return n.GetRepairResult(env.Clock.Now().Add(24*time.Hour)).Action != ""

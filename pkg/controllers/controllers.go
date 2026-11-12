@@ -65,7 +65,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
-	statenodeclaimgc "sigs.k8s.io/karpenter/pkg/controllers/state/nodeclaimgc"
 	staticdeprovisioning "sigs.k8s.io/karpenter/pkg/controllers/static/deprovisioning"
 	staticprovisioning "sigs.k8s.io/karpenter/pkg/controllers/static/provisioning"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -140,7 +139,6 @@ func NewControllers(
 		informer.NewNodePoolController(kubeClient, cloudProvider, clusterState, clusterCost),
 		informer.NewNodeClaimController(kubeClient, cloudProvider, clusterCost),
 		informer.NewPricingController(kubeClient, cloudProvider, clusterCost),
-		statenodeclaimgc.NewController(kubeClient, clusterState),
 		termination.NewController(clock, kubeClient, cloudProvider, terminator.NewTerminator(clock, kubeClient, evictionQueue, recorder), recorder, s.Nodes),
 		nodepoolreadiness.NewController(clock, kubeClient, cloudProvider),
 		nodepoolregistrationhealth.NewController(clock, kubeClient, cloudProvider, s.NodePoolState),

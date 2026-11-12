@@ -203,7 +203,7 @@ var _ = Describe("Buffer Pod Counts", func() {
 	})
 	It("should drop a NodeClaim's counts once the NodeClaim is gone", func() {
 		cs.BufferPods.Replace(map[string]int{"provider-a": 2})
-		cluster.DeleteNodeClaim("provider-a")
+		cluster.NodeClaimStore.Forget("provider-a")
 		Expect(bufferPodCount("provider-a")).To(Equal(0))
 	})
 

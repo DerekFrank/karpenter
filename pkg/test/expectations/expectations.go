@@ -729,7 +729,7 @@ func ExpectNodeClaimDeployedAndStateUpdated(ctx context.Context, c client.Client
 	GinkgoHelper()
 
 	nc, node, err := ExpectNodeClaimDeployed(ctx, c, cloudProvider, nc)
-	cluster.UpdateNodeClaim(nc)
+	cluster.NodeClaimStore.Observe(nc)
 	if err != nil {
 		return nc, nil
 	}

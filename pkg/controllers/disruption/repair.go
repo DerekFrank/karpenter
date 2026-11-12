@@ -301,8 +301,6 @@ func (r *Repair) commitReboot(ctx context.Context, candidate *Candidate) (bool, 
 	if err := r.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
 		return false, err
 	}
-	// Make the reboot visible before the informer catches up.
-	r.cluster.UpdateNodeClaim(nodeClaim)
 	r.rebootHistory.RecordCommittedReboot(nodeClaim.UID)
 	log.FromContext(ctx).WithValues("NodeClaim", klog.KObj(nodeClaim)).Info("committed node reboot")
 	return true, nil
