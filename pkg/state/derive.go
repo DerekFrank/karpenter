@@ -49,15 +49,20 @@ type Equaler[C any] interface {
 // Derivation keeps the Derived fields of a store's entries up to date from the entries of another store. Make one with
 // Derive.
 type Derivation[K1, K2 comparable, D2 any, C Contribution[D2, C]] struct {
-	// read computes a source key's contribution, and returns the version of its entry it computed from.
-	read       func(K1) (version any, next record[K2, C], contributes bool)
-	current    func(K1) any
+	// read computes a source key's contribution, and returns the version of its entry it computed from and whether the
+	// entry exists.
+	read func(K1) (version uint64, exists bool, next record[K2, C], contributes bool)
+	// exists returns whether the source key's entry exists now.
+	exists     func(K1) bool
 	fromSynced func() bool
 	to         target[K2, D2]
 
 	// records and byKey are what each source key contributes, under to's lock.
 	records map[K1]record[K2, C]
 	byKey   map[K2]map[K1]struct{}
+	// versions are the versions of the source entries each source key's contribution was computed from, for every
+	// source entry that exists, under to's lock.
+	versions map[K1]uint64
 	// settles hand each change of a source key's contribution to each Claims against the Derivation, under to's lock.
 	settles []func(source K1, value C, contributes bool)
 	// removes end each Claims against the Derivation when it's removed, under to's lock.
@@ -138,30 +143,31 @@ func derive[K1, K2 comparable, O1, D1, I1, O2, D2, I2 any, C Contribution[D2, C]
 	src := from.s
 	var zero K2
 	d := &Derivation[K1, K2, D2, C]{
-		read: func(k K1) (any, record[K2, C], bool) {
+		read: func(k K1) (uint64, bool, record[K2, C], bool) {
 			v, ok := src.slots.Load(k)
 			if !ok {
-				return nil, record[K2, C]{}, false
+				return 0, false, record[K2, C]{}, false
 			}
 			sl := v.(*slot[O1, D1, I1])
 			if !sl.exists {
-				return v, record[K2, C]{}, false
+				return sl.version, false, record[K2, C]{}, false
 			}
 			next := record[K2, C]{key: key(k, sl.entry)}
 			if next.key == zero {
-				return v, next, false
+				return sl.version, true, next, false
 			}
 			next.value = value(k, sl.entry)
-			return v, next, true
+			return sl.version, true, next, true
 		},
-		current: func(k K1) any {
-			v, _ := src.slots.Load(k)
-			return v
+		exists: func(k K1) bool {
+			v, ok := src.slots.Load(k)
+			return ok && v.(*slot[O1, D1, I1]).exists
 		},
 		fromSynced: from.Synced,
 		to:         to.s,
 		records:    map[K1]record[K2, C]{},
 		byKey:      map[K2]map[K1]struct{}{},
+		versions:   map[K1]uint64{},
 	}
 	if any(src) == any(to.s) {
 		// A Derive from a store onto itself, such as a Node's repair matches onto its entry, is synced once its sweep is:
@@ -233,27 +239,36 @@ func (d *Derivation[K1, K2, D2, C]) Sources(key K2) []K1 {
 func (d *Derivation[K1, K2, D2, C]) clearLocked() {
 	d.records = map[K1]record[K2, C]{}
 	d.byKey = map[K2]map[K1]struct{}{}
+	d.versions = map[K1]uint64{}
 }
 
 // apply applies k's latest entry. It computes the contribution without a lock, then commits it under to's lock only if
-// from still holds the entry it computed from, and recomputes otherwise, so the last commit for k is from k's latest
-// entry. A store's slots never change once stored, so the slot pointer identifies a version of the entry.
+// it's from a newer version of k's entry than the one the Derivation recorded, so an older recompute loses to a newer
+// one and the last commit for k is from k's latest entry. A source entry that's gone has no version: its removal
+// commits only while the entry is still gone, and a contribution only while the entry still exists, so a recompute
+// can't outlive a removal it raced, or undo the source's return.
 func (d *Derivation[K1, K2, D2, C]) apply(k K1) {
-	for {
-		read, next, contributes := d.read(k)
-		d.to.lock()
-		if d.current(k) != read {
-			d.to.unlock()
-			continue
-		}
-		if d.removed {
-			d.to.unlock()
-			return
-		}
-		d.commitLocked(k, next, contributes)
-		d.to.unlock()
+	version, exists, next, contributes := d.read(k)
+	d.commit(k, version, exists, next, contributes)
+}
+
+// commit commits a contribution of k computed from the version of its entry, which exists or is gone.
+func (d *Derivation[K1, K2, D2, C]) commit(k K1, version uint64, exists bool, next record[K2, C], contributes bool) {
+	d.to.lock()
+	defer d.to.unlock()
+	if d.removed {
 		return
 	}
+	recorded, seen := d.versions[k]
+	switch {
+	case exists && seen && version <= recorded, exists != d.exists(k), !exists && !seen:
+		return
+	case exists:
+		d.versions[k] = version
+	default:
+		delete(d.versions, k)
+	}
+	d.commitLocked(k, next, contributes)
 }
 
 func (d *Derivation[K1, K2, D2, C]) commitLocked(k K1, next record[K2, C], contributes bool) {
