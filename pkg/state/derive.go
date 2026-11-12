@@ -49,20 +49,20 @@ type Equaler[C any] interface {
 // Derivation keeps the Derived fields of a store's entries up to date from the entries of another store. Make one with
 // Derive.
 type Derivation[K1, K2 comparable, D2 any, C Contribution[D2, C]] struct {
-	// read computes a source key's contribution, and returns the version of its entry it computed from and whether the
-	// entry exists.
-	read func(K1) (version uint64, exists bool, next record[K2, C], contributes bool)
-	// exists returns whether the source key's entry exists now.
-	exists     func(K1) bool
+	// read computes a source key's contribution from its entry, and returns whether the entry exists.
+	read       func(K1) (next record[K2, C], exists bool)
 	fromSynced func() bool
 	to         target[K2, D2]
 
-	// records and byKey are what each source key contributes, under to's lock.
+	// records are what each source key whose entry exists contributes and the version of the entry it's from, plus, at
+	// infinity, each source key that left while another apply was in flight, under to's lock. byKey are the
+	// contributing source keys by the key they contribute to.
 	records map[K1]record[K2, C]
 	byKey   map[K2]map[K1]struct{}
-	// versions are the versions of the source entries each source key's contribution was computed from, for every
-	// source entry that exists, under to's lock.
-	versions map[K1]uint64
+	// buried are the keys of the records at infinity, which go once no apply is in flight.
+	buried []K1 // bounded: source keys that left while an apply was in flight
+	// inflight counts the applies between their read and their commit.
+	inflight atomic.Int64
 	// settles hand each change of a source key's contribution to each Claims against the Derivation, under to's lock.
 	settles []func(source K1, value C, contributes bool)
 	// removes end each Claims against the Derivation when it's removed, under to's lock.
@@ -79,6 +79,10 @@ type Derivation[K1, K2 comparable, D2 any, C Contribution[D2, C]] struct {
 type record[K comparable, C any] struct {
 	key   K
 	value C
+	// version is the version of the source entry the record is from.
+	version entryVersion
+	// contributes is whether the source contributes value to key: not when its key is zero, nor once it's buried.
+	contributes bool
 }
 
 // target is the store a Derivation writes, under its lock.
@@ -143,31 +147,28 @@ func derive[K1, K2 comparable, O1, D1, I1, O2, D2, I2 any, C Contribution[D2, C]
 	src := from.s
 	var zero K2
 	d := &Derivation[K1, K2, D2, C]{
-		read: func(k K1) (uint64, bool, record[K2, C], bool) {
+		read: func(k K1) (record[K2, C], bool) {
+			// A source that's gone is at infinity in an incarnation as late as the store's count when it's read, which
+			// beats every read of it from before it left, and loses to its next incarnation.
+			gone := record[K2, C]{version: entryVersion{inc: src.count.Load(), n: infinity}}
 			v, ok := src.slots.Load(k)
 			if !ok {
-				return 0, false, record[K2, C]{}, false
+				return gone, false
 			}
 			sl := v.(*slot[O1, D1, I1])
 			if !sl.exists {
-				return sl.version, false, record[K2, C]{}, false
+				return gone, false
 			}
-			next := record[K2, C]{key: key(k, sl.entry)}
-			if next.key == zero {
-				return sl.version, true, next, false
+			next := record[K2, C]{key: key(k, sl.entry), version: sl.version}
+			if next.key != zero {
+				next.value, next.contributes = value(k, sl.entry), true
 			}
-			next.value = value(k, sl.entry)
-			return sl.version, true, next, true
-		},
-		exists: func(k K1) bool {
-			v, ok := src.slots.Load(k)
-			return ok && v.(*slot[O1, D1, I1]).exists
+			return next, true
 		},
 		fromSynced: from.Synced,
 		to:         to.s,
 		records:    map[K1]record[K2, C]{},
 		byKey:      map[K2]map[K1]struct{}{},
-		versions:   map[K1]uint64{},
 	}
 	if any(src) == any(to.s) {
 		// A Derive from a store onto itself, such as a Node's repair matches onto its entry, is synced once its sweep is:
@@ -218,7 +219,9 @@ func (d *Derivation[K1, K2, D2, C]) Remove() {
 		stop()
 	}
 	for _, r := range d.records {
-		d.to.derivedLocked(r.key, r.value.Delete, -1, false)
+		if r.contributes {
+			d.to.derivedLocked(r.key, r.value.Delete, -1, false)
+		}
 	}
 	d.clearLocked()
 	d.to.removeSourceLocked(d)
@@ -239,60 +242,73 @@ func (d *Derivation[K1, K2, D2, C]) Sources(key K2) []K1 {
 func (d *Derivation[K1, K2, D2, C]) clearLocked() {
 	d.records = map[K1]record[K2, C]{}
 	d.byKey = map[K2]map[K1]struct{}{}
-	d.versions = map[K1]uint64{}
+	d.buried = nil
 }
 
 // apply applies k's latest entry. It computes the contribution without a lock, then commits it under to's lock only if
-// it's from a newer version of k's entry than the one the Derivation recorded, so an older recompute loses to a newer
-// one and the last commit for k is from k's latest entry. A source entry that's gone has no version: its removal
-// commits only while the entry is still gone, and a contribution only while the entry still exists, so a recompute
-// can't outlive a removal it raced, or undo the source's return.
+// it's from a newer version of k's entry than the record's, so an older recompute loses to a newer one and the last
+// commit for k is from k's latest entry. A source that leaves is its record's incarnation at infinity, which beats
+// every recompute from before it left and loses to the source's next incarnation.
 func (d *Derivation[K1, K2, D2, C]) apply(k K1) {
-	version, exists, next, contributes := d.read(k)
-	d.commit(k, version, exists, next, contributes)
+	d.inflight.Add(1)
+	next, exists := d.read(k)
+	d.commit(k, next, exists)
 }
 
-// commit commits a contribution of k computed from the version of its entry, which exists or is gone.
-func (d *Derivation[K1, K2, D2, C]) commit(k K1, version uint64, exists bool, next record[K2, C], contributes bool) {
+// commit commits a record of k read from its entry, which exists or is gone, and ends the apply that read it.
+func (d *Derivation[K1, K2, D2, C]) commit(k K1, next record[K2, C], exists bool) {
 	d.to.lock()
 	defer d.to.unlock()
+	defer d.endLocked()
 	if d.removed {
 		return
 	}
-	recorded, seen := d.versions[k]
-	switch {
-	case exists && seen && version <= recorded, exists != d.exists(k), !exists && !seen:
-		return
-	case exists:
-		d.versions[k] = version
-	default:
-		delete(d.versions, k)
-	}
-	d.commitLocked(k, next, contributes)
-}
-
-func (d *Derivation[K1, K2, D2, C]) commitLocked(k K1, next record[K2, C], contributes bool) {
 	prev, had := d.records[k]
-	if had && (!contributes || prev.key != next.key) {
+	switch {
+	case had && !prev.version.less(next.version), !exists && had && prev.version.n == infinity:
+		return
+	case !exists && !had && d.inflight.Load() == 1:
+		return
+	}
+	if prev.contributes && (!next.contributes || prev.key != next.key) {
 		if delete(d.byKey[prev.key], k); len(d.byKey[prev.key]) == 0 {
 			delete(d.byKey, prev.key)
 		}
 	}
-	if contributes {
-		d.records[k] = next
-		if !had || prev.key != next.key {
-			if d.byKey[next.key] == nil {
-				d.byKey[next.key] = map[K1]struct{}{}
-			}
-			d.byKey[next.key][k] = struct{}{}
+	if next.contributes && (!prev.contributes || prev.key != next.key) {
+		if d.byKey[next.key] == nil {
+			d.byKey[next.key] = map[K1]struct{}{}
 		}
-	} else {
+		d.byKey[next.key][k] = struct{}{}
+	}
+	switch {
+	case exists:
+		d.records[k] = next
+	case d.inflight.Load() > 1:
+		// Another apply may hold a read from before k left: bury k at infinity, so that read loses.
+		d.records[k] = next
+		d.buried = append(d.buried, k)
+	default:
 		delete(d.records, k)
 	}
-	moveContribution(d.to, prev, had, next, contributes)
+	moveContribution(d.to, prev, prev.contributes, next, next.contributes)
 	for _, settle := range d.settles {
-		settle(k, next.value, contributes)
+		settle(k, next.value, next.contributes)
 	}
+}
+
+// endLocked ends an apply, and drops the buried records once no apply is in flight, since no read from before they
+// left remains.
+func (d *Derivation[K1, K2, D2, C]) endLocked() {
+	if d.inflight.Add(-1) != 0 || len(d.buried) == 0 {
+		return
+	}
+	for _, k := range d.buried {
+		if r, ok := d.records[k]; ok && r.version.n == infinity {
+			delete(d.records, k)
+		}
+	}
+	d.buried = d.buried[:0]
 }
 
 // moveContribution moves a source's contribution from prev to next, dispatching to Update and Delete as Contribution

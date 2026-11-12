@@ -521,3 +521,10 @@ func (s *Source) Subscribe(fn func(types.NamespacedName)) func() {
 
 // HasSynced returns whether the informer has synced.
 func (s *Source) HasSynced() bool { return s.o.informer.HasSynced() }
+
+// Holds returns whether the informer's store still holds the object with the UID under key, even one the client
+// deleted: until it drops it, the informer can still deliver it.
+func (s *Source) Holds(key types.NamespacedName, uid types.UID) bool {
+	obj, ok := s.o.lookupCache(key)
+	return ok && obj.GetUID() == uid
+}

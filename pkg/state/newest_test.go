@@ -113,21 +113,43 @@ var _ = ginkgo.Describe("LevelStore", func() {
 		Expect(fields(s, "z")).To(cpuAndCount(5, 1))
 		Expect(fields(s, "y")).To(cpuAndCount(3, 1))
 	})
-	ginkgo.It("should drop an object a read from before its removal commits after the removal", func() {
+	ginkgo.It("should drop a stale read of an object it removed while its source still holds it", func() {
 		key := types.NamespacedName{Name: "a"}
-		late := &readsOnce{Objects: NewObjects(), first: nodeClaim("a", "x", 1, "1")}
-		store := newLevelNodeClaims(late)
+		hiding := &hides{Objects: NewObjects()}
+		store := newLevelNodeClaims(hiding)
 		feed := store.s.feed.(*newestOf[types.NamespacedName, *v1.NodeClaim, struct{}, nodeClaimIntent])
+		stale := nodeClaim("a", "x", 1, "1")
+		hiding.Put(stale)
+		hiding.hidden = true
 		feed.apply(key)
 		_, ok := store.Get(key)
-		Expect(ok).To(BeFalse(), "the store once the read that followed the late commit found the object gone")
+		Expect(ok).To(BeFalse(), "the store once the source hides the object as deleted")
+		feed.commit(key, key, stale, true)
+		_, ok = store.Get(key)
+		Expect(ok).To(BeFalse(), "the store once a read from before the removal commits, want it at infinity")
+		hiding.Remove(key)
+		_, ok = store.s.slots.Load(key)
+		Expect(ok).To(BeFalse(), "the slot once the source drops the object, want its gone UID pruned")
+	})
+	ginkgo.It("should drop an old UID's stale event once the name is recreated with a new UID", func() {
+		feed := nodeClaims.s.feed.(*newestOf[types.NamespacedName, *v1.NodeClaim, struct{}, nodeClaimIntent])
+		key := types.NamespacedName{Name: "a"}
+		old := nodeClaim("a", "x", 1, "1")
+		objects.Put(old)
+		replacement := nodeClaim("a", "y", 5, "4")
+		replacement.UID = "a-2"
+		objects.Put(replacement)
+		feed.commit(key, key, old, true)
+		e, _ := nodeClaims.Get(key)
+		Expect(e.Object.UID).To(Equal(types.UID("a-2")), "the store once the old UID's event arrives late")
+		Expect(pooled(s)).To(Equal(map[string]poolFields{"y": {CPU: 4, Count: 1}}))
 	})
 	ginkgo.It("should keep the newer version when an older read commits late", func() {
 		feed := nodeClaims.s.feed.(*newestOf[types.NamespacedName, *v1.NodeClaim, struct{}, nodeClaimIntent])
 		key := types.NamespacedName{Name: "a"}
 		stale := nodeClaim("a", "x", 1, "1")
 		objects.Put(nodeClaim("a", "y", 2, "2"))
-		Expect(feed.commit(key, stale, true)).To(BeFalse(), "an older version, want it to lose")
+		feed.commit(key, key, stale, true)
 		e, _ := nodeClaims.Get(key)
 		Expect(e.Object.ResourceVersion).To(Equal("2"))
 		Expect(pooled(s)).To(Equal(recount(nodeClaims)))
@@ -347,16 +369,16 @@ var _ = ginkgo.Describe("LevelStore over the overlay", func() {
 	})
 })
 
-// readsOnce returns first from its first Get, a read from before the object's removal, and Objects' after.
-type readsOnce struct {
+// hides is Objects that hides the objects it holds while hidden, as the overlay hides an object the client deleted
+// while the informer's store still holds it.
+type hides struct {
 	*Objects
-	first client.Object
+	hidden bool
 }
 
-func (r *readsOnce) Get(key types.NamespacedName) (client.Object, bool) {
-	if first := r.first; first != nil {
-		r.first = nil
-		return first, true
+func (h *hides) Get(key types.NamespacedName) (client.Object, bool) {
+	if h.hidden {
+		return nil, false
 	}
-	return r.Objects.Get(key)
+	return h.Objects.Get(key)
 }

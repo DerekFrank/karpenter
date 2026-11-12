@@ -20,9 +20,13 @@ package state
 
 import (
 	"iter"
+	"math"
 	"reflect"
 	"slices"
 	"sync"
+	"sync/atomic"
+
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // Entry describes one object: the object itself, the fields Derives and Claims compute about it from other stores,
@@ -60,8 +64,23 @@ const (
 type slot[O, D, I any] struct {
 	entry  Entry[O, D, I]
 	exists bool
-	// version orders the slots stored under a key: the store stamps each with its next count.
-	version uint64
+	// version orders the slots stored under a key.
+	version entryVersion
+	// gone are the UIDs a level store removed under the key while its source still holds them, so that a stale read
+	// of one is dropped.
+	gone []types.UID // bounded: objects removed under one name that the informer hasn't dropped, normally 0-1
+}
+
+// entryVersion is a slot's version: the incarnation of its entry, which is the store's count of its writes when the entry
+// appeared, and the count of its last write. A removal is its incarnation at infinity, which a reappearance beats,
+// since a reappearance starts a later incarnation. Versions compare lexicographically.
+type entryVersion struct{ inc, n uint64 }
+
+// infinity is a removal's count.
+const infinity = math.MaxUint64
+
+func (v entryVersion) less(o entryVersion) bool {
+	return v.inc < o.inc || (v.inc == o.inc && v.n < o.n)
 }
 
 // core is a store's state, shared by its Reader and its Store.
@@ -72,8 +91,8 @@ type core[K comparable, O, D, I any] struct {
 	slots sync.Map // K -> *slot[O, D, I]
 
 	mu sync.Mutex
-	// version counts the slots stored, under mu.
-	version uint64
+	// count counts the slots stored. It changes under mu, and a Derive reads it as of a removal.
+	count atomic.Uint64
 	// refs counts each key's contributions and claims, under mu.
 	refs        map[K]int
 	subscribers []*func(Change[K, O, D, I])
@@ -323,9 +342,12 @@ func (c *core[K, O, D, I]) intentLocked(key K, update func(I) I) bool {
 // storeLocked stores next under key, or deletes the slot once its entry doesn't exist and nothing contributes to it,
 // and records the change of an entry that existed before or after.
 func (c *core[K, O, D, I]) storeLocked(key K, cur, next *slot[O, D, I]) {
-	c.version++
-	next.version = c.version
-	if next.exists || c.refs[key] != 0 {
+	count := c.count.Add(1)
+	next.version = entryVersion{inc: cur.version.inc, n: count}
+	if next.exists && !cur.exists {
+		next.version.inc = count
+	}
+	if next.exists || c.refs[key] != 0 || len(next.gone) != 0 {
 		c.slots.Store(key, next)
 	} else {
 		c.slots.Delete(key)

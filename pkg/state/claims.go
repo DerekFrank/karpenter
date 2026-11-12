@@ -135,7 +135,7 @@ func (c *Claims[K1, K, D, C, H]) ReserveReplacing(key K, n int, value H, replaci
 			continue
 		}
 		seen[source] = struct{}{}
-		if r, ok := c.derivation.records[source]; ok && r.key == key {
+		if r, ok := c.derivation.records[source]; ok && r.contributes && r.key == key {
 			view = r.value.Delete(view)
 		}
 	}
@@ -177,6 +177,7 @@ func (c *Claims[K1, K, D, C, H]) bind(claim *Claim[K1, K, H], source K1) {
 		return
 	}
 	r, seen := c.derivation.records[source]
+	seen = seen && r.contributes
 	if seen && c.counts(r.value) {
 		c.releaseLocked(claim)
 		return

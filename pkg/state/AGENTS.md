@@ -87,22 +87,24 @@ There are two kinds of store. They differ only in where the object comes from:
 - **A store's entries never change once stored.** A reader takes no lock and
   can keep what `Get` and `List` return. Every write takes the store's one
   lock, and notifies once the lock is released.
-- **Every entry carries a version**, the store's count of its writes, stamped
-  on each write, `Touch` included. A `Derive` records the version of each
-  source entry it computed a contribution from, and commits a recompute only
-  from a newer version, so an older recompute loses. A source entry that's gone
-  has no version: its removal commits only while it's still gone, and a
-  contribution only while it still exists.
+- **Every entry carries a version `(incarnation, count)`**, compared
+  lexicographically. The count is the store's count of its writes, stamped on
+  each write, `Touch` included; an entry's incarnation is the count when it
+  appeared. A removal is its incarnation at infinity, and a reappearance starts
+  a later incarnation, which beats it. A `Derive` keeps the version of each
+  source entry in its record of the source's contribution, and commits a
+  recompute only from a newer version, so an older recompute, including one
+  from before the source left, loses. A source that leaves while another apply
+  is in flight stays recorded at infinity until no apply is in flight.
 - **A level store applies the newest version of an object on each
   notification** (`NewLevelStore`, used for NodeClaims). On every key its
   `Newest` notifies, from an informer event, a write or a delete, it reads that
-  object's newest version and holds it, or drops the entry once it's gone. It
-  keeps no versions or tombstones of its own: a version the informer skips,
-  repeats or delivers late never reaches it, because `overlay.Source` already
-  returns the newer of the cache's object and the client's own write, and
-  hides an object the client deleted until the informer's store drops it. An
-  older read loses to the object held; a read from before a removal is undone
-  by the re-read that follows each commit.
+  object's newest version and holds it, or drops the entry once it's gone.
+  `overlay.Source` returns the newer of the cache's object and the client's own
+  write, and hides an object the client deleted until the informer's store
+  drops it. Within one object an older resourceVersion loses, and across UIDs
+  the older resourceVersion loses. A removed UID stays at infinity in the slot
+  while the source still holds it, so a stale read of it loses.
 - **Any other object store orders each object's versions** by UID and
   resourceVersion: an older version arriving after a newer one is dropped, a
   delete leaves a tombstone until the informer's delete, and a newer object

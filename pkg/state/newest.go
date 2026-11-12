@@ -41,6 +41,9 @@ type Newest interface {
 	Subscribe(fn func(types.NamespacedName)) func()
 	// HasSynced returns whether it holds the objects the API server held when it started.
 	HasSynced() bool
+	// Holds returns whether it still holds the object with the UID under key, even if it hides it as deleted: until it
+	// doesn't, an event of the object can still arrive.
+	Holds(key types.NamespacedName, uid types.UID) bool
 }
 
 // NewLevelStore returns a store of the objects of kind S that from holds and in accepts, each under the key key
@@ -94,53 +97,80 @@ func (n *newestOf[K, S, D, I]) sweep() {
 }
 
 // apply holds the newest version of the object named name. It reads it without the store's lock, and commits it only if
-// it's at least as new as the object held, so an older read loses to a newer one. A removal has no version, so after a
-// commit it reads again, and applies the newer version it finds: a read from before a removal can't outlive it.
+// it's newer than the entry's, so an older read loses to a newer one.
 func (n *newestOf[K, S, D, I]) apply(name types.NamespacedName) {
 	var zero K
 	k := n.key(name)
 	if k == zero {
 		return
 	}
-	obj, ok := n.newest(name)
-	for n.commit(k, obj, ok) {
-		again, still := n.newest(name)
-		if still == ok && (!ok || any(again) == any(obj)) {
-			return
-		}
-		obj, ok = again, still
-	}
-}
-
-func (n *newestOf[K, S, D, I]) newest(name types.NamespacedName) (S, bool) {
 	var obj S
 	o, ok := n.from.Get(name)
 	if ok {
 		obj, ok = o.(S)
+		ok = ok && n.in(obj)
 	}
-	return obj, ok && n.in(obj)
+	n.commit(name, k, obj, ok)
 }
 
-// commit holds obj under k, or drops k's entry when ok is false, and returns whether it changed the entry. An older
-// version of the object held loses. A version as new as the one held replaces it, so the store converges on the
-// informer's own object for a version the overlay held a copy of. An object with another UID replaces the one held,
-// which drops its intent.
-func (n *newestOf[K, S, D, I]) commit(k K, obj S, ok bool) bool {
+// commit holds obj under k, or removes k's object when ok is false. Within one object, an older resourceVersion loses,
+// and one as new as the object held replaces it, so the store converges on the informer's own object for a version the
+// overlay held a copy of. A removed object, and one another UID replaced, is at infinity: its UID stays in the slot's
+// gone while from still holds it, so a stale read of it loses, and the next object under the name starts a new
+// incarnation, which drops the entry's intent.
+func (n *newestOf[K, S, D, I]) commit(name types.NamespacedName, k K, obj S, ok bool) {
 	c := n.core
 	c.mu.Lock()
 	defer c.unlock()
 	cur, _ := c.load(k)
 	switch {
-	case !ok && !cur.exists, ok && cur.exists && any(cur.entry.Object) == any(obj):
-		return false
+	case ok && slices.Contains(cur.gone, identity(obj)):
+	case ok && cur.exists && identity(cur.entry.Object) == identity(obj):
+		if any(cur.entry.Object) != any(obj) && (obj.GetResourceVersion() == "" || resourceVersion(obj) >= resourceVersion(cur.entry.Object)) {
+			c.objectLocked(k, obj, true)
+		}
 	case ok && cur.exists && obj.GetResourceVersion() != "" && resourceVersion(obj) < resourceVersion(cur.entry.Object):
-		return false
-	case ok && cur.exists && identity(cur.entry.Object) != identity(obj):
-		var none S
-		c.objectLocked(k, none, false)
+		// resourceVersions order every object of a kind, so an older UID's object is older than the one that replaced it.
+	case ok:
+		if cur.exists {
+			n.buryLocked(k, cur)
+		}
+		c.objectLocked(k, obj, true)
+	case cur.exists:
+		n.buryLocked(k, cur)
 	}
-	c.objectLocked(k, obj, ok)
-	return true
+	n.pruneLocked(name, k)
+}
+
+// buryLocked removes k's object, which drops the entry's intent, and records its UID as gone.
+func (n *newestOf[K, S, D, I]) buryLocked(k K, cur *slot[S, D, I]) {
+	next := *cur
+	next.exists = false
+	var none S
+	var zero I
+	next.entry.Object, next.entry.Intent = none, zero
+	next.gone = append(slices.Clip(cur.gone), identity(cur.entry.Object))
+	n.core.storeLocked(k, cur, &next)
+}
+
+// pruneLocked drops the UIDs gone under k that from no longer holds: the informer's store has dropped them, so no event
+// of theirs can arrive.
+func (n *newestOf[K, S, D, I]) pruneLocked(name types.NamespacedName, k K) {
+	cur, ok := n.core.load(k)
+	if !ok || len(cur.gone) == 0 {
+		return
+	}
+	gone := slices.DeleteFunc(slices.Clone(cur.gone), func(uid types.UID) bool { return !n.from.Holds(name, uid) })
+	if len(gone) == len(cur.gone) {
+		return
+	}
+	next := *cur
+	next.gone = gone
+	if !next.exists && len(gone) == 0 && n.core.refs[k] == 0 {
+		n.core.slots.Delete(k)
+		return
+	}
+	n.core.slots.Store(k, &next)
 }
 
 // Objects is a Newest that a caller fills, for a store without an informer, such as a suite's, which shows it each
@@ -225,4 +255,9 @@ func (o *Objects) HasSynced() bool { return true }
 func resourceVersion(obj client.Object) uint64 {
 	rv, _ := strconv.ParseUint(obj.GetResourceVersion(), 10, 64)
 	return rv
+}
+
+func (o *Objects) Holds(key types.NamespacedName, uid types.UID) bool {
+	obj, ok := o.Get(key)
+	return ok && identity(obj) == uid
 }
