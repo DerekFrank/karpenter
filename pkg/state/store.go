@@ -20,11 +20,9 @@ package state
 
 import (
 	"iter"
-	"math"
 	"reflect"
 	"slices"
 	"sync"
-	"sync/atomic"
 
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -64,23 +62,9 @@ const (
 type slot[O, D, I any] struct {
 	entry  Entry[O, D, I]
 	exists bool
-	// version orders the slots stored under a key.
-	version entryVersion
 	// gone are the UIDs a level store removed under the key while its source still holds them, so that a stale read
 	// of one is dropped.
 	gone []types.UID // bounded: objects removed under one name that the informer hasn't dropped, normally 0-1
-}
-
-// entryVersion is a slot's version: the incarnation of its entry, which is the store's count of its writes when the entry
-// appeared, and the count of its last write. A removal is its incarnation at infinity, which a reappearance beats,
-// since a reappearance starts a later incarnation. Versions compare lexicographically.
-type entryVersion struct{ inc, n uint64 }
-
-// infinity is a removal's count.
-const infinity = math.MaxUint64
-
-func (v entryVersion) less(o entryVersion) bool {
-	return v.inc < o.inc || (v.inc == o.inc && v.n < o.n)
 }
 
 // core is a store's state, shared by its Reader and its Store.
@@ -91,8 +75,6 @@ type core[K comparable, O, D, I any] struct {
 	slots sync.Map // K -> *slot[O, D, I]
 
 	mu sync.Mutex
-	// count counts the slots stored. It changes under mu, and a Derive reads it as of a removal.
-	count atomic.Uint64
 	// refs counts each key's contributions and claims, under mu.
 	refs        map[K]int
 	subscribers []*func(Change[K, O, D, I])
@@ -193,15 +175,16 @@ func (r Reader[K, O, D, I]) Synced() bool {
 
 // Touch notifies key's subscribers without changing its entry, so that the Derives from the store recompute key's
 // contribution, for a contribution that reads another store's entry that changed, such as a NodeClaim's, which reads
-// its Node's. It stores the entry under a new version, so the recompute is newer than the contribution it replaces.
+// its Node's.
 func (s *Store[K, O, D, I]) Touch(key K) {
-	c := s.s
-	c.mu.Lock()
-	if cur, _ := c.load(key); cur.exists {
-		next := *cur
-		c.storeLocked(key, cur, &next)
+	e, ok := s.Get(key)
+	if !ok {
+		return
 	}
-	c.unlock()
+	s.s.mu.Lock()
+	subscribers := s.s.subscribers
+	s.s.mu.Unlock()
+	notify(subscribers, []Change[K, O, D, I]{{Key: key, Old: e, New: e, Existed: true, Exists: true}})
 }
 
 // Clear empties the store in place, notifying the removal of each entry, so that subscribers stay subscribed. An
@@ -342,11 +325,6 @@ func (c *core[K, O, D, I]) intentLocked(key K, update func(I) I) bool {
 // storeLocked stores next under key, or deletes the slot once its entry doesn't exist and nothing contributes to it,
 // and records the change of an entry that existed before or after.
 func (c *core[K, O, D, I]) storeLocked(key K, cur, next *slot[O, D, I]) {
-	count := c.count.Add(1)
-	next.version = entryVersion{inc: cur.version.inc, n: count}
-	if next.exists && !cur.exists {
-		next.version.inc = count
-	}
 	if next.exists || c.refs[key] != 0 || len(next.gone) != 0 {
 		c.slots.Store(key, next)
 	} else {

@@ -87,15 +87,12 @@ There are two kinds of store. They differ only in where the object comes from:
 - **A store's entries never change once stored.** A reader takes no lock and
   can keep what `Get` and `List` return. Every write takes the store's one
   lock, and notifies once the lock is released.
-- **Every entry carries a version `(incarnation, count)`**, compared
-  lexicographically. The count is the store's count of its writes, stamped on
-  each write, `Touch` included; an entry's incarnation is the count when it
-  appeared. A removal is its incarnation at infinity, and a reappearance starts
-  a later incarnation, which beats it. A `Derive` keeps the version of each
-  source entry in its record of the source's contribution, and commits a
-  recompute only from a newer version, so an older recompute, including one
-  from before the source left, loses. A source that leaves while another apply
-  is in flight stays recorded at infinity until no apply is in flight.
+- **Versions apply to object stores; a `Derive` commits only from its source's
+  current entry.** A level store orders an object's versions by
+  resourceVersion, below. A `Derive` computes a contribution from a source entry
+  without a lock, and commits it only if that entry is still the source store's
+  current one, by pointer, recomputing otherwise: a removed source has no
+  current entry, so a recompute from before the removal is refused and retried.
 - **A level store applies the newest version of an object on each
   notification** (`NewLevelStore`, used for NodeClaims). On every key its
   `Newest` notifies, from an informer event, a write or a delete, it reads that
