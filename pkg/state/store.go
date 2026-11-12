@@ -80,7 +80,7 @@ type core[K comparable, O, D, I any] struct {
 	// pending are the changes made under mu, notified once it's released.
 	pending []Change[K, O, D, I]
 	// feed feeds an object store from its kind's objects.
-	feed objectFeed
+	feed feeder
 	// sources are the Derives into the store, by Derivation; it's synced once they are.
 	sources map[any]func() bool
 	// cleared drop what each Derive, Claims and expiring Intent of the store recorded, when the store is cleared.

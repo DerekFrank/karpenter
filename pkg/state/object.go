@@ -59,16 +59,20 @@ func NewObjectStoreBy[K comparable, S client.Object, D, I any](kubeClient client
 	return &Store[K, S, D, I]{Reader[K, S, D, I]{c}}
 }
 
-// objectFeed feeds an object store from its kind's objects, under the store's lock.
+// feeder feeds an object store from its kind's objects.
+type feeder interface {
+	start(ctx context.Context) error
+	synced() bool
+	clearLocked()
+}
+
+// objectFeed feeds an object store from the versions of its kind's objects it's given, under the store's lock.
 type objectFeed interface {
+	feeder
 	kind() reflect.Type
 	changeLocked(obj client.Object, deleted bool, from origin)
 	forgetLocked(name types.NamespacedName)
 	resyncLocked(objs []client.Object, scope []types.NamespacedName)
-	start(ctx context.Context) error
-	synced() bool
-	watching() bool
-	clearLocked()
 }
 
 type objectsOf[K comparable, S client.Object, D, I any] struct {
@@ -88,8 +92,6 @@ type objectsOf[K comparable, S client.Object, D, I any] struct {
 func (p *objectsOf[K, S, D, I]) kind() reflect.Type { return p.typ }
 
 func (p *objectsOf[K, S, D, I]) synced() bool { return !p.watch || p.listed.Load() }
-
-func (p *objectsOf[K, S, D, I]) watching() bool { return p.watch }
 
 func (p *objectsOf[K, S, D, I]) clearLocked() {
 	p.versions = newFeed()
@@ -159,6 +161,10 @@ func (p *objectsOf[K, S, D, I]) resyncLocked(objs []client.Object, scope []types
 // start subscribes to the kind's informer and the client's writes, then applies a List under the store's lock, so that
 // events arriving meanwhile apply after it.
 func (p *objectsOf[K, S, D, I]) start(ctx context.Context) error {
+	if !p.watch {
+		<-ctx.Done()
+		return nil
+	}
 	s := p.core
 	obj := reflect.New(p.typ.Elem()).Interface().(S)
 	list, err := listFor(p.kubeClient.Scheme(), obj)
@@ -218,7 +224,7 @@ func (p *objectsOf[K, S, D, I]) start(ctx context.Context) error {
 
 // Start follows the kind of an object store made with a kubeClient until ctx is done. It implements manager.Runnable.
 func (s *Store[K, O, D, I]) Start(ctx context.Context) error {
-	if s.s.feed == nil || !s.s.feed.watching() {
+	if s.s.feed == nil {
 		<-ctx.Done()
 		return nil
 	}
@@ -235,8 +241,9 @@ func (s *Store[K, O, D, I]) Observe(obj client.Object) {
 // reconciler that finds it missing from the cache.
 func Forget[K comparable, O, D, I any](s *Store[K, O, D, I], name types.NamespacedName) {
 	c := s.s
+	f := c.objectFeed()
 	c.mu.Lock()
-	c.feed.forgetLocked(name)
+	f.forgetLocked(name)
 	c.unlock()
 }
 
@@ -245,18 +252,29 @@ func Forget[K comparable, O, D, I any](s *Store[K, O, D, I], name types.Namespac
 // objs leave out, which heals events s missed.
 func Resync[K comparable, O client.Object, D, I any](s *Store[K, O, D, I], objs []O, scope []types.NamespacedName) {
 	c := s.s
+	f := c.objectFeed()
 	c.mu.Lock()
-	c.feed.resyncLocked(lo.Map(objs, func(obj O, _ int) client.Object { return obj }), scope)
+	f.resyncLocked(lo.Map(objs, func(obj O, _ int) client.Object { return obj }), scope)
 	c.unlock()
 }
 
 func (c *core[K, O, D, I]) change(obj client.Object, deleted bool, from origin) {
-	if c.feed == nil || c.feed.kind() != reflect.TypeOf(obj) {
+	f := c.objectFeed()
+	if f.kind() != reflect.TypeOf(obj) {
 		panic(fmt.Sprintf("store holds no %T", obj))
 	}
 	c.mu.Lock()
-	c.feed.changeLocked(obj, deleted, from)
+	f.changeLocked(obj, deleted, from)
 	c.unlock()
+}
+
+// objectFeed returns the feed of a store that's given its objects' versions.
+func (c *core[K, O, D, I]) objectFeed() objectFeed {
+	f, ok := c.feed.(objectFeed)
+	if !ok {
+		panic("the store isn't fed versions of its objects")
+	}
+	return f
 }
 
 // feed orders an object's versions by UID and resourceVersion. A delete from a write leaves a tombstone until the
