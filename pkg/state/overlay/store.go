@@ -26,6 +26,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/types"
 	toolscache "k8s.io/client-go/tools/cache"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -44,9 +45,19 @@ type overlay struct {
 	indexed map[indexKey]map[types.NamespacedName]struct{}
 
 	cached func(types.NamespacedName) bool
+	// lookup reads the informer's own object, without the tombstones; nil without an informer store.
+	lookup func(types.NamespacedName) (client.Object, bool)
+	// tombstones are the UIDs of the objects the client deleted, by key, which reads hide while the informer's store
+	// still holds them.
+	tombstones sync.Map
+	buriedN    atomic.Int64
 
-	handlersMu sync.RWMutex
-	handlers   map[*WriteHandler]struct{}
+	informer cache.Informer
+	store    toolscache.Store
+
+	handlersMu  sync.RWMutex
+	handlers    map[*WriteHandler]struct{}
+	keyHandlers map[*func(types.NamespacedName)]struct{}
 }
 
 type entry struct {
@@ -74,7 +85,8 @@ func parseResourceVersion(resourceVersion string) uint64 {
 }
 
 func newOverlay() *overlay {
-	return &overlay{pinned: map[uint64]int{}, indexed: map[indexKey]map[types.NamespacedName]struct{}{}, handlers: map[*WriteHandler]struct{}{}}
+	return &overlay{pinned: map[uint64]int{}, indexed: map[indexKey]map[types.NamespacedName]struct{}{}, handlers: map[*WriteHandler]struct{}{},
+		keyHandlers: map[*func(types.NamespacedName)]struct{}{}}
 }
 
 func (o *overlay) standsIn(key types.NamespacedName, e *entry) bool {
@@ -157,6 +169,8 @@ func (o *overlay) observe(raw any) {
 	if rv := parseResourceVersion(obj.GetResourceVersion()); rv != 0 {
 		storeMax(&o.w, rv)
 	}
+	key := client.ObjectKeyFromObject(obj)
+	o.prune(key)
 	o.pinMu.Lock()
 	safe := o.w.Load()
 	for w0 := range o.pinned {
@@ -164,17 +178,109 @@ func (o *overlay) observe(raw any) {
 	}
 	o.pinMu.Unlock()
 	var gone []client.Object
+	evicted := []types.NamespacedName{key}
 	o.heapMu.Lock()
 	for len(o.byRV) > 0 && o.byRV[0].rv <= safe {
 		item := heap.Pop(&o.byRV).(rvItem)
-		if o.entries.CompareAndDelete(item.key, item.entry) && item.entry.created && o.cached != nil && !o.cached(item.key) {
-			gone = append(gone, item.entry.obj)
+		if o.entries.CompareAndDelete(item.key, item.entry) {
+			if item.key != key {
+				evicted = append(evicted, item.key)
+			}
+			if item.entry.created && o.cached != nil && !o.cached(item.key) {
+				gone = append(gone, item.entry.obj)
+			}
 		}
 		o.unindex(item.key, item.entry)
 	}
 	o.heapMu.Unlock()
 	for _, obj := range gone {
 		o.notify(obj, true)
+	}
+	o.notifyKeys(evicted...)
+}
+
+// remove forgets the client's writes of an object the server removed, hides the informer's copy of it, and notifies the
+// handlers.
+func (o *overlay) remove(obj client.Object) {
+	key := client.ObjectKeyFromObject(obj)
+	o.forget(key)
+	o.bury(obj)
+	o.notify(obj.DeepCopyObject().(client.Object), true)
+	o.notifyKeys(key)
+}
+
+// bury records that the client deleted the object, so that reads hide the informer's copy of it until the informer's
+// store drops it. A new object under the same name has another UID, and reads show it.
+func (o *overlay) bury(obj client.Object) {
+	key := client.ObjectKeyFromObject(obj)
+	if _, loaded := o.tombstones.Swap(key, obj.GetUID()); !loaded {
+		o.buriedN.Add(1)
+	}
+	// The informer may have delivered the delete before the tombstone was stored; prune after storing it, since the
+	// informer's store only moves forward.
+	o.prune(key)
+}
+
+// prune drops the key's tombstone once the informer's store no longer holds the object it buries.
+func (o *overlay) prune(key types.NamespacedName) {
+	uid, ok := o.tombstones.Load(key)
+	if !ok {
+		return
+	}
+	if cached, ok := o.lookupCache(key); (!ok || cached.GetUID() != uid) && o.tombstones.CompareAndDelete(key, uid) {
+		o.buriedN.Add(-1)
+	}
+}
+
+// buried returns whether the overlay holds a tombstone.
+func (o *overlay) buried() bool { return o.buriedN.Load() > 0 }
+
+func (o *overlay) lookupCache(key types.NamespacedName) (client.Object, bool) {
+	if o.lookup == nil {
+		return nil, false
+	}
+	return o.lookup(key)
+}
+
+// hidden returns whether obj, the informer's copy of an object, is one the client deleted.
+func (o *overlay) hidden(obj client.Object) bool {
+	if !o.buried() {
+		return false
+	}
+	uid, ok := o.tombstones.Load(client.ObjectKeyFromObject(obj))
+	return ok && uid == obj.GetUID()
+}
+
+// cachedVisible returns the informer's object under key, unless the client deleted it.
+func (o *overlay) cachedVisible(key types.NamespacedName) (client.Object, bool) {
+	obj, ok := o.lookupCache(key)
+	if !ok || o.hidden(obj) {
+		return nil, false
+	}
+	return obj, true
+}
+
+// newestOf returns the newest version of the object under key the overlay knows, without copying it: the client's own
+// write when it's newer than the informer's, or the informer's, unless the client deleted it.
+func (o *overlay) newestOf(key types.NamespacedName) (client.Object, bool) {
+	cached, inCache := o.cachedVisible(key)
+	e, ok := o.get(key)
+	switch {
+	case ok && inCache && e.newerThan(cached), ok && !inCache && e.created:
+		return e.obj, true
+	case inCache:
+		return cached, true
+	}
+	return nil, false
+}
+
+func (o *overlay) notifyKeys(keys ...types.NamespacedName) {
+	o.handlersMu.RLock()
+	defer o.handlersMu.RUnlock()
+	for h := range o.keyHandlers {
+		for _, key := range keys {
+			(*h)(key)
+		}
 	}
 }
 

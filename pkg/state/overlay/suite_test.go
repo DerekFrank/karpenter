@@ -370,6 +370,27 @@ var _ = Describe("Overlay", func() {
 		err := overlayClient.Get(ctx, client.ObjectKeyFromObject(pod), &corev1.Pod{})
 		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "got %v", err)
 	})
+	It("should hide an object it deleted while the informer still holds it", func() {
+		pod := test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Namespace: "default"}})
+		Expect(overlayClient.Create(ctx, pod)).To(Succeed())
+		informers.release()
+		var notified []client.ObjectKey
+		source := lo.Must(overlayClient.Source(&corev1.Pod{}))
+		source.Subscribe(func(key client.ObjectKey) { notified = append(notified, key) })
+
+		Expect(overlayClient.Delete(ctx, pod, client.GracePeriodSeconds(0))).To(Succeed())
+		Expect(notified).To(ConsistOf(client.ObjectKeyFromObject(pod)), "keys notified once the delete returns")
+		err := overlayClient.Get(ctx, client.ObjectKeyFromObject(pod), &corev1.Pod{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "got %v", err)
+		list := &corev1.PodList{}
+		Expect(overlayClient.List(ctx, list, client.InNamespace("default"))).To(Succeed())
+		Expect(list.Items).ToNot(ContainElement(HaveField("Name", pod.Name)))
+		_, ok := source.Get(client.ObjectKeyFromObject(pod))
+		Expect(ok).To(BeFalse(), "the source's newest version of the deleted pod")
+
+		informers.release()
+		Expect(pods.buried()).To(BeFalse(), "a tombstone once the informer delivered the delete")
+	})
 	It("should read an object a finalizer keeps as terminating once it deletes it", func() {
 		stored := nodeClaim.DeepCopy()
 		nodeClaim.Finalizers = []string{v1.TerminationFinalizer}

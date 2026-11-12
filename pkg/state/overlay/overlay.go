@@ -15,7 +15,13 @@ limitations under the License.
 */
 
 // Package overlay provides a client whose cache reads include the client's own writes before the informer delivers
-// them, without waiting for the informer.
+// them, without waiting for the informer, and hide the objects it deleted until the informer delivers the deletes.
+//
+// A Delete that leaves the object in storage, such as one a finalizer holds, is a write like any other: the overlay
+// serves the terminating object it returned. Only a Delete that removes the object hides it. Telling the two apart
+// depends on the controller-runtime fork go.mod replaces controller-runtime with (DerekFrank/controller-runtime,
+// "Populate obj with the remaining object on Delete"), which writes the remaining object into the Delete's obj, until
+// upstream controller-runtime returns the delete response (a delete-response-v0.25 branch is ready for v0.25).
 package overlay
 
 import (
@@ -23,6 +29,7 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 
@@ -82,11 +89,21 @@ func New(ctx context.Context, c client.Client, informers cache.Informers, kinds 
 			return nil, fmt.Errorf("getting informer for %s, %w", gvk, err)
 		}
 		ov := newOverlay()
+		ov.informer = informer
 		if s, ok := informer.(interface{ GetStore() toolscache.Store }); ok {
 			store := s.GetStore()
+			ov.store = store
+			ov.lookup = func(key types.NamespacedName) (client.Object, bool) {
+				obj, exists, err := store.GetByKey(toolscache.NewObjectName(key.Namespace, key.Name).String())
+				if err != nil || !exists {
+					return nil, false
+				}
+				o, ok := obj.(client.Object)
+				return o, ok
+			}
 			ov.cached = func(key types.NamespacedName) bool {
-				_, exists, err := store.GetByKey(toolscache.NewObjectName(key.Namespace, key.Name).String())
-				return err == nil && exists
+				_, ok := ov.cachedVisible(key)
+				return ok
 			}
 		}
 		if _, err := informer.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
@@ -177,10 +194,22 @@ func (c *Client) record(obj client.Object, created bool) error {
 	if err != nil || o == nil {
 		return err
 	}
+	if removed(obj) {
+		o.remove(obj)
+		return nil
+	}
 	stored := obj.DeepCopyObject().(client.Object)
 	o.record(stored, c.indexersFor(gvk), created)
 	o.notify(stored, false)
+	o.notifyKeys(client.ObjectKeyFromObject(stored))
 	return nil
+}
+
+// removed returns whether a write's response is an object the server removed: one being deleted without a grace period
+// whose last finalizer the write removed.
+func removed(obj client.Object) bool {
+	grace := obj.GetDeletionGracePeriodSeconds()
+	return obj.GetDeletionTimestamp() != nil && len(obj.GetFinalizers()) == 0 && (grace == nil || *grace == 0)
 }
 
 func (c *Client) indexersFor(gvk schema.GroupVersionKind) map[string]client.IndexerFunc {
@@ -220,7 +249,10 @@ func (c *Client) Patch(ctx context.Context, obj client.Object, patch client.Patc
 }
 
 // Delete records the object the server returned if the client updated obj with it, which it does when the object
-// remains in storage, and otherwise forgets the client's writes of the object.
+// remains in storage, and otherwise forgets the client's writes of the object and hides it until the informer's store
+// drops it. Telling the two apart relies on the controller-runtime fork go.mod replaces controller-runtime with
+// (DerekFrank/controller-runtime, "Populate obj with the remaining object on Delete"), until upstream returns the delete
+// response.
 func (c *Client) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
 	rv := obj.GetResourceVersion()
 	if err := c.Client.Delete(ctx, obj, opts...); err != nil {
@@ -236,13 +268,12 @@ func (c *Client) Delete(ctx context.Context, obj client.Object, opts ...client.D
 	if obj.GetResourceVersion() != rv {
 		return c.record(obj, false)
 	}
-	o.forget(client.ObjectKeyFromObject(obj))
-	o.notify(obj.DeepCopyObject().(client.Object), true)
+	o.remove(obj)
 	return nil
 }
 
 func (c *Client) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-	o, _, err := c.overlayFor(obj)
+	o, gvk, err := c.overlayFor(obj)
 	if err != nil {
 		return err
 	}
@@ -251,11 +282,14 @@ func (c *Client) Get(ctx context.Context, key client.ObjectKey, obj client.Objec
 	}
 	e, ok := o.get(key)
 	err = c.Client.Get(ctx, key, obj, opts...)
-	if !ok || (err != nil && !apierrors.IsNotFound(err)) {
+	if err != nil && !apierrors.IsNotFound(err) {
 		return err
 	}
-	if err == nil && !e.newerThan(obj) {
-		return nil
+	if err == nil && o.hidden(obj) {
+		err = apierrors.NewNotFound(schema.GroupResource{Group: gvk.Group, Resource: gvk.Kind}, key.Name)
+	}
+	if !ok || (err == nil && !e.newerThan(obj)) {
+		return err
 	}
 	if err != nil && !o.standsIn(key, e) {
 		return err
@@ -277,12 +311,19 @@ func (c *Client) List(ctx context.Context, list client.ObjectList, opts ...clien
 	if err := c.Client.List(ctx, list, opts...); err != nil {
 		return err
 	}
-	if o.newest.Load() <= w0 {
+	buried := o.buried()
+	if o.newest.Load() <= w0 && !buried {
 		return nil
 	}
 	items, err := meta.ExtractList(list)
 	if err != nil {
 		return err
+	}
+	if buried {
+		items = slices.DeleteFunc(items, func(item runtime.Object) bool { return o.hidden(item.(client.Object)) })
+		if o.newest.Load() <= w0 {
+			return meta.SetList(list, items)
+		}
 	}
 	listOpts := (&client.ListOptions{}).ApplyOptions(opts)
 	indexers := c.indexersFor(gvk)
@@ -418,3 +459,65 @@ func (s *subResourceClient) Patch(ctx context.Context, obj client.Object, patch 
 	}
 	return s.parent.record(obj, false)
 }
+
+// Source is the newest version of each object of one kind that a Client knows: its own write when it's newer than the
+// informer's copy, or the informer's copy, unless the client deleted the object. It's where a store that applies each
+// object's newest version reads it.
+type Source struct{ o *overlay }
+
+// Source returns the newest versions of the objects of obj's kind, which the client must overlay and read from an
+// informer's store.
+func (c *Client) Source(obj client.Object) (*Source, error) {
+	o, gvk, err := c.overlayFor(obj)
+	if err != nil {
+		return nil, err
+	}
+	if o == nil || o.store == nil {
+		return nil, fmt.Errorf("%s isn't overlaid on an informer's store", gvk)
+	}
+	return &Source{o: o}, nil
+}
+
+// Get returns the newest version of the object under key, and whether it exists. The object is the informer's or the
+// overlay's own, so it's read-only.
+func (s *Source) Get(key types.NamespacedName) (client.Object, bool) { return s.o.newestOf(key) }
+
+// Keys returns the keys of the objects the informer's store holds and the client created since.
+func (s *Source) Keys() []types.NamespacedName {
+	var keys []types.NamespacedName
+	seen := map[types.NamespacedName]struct{}{}
+	for _, k := range s.o.store.ListKeys() {
+		namespace, name, err := toolscache.SplitMetaNamespaceKey(k)
+		if err != nil {
+			continue
+		}
+		key := types.NamespacedName{Namespace: namespace, Name: name}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	s.o.entries.Range(func(k, _ any) bool {
+		if _, ok := seen[k.(types.NamespacedName)]; !ok {
+			keys = append(keys, k.(types.NamespacedName))
+		}
+		return true
+	})
+	return keys
+}
+
+// Subscribe calls fn with the key of each object whose newest version may have changed: on each of the informer's
+// events, each of the client's writes and deletes, and each write the overlay stops holding. fn runs on the goroutine of
+// the change, after it's visible to Get, so it must not block. It returns a func that stops it.
+func (s *Source) Subscribe(fn func(types.NamespacedName)) func() {
+	h := &fn
+	s.o.handlersMu.Lock()
+	defer s.o.handlersMu.Unlock()
+	s.o.keyHandlers[h] = struct{}{}
+	return func() {
+		s.o.handlersMu.Lock()
+		defer s.o.handlersMu.Unlock()
+		delete(s.o.keyHandlers, h)
+	}
+}
+
+// HasSynced returns whether the informer has synced.
+func (s *Source) HasSynced() bool { return s.o.informer.HasSynced() }
