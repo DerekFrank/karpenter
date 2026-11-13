@@ -36,6 +36,7 @@ import (
 	autoscalingv1beta1 "sigs.k8s.io/karpenter/pkg/apis/autoscaling/v1beta1"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/capacitybuffer"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
@@ -64,13 +65,11 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
-	statenodeclaimgc "sigs.k8s.io/karpenter/pkg/controllers/state/nodeclaimgc"
 	staticdeprovisioning "sigs.k8s.io/karpenter/pkg/controllers/static/deprovisioning"
 	staticprovisioning "sigs.k8s.io/karpenter/pkg/controllers/static/provisioning"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
-	"sigs.k8s.io/karpenter/pkg/state/nodepoolhealth"
 	"sigs.k8s.io/karpenter/pkg/state/prediction"
 )
 
@@ -102,6 +101,9 @@ func WithRegistrationHook(hook cloudprovider.NodeLifecycleHook) option.Function[
 	}
 }
 
+// NewControllers returns Karpenter's controllers, which read the cluster's state from s, and from clusterState, the
+// façade over s.Nodes. The caller builds s with cluster.New and starts its stores with s.Register.
+//
 //nolint:gocyclo
 func NewControllers(
 	ctx context.Context,
@@ -111,7 +113,8 @@ func NewControllers(
 	recorder events.Recorder,
 	cloudProvider cloudprovider.CloudProvider,
 	overlayUndecoratedCloudProvider cloudprovider.CloudProvider,
-	cluster *state.Cluster,
+	s cluster.State,
+	clusterState *state.Cluster,
 	instanceTypeStore *nodeoverlay.InstanceTypeStore,
 	predictionStore *prediction.Store,
 	opts ...option.Function[ControllerOptions],
@@ -119,37 +122,35 @@ func NewControllers(
 	o := option.Resolve(opts...)
 	deviceAllocationController := deviceallocation.NewController(kubeClient)
 	virtualPodCache := virtualpods.NewVirtualPodCache(kubeClient)
-	p := provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, cluster, clock, deviceAllocationController, virtualPodCache, predictionStore)
+	p := provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, clusterState, clock, deviceAllocationController, virtualPodCache, predictionStore,
+		s.Nomination, s.BufferPods)
 	evictionQueue := terminator.NewQueue(clock, kubeClient, recorder)
-	disruptionQueue := disruption.NewQueue(kubeClient, recorder, cluster, clock, p)
-	npState := nodepoolhealth.NewState()
+	disruptionQueue := disruption.NewQueue(kubeClient, recorder, clusterState, clock, p, s.Deletion)
 	clusterCost := cost.NewClusterCost(ctx, cloudProvider, kubeClient)
 	controllers := []controller.Controller{
 		p, evictionQueue, disruptionQueue,
-		disruption.NewController(ctx, clock, kubeClient, p, cloudProvider, recorder, cluster, disruptionQueue, clusterCost),
-		provisioning.NewPodController(kubeClient, p, cluster),
+		disruption.NewController(ctx, clock, kubeClient, p, cloudProvider, recorder, clusterState, disruptionQueue, clusterCost),
+		provisioning.NewPodController(kubeClient, p, clusterState),
 		provisioning.NewNodeController(kubeClient, p),
 		nodepoolhash.NewController(kubeClient, cloudProvider),
 		expiration.NewController(clock, kubeClient, cloudProvider),
-		informer.NewDaemonSetController(kubeClient, cluster),
-		informer.NewNodeController(kubeClient, cluster),
-		informer.NewPodController(kubeClient, cluster),
-		informer.NewNodePoolController(kubeClient, cloudProvider, cluster, clusterCost),
-		informer.NewNodeClaimController(kubeClient, cloudProvider, cluster, clusterCost),
+		informer.NewPodController(kubeClient, clusterState),
+		informer.NewPersistentVolumeClaimController(kubeClient, clusterState),
+		informer.NewNodePoolController(kubeClient, cloudProvider, clusterState, clusterCost),
+		informer.NewNodeClaimController(kubeClient, cloudProvider, clusterCost),
 		informer.NewPricingController(kubeClient, cloudProvider, clusterCost),
-		statenodeclaimgc.NewController(kubeClient, cluster),
-		termination.NewController(clock, kubeClient, cloudProvider, terminator.NewTerminator(clock, kubeClient, evictionQueue, recorder), recorder),
+		termination.NewController(clock, kubeClient, cloudProvider, terminator.NewTerminator(clock, kubeClient, evictionQueue, recorder), recorder, s.Nodes),
 		nodepoolreadiness.NewController(clock, kubeClient, cloudProvider),
-		nodepoolregistrationhealth.NewController(clock, kubeClient, cloudProvider, npState),
-		nodepoolcounter.NewController(kubeClient, cloudProvider, cluster),
+		nodepoolregistrationhealth.NewController(clock, kubeClient, cloudProvider, s.NodePoolState),
+		nodepoolcounter.NewController(kubeClient, cloudProvider, s.NodePools),
 		nodepoolvalidation.NewController(clock, kubeClient, cloudProvider),
 		podevents.NewController(clock, kubeClient, cloudProvider),
 		nodeclaimconsistency.NewController(clock, kubeClient, cloudProvider, recorder),
-		nodeclaimlifecycle.NewController(clock, kubeClient, cloudProvider, recorder, cluster, npState, o.registrationHooks),
+		nodeclaimlifecycle.NewController(clock, kubeClient, cloudProvider, recorder, clusterState, s.Registrations, o.registrationHooks),
 		nodeclaimgarbagecollection.NewController(clock, kubeClient, cloudProvider),
 		nodeclaimdisruption.NewController(clock, kubeClient, cloudProvider),
 		nodeclaimhydration.NewController(kubeClient, cloudProvider),
-		nodehydration.NewController(kubeClient, cloudProvider),
+		nodehydration.NewController(kubeClient, cloudProvider, s.Nodes),
 	}
 
 	if !options.FromContext(ctx).IgnoreDRARequests {
@@ -158,9 +159,9 @@ func NewControllers(
 
 	if !options.FromContext(ctx).DisableClusterStateObservability {
 		controllers = append(controllers,
-			metricspod.NewController(kubeClient, cluster),
+			metricspod.NewController(kubeClient, clusterState),
 			metricsnodepool.NewController(kubeClient, cloudProvider, clusterCost),
-			metricsnode.NewController(cluster),
+			metricsnode.NewController(clusterState.NodeState),
 			status.NewController[*v1.NodeClaim](
 				kubeClient,
 				mgr.GetEventRecorderFor("karpenter"), //nolint:staticcheck // SA1019: will be replaced by mgr.GetEventRecorder once operatorpkg is updated
@@ -186,15 +187,15 @@ func NewControllers(
 	// The repair disruption method is registered in the disruption controller. --legacy-node-repair instead runs the
 	// legacy node.health controller.
 	if len(cloudProvider.RepairPolicies()) != 0 && options.FromContext(ctx).FeatureGates.NodeRepair && options.FromContext(ctx).LegacyNodeRepair {
-		controllers = append(controllers, legacyrepair.NewController(kubeClient, cloudProvider, clock, recorder))
+		controllers = append(controllers, legacyrepair.NewController(kubeClient, cloudProvider, clusterState, clock, recorder))
 	}
 	if options.FromContext(ctx).FeatureGates.StaticCapacity {
-		controllers = append(controllers, staticprovisioning.NewController(kubeClient, cluster, recorder, cloudProvider, p, clock, deviceAllocationController, virtualPodCache))
-		controllers = append(controllers, staticdeprovisioning.NewController(kubeClient, cluster, cloudProvider, clock, recorder))
+		controllers = append(controllers, staticprovisioning.NewController(kubeClient, clusterState, recorder, cloudProvider, p, clock, deviceAllocationController, virtualPodCache))
+		controllers = append(controllers, staticdeprovisioning.NewController(kubeClient, clusterState, cloudProvider, clock, recorder))
 	}
 
 	if options.FromContext(ctx).FeatureGates.NodeOverlay {
-		controllers = append(controllers, nodeoverlay.NewController(clock, kubeClient, overlayUndecoratedCloudProvider, instanceTypeStore, cluster))
+		controllers = append(controllers, nodeoverlay.NewController(clock, kubeClient, overlayUndecoratedCloudProvider, instanceTypeStore, clusterState))
 	}
 
 	if options.FromContext(ctx).FeatureGates.CapacityBuffer {
@@ -218,11 +219,11 @@ func NewControllers(
 		deletionCostQueue := deletioncost.NewQueue(kubeClient)
 		controllers = append(controllers,
 			deletionCostQueue,
-			deletioncost.NewController(clock, kubeClient, cloudProvider, cluster, deletionCostQueue),
+			deletioncost.NewController(clock, kubeClient, cloudProvider, clusterState, deletionCostQueue),
 		)
 	}
 	if o.enableVPAPrediction && options.FromContext(ctx).FeatureGates.PredictionEnabled {
-		controllers = append(controllers, informer.NewVPAController(kubeClient, predictionStore, cluster, recorder))
+		controllers = append(controllers, informer.NewVPAController(kubeClient, predictionStore, clusterState, recorder))
 	}
 
 	return controllers

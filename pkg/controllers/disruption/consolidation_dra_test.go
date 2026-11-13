@@ -97,7 +97,7 @@ var _ = Describe("Consolidation/DRA", func() {
 		})
 		node.Labels[corev1.LabelHostname] = node.Name
 		ExpectApplied(ctx, env.Client, nodeClaim, node)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		return nodeClaim, ExpectExists(ctx, env.Client, node)
 	}
 

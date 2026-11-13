@@ -34,8 +34,9 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
@@ -76,7 +77,7 @@ func makeCandidate(nodeName string, np *v1.NodePool, it *cloudprovider.InstanceT
 			},
 		},
 	}
-	sn := &state.StateNode{
+	sn := &karpentercluster.StateNode{
 		Node: node,
 	}
 	// EvictionCost reads the PodDeletionCostManagement gate off the context, so
@@ -124,8 +125,8 @@ func makePod(name string, deletionCost string) *corev1.Pod {
 
 // candidateNodes extracts the StateNode references from candidates for use as
 // the allNodes parameter to computeNodePoolTotals in tests.
-func candidateNodes(candidates []*Candidate) []*state.StateNode {
-	nodes := make([]*state.StateNode, len(candidates))
+func candidateNodes(candidates []*Candidate) []*karpentercluster.StateNode {
+	nodes := make([]*karpentercluster.StateNode, len(candidates))
 	for i, c := range candidates {
 		nodes[i] = c.StateNode
 	}
@@ -170,7 +171,7 @@ func makeShouldDisruptCandidate(np *v1.NodePool, policy v1.ConsolidationPolicy) 
 	it := makeInstanceType("m7i.xlarge", 4.84)
 
 	return &Candidate{
-		StateNode: &state.StateNode{
+		StateNode: &karpentercluster.StateNode{
 			Node:      node,
 			NodeClaim: nc,
 		},

@@ -30,15 +30,15 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
-	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
+	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 )
 
 var _ = Describe("RebootHistory", func() {
 	candidateWithAction := func(uid types.UID, action cloudprovider.RepairAction) *Candidate {
 		return &Candidate{
-			StateNode:          &state.StateNode{NodeClaim: &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{UID: uid}}},
-			RepairPolicyResult: health.RepairResult{Action: action, Condition: "AcceleratorReady", Reason: "XID48"},
+			StateNode:          &karpentercluster.StateNode{NodeClaim: &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{UID: uid}}},
+			RepairPolicyResult: repair.RepairResult{Action: action, Condition: "AcceleratorReady", Reason: "XID48"},
 		}
 	}
 

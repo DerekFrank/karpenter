@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/apis/v1alpha1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
@@ -68,8 +69,9 @@ var _ = BeforeSuite(func() {
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(testv1alpha1.CRDs...))
 	cloudProvider = fake.NewCloudProvider()
 	store = NewInstanceTypeStore()
-	cluster = state.NewCluster(env.Clock, env.Client, cloudProvider)
-	nodeOverlayController = NewController(env.Clock, env.Client, cloudProvider, store, cluster)
+	cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
+	cluster = state.NewCluster(env.Clock, env.Overlay, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
+	nodeOverlayController = NewController(env.Clock, env.Overlay, cloudProvider, store, cluster)
 })
 
 var _ = BeforeEach(func() {
@@ -132,7 +134,7 @@ var _ = Describe("Validation", func() {
 		ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 		// Check that the condition was set correctly
-		updatedOverlay := ExpectExists(ctx, env.Client, overlay)
+		updatedOverlay := ExpectExists(ctx, env.APIServer, overlay)
 		Expect(updatedOverlay.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 	})
 	Context("Runtime Validation", func() {
@@ -154,7 +156,7 @@ var _ = Describe("Validation", func() {
 			ExpectApplied(ctx, env.Client, overlay)
 			ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
-			updatedOverlay := ExpectExists(ctx, env.Client, overlay)
+			updatedOverlay := ExpectExists(ctx, env.APIServer, overlay)
 			Expect(updatedOverlay.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeFalse())
 			Expect(updatedOverlay.StatusConditions().Get(v1alpha1.ConditionTypeValidationSucceeded).Reason).To(Equal("RuntimeValidation"))
 		})
@@ -179,7 +181,7 @@ var _ = Describe("Validation", func() {
 			ExpectApplied(ctx, env.Client, overlay)
 			ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
-			updatedOverlay := ExpectExists(ctx, env.Client, overlay)
+			updatedOverlay := ExpectExists(ctx, env.APIServer, overlay)
 			Expect(updatedOverlay.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeFalse())
 			Expect(updatedOverlay.StatusConditions().Get(v1alpha1.ConditionTypeValidationSucceeded).Reason).To(Equal("RuntimeValidation"))
 		})
@@ -224,11 +226,11 @@ var _ = Describe("Validation", func() {
 				ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 				// Check that the conditions were set correctly
-				updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+				updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 				Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeFalse())
 				Expect(updatedOverlayA.StatusConditions().Get(v1alpha1.ConditionTypeValidationSucceeded).Reason).To(Equal("Conflict"))
 
-				updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+				updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 				Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 			})
 			It("should succeed with requirements overlays don't overlap", func() {
@@ -280,10 +282,10 @@ var _ = Describe("Validation", func() {
 				ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 				// Check that the conditions were set correctly
-				updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+				updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 				Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 
-				updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+				updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 				Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 			})
 		})
@@ -366,11 +368,11 @@ var _ = Describe("Validation", func() {
 				ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 				// Check that the conditions were set correctly
-				updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+				updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 				Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeFalse())
 				Expect(updatedOverlayA.StatusConditions().Get(v1alpha1.ConditionTypeValidationSucceeded).Reason).To(Equal("Conflict"))
 
-				updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+				updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 				Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 			})
 			It("should fail with requirements overlays overlap on capacity type", func() {
@@ -411,11 +413,11 @@ var _ = Describe("Validation", func() {
 				ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 				// Check that the conditions were set correctly
-				updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+				updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 				Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeFalse())
 				Expect(updatedOverlayA.StatusConditions().Get(v1alpha1.ConditionTypeValidationSucceeded).Reason).To(Equal("Conflict"))
 
-				updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+				updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 				Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 			})
 			It("should succeed with requirements overlays don't overlap", func() {
@@ -457,10 +459,10 @@ var _ = Describe("Validation", func() {
 				ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 				// Check that the conditions were set correctly
-				updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+				updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 				Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 
-				updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+				updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 				Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 			})
 			It("should fail with requirements overlays overlap", func() {
@@ -502,11 +504,11 @@ var _ = Describe("Validation", func() {
 				ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 				// Check that the conditions were set correctly
-				updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+				updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 				Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeFalse())
 				Expect(updatedOverlayA.StatusConditions().Get(v1alpha1.ConditionTypeValidationSucceeded).Reason).To(Equal("Conflict"))
 
-				updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+				updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 				Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 			})
 		})
@@ -552,11 +554,11 @@ var _ = Describe("Validation", func() {
 				ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 				// Check that the conditions were set correctly
-				updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+				updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 				Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeFalse())
 				Expect(updatedOverlayA.StatusConditions().Get(v1alpha1.ConditionTypeValidationSucceeded).Reason).To(Equal("Conflict"))
 
-				updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+				updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 				Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 			},
 			Entry("Price", v1alpha1.NodeOverlay{Spec: v1alpha1.NodeOverlaySpec{Price: new("1.03")}}, v1alpha1.NodeOverlay{Spec: v1alpha1.NodeOverlaySpec{Price: new("23")}}),
@@ -602,11 +604,11 @@ var _ = Describe("Validation", func() {
 				ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 				// Check that the conditions were set correctly
-				updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+				updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 				Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeFalse())
 				Expect(updatedOverlayA.StatusConditions().Get(v1alpha1.ConditionTypeValidationSucceeded).Reason).To(Equal("Conflict"))
 
-				updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+				updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 				Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 			},
 			Entry("Price", v1alpha1.NodeOverlay{Spec: v1alpha1.NodeOverlaySpec{Price: new("100")}}, v1alpha1.NodeOverlay{Spec: v1alpha1.NodeOverlaySpec{Price: new("100")}}),
@@ -652,10 +654,10 @@ var _ = Describe("Validation", func() {
 				ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 				// Check that the conditions were set correctly
-				updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+				updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 				Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 
-				updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+				updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 				Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 			},
 			Entry("Price", v1alpha1.NodeOverlay{Spec: v1alpha1.NodeOverlaySpec{Price: new("54")}}, v1alpha1.NodeOverlay{Spec: v1alpha1.NodeOverlaySpec{Price: new("23")}}),
@@ -701,10 +703,10 @@ var _ = Describe("Validation", func() {
 				ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 				// Check that the conditions were set correctly
-				updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+				updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 				Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 
-				updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+				updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 				Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 			},
 			Entry("Price", v1alpha1.NodeOverlay{Spec: v1alpha1.NodeOverlaySpec{Price: new("34")}}, v1alpha1.NodeOverlay{Spec: v1alpha1.NodeOverlaySpec{Price: new("2")}}),
@@ -755,11 +757,11 @@ var _ = Describe("Validation", func() {
 			ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 			// Check that the conditions were set correctly
-			updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+			updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 			Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeFalse())
 			Expect(updatedOverlayA.StatusConditions().Get(v1alpha1.ConditionTypeValidationSucceeded).Reason).To(Equal("Conflict"))
 
-			updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+			updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 			Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 		})
 		It("should fail with conflicting capacity overlays with multiple overlays", func() {
@@ -823,14 +825,14 @@ var _ = Describe("Validation", func() {
 			ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 			// Check that the conditions were set correctly
-			updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+			updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 			Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeFalse())
 			Expect(updatedOverlayA.StatusConditions().Get(v1alpha1.ConditionTypeValidationSucceeded).Reason).To(Equal("Conflict"))
 
-			updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+			updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 			Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 
-			updatedOverlayC := ExpectExists(ctx, env.Client, overlayC)
+			updatedOverlayC := ExpectExists(ctx, env.APIServer, overlayC)
 			Expect(updatedOverlayC.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 		})
 		It("should pass with capacity adjustment are the same overlays with overlapping requirements", func() {
@@ -876,11 +878,11 @@ var _ = Describe("Validation", func() {
 			ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 			// Check that the conditions were set correctly
-			updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+			updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 			Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeFalse())
 			Expect(updatedOverlayA.StatusConditions().Get(v1alpha1.ConditionTypeValidationSucceeded).Reason).To(Equal("Conflict"))
 
-			updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+			updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 			Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 		})
 		It("should pass with conflicting capacity overlays with mutually exclusive requirements", func() {
@@ -927,10 +929,10 @@ var _ = Describe("Validation", func() {
 			ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 			// Check that the conditions were set correctly
-			updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+			updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 			Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 
-			updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+			updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 			Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 		})
 		It("should pass with conflicting capacity overlays with mutually exclusive weights", func() {
@@ -977,10 +979,10 @@ var _ = Describe("Validation", func() {
 			ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 			// Check that the conditions were set correctly
-			updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+			updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 			Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 
-			updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+			updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 			Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 		})
 		It("should pass with non conflicting capacity overlays with overlapping requirements", func() {
@@ -1027,10 +1029,10 @@ var _ = Describe("Validation", func() {
 			ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 			// Check that the conditions were set correctly
-			updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+			updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 			Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 
-			updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+			updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 			Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 		})
 	})
@@ -1206,7 +1208,7 @@ var _ = Describe("Instance Type Controller", func() {
 				ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 				// Check that the conditions were set correctly
-				updatedOverlayA := ExpectExists(ctx, env.Client, overlay)
+				updatedOverlayA := ExpectExists(ctx, env.APIServer, overlay)
 				Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeFalse())
 
 				instanceTypeList, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
@@ -1661,11 +1663,11 @@ var _ = Describe("Instance Type Controller", func() {
 				ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 				// Check that the conditions were set correctly
-				updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+				updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 				Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeFalse())
 				Expect(updatedOverlayA.StatusConditions().Get(v1alpha1.ConditionTypeValidationSucceeded).Reason).To(Equal("Conflict"))
 
-				updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+				updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 				Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 
 				instanceTypeList, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
@@ -1747,11 +1749,11 @@ var _ = Describe("Instance Type Controller", func() {
 				ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 				// Check that the conditions were set correctly
-				updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+				updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 				Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeFalse())
 				Expect(updatedOverlayA.StatusConditions().Get(v1alpha1.ConditionTypeValidationSucceeded).Reason).To(Equal("Conflict"))
 
-				updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+				updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 				Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 
 				instanceTypeList, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
@@ -2316,9 +2318,9 @@ var _ = Describe("Instance Type Controller", func() {
 			ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 			// Both overlays should pass validation since they have different weights
-			updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+			updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 			Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
-			updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+			updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 			Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 
 			instanceTypeList, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
@@ -2375,11 +2377,11 @@ var _ = Describe("Instance Type Controller", func() {
 			ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 			// Check that the conditions were set correctly
-			updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+			updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 			Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeFalse())
 			Expect(updatedOverlayA.StatusConditions().Get(v1alpha1.ConditionTypeValidationSucceeded).Reason).To(Equal("Conflict"))
 
-			updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+			updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 			Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 
 			instanceTypeList, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
@@ -2455,11 +2457,11 @@ var _ = Describe("Instance Type Controller", func() {
 			ExpectReconciled(ctx, nodeOverlayController, reconcile.Request{})
 
 			// Check that the conditions were set correctly
-			updatedOverlayA := ExpectExists(ctx, env.Client, overlayA)
+			updatedOverlayA := ExpectExists(ctx, env.APIServer, overlayA)
 			Expect(updatedOverlayA.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeFalse())
 			Expect(updatedOverlayA.StatusConditions().Get(v1alpha1.ConditionTypeValidationSucceeded).Reason).To(Equal("Conflict"))
 
-			updatedOverlayB := ExpectExists(ctx, env.Client, overlayB)
+			updatedOverlayB := ExpectExists(ctx, env.APIServer, overlayB)
 			Expect(updatedOverlayB.StatusConditions().IsTrue(v1alpha1.ConditionTypeValidationSucceeded)).To(BeTrue())
 
 			instanceTypeList, err := cloudProvider.GetInstanceTypes(ctx, nodePool)

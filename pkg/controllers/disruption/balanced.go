@@ -23,8 +23,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
@@ -45,7 +46,7 @@ type NodePoolTotals struct {
 // For candidate nodes, we use the accurate RescheduleDisruptionCost already
 // computed from pod objects. For non-candidate nodes, we use the exact
 // disruption cost maintained incrementally on StateNode.
-func computeNodePoolTotals(_ context.Context, allCandidates []*Candidate, allNodes []*state.StateNode, clusterCost *cost.ClusterCost) map[string]NodePoolTotals {
+func computeNodePoolTotals(_ context.Context, allCandidates []*Candidate, allNodes []*karpentercluster.StateNode, clusterCost *cost.ClusterCost) map[string]NodePoolTotals {
 	// Build candidate lookup by node name for O(1) access.
 	candidateByName := make(map[string]*Candidate, len(allCandidates))
 	for _, c := range allCandidates {

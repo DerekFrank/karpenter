@@ -121,7 +121,7 @@ var _ = Describe("Annotation", func() {
 			}
 			pod := rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name})
 			ExpectApplied(ctx, env.Client, pod)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 			const rank = -10
 			enqueueAndReconcile(pod, rank, false)
@@ -146,7 +146,7 @@ var _ = Describe("Annotation", func() {
 				NodeName:   nodes[0].Name,
 			})
 			ExpectApplied(ctx, env.Client, pod)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 			const rank = -10
 			enqueueAndReconcile(pod, rank, false)
@@ -170,7 +170,7 @@ var _ = Describe("Annotation", func() {
 				NodeName:   nodes[0].Name,
 			})
 			ExpectApplied(ctx, env.Client, pod)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 			const rank = -20
 			enqueueAndReconcile(pod, rank, false)
@@ -194,7 +194,7 @@ var _ = Describe("Annotation", func() {
 				pods[i] = rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name})
 				ExpectApplied(ctx, env.Client, pods[i])
 			}
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 			const rank = -7
 			for _, pod := range pods {
@@ -220,7 +220,7 @@ var _ = Describe("Annotation", func() {
 			pod0 := rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name})
 			pod1 := rsOwnedPod(test.PodOptions{NodeName: nodes[1].Name})
 			ExpectApplied(ctx, env.Client, pod0, pod1)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 			enqueueAndReconcile(pod0, -10, false)
 			enqueueAndReconcile(pod1, -9, false)
@@ -250,9 +250,9 @@ var _ = Describe("Annotation", func() {
 				NodeName:   nodes[0].Name,
 			})
 			ExpectApplied(ctx, env.Client, pod)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			counter := &countingClient{Client: env.Client}
+			counter := &countingClient{Client: env.Overlay}
 			q := deletioncost.NewQueue(counter)
 			before := podAnnotationWritesDelta(map[string]string{deletioncost.Result.Name: deletioncost.ResultSkippedUnchanged.Name})
 			q.Add(pod, rank, false)
@@ -274,9 +274,9 @@ var _ = Describe("Annotation", func() {
 			}
 			pod := rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name})
 			ExpectApplied(ctx, env.Client, pod)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			throttler := newThrottlingClient(env.Client, 1)
+			throttler := newThrottlingClient(env.Overlay, 1)
 			q := deletioncost.NewQueue(throttler)
 			before := podAnnotationWritesDelta(map[string]string{deletioncost.Result.Name: deletioncost.ResultError.Name})
 			q.Add(pod, -11, false)
@@ -307,7 +307,7 @@ var _ = Describe("Annotation", func() {
 			}
 			pod := rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name})
 			ExpectApplied(ctx, env.Client, pod)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 			snapshot := &corev1.Pod{}
 			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(pod), snapshot)).To(Succeed())
@@ -342,7 +342,7 @@ var _ = Describe("Annotation", func() {
 			live := &corev1.Pod{}
 			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(pod), live)).To(Succeed())
 
-			q := deletioncost.NewQueue(&notFoundClient{Client: env.Client})
+			q := deletioncost.NewQueue(&notFoundClient{Client: env.Overlay})
 			before := podAnnotationWritesDelta(map[string]string{deletioncost.Result.Name: deletioncost.ResultSkippedNotFound.Name})
 			q.Add(live, -1, false)
 			_, err := q.Reconcile(ctx, live)
@@ -377,7 +377,7 @@ var _ = Describe("Annotation", func() {
 			}
 			pod := rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name})
 			ExpectApplied(ctx, env.Client, pod)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 			queue.Add(pod, -1, false)
 			queue.Add(pod, -5, false)
@@ -404,10 +404,10 @@ var _ = Describe("Annotation", func() {
 			}
 			pod := rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name})
 			ExpectApplied(ctx, env.Client, pod)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 			blocker := &blockingPatchClient{
-				Client:  env.Client,
+				Client:  env.Overlay,
 				entered: make(chan struct{}),
 				proceed: make(chan struct{}),
 			}
@@ -449,9 +449,9 @@ var _ = Describe("Annotation", func() {
 			podA := rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name})
 			podB := rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name})
 			ExpectApplied(ctx, env.Client, podA, podB)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			throttler := newThrottlingClient(env.Client, 2)
+			throttler := newThrottlingClient(env.Overlay, 2)
 			q := deletioncost.NewQueue(throttler)
 			q.Add(podA, -3, false)
 			q.Add(podB, -3, false)
@@ -493,7 +493,7 @@ var _ = Describe("Annotation", func() {
 				NodeName:   nodes[0].Name,
 			})
 			ExpectApplied(ctx, env.Client, pod)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 			enqueueAndReconcile(pod, 0, true)
 
@@ -521,7 +521,7 @@ var _ = Describe("Annotation", func() {
 				NodeName: nodes[0].Name,
 			})
 			ExpectApplied(ctx, env.Client, pod)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 			enqueueAndReconcile(pod, 0, true)
 
@@ -543,9 +543,9 @@ var _ = Describe("Annotation", func() {
 			}
 			pod := rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name})
 			ExpectApplied(ctx, env.Client, pod)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			counter := &countingClient{Client: env.Client}
+			counter := &countingClient{Client: env.Overlay}
 			q := deletioncost.NewQueue(counter)
 			q.Add(pod, 0, true)
 			ExpectObjectReconciled(ctx, env.Client, q, pod)
