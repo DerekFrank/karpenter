@@ -64,6 +64,8 @@ type Check interface {
 // scanPeriod is how often we inspect and report issues that are found.
 const scanPeriod = 10 * time.Minute
 
+// NewController returns the NodeClaim consistency controller, which reconciles a NodeClaim when it or the Node with its
+// providerID changes, finding the NodeClaim of a Node through the node state.
 func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, recorder events.Recorder) *Controller {
 	return &Controller{
 		clock:         clk,
@@ -157,10 +159,7 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		For(&v1.NodeClaim{}, builder.WithPredicates(nodeclaimutils.IsManagedPredicateFuncs(c.cloudProvider))).
-		Watches(
-			&corev1.Node{},
-			nodeclaimutils.NodeEventHandler(c.kubeClient, c.cloudProvider),
-		).
+		Watches(&corev1.Node{}, nodeclaimutils.NodeEventHandler(c.kubeClient, c.cloudProvider)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), 10, 1000)}).
 		Complete(reconcile.AsReconciler(m.GetClient(), c))
 }
