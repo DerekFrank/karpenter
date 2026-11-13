@@ -111,7 +111,7 @@ var _ = Describe("StaticDrift", func() {
 				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
 			}
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// Should only allow 2 nodes to be disrupted because of budget
@@ -127,7 +127,7 @@ var _ = Describe("StaticDrift", func() {
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(2))
 			for _, cmd := range cmds {
-				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmd)
+				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cloudProvider, cmd)
 				ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
 				// Cascade any deletion of the nodeClaims to the nodes
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, cmd.Candidates[0].NodeClaim)
@@ -170,7 +170,7 @@ var _ = Describe("StaticDrift", func() {
 				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
 			}
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// Should only allow 1 nodes to be disrupted because of budget
@@ -186,7 +186,7 @@ var _ = Describe("StaticDrift", func() {
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
 			for _, cmd := range cmds {
-				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmd)
+				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cloudProvider, cmd)
 				ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
 
 				// Cascade any deletion of the nodeClaims to the nodes
@@ -306,7 +306,7 @@ var _ = Describe("StaticDrift", func() {
 				ExpectApplied(ctx, env.Client, n)
 			}
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, allNodes, allNodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, allNodes, allNodeClaims)
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			ExpectMetricGaugeValue(disruption.NodePoolAllowedDisruptions, 1, map[string]string{
@@ -342,7 +342,7 @@ var _ = Describe("StaticDrift", func() {
 
 			// Execute the commands
 			for _, cmd := range cmds {
-				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmd)
+				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cloudProvider, cmd)
 				ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
 				// Cascade any deletion of the nodeClaims to the nodes
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, cmd.Candidates[0].NodeClaim)
@@ -394,7 +394,7 @@ var _ = Describe("StaticDrift", func() {
 				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
 			}
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// Verify StateNodePool Has been updated
@@ -434,7 +434,7 @@ var _ = Describe("StaticDrift", func() {
 				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
 			}
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			ExpectMetricGaugeValue(disruption.NodePoolAllowedDisruptions, 2, map[string]string{
@@ -450,7 +450,7 @@ var _ = Describe("StaticDrift", func() {
 			Expect(cmds).To(HaveLen(2))
 			Expect(recorder.Calls(events.DisruptionBlocked)).To(Equal(0))
 			for _, cmd := range cmds {
-				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmd)
+				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cloudProvider, cmd)
 				ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
 				// Cascade any deletion of the nodeClaims to the nodes
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, cmd.Candidates[0].NodeClaim)
@@ -493,7 +493,7 @@ var _ = Describe("StaticDrift", func() {
 				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
 			}
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			ExpectMetricGaugeValue(disruption.NodePoolAllowedDisruptions, 5, map[string]string{
@@ -508,7 +508,7 @@ var _ = Describe("StaticDrift", func() {
 			cmds := queue.GetCommands()
 			Expect(cmds).To(HaveLen(2))
 			for _, cmd := range cmds {
-				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmd)
+				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cloudProvider, cmd)
 				ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
 				// Cascade any deletion of the nodeClaims to the nodes
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, cmd.Candidates[0].NodeClaim)
@@ -551,7 +551,7 @@ var _ = Describe("StaticDrift", func() {
 				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
 			}
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 			for i := range 5 {
 				ExpectSingletonReconciled(ctx, disruptionController)
@@ -562,7 +562,7 @@ var _ = Describe("StaticDrift", func() {
 				cmds := queue.GetCommands()
 				Expect(cmds).To(HaveLen(1))
 				for _, cmd := range cmds {
-					ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmd)
+					ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cloudProvider, cmd)
 					// Any point in time we should not go over limit
 					Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(6))
 					ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
@@ -621,7 +621,7 @@ var _ = Describe("StaticDrift", func() {
 			ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
 
 			// 1st node is drifted
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// Verify StateNodePool Has been updated
@@ -636,7 +636,6 @@ var _ = Describe("StaticDrift", func() {
 
 			// reconcile
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaims[1])
-			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(nodes[1]))
 			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaims[1]))
 
 			remainingNodeClaims := &v1.NodeClaimList{}
@@ -655,7 +654,7 @@ var _ = Describe("StaticDrift", func() {
 			cmds = queue.GetCommands()
 			Expect(cmds).To(HaveLen(1))
 			for _, cmd := range cmds {
-				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmd)
+				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cloudProvider, cmd)
 				ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
 				// Cascade any deletion of the nodeClaims to the nodes
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, cmd.Candidates[0].NodeClaim)
@@ -778,7 +777,7 @@ var _ = Describe("StaticDrift", func() {
 			allNodeClaims := append(nodeClaims1, nodeClaims2...)
 			allNodeClaims = append(allNodeClaims, nodeClaims3...)
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, allNodes, allNodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, allNodes, allNodeClaims)
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			ExpectMetricGaugeValue(disruption.NodePoolAllowedDisruptions, 2, map[string]string{
@@ -808,7 +807,7 @@ var _ = Describe("StaticDrift", func() {
 
 			// Execute the commands
 			for _, cmd := range cmds {
-				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cluster, cloudProvider, cmd)
+				ExpectMakeNewNodeClaimsReady(ctx, env.Client, env.Clock, cloudProvider, cmd)
 				ExpectObjectReconciled(ctx, env.Client, queue, cmd.Candidates[0].NodeClaim)
 				// Cascade any deletion of the nodeClaims to the nodes
 				ExpectNodeClaimsCascadeDeletion(ctx, env.Client, cmd.Candidates[0].NodeClaim)
@@ -833,7 +832,7 @@ var _ = Describe("StaticDrift", func() {
 			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// Should not drift any nodes when target is 0
@@ -868,7 +867,7 @@ var _ = Describe("StaticDrift", func() {
 
 			}
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// Verify StateNodePool Has been updated
@@ -884,7 +883,7 @@ var _ = Describe("StaticDrift", func() {
 			ExpectApplied(ctx, env.Client, nodeClaim, node, nodePool)
 
 			// inform cluster state about nodes and nodeclaims
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// Verify StateNodePool Has been updated
@@ -900,7 +899,7 @@ var _ = Describe("StaticDrift", func() {
 			ExpectApplied(ctx, env.Client, nodeClaim, node, nodePool)
 
 			// inform cluster state about nodes and nodeclaims
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			ExpectSingletonReconciled(ctx, disruptionController)
 
 			// Verify StateNodePool Has been updated
@@ -916,7 +915,7 @@ var _ = Describe("StaticDrift", func() {
 			ExpectApplied(ctx, env.Client, nodeClaim, node, nodePool)
 
 			// inform cluster state about nodes and nodeclaims
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 			ExpectSingletonReconciled(ctx, disruptionController)
 

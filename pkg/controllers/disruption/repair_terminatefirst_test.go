@@ -59,7 +59,6 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			LastTransitionTime: metav1.Time{Time: env.Clock.Now()},
 		})
 		ExpectApplied(ctx, env.Client, n)
-		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(n))
 	}
 
 	BeforeEach(func() {
@@ -67,8 +66,8 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		useRepairPolicies([]cloudprovider.RepairPolicy{
 			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, TerminationGracePeriod: lo.ToPtr(repairTGP), Action: cloudprovider.ReplaceNode},
 		})
-		repairController = disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
-			disruption.WithMethods(disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue))))
+		repairController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, queue, clusterCost,
+			disruption.WithMethods(disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue))))
 	})
 
 	// staticNodePoolAtLimit: limit == replicas, so the pool is at its limit and can't stage a replacement.
@@ -86,7 +85,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
 		}})
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		markUnhealthy(node)
 		env.Clock.Step(31 * time.Minute)
 
@@ -115,7 +114,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
 		}})
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		markUnhealthy(node)
 		env.Clock.Step(31 * time.Minute)
 
@@ -140,12 +139,13 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
 		}})
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
-		// Simulate an outstanding reservation (an in-flight replacement from another command) consuming the only spare
-		// slot under the limit. A naive active-node count (1 < 2) would wrongly see headroom and replace-first.
-		Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(BeEquivalentTo(int64(1)))
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		markUnhealthy(node)
 		env.Clock.Step(31 * time.Minute)
+		// Simulate an outstanding reservation (an in-flight replacement from another command) consuming the only spare
+		// slot under the limit. A naive active-node count (1 < 2) would wrongly see headroom and replace-first. It's
+		// taken after the clock step, which would otherwise expire it.
+		Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(HaveLen(1))
 
 		ExpectSingletonReconciled(ctx, repairController)
 
@@ -164,7 +164,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
 		}})
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		markUnhealthy(node)
 		env.Clock.Step(31 * time.Minute)
 
@@ -184,7 +184,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
 		}})
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		markUnhealthy(node)
 		env.Clock.Step(31 * time.Minute)
 
@@ -209,7 +209,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		for i := range nodes {
 			ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
 		}
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 		markUnhealthy(nodes[0])
 		env.Clock.Step(31 * time.Minute)
 
@@ -254,7 +254,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			Allocatable: map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("32"), corev1.ResourcePods: resource.MustParse("100")},
 		}})
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		rs := test.ReplicaSet()
 		ExpectApplied(ctx, env.Client, rs)
 		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
@@ -263,7 +263,6 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		}}}})
 		ExpectApplied(ctx, env.Client, pod)
 		ExpectManualBinding(ctx, env.Client, pod, node)
-		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
 		markUnhealthy(node)
 		env.Clock.Step(31 * time.Minute)
 
@@ -281,7 +280,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
 		}})
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		// Bind a reschedulable pod so the pre-spin simulation produces a replacement.
 		rs := test.ReplicaSet()
 		ExpectApplied(ctx, env.Client, rs)
@@ -291,7 +290,6 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		}}}})
 		ExpectApplied(ctx, env.Client, pod)
 		ExpectManualBinding(ctx, env.Client, pod, node)
-		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
 		markUnhealthy(node)
 		env.Clock.Step(31 * time.Minute)
 
@@ -319,7 +317,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		for i := range nodes {
 			ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
 		}
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 		markUnhealthy(nodes[0])
 		markUnhealthy(nodes[1])
 		env.Clock.Step(31 * time.Minute)
@@ -368,7 +366,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			Allocatable: map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("32"), corev1.ResourcePods: resource.MustParse("100")},
 		}})
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		// A reschedulable pod so the pre-spin simulation has a workload it can only place by freeing the reservation.
 		rs := test.ReplicaSet()
 		ExpectApplied(ctx, env.Client, rs)
@@ -378,7 +376,6 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		}}}})
 		ExpectApplied(ctx, env.Client, pod)
 		ExpectManualBinding(ctx, env.Client, pod, node)
-		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
 		markUnhealthy(node)
 		env.Clock.Step(31 * time.Minute)
 
@@ -434,12 +431,11 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			Allocatable: map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("32"), corev1.ResourcePods: resource.MustParse("100")},
 		}})
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		// A pod that blocks eviction: repair's bounded drain removes it, so the credit-back plan must still place it.
 		pod := test.Pod(test.PodOptions{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{v1.DoNotDisruptAnnotationKey: "true"}}})
 		ExpectApplied(ctx, env.Client, pod)
 		ExpectManualBinding(ctx, env.Client, pod, node)
-		ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
 		markUnhealthy(node)
 		env.Clock.Step(31 * time.Minute)
 
@@ -465,7 +461,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 				Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
 			}})
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			markUnhealthy(node)
 			env.Clock.Step(31 * time.Minute)
 
@@ -492,7 +488,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
 		}})
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		markUnhealthy(node)
 		env.Clock.Step(31 * time.Minute)
 
@@ -513,7 +509,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
 		}})
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		markUnhealthy(node)
 		env.Clock.Step(31 * time.Minute)
 
@@ -533,7 +529,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"},
 		}})
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		Expect(env.Client.Delete(ctx, nodePool)).To(Succeed()) // finalizer keeps it around with a DeletionTimestamp
 		markUnhealthy(node)
 		env.Clock.Step(31 * time.Minute)
@@ -592,7 +588,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 				cloudprovider.ReservationIDLabel: id,
 			}}})
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			markUnhealthy(node)
 			env.Clock.Step(31 * time.Minute)
 			ExpectSingletonReconciled(ctx, repairController)
@@ -610,7 +606,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			ExpectMetricCounterValue(disruption.TerminateFirstDecisionsTotal, 1, map[string]string{metrics.NodePoolLabel: nodePool.Name, metrics.ReasonLabel: "unhealthy", disruption.TerminateFirstReasonDim.Name: string(disruption.TerminateFirstNoReservedCapacity)})
 			Expect(cmds[0].Replacements).To(HaveLen(0))
 			// The delete-only path must not hold the limits.nodes slot it never uses.
-			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(BeEquivalentTo(int64(1)))
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(HaveLen(1))
 		})
 
 		// A node whose reservation is no longer offered frees no slot a refill could launch into, so terminating it first
@@ -647,7 +643,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 				corev1.LabelTopologyZone:       mostExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
 			}}})
 			ExpectApplied(ctx, env.Client, staticPool, staticNodeClaim, staticNode, dynamicPool, dynamicNodeClaim, dynamicNode)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController,
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock,
 				[]*corev1.Node{staticNode, dynamicNode}, []*v1.NodeClaim{staticNodeClaim, dynamicNodeClaim})
 			// The static node has been unhealthy longer, so it scores higher and is evaluated first.
 			markUnhealthy(staticNode)
@@ -655,8 +651,8 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			markUnhealthy(dynamicNode)
 			env.Clock.Step(31 * time.Minute)
 			erroring := &instanceTypesErrorCloudProvider{CloudProvider: cloudProvider, nodePools: []string{staticPool.Name}}
-			repairController = disruption.NewController(ctx, env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
-				disruption.WithMethods(disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, erroring, recorder, queue))))
+			repairController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, queue, clusterCost,
+				disruption.WithMethods(disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, erroring, recorder, queue))))
 
 			ExpectSingletonReconciled(ctx, repairController)
 
@@ -706,7 +702,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 				cloudprovider.ReservationIDLabel: reservationID,
 			}}})
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			markUnhealthy(node)
 			env.Clock.Step(31 * time.Minute)
 			ExpectSingletonReconciled(ctx, repairController)
