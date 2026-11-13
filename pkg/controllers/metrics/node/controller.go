@@ -34,11 +34,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/state"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
@@ -55,6 +57,20 @@ var (
 	nodeNameLabel  = opmetrics.Label{Name: nodeName, Help: "The name of the node."}
 	nodePhaseLabel = opmetrics.Label{Name: nodePhase, Help: "The node's lifecycle phase, e.g. `Pending`, `Running`."}
 	managedLabel   = opmetrics.Label{Name: managed, Help: "Whether the node is managed by Karpenter.", Values: metrics.BoolValues}
+)
+
+// ClusterStateNodesCount is how many nodes cluster state reads (NodeState.Nodes): the launched NodeClaims, and the
+// unmanaged Nodes.
+var ClusterStateNodesCount = opmetrics.NewPrometheusGauge(
+	crmetrics.Registry,
+	prometheus.GaugeOpts{
+		Namespace: metrics.Namespace,
+		Subsystem: "cluster_state",
+		Name:      "node_count",
+		Help:      "Current count of nodes in cluster state",
+	},
+	[]opmetrics.Label{},
+	opmetrics.GA,
 )
 
 var (
@@ -182,15 +198,74 @@ func nodeLabelNames() []opmetrics.Label {
 	)
 }
 
+const (
+	// BatchWindow is how long the controller folds node, NodeClaim and pod changes into one rebuild, which bounds how
+	// stale the metrics are after a change.
+	BatchWindow = 5 * time.Second
+	// LifetimeRefresh is how often the controller rebuilds while nothing changes, since the Lifetime metric is a
+	// function of the time.
+	LifetimeRefresh = time.Minute
+)
+
 type Controller struct {
-	cluster     *state.Cluster
+	nodes       *karpentercluster.NodeState
 	metricStore *metrics.Store
+	// counts holds the node count ClusterStateNodesCount publishes, derived from the NodeClaim and Node stores in
+	// Register.
+	counts *state.Store[nodeCountKey, nodeCountKey, nodeCounts, struct{}]
 }
 
-func NewController(cluster *state.Cluster) *Controller {
+// nodeCountKey is the key of the one entry of the controller's node count. Its zero value contributes to nothing.
+type nodeCountKey struct{ counted bool }
+
+// counted is the key every counted node contributes to.
+var counted = nodeCountKey{counted: true}
+
+// nodeCounts are the nodes cluster state reads: the launched NodeClaims, and the unmanaged Nodes.
+type nodeCounts struct {
+	// LaunchedNodeClaims counts the NodeClaims with a providerID, deleting or not.
+	LaunchedNodeClaims int
+	// UnmanagedNodes counts the Nodes with neither a NodeClaim owner reference nor the NodePool label.
+	UnmanagedNodes int
+}
+
+// launchedNodeClaim is a launched NodeClaim's contribution of one to LaunchedNodeClaims.
+type launchedNodeClaim int
+
+func (n launchedNodeClaim) Update(c nodeCounts, prev launchedNodeClaim) nodeCounts {
+	c.LaunchedNodeClaims += int(n - prev)
+	return c
+}
+
+func (n launchedNodeClaim) Delete(c nodeCounts) nodeCounts {
+	c.LaunchedNodeClaims -= int(n)
+	return c
+}
+
+// unmanagedNode is an unmanaged Node's contribution of one to UnmanagedNodes.
+type unmanagedNode int
+
+func (n unmanagedNode) Update(c nodeCounts, prev unmanagedNode) nodeCounts {
+	c.UnmanagedNodes += int(n - prev)
+	return c
+}
+
+func (n unmanagedNode) Delete(c nodeCounts) nodeCounts {
+	c.UnmanagedNodes -= int(n)
+	return c
+}
+
+// nodeCount is how many nodes cluster state reads.
+func (c *Controller) nodeCount() int {
+	e, _ := c.counts.Get(counted)
+	return e.Derived.LaunchedNodeClaims + e.Derived.UnmanagedNodes
+}
+
+// NewController returns the node metrics controller, which reads the nodes of cluster state.
+func NewController(nodes *karpentercluster.NodeState) *Controller {
 	initializeMetrics()
 	return &Controller{
-		cluster:     cluster,
+		nodes:       nodes,
 		metricStore: metrics.NewStore(),
 	}
 }
@@ -198,12 +273,16 @@ func NewController(cluster *state.Cluster) *Controller {
 func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name()) //nolint:ineffassign,staticcheck
 
-	nodes := lo.Reject(c.cluster.DeepCopyNodes(), func(n *state.StateNode, _ int) bool {
-		return n.Node == nil
-	})
+	// The metrics only read the nodes, so they share cluster state's rather than copying their usage.
+	var nodes karpentercluster.StateNodes
+	for n := range c.nodes.Nodes() {
+		if n.Node != nil {
+			nodes = append(nodes, n)
+		}
+	}
 
 	// Build per-node metrics
-	metricsMap := lo.SliceToMap(nodes, func(n *state.StateNode) (string, []*metrics.StoreMetric) {
+	metricsMap := lo.SliceToMap(nodes, func(n *karpentercluster.StateNode) (string, []*metrics.StoreMetric) {
 		return client.ObjectKeyFromObject(n.Node).String(), buildMetrics(n)
 	})
 
@@ -211,8 +290,10 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	metricsMap["clusterUtilization"] = buildClusterUtilizationMetric(nodes)
 
 	c.metricStore.ReplaceAll(metricsMap)
+	ClusterStateNodesCount.Set(float64(c.nodeCount()), nil)
 
-	return reconciler.Result{RequeueAfter: time.Second * 5}, nil
+	// The sources wake the controller on every change but the time passing, which Lifetime reads.
+	return reconciler.Result{RequeueAfter: LifetimeRefresh}, nil //storelint:deadline the Lifetime metric is a function of the time
 }
 
 func (c *Controller) Name() string {
@@ -220,13 +301,53 @@ func (c *Controller) Name() string {
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
+	// The node count is derived from cluster state's NodeClaim and Node stores.
+	c.counts = state.NewSyntheticStore[nodeCountKey, nodeCountKey, nodeCounts, struct{}](func(k nodeCountKey) nodeCountKey { return k })
+	state.Derive(c.nodes.NodeClaimStore.Reader, c.counts,
+		func(_ string, e karpentercluster.NodeClaimEntry) nodeCountKey {
+			return lo.Ternary(karpentercluster.Launched(e), counted, nodeCountKey{})
+		},
+		func(string, karpentercluster.NodeClaimEntry) launchedNodeClaim { return 1 })
+	state.DeriveObject(c.nodes.NodeStore.Reader, c.counts,
+		func(_ string, node *corev1.Node) nodeCountKey {
+			return lo.Ternary(karpentercluster.Unmanaged(node), counted, nodeCountKey{})
+		},
+		func(string, *corev1.Node) unmanagedNode { return 1 })
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		WatchesRawSource(singleton.Source()).
+		// The controller rebuilds every metric at most once per BatchWindow while the nodes change.
+		WatchesRawSource(state.After(BatchWindow, c.wakes())).
+		WatchesRawSource(state.Requires(c.nodes)).
 		Complete(singleton.AsReconciler(c))
 }
 
-func buildClusterUtilizationMetric(nodes state.StateNodes) []*metrics.StoreMetric {
+// wakes are the changes the metrics read: a launched NodeClaim appearing, going or linking its Node; and a Node changing,
+// or the requests and limits of its pods. A NodeClaim launching or going, and a Node changing, also cover every change of
+// the node count. A NodeClaim's status and intent, and a pod's status, are left out.
+func (c *Controller) wakes() source.SyncingSource {
+	return state.Wake(
+		c.nodes.NodeClaimStore.SourceOn(func(_ string, e karpentercluster.NodeClaimEntry) any {
+			if e.Object.Status.ProviderID == "" {
+				return nil
+			}
+			return e.Derived.Node
+		}),
+		c.nodes.NodeStore.SourceOn(func(_ string, e karpentercluster.NodeEntry) any {
+			u := e.Derived.Usage
+			return nodeInputs{Node: e.Object, Pods: u.Pods, Requests: u.Requests, Limits: u.Limits, DaemonSetRequests: u.DaemonSetRequests, DaemonSetLimits: u.DaemonSetLimits}
+		}),
+	)
+}
+
+// nodeInputs are what the metrics read of a Node's entry.
+type nodeInputs struct {
+	Node                                                 *corev1.Node
+	Pods                                                 int
+	Requests, Limits, DaemonSetRequests, DaemonSetLimits corev1.ResourceList
+}
+
+func buildClusterUtilizationMetric(nodes karpentercluster.StateNodes) []*metrics.StoreMetric {
 
 	// Aggregate resources allocated/utilized for all the nodes and pods inside the nodes
 	allocatableAggregate, utilizedAggregate := corev1.ResourceList{}, corev1.ResourceList{}
@@ -263,7 +384,7 @@ func buildClusterUtilizationMetric(nodes state.StateNodes) []*metrics.StoreMetri
 	return res
 }
 
-func buildMetrics(n *state.StateNode) (res []*metrics.StoreMetric) {
+func buildMetrics(n *karpentercluster.StateNode) (res []*metrics.StoreMetric) {
 	for gaugeMetric, resourceList := range map[opmetrics.GaugeMetric]corev1.ResourceList{
 		SystemOverhead:      resources.Subtract(n.Node.Status.Capacity, n.Node.Status.Allocatable),
 		TotalPodRequests:    n.PodRequests(),
@@ -288,13 +409,13 @@ func buildMetrics(n *state.StateNode) (res []*metrics.StoreMetric) {
 		})
 }
 
-func getNodeLabelsWithResourceType(n *state.StateNode, resourceTypeName string) prometheus.Labels {
+func getNodeLabelsWithResourceType(n *karpentercluster.StateNode, resourceTypeName string) prometheus.Labels {
 	metricLabels := getNodeLabels(n)
 	metricLabels[metrics.ResourceTypeLabel] = resourceTypeName
 	return metricLabels
 }
 
-func getNodeLabels(n *state.StateNode) prometheus.Labels {
+func getNodeLabels(n *karpentercluster.StateNode) prometheus.Labels {
 	node := n.Node
 	metricLabels := map[string]string{}
 	metricLabels[nodeName] = node.Name
