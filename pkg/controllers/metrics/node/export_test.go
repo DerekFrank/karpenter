@@ -16,13 +16,6 @@ limitations under the License.
 
 package node
 
-import (
-	"sigs.k8s.io/controller-runtime/pkg/source"
-)
-
-// Wakes is what Register wakes the controller on, without the BatchWindow, for tests to start on a queue.
-func (c *Controller) Wakes() source.SyncingSource { return c.wakes() }
-
 // The node count's contributions, for their law checks.
 type (
 	NodeCounts        = nodeCounts

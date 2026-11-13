@@ -18,28 +18,22 @@ package node
 
 import (
 	"context"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
-	"github.com/awslabs/operatorpkg/reconciler"
-	"github.com/awslabs/operatorpkg/singleton"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/sets"
-	controllerruntime "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/metrics"
-	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/state"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
@@ -59,157 +53,70 @@ var (
 	managedLabel   = opmetrics.Label{Name: managed, Help: "Whether the node is managed by Karpenter.", Values: metrics.BoolValues}
 )
 
-// ClusterStateNodesCount is how many nodes cluster state reads (NodeState.Nodes): the launched NodeClaims, and the
-// unmanaged Nodes.
-var ClusterStateNodesCount = opmetrics.NewPrometheusGauge(
-	crmetrics.Registry,
-	prometheus.GaugeOpts{
-		Namespace: metrics.Namespace,
-		Subsystem: "cluster_state",
-		Name:      "node_count",
-		Help:      "Current count of nodes in cluster state",
-	},
-	[]opmetrics.Label{},
-	opmetrics.GA,
+// The node gauges are built at scrape time from cluster state's stores, by the Collector Register registers.
+var (
+	// ClusterStateNodesCount is how many nodes cluster state reads (NodeState.Nodes): the launched NodeClaims, and the
+	// unmanaged Nodes.
+	ClusterStateNodesCount = metrics.NewCollectedGauge(
+		prometheus.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: "cluster_state",
+			Name:      "node_count",
+			Help:      "Current count of nodes in cluster state",
+		},
+		[]opmetrics.Label{},
+		opmetrics.GA,
+	)
+	Allocatable         *metrics.CollectedGauge
+	TotalPodRequests    *metrics.CollectedGauge
+	TotalPodLimits      *metrics.CollectedGauge
+	TotalDaemonRequests *metrics.CollectedGauge
+	TotalDaemonLimits   *metrics.CollectedGauge
+	SystemOverhead      *metrics.CollectedGauge
+	Lifetime            *metrics.CollectedGauge
+	ClusterUtilization  *metrics.CollectedGauge
+
+	// wellKnownLabels are the node labels the gauges carry, each with its metric label name, in the order of the
+	// gauges' Labels.
+	wellKnownLabels []wellKnownLabel
 )
 
-var (
-	Allocatable         opmetrics.GaugeMetric
-	TotalPodRequests    opmetrics.GaugeMetric
-	TotalPodLimits      opmetrics.GaugeMetric
-	TotalDaemonRequests opmetrics.GaugeMetric
-	TotalDaemonLimits   opmetrics.GaugeMetric
-	SystemOverhead      opmetrics.GaugeMetric
-	Lifetime            opmetrics.GaugeMetric
-	ClusterUtilization  opmetrics.GaugeMetric
-)
+type wellKnownLabel struct{ key, name string }
 
 // Initialize metrics at runtime to ensure cloud provider's well-known labels are properly
-// injected, preventing race conditions in dependency ordering during label injection for global variable. .
+// injected, preventing race conditions in dependency ordering during label injection for global variable.
 func initializeMetrics() {
-	Allocatable = opmetrics.NewPrometheusGauge(
-		crmetrics.Registry,
-		prometheus.GaugeOpts{
-			Namespace: metrics.Namespace,
-			Subsystem: metrics.NodeSubsystem,
-			Name:      "allocatable",
-			Help:      "Node allocatable are the resources allocatable by nodes.",
-		},
-		nodeLabelNamesWithResourceType(),
-		opmetrics.Beta,
-	)
-	TotalPodRequests = opmetrics.NewPrometheusGauge(
-		crmetrics.Registry,
-		prometheus.GaugeOpts{
-			Namespace: metrics.Namespace,
-			Subsystem: metrics.NodeSubsystem,
-			Name:      "total_pod_requests",
-			Help:      "Node total pod requests are the resources requested by pods bound to nodes, including the DaemonSet pods.",
-		},
-		nodeLabelNamesWithResourceType(),
-		opmetrics.Beta,
-	)
-	TotalPodLimits = opmetrics.NewPrometheusGauge(
-		crmetrics.Registry,
-		prometheus.GaugeOpts{
-			Namespace: metrics.Namespace,
-			Subsystem: metrics.NodeSubsystem,
-			Name:      "total_pod_limits",
-			Help:      "Node total pod limits are the resources specified by pod limits, including the DaemonSet pods.",
-		},
-		nodeLabelNamesWithResourceType(),
-		opmetrics.Beta,
-	)
-	TotalDaemonRequests = opmetrics.NewPrometheusGauge(
-		crmetrics.Registry,
-		prometheus.GaugeOpts{
-			Namespace: metrics.Namespace,
-			Subsystem: metrics.NodeSubsystem,
-			Name:      "total_daemon_requests",
-			Help:      "Node total daemon requests are the resource requested by DaemonSet pods bound to nodes.",
-		},
-		nodeLabelNamesWithResourceType(),
-		opmetrics.Beta,
-	)
-	TotalDaemonLimits = opmetrics.NewPrometheusGauge(
-		crmetrics.Registry,
-		prometheus.GaugeOpts{
-			Namespace: metrics.Namespace,
-			Subsystem: metrics.NodeSubsystem,
-			Name:      "total_daemon_limits",
-			Help:      "Node total daemon limits are the resources specified by DaemonSet pod limits.",
-		},
-		nodeLabelNamesWithResourceType(),
-		opmetrics.Beta,
-	)
-	SystemOverhead = opmetrics.NewPrometheusGauge(
-		crmetrics.Registry,
-		prometheus.GaugeOpts{
-			Namespace: metrics.Namespace,
-			Subsystem: metrics.NodeSubsystem,
-			Name:      "system_overhead",
-			Help:      "Node system daemon overhead are the resources reserved for system overhead, the difference between the node's capacity and allocatable values are reported by the status.",
-		},
-		nodeLabelNamesWithResourceType(),
-		opmetrics.Beta,
-	)
-	Lifetime = opmetrics.NewPrometheusGauge(
-		crmetrics.Registry,
-		prometheus.GaugeOpts{
-			Namespace: metrics.Namespace,
-			Subsystem: metrics.NodeSubsystem,
-			Name:      "current_lifetime_seconds",
-			Help:      "Node age in seconds",
-		},
-		nodeLabelNames(),
-		opmetrics.Alpha,
-	)
-	ClusterUtilization = opmetrics.NewPrometheusGauge(
-		crmetrics.Registry,
-		prometheus.GaugeOpts{
-			Namespace: metrics.Namespace,
-			Subsystem: "cluster",
-			Name:      "utilization_percent",
-			Help:      "Utilization of allocatable resources by pod requests",
-		},
-		[]opmetrics.Label{metrics.ResourceType},
-		opmetrics.Alpha,
-	)
+	wellKnownLabels = getWellKnownLabels()
+	gauge := func(subsystem, name, help string, labels []opmetrics.Label, stage opmetrics.Stage) *metrics.CollectedGauge {
+		return metrics.NewCollectedGauge(prometheus.GaugeOpts{Namespace: metrics.Namespace, Subsystem: subsystem, Name: name, Help: help}, labels, stage)
+	}
+	Allocatable = gauge(metrics.NodeSubsystem, "allocatable", "Node allocatable are the resources allocatable by nodes.", nodeLabelNamesWithResourceType(), opmetrics.Beta)
+	TotalPodRequests = gauge(metrics.NodeSubsystem, "total_pod_requests", "Node total pod requests are the resources requested by pods bound to nodes, including the DaemonSet pods.", nodeLabelNamesWithResourceType(), opmetrics.Beta)
+	TotalPodLimits = gauge(metrics.NodeSubsystem, "total_pod_limits", "Node total pod limits are the resources specified by pod limits, including the DaemonSet pods.", nodeLabelNamesWithResourceType(), opmetrics.Beta)
+	TotalDaemonRequests = gauge(metrics.NodeSubsystem, "total_daemon_requests", "Node total daemon requests are the resource requested by DaemonSet pods bound to nodes.", nodeLabelNamesWithResourceType(), opmetrics.Beta)
+	TotalDaemonLimits = gauge(metrics.NodeSubsystem, "total_daemon_limits", "Node total daemon limits are the resources specified by DaemonSet pod limits.", nodeLabelNamesWithResourceType(), opmetrics.Beta)
+	SystemOverhead = gauge(metrics.NodeSubsystem, "system_overhead", "Node system daemon overhead are the resources reserved for system overhead, the difference between the node's capacity and allocatable values are reported by the status.", nodeLabelNamesWithResourceType(), opmetrics.Beta)
+	Lifetime = gauge(metrics.NodeSubsystem, "current_lifetime_seconds", "Node age in seconds", nodeLabelNames(), opmetrics.Alpha)
+	ClusterUtilization = gauge("cluster", "utilization_percent", "Utilization of allocatable resources by pod requests", []opmetrics.Label{metrics.ResourceType}, opmetrics.Alpha)
 }
 
 func nodeLabelNamesWithResourceType() []opmetrics.Label {
-	return append(
-		nodeLabelNames(),
-		metrics.ResourceType,
-	)
+	return append(nodeLabelNames(), metrics.ResourceType)
 }
 
+// nodeLabelNames are the per-node dimensions: the well-known labels, which include the NodePool label and are
+// self-describing so are wrapped without help text, then the node's name, phase and whether it's managed.
 func nodeLabelNames() []opmetrics.Label {
 	return append(
-		// WellKnownLabels includes the nodepool label, so we don't need to add it as its own item here.
-		// If we do, prometheus will panic since there would be duplicate labels.
-		// The well-known labels are self-describing, so they are wrapped without help text.
-		lo.Map(sets.New(lo.Values(getWellKnownLabels())...).UnsortedList(), func(l string, _ int) opmetrics.Label {
-			return opmetrics.Label{Name: l}
-		}),
+		lo.Map(wellKnownLabels, func(l wellKnownLabel, _ int) opmetrics.Label { return opmetrics.Label{Name: l.name} }),
 		nodeNameLabel,
 		nodePhaseLabel,
 		managedLabel,
 	)
 }
 
-const (
-	// BatchWindow is how long the controller folds node, NodeClaim and pod changes into one rebuild, which bounds how
-	// stale the metrics are after a change.
-	BatchWindow = 5 * time.Second
-	// LifetimeRefresh is how often the controller rebuilds while nothing changes, since the Lifetime metric is a
-	// function of the time.
-	LifetimeRefresh = time.Minute
-)
-
 type Controller struct {
-	nodes       *karpentercluster.NodeState
-	metricStore *metrics.Store
+	nodes *karpentercluster.NodeState
 	// counts holds the node count ClusterStateNodesCount publishes, derived from the NodeClaim and Node stores in
 	// Register.
 	counts *state.Store[nodeCountKey, nodeCountKey, nodeCounts, struct{}]
@@ -261,46 +168,18 @@ func (c *Controller) nodeCount() int {
 	return e.Derived.LaunchedNodeClaims + e.Derived.UnmanagedNodes
 }
 
-// NewController returns the node metrics controller, which reads the nodes of cluster state.
+// NewController returns the node metrics, which read the nodes of cluster state at scrape time.
 func NewController(nodes *karpentercluster.NodeState) *Controller {
 	initializeMetrics()
-	return &Controller{
-		nodes:       nodes,
-		metricStore: metrics.NewStore(),
-	}
-}
-
-func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
-	ctx = injection.WithControllerName(ctx, c.Name()) //nolint:ineffassign,staticcheck
-
-	// The metrics only read the nodes, so they share cluster state's rather than copying their usage.
-	var nodes karpentercluster.StateNodes
-	for n := range c.nodes.Nodes() {
-		if n.Node != nil {
-			nodes = append(nodes, n)
-		}
-	}
-
-	// Build per-node metrics
-	metricsMap := lo.SliceToMap(nodes, func(n *karpentercluster.StateNode) (string, []*metrics.StoreMetric) {
-		return client.ObjectKeyFromObject(n.Node).String(), buildMetrics(n)
-	})
-
-	// Build cluster level metric
-	metricsMap["clusterUtilization"] = buildClusterUtilizationMetric(nodes)
-
-	c.metricStore.ReplaceAll(metricsMap)
-	ClusterStateNodesCount.Set(float64(c.nodeCount()), nil)
-
-	// The sources wake the controller on every change but the time passing, which Lifetime reads.
-	return reconciler.Result{RequeueAfter: LifetimeRefresh}, nil //storelint:deadline the Lifetime metric is a function of the time
+	return &Controller{nodes: nodes}
 }
 
 func (c *Controller) Name() string {
 	return "metrics.node"
 }
 
-func (c *Controller) Register(_ context.Context, m manager.Manager) error {
+// Register derives the node count and registers the Collector. Nothing reconciles: each scrape reads the stores.
+func (c *Controller) Register(_ context.Context, _ manager.Manager) error {
 	// The node count is derived from cluster state's NodeClaim and Node stores.
 	c.counts = state.NewSyntheticStore[nodeCountKey, nodeCountKey, nodeCounts, struct{}](func(k nodeCountKey) nodeCountKey { return k })
 	state.Derive(c.nodes.NodeClaimStore.Reader, c.counts,
@@ -313,132 +192,88 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 			return lo.Ternary(karpentercluster.Unmanaged(node), counted, nodeCountKey{})
 		},
 		func(string, *corev1.Node) unmanagedNode { return 1 })
-	return controllerruntime.NewControllerManagedBy(m).
-		Named(c.Name()).
-		WatchesRawSource(singleton.Source()).
-		// The controller rebuilds every metric at most once per BatchWindow while the nodes change.
-		WatchesRawSource(state.After(BatchWindow, c.wakes())).
-		WatchesRawSource(state.Requires(c.nodes)).
-		Complete(singleton.AsReconciler(c))
+	return crmetrics.Registry.Register(metrics.NewCollector(
+		func() bool { return c.nodes.Synced() && c.counts.Synced() },
+		c.collect,
+		ClusterStateNodesCount, Allocatable, TotalPodRequests, TotalPodLimits, TotalDaemonRequests, TotalDaemonLimits, SystemOverhead, Lifetime, ClusterUtilization,
+	))
 }
 
-// wakes are the changes the metrics read: a launched NodeClaim appearing, going or linking its Node; and a Node changing,
-// or the requests and limits of its pods. A NodeClaim launching or going, and a Node changing, also cover every change of
-// the node count. A NodeClaim's status and intent, and a pod's status, are left out.
-func (c *Controller) wakes() source.SyncingSource {
-	return state.Wake(
-		c.nodes.NodeClaimStore.SourceOn(func(_ string, e karpentercluster.NodeClaimEntry) any {
-			if e.Object.Status.ProviderID == "" {
-				return nil
-			}
-			return e.Derived.Node
-		}),
-		c.nodes.NodeStore.SourceOn(func(_ string, e karpentercluster.NodeEntry) any {
-			u := e.Derived.Usage
-			return nodeInputs{Node: e.Object, Pods: u.Pods, Requests: u.Requests, Limits: u.Limits, DaemonSetRequests: u.DaemonSetRequests, DaemonSetLimits: u.DaemonSetLimits}
-		}),
-	)
-}
-
-// nodeInputs are what the metrics read of a Node's entry.
-type nodeInputs struct {
-	Node                                                 *corev1.Node
-	Pods                                                 int
-	Requests, Limits, DaemonSetRequests, DaemonSetLimits corev1.ResourceList
-}
-
-func buildClusterUtilizationMetric(nodes karpentercluster.StateNodes) []*metrics.StoreMetric {
-
-	// Aggregate resources allocated/utilized for all the nodes and pods inside the nodes
-	allocatableAggregate, utilizedAggregate := corev1.ResourceList{}, corev1.ResourceList{}
-
-	for _, node := range nodes {
-		resources.MergeInto(allocatableAggregate, node.Allocatable())
-		resources.MergeInto(utilizedAggregate, node.PodRequests())
-	}
-
-	res := make([]*metrics.StoreMetric, 0, len(allocatableAggregate))
-
-	for resourceName, allocatableResource := range allocatableAggregate {
-
-		if allocatableResource.Value() == 0 {
-			// This zero check may be unnecessary. I'm erring towards caution.
+// collect emits every node gauge for the nodes cluster state reads now. It reads each node's entries once, and sums
+// allocatable and requests for the cluster's utilization as it goes.
+func (c *Controller) collect(emit metrics.Emit) {
+	emit.Gauge(ClusterStateNodesCount, float64(c.nodeCount()))
+	allocatable, utilized := corev1.ResourceList{}, corev1.ResourceList{}
+	for n := range c.nodes.Nodes() {
+		if n.Node == nil {
 			continue
 		}
+		collectNode(emit, n)
+		resources.MergeInto(allocatable, n.Allocatable())
+		resources.MergeInto(utilized, n.PodRequests())
+	}
+	collectClusterUtilization(emit, allocatable, utilized)
+}
 
-		utilizedResource := utilizedAggregate[resourceName]
-
+func collectClusterUtilization(emit metrics.Emit, allocatable, utilized corev1.ResourceList) {
+	for resourceName, allocatableResource := range allocatable {
+		if allocatableResource.Value() == 0 {
+			continue
+		}
+		utilizedResource := utilized[resourceName]
 		// Typecast to float before the calculation to maximize resolution
 		utilizationPercentage := 100 * lo.Ternary(
 			resourceName == corev1.ResourceCPU,
 			float64(utilizedResource.MilliValue())/float64(allocatableResource.MilliValue()),
 			float64(utilizedResource.Value())/float64(allocatableResource.Value()))
-
-		res = append(res, &metrics.StoreMetric{
-			GaugeMetric: ClusterUtilization,
-			Value:       utilizationPercentage,
-			Labels:      map[string]string{metrics.ResourceTypeLabel: resourceNameToString(resourceName)},
-		})
+		emit.Gauge(ClusterUtilization, utilizationPercentage, resourceNameToString(resourceName))
 	}
-
-	return res
 }
 
-func buildMetrics(n *karpentercluster.StateNode) (res []*metrics.StoreMetric) {
-	for gaugeMetric, resourceList := range map[opmetrics.GaugeMetric]corev1.ResourceList{
-		SystemOverhead:      resources.Subtract(n.Node.Status.Capacity, n.Node.Status.Allocatable),
-		TotalPodRequests:    n.PodRequests(),
-		TotalPodLimits:      n.PodLimits(),
-		TotalDaemonRequests: n.DaemonSetRequests(),
-		TotalDaemonLimits:   n.DaemonSetLimits(),
-		Allocatable:         n.Node.Status.Allocatable,
+// collectNode emits a node's gauges. Its label values are built once, and each resource's series adds its resource
+// type.
+func collectNode(emit metrics.Emit, n *karpentercluster.StateNode) {
+	values := nodeLabelValues(n)
+	for _, g := range []struct {
+		gauge     *metrics.CollectedGauge
+		resources corev1.ResourceList
+	}{
+		{SystemOverhead, resources.Subtract(n.Node.Status.Capacity, n.Node.Status.Allocatable)},
+		{TotalPodRequests, n.PodRequests()},
+		{TotalPodLimits, n.PodLimits()},
+		{TotalDaemonRequests, n.DaemonSetRequests()},
+		{TotalDaemonLimits, n.DaemonSetLimits()},
+		{Allocatable, n.Node.Status.Allocatable},
 	} {
-		for resourceName, quantity := range resourceList {
-			res = append(res, &metrics.StoreMetric{
-				GaugeMetric: gaugeMetric,
-				Value:       lo.Ternary(resourceName == corev1.ResourceCPU, float64(quantity.MilliValue())/float64(1000), float64(quantity.Value())),
-				Labels:      getNodeLabelsWithResourceType(n, resourceNameToString(resourceName)),
-			})
+		for resourceName, quantity := range g.resources {
+			emit.Gauge(g.gauge, lo.Ternary(resourceName == corev1.ResourceCPU, float64(quantity.MilliValue())/float64(1000), float64(quantity.Value())),
+				append(values, resourceNameToString(resourceName))...)
 		}
 	}
-	return append(res,
-		&metrics.StoreMetric{
-			GaugeMetric: Lifetime,
-			Value:       time.Since(n.Node.GetCreationTimestamp().Time).Seconds(),
-			Labels:      getNodeLabels(n),
-		})
+	emit.Gauge(Lifetime, time.Since(n.Node.GetCreationTimestamp().Time).Seconds(), values...)
 }
 
-func getNodeLabelsWithResourceType(n *karpentercluster.StateNode, resourceTypeName string) prometheus.Labels {
-	metricLabels := getNodeLabels(n)
-	metricLabels[metrics.ResourceTypeLabel] = resourceTypeName
-	return metricLabels
-}
-
-func getNodeLabels(n *karpentercluster.StateNode) prometheus.Labels {
-	node := n.Node
-	metricLabels := map[string]string{}
-	metricLabels[nodeName] = node.Name
-	metricLabels[nodePhase] = string(node.Status.Phase)
-	metricLabels[managed] = strconv.FormatBool(n.Managed())
-
-	// Populate well known labels
-	for wellKnownLabel, label := range getWellKnownLabels() {
-		metricLabels[label] = node.Labels[wellKnownLabel]
+// nodeLabelValues are a node's values for nodeLabelNames, in its order, with room for the resource type.
+func nodeLabelValues(n *karpentercluster.StateNode) []string {
+	values := make([]string, 0, len(wellKnownLabels)+4)
+	for _, l := range wellKnownLabels {
+		values = append(values, n.Node.Labels[l.key])
 	}
-	return metricLabels
+	return append(values, n.Node.Name, string(n.Node.Status.Phase), strconv.FormatBool(n.Managed()))
 }
 
-func getWellKnownLabels() map[string]string {
-	labels := make(map[string]string)
-	for wellKnownLabel := range v1.WellKnownLabels {
-		if parts := strings.Split(wellKnownLabel, "/"); len(parts) == 2 {
-			label := parts[1]
+// getWellKnownLabels returns the well-known node labels, each with its metric label name in snake_case, sorted and
+// deduplicated by name, since a gauge can't carry a label twice.
+func getWellKnownLabels() []wellKnownLabel {
+	byName := map[string]string{}
+	for key := range v1.WellKnownLabels {
+		if parts := strings.Split(key, "/"); len(parts) == 2 {
 			// Reformat label names to be consistent with Prometheus naming conventions (snake_case)
-			label = strings.ReplaceAll(strings.ToLower(label), "-", "_")
-			labels[wellKnownLabel] = label
+			byName[strings.ReplaceAll(strings.ToLower(parts[1]), "-", "_")] = key
 		}
 	}
+	labels := lo.MapToSlice(byName, func(name, key string) wellKnownLabel { return wellKnownLabel{key: key, name: name} })
+	sort.Slice(labels, func(i, j int) bool { return labels[i].name < labels[j].name })
 	return labels
 }
 
