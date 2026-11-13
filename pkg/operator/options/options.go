@@ -67,6 +67,7 @@ type FeatureGates struct {
 	NodeOverlay               bool
 	StaticCapacity            bool
 	CapacityBuffer            bool
+	CapacityQuota             bool
 	TerminateFirstDrift       bool
 	TerminateFirstRepair      bool
 	PodDeletionCostManagement bool
@@ -128,6 +129,13 @@ var (
 		Help: "Enables the CapacityBuffer API (autoscaling.x-k8s.io). Karpenter provisions and keeps the spare " +
 			"capacity CapacityBuffers describe.",
 	}
+	CapacityQuotaFeatureGate = FeatureGate{
+		Name:    "CapacityQuota",
+		Default: false,
+		Stage:   docs.Alpha,
+		Help: "Enables the CapacityQuota API (autoscaling.x-k8s.io). Karpenter launches a node only if it fits " +
+			"every CapacityQuota whose selector may match it, as well as its NodePool's limits.",
+	}
 	TerminateFirstDriftFeatureGate = FeatureGate{
 		Name:    "TerminateFirstDrift",
 		Default: false,
@@ -167,6 +175,7 @@ var KarpenterFeatureGates = []FeatureGate{
 	NodeOverlayFeatureGate,
 	StaticCapacityFeatureGate,
 	CapacityBufferFeatureGate,
+	CapacityQuotaFeatureGate,
 	TerminateFirstDriftFeatureGate,
 	TerminateFirstRepairFeatureGate,
 	PodDeletionCostManagementFeatureGate,
@@ -294,6 +303,7 @@ func DefaultFeatureGates() FeatureGates {
 		NodeOverlay:               NodeOverlayFeatureGate.Default,
 		StaticCapacity:            StaticCapacityFeatureGate.Default,
 		CapacityBuffer:            CapacityBufferFeatureGate.Default,
+		CapacityQuota:             CapacityQuotaFeatureGate.Default,
 		TerminateFirstDrift:       TerminateFirstDriftFeatureGate.Default,
 		TerminateFirstRepair:      TerminateFirstRepairFeatureGate.Default,
 		PodDeletionCostManagement: PodDeletionCostManagementFeatureGate.Default,
@@ -328,6 +338,9 @@ func ParseFeatureGates(gateStr string) (FeatureGates, error) {
 	}
 	if val, ok := gateMap[CapacityBufferFeatureGate.Name]; ok {
 		gates.CapacityBuffer = val
+	}
+	if val, ok := gateMap[CapacityQuotaFeatureGate.Name]; ok {
+		gates.CapacityQuota = val
 	}
 	if val, ok := gateMap[TerminateFirstDriftFeatureGate.Name]; ok {
 		gates.TerminateFirstDrift = val

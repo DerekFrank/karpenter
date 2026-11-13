@@ -37,10 +37,13 @@ var (
 	NodeOverlayCRD []byte
 	//go:embed crds/autoscaling.x-k8s.io_capacitybuffers.yaml
 	CapacityBufferCRD []byte
-	CRDs              = []*apiextensionsv1.CustomResourceDefinition{
+	//go:embed crds/autoscaling.x-k8s.io_capacityquotas.yaml
+	CapacityQuotaCRD []byte
+	CRDs             = []*apiextensionsv1.CustomResourceDefinition{
 		object.Unmarshal[apiextensionsv1.CustomResourceDefinition](NodePoolCRD),
 		object.Unmarshal[apiextensionsv1.CustomResourceDefinition](NodeClaimCRD),
 		object.Unmarshal[apiextensionsv1.CustomResourceDefinition](NodeOverlayCRD),
 		object.Unmarshal[apiextensionsv1.CustomResourceDefinition](CapacityBufferCRD),
+		object.Unmarshal[apiextensionsv1.CustomResourceDefinition](CapacityQuotaCRD),
 	}
 )
