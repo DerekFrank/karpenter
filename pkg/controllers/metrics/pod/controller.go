@@ -70,7 +70,11 @@ var (
 	podReadyLabel            = opmetrics.Label{Name: podReady, Help: "Whether the pod is ready.", Values: metrics.BoolValues}
 	managedLabel             = opmetrics.Label{Name: managed, Help: "Whether the pod is bound to a Karpenter-managed node.", Values: metrics.BoolValues}
 	podDynamicResourcesLabel = opmetrics.Label{Name: podDynamicResources, Help: "Whether the pod has DRA (dynamic resource allocation) requirements.", Values: metrics.BoolValues}
-	podPhaseLabel            = opmetrics.Label{
+	// podNameKey and podNamespaceKey mark the pod's name and namespace as Key on the
+	// metrics whose other labels can vary for a pod, so its series can be deleted with DeleteByKey.
+	podNameKey      = func() opmetrics.Label { l := podNameLabel; l.Key = true; return l }()
+	podNamespaceKey = func() opmetrics.Label { l := podNamespaceLabel; l.Key = true; return l }()
+	podPhaseLabel   = opmetrics.Label{
 		Name: podPhase,
 		Help: "The pod's lifecycle phase.",
 		Values: []opmetrics.Value{
@@ -138,7 +142,7 @@ var (
 			Name:      "unbound_time_seconds",
 			Help:      "The time from pod creation until the pod is bound.",
 		},
-		[]opmetrics.Label{podNameLabel, podNamespaceLabel, podDynamicResourcesLabel},
+		[]opmetrics.Label{podNameKey, podNamespaceKey, podDynamicResourcesLabel},
 		opmetrics.Alpha,
 	)
 	// Stage: alpha
@@ -163,7 +167,7 @@ var (
 			Name:      "provisioning_unbound_time_seconds",
 			Help:      "The time from when Karpenter first thinks the pod can schedule until it binds. Note: this calculated from a point in memory, not by the pod creation timestamp.",
 		},
-		[]opmetrics.Label{podNameLabel, podNamespaceLabel, podDynamicResourcesLabel},
+		[]opmetrics.Label{podNameKey, podNamespaceKey, podDynamicResourcesLabel},
 		opmetrics.Alpha,
 	)
 	// Stage: alpha
@@ -207,9 +211,8 @@ var (
 
 // Controller for the resource
 type Controller struct {
-	kubeClient  client.Client
-	metricStore *metrics.Store
-	cluster     *state.Cluster
+	kubeClient client.Client
+	cluster    *state.Cluster
 
 	pendingPods     sets.Set[string]
 	unscheduledPods sets.Set[string]
@@ -217,8 +220,8 @@ type Controller struct {
 
 func labelNames() []opmetrics.Label {
 	return []opmetrics.Label{
-		podNameLabel,
-		podNamespaceLabel,
+		podNameKey,
+		podNamespaceKey,
 		ownerLabel,
 		podHostNameLabel,
 		podScheduledLabel,
@@ -237,7 +240,6 @@ func labelNames() []opmetrics.Label {
 func NewController(kubeClient client.Client, cluster *state.Cluster) *Controller {
 	return &Controller{
 		kubeClient:      kubeClient,
-		metricStore:     metrics.NewStore(),
 		pendingPods:     sets.New[string](),
 		unscheduledPods: sets.New[string](),
 		cluster:         cluster,
@@ -263,11 +265,11 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			})
 			c.unscheduledPods.Delete(req.String())
 			// Delete the unbound metric since the pod is deleted
-			PodUnboundTimeSeconds.DeletePartialMatch(map[string]string{
+			PodUnboundTimeSeconds.DeleteByKey(map[string]string{
 				podName:      req.Name,
 				podNamespace: req.Namespace,
 			})
-			PodProvisioningUnboundTimeSeconds.DeletePartialMatch(map[string]string{
+			PodProvisioningUnboundTimeSeconds.DeleteByKey(map[string]string{
 				podName:      req.Name,
 				podNamespace: req.Namespace,
 			})
@@ -275,7 +277,10 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 				podName:      req.Name,
 				podNamespace: req.Namespace,
 			})
-			c.metricStore.Delete(req.String())
+			PodState.DeleteByKey(map[string]string{
+				podName:      req.Name,
+				podNamespace: req.Namespace,
+			})
 		}
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
@@ -283,13 +288,10 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	if err != nil {
 		return reconcile.Result{}, err
 	}
-	c.metricStore.Update(client.ObjectKeyFromObject(pod).String(), []*metrics.StoreMetric{
-		{
-			GaugeMetric: PodState,
-			Value:       1,
-			Labels:      labels,
-		},
-	})
+	PodState.ReplaceByKey(map[string]string{
+		podName:      pod.Name,
+		podNamespace: pod.Namespace,
+	}, opmetrics.Sample{Value: 1, Labels: labels})
 	c.recordPodSchedulingUndecidedMetric(pod)
 	// Get the time for when we Karpenter first thought the pod was schedulable. This should be zero if we didn't simulate for this pod.
 	schedulableTime := c.cluster.PodSchedulingSuccessTime(types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace})
@@ -423,7 +425,7 @@ func (c *Controller) recordPodBoundMetric(pod *corev1.Pod, schedulableTime time.
 				})
 			} else {
 				// Idempotently delete the unbound_time_seconds metric if the schedulable time is zero
-				PodProvisioningUnboundTimeSeconds.DeletePartialMatch(map[string]string{
+				PodProvisioningUnboundTimeSeconds.DeleteByKey(map[string]string{
 					podName:      pod.Name,
 					podNamespace: pod.Namespace,
 				})
@@ -434,11 +436,11 @@ func (c *Controller) recordPodBoundMetric(pod *corev1.Pod, schedulableTime time.
 	}
 	if c.unscheduledPods.Has(key) && ok && cond.Status == corev1.ConditionTrue {
 		// Delete the unbound metric since the pod is now bound
-		PodUnboundTimeSeconds.DeletePartialMatch(map[string]string{
+		PodUnboundTimeSeconds.DeleteByKey(map[string]string{
 			podName:      pod.Name,
 			podNamespace: pod.Namespace,
 		})
-		PodProvisioningUnboundTimeSeconds.DeletePartialMatch(map[string]string{
+		PodProvisioningUnboundTimeSeconds.DeleteByKey(map[string]string{
 			podName:      pod.Name,
 			podNamespace: pod.Namespace,
 		})

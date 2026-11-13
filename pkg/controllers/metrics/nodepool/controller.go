@@ -26,6 +26,7 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -42,6 +43,10 @@ import (
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 )
 
+// nodePoolKey is the nodepool dimension as a Key, for the metrics with a series per
+// resource type of a nodepool.
+var nodePoolKey = func() opmetrics.Label { l := metrics.NodePool; l.Key = true; return l }()
+
 var (
 	Limit = opmetrics.NewPrometheusGauge(
 		crmetrics.Registry,
@@ -53,7 +58,7 @@ var (
 		},
 		[]opmetrics.Label{
 			metrics.ResourceType,
-			metrics.NodePool,
+			nodePoolKey,
 		},
 		opmetrics.GA,
 	)
@@ -67,7 +72,7 @@ var (
 		},
 		[]opmetrics.Label{
 			metrics.ResourceType,
-			metrics.NodePool,
+			nodePoolKey,
 		},
 		opmetrics.GA,
 	)
@@ -100,7 +105,6 @@ type Controller struct {
 	cloudProvider cloudprovider.CloudProvider
 	clusterCost   *cost.ClusterCost
 	backoff       *nodepoolbackoff.State
-	metricStore   *metrics.Store
 }
 
 // NewController constructs a controller instance
@@ -108,7 +112,6 @@ func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudPr
 	return &Controller{
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
-		metricStore:   metrics.NewStore(),
 		clusterCost:   clusterCost,
 		backoff:       backoff,
 	}
@@ -121,45 +124,37 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	nodePool := &v1.NodePool{}
 	if err := c.kubeClient.Get(ctx, req.NamespacedName, nodePool); err != nil {
 		if errors.IsNotFound(err) {
-			c.metricStore.Delete(req.String())
+			key := map[string]string{metrics.NodePoolLabel: req.Name}
+			ClusterCost.Delete(key)
+			DriftBackoffSeconds.Delete(key)
+			Usage.DeleteByKey(key)
+			Limit.DeleteByKey(key)
 		}
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 	if !nodepoolutils.IsManaged(nodePool, c.cloudProvider) {
 		return reconcile.Result{}, nil
 	}
-	c.metricStore.Update(req.String(), c.buildMetrics(nodePool))
-	// periodically update our metrics per nodepool even if nothing has changed
-	return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
-}
-
-func (c *Controller) buildMetrics(nodePool *v1.NodePool) (res []*metrics.StoreMetric) {
-	res = append(res, &metrics.StoreMetric{
-		GaugeMetric: ClusterCost,
-		Labels:      map[string]string{metrics.NodePoolLabel: nodePool.Name},
-		Value:       c.clusterCost.GetNodepoolCost(nodePool),
-	})
+	key := map[string]string{metrics.NodePoolLabel: nodePool.Name}
+	ClusterCost.Set(c.clusterCost.GetNodepoolCost(nodePool), key)
 	if remaining := c.backoff.Remaining(nodePool); remaining > 0 {
-		res = append(res, &metrics.StoreMetric{
-			GaugeMetric: DriftBackoffSeconds,
-			Labels:      map[string]string{metrics.NodePoolLabel: nodePool.Name},
-			Value:       remaining.Seconds(),
-		})
+		DriftBackoffSeconds.Set(remaining.Seconds(), key)
+	} else {
+		DriftBackoffSeconds.Delete(key)
 	}
-
-	for gaugeVec, resourceList := range map[opmetrics.GaugeMetric]corev1.ResourceList{
+	for gauge, resourceList := range map[opmetrics.GaugeMetric]corev1.ResourceList{
 		Usage: nodePool.Status.Resources,
 		Limit: getLimits(nodePool),
 	} {
-		for k, v := range resourceList {
-			res = append(res, &metrics.StoreMetric{
-				GaugeMetric: gaugeVec,
-				Labels:      makeLabels(nodePool, strings.ReplaceAll(strings.ToLower(string(k)), "-", "_")),
-				Value:       lo.Ternary(k == corev1.ResourceCPU, float64(v.MilliValue())/float64(1000), float64(v.Value())),
-			})
-		}
+		gauge.ReplaceByKey(key, lo.MapToSlice(resourceList, func(k corev1.ResourceName, v resource.Quantity) opmetrics.Sample {
+			return opmetrics.Sample{
+				Labels: makeLabels(nodePool, strings.ReplaceAll(strings.ToLower(string(k)), "-", "_")),
+				Value:  lo.Ternary(k == corev1.ResourceCPU, float64(v.MilliValue())/float64(1000), float64(v.Value())),
+			}
+		})...)
 	}
-	return res
+	// periodically update our metrics per nodepool even if nothing has changed
+	return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
 func getLimits(nodePool *v1.NodePool) corev1.ResourceList {

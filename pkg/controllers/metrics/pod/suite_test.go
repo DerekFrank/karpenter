@@ -128,6 +128,12 @@ var _ = Describe("Pod Metrics", func() {
 			"phase":     string(p.Status.Phase),
 		})
 		Expect(found).To(BeTrue())
+		_, found = FindMetricWithLabelValues("karpenter_pods_state", map[string]string{
+			"name":      p.GetName(),
+			"namespace": p.GetNamespace(),
+			"phase":     string(corev1.PodPending),
+		})
+		Expect(found).To(BeFalse())
 	})
 	It("should update the pod bound and unbound time metrics", func() {
 		p := test.Pod()
