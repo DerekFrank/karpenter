@@ -31,7 +31,9 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
-const MultiNodeConsolidationTimeoutDuration = 1 * time.Minute
+// MultiNodeConsolidationTimeoutDuration bounds multi-node consolidation's search for a command, as
+// SingleNodeConsolidationTimeoutDuration bounds single-node consolidation's.
+var MultiNodeConsolidationTimeoutDuration = 1 * time.Minute
 
 type MultiNodeConsolidation struct {
 	consolidation
