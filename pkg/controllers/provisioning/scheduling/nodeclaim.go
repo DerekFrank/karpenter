@@ -43,6 +43,13 @@ import (
 type NodeClaim struct {
 	NodeClaimTemplate
 
+	// Reservation, if set, holds the NodeClaim's place against its limits until it is created and counted.
+	Reservation Reservation
+	// LimitsReserved is whether Reservation already holds the NodeClaim's place against its NodePool's resource
+	// limits, as the disruption queue reserves a replacement's before it marks its candidates, so that creating it
+	// reserves no more.
+	LimitsReserved bool
+
 	Pods                 []*corev1.Pod
 	volumes              scheduling.Volumes
 	reservationManager   *ReservationManager
@@ -63,6 +70,41 @@ type NodeClaim struct {
 	// creditReservationCapacity models slots a disruption candidate will free on termination: a reservation with a
 	// positive credit here is classified as reservable even if its offering's static ReservationCapacity is 0.
 	creditReservationCapacity map[string]int // reservationID -> credit count
+}
+
+// Reservation holds a NodeClaim's place against a limit. Bind it to the NodeClaim once created, so it is released
+// once the NodeClaim counts against the limit, or Release it if the NodeClaim won't be created.
+type Reservation interface {
+	// Bind takes the NodeClaim's name.
+	Bind(nodeClaimName string)
+	Release()
+}
+
+// Reservations are the Reservations one NodeClaim holds against several limits, bound and released together.
+type Reservations []Reservation
+
+func (r Reservations) Bind(nodeClaimName string) {
+	for _, reservation := range r {
+		reservation.Bind(nodeClaimName)
+	}
+}
+
+func (r Reservations) Release() {
+	for _, reservation := range r {
+		reservation.Release()
+	}
+}
+
+// AddReservation adds reservation to what the NodeClaim holds.
+func (n *NodeClaim) AddReservation(reservation Reservation) {
+	switch existing := n.Reservation.(type) {
+	case nil:
+		n.Reservation = reservation
+	case Reservations:
+		n.Reservation = append(existing, reservation)
+	default:
+		n.Reservation = Reservations{existing, reservation}
+	}
 }
 
 // ReservedOfferingError indicates a NodeClaim couldn't be created or a pod couldn't be added to an exxisting NodeClaim
