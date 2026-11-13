@@ -65,6 +65,9 @@ const (
 
 type NodeDrainError struct {
 	error
+	// RetryAt is the earliest time a waiting pod's drain changes with time alone, as it becomes stuck terminating or
+	// due for force deletion. It is zero when no waiting pod has such a time.
+	RetryAt time.Time
 }
 
 func NewNodeDrainError(err error) *NodeDrainError {

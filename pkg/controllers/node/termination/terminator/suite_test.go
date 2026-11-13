@@ -18,6 +18,7 @@ package terminator_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -363,5 +364,50 @@ var _ = Describe("Eviction/Queue", func() {
 			pod = ExpectExists(ctx, env.Client, pod)
 			Expect(pod.DeletionTimestamp).ToNot(BeNil())
 		})
+	})
+})
+
+var _ = Describe("Drain", func() {
+	var t *terminator.Terminator
+	var node *corev1.Node
+	drainError := func(nodeTerminationTime *time.Time, opts ...terminator.DrainOption) *terminator.NodeDrainError {
+		GinkgoHelper()
+		err := t.Drain(ctx, node, nodeTerminationTime, opts...)
+		var drainErr *terminator.NodeDrainError
+		Expect(errors.As(err, &drainErr)).To(BeTrue())
+		return drainErr
+	}
+	podOnNode := func(tgp int64) *corev1.Pod {
+		return test.Pod(test.PodOptions{NodeName: node.Name, TerminationGracePeriodSeconds: new(tgp)})
+	}
+	BeforeEach(func() {
+		env.Clock.SetTime(time.Now())
+		t = terminator.NewTerminator(env.Clock, env.Client, queue, recorder)
+		node = test.Node(test.NodeOptions{ProviderID: "my-provider"})
+	})
+	It("should retry once a terminating pod is stuck terminating", func() {
+		pod := podOnNode(30)
+		ExpectApplied(ctx, env.Client, node, pod)
+		DeferCleanup(func() { ExpectFinalizersRemoved(ctx, env.Client, pod) })
+		ExpectDeletionTimestampSet(ctx, env.Client, pod)
+		pod = ExpectExists(ctx, env.Client, pod)
+		env.Clock.SetTime(pod.DeletionTimestamp.Time)
+		Expect(drainError(nil).RetryAt).To(BeTemporally("==", pod.DeletionTimestamp.Add(time.Minute)))
+	})
+	It("should retry at the earliest time a pod is due for force deletion", func() {
+		ExpectApplied(ctx, env.Client, node, podOnNode(60), podOnNode(120))
+		nodeTerminationTime := env.Clock.Now().Add(5 * time.Minute)
+		Expect(drainError(&nodeTerminationTime).RetryAt).To(BeTemporally("==", nodeTerminationTime.Add(-120*time.Second)))
+		env.Clock.SetTime(nodeTerminationTime.Add(-90 * time.Second))
+		Expect(drainError(&nodeTerminationTime).RetryAt).To(BeTemporally("==", nodeTerminationTime.Add(-60*time.Second)))
+	})
+	It("should not retry at a force deletion time when leaving residual pods", func() {
+		ExpectApplied(ctx, env.Client, node, podOnNode(60))
+		nodeTerminationTime := env.Clock.Now().Add(5 * time.Minute)
+		Expect(drainError(&nodeTerminationTime, terminator.LeaveResidualPods()).RetryAt.IsZero()).To(BeTrue())
+	})
+	It("should not retry at a time when no pod changes with time", func() {
+		ExpectApplied(ctx, env.Client, node, podOnNode(60))
+		Expect(drainError(nil).RetryAt.IsZero()).To(BeTrue())
 	})
 })
