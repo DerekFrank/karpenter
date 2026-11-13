@@ -55,8 +55,12 @@ type VPAController struct {
 	lastSeen map[types.NamespacedName]string
 }
 
-func NewVPAController(kubeClient client.Client, store *prediction.Store, cluster *state.Cluster, recorder events.Recorder) *VPAController {
+// The VPA types are registered with the scheme before anything reads it, since a running cache decodes with it.
+func init() {
 	utilruntime.Must(vpav1.AddToScheme(scheme.Scheme))
+}
+
+func NewVPAController(kubeClient client.Client, store *prediction.Store, cluster *state.Cluster, recorder events.Recorder) *VPAController {
 	return &VPAController{
 		kubeClient: kubeClient,
 		store:      store,
@@ -77,7 +81,7 @@ func (c *VPAController) Reconcile(ctx context.Context) (reconciler.Result, error
 			}
 			c.lastSeen = make(map[types.NamespacedName]string)
 			c.store.MarkHydrated()
-			return reconciler.Result{RequeueAfter: 1 * time.Minute}, nil
+			return reconciler.Result{RequeueAfter: 1 * time.Minute}, nil //storelint:deadline poll: VPA predictions (review 11)
 		}
 		return reconciler.Result{}, err
 	}
@@ -99,7 +103,7 @@ func (c *VPAController) Reconcile(ctx context.Context) (reconciler.Result, error
 		c.cluster.MarkUnconsolidated()
 	}
 	c.store.MarkHydrated()
-	return reconciler.Result{RequeueAfter: 30 * time.Second}, nil
+	return reconciler.Result{RequeueAfter: 30 * time.Second}, nil //storelint:deadline poll: VPA predictions (review 11)
 }
 
 // deleteUnseen removes predictions of VPAs that no longer exist and reports whether the store's predictions changed.

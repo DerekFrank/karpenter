@@ -296,7 +296,7 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 	c.recordPodStartupMetric(pod, schedulableTime)
 	c.recordPodBoundMetric(pod, schedulableTime)
 	// Requeue every 30s for pods that are stuck without a state change
-	return reconcile.Result{RequeueAfter: 30 * time.Second}, nil
+	return reconcile.Result{RequeueAfter: 30 * time.Second}, nil //storelint:deadline poll: pods stuck without a state change
 }
 
 func (c *Controller) recordPodSchedulingUndecidedMetric(pod *corev1.Pod) {

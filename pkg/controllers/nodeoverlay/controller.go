@@ -137,7 +137,7 @@ func (c *Controller) Reconcile(ctx context.Context, _ reconcile.Request) (reconc
 	if errs != nil {
 		return reconcile.Result{}, errs
 	}
-	return reconcile.Result{RequeueAfter: 6 * time.Hour}, nil
+	return reconcile.Result{RequeueAfter: 6 * time.Hour}, nil //storelint:deadline periodic revalidation of overlays
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
