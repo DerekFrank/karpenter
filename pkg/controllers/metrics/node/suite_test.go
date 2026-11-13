@@ -22,12 +22,10 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/util/workqueue"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/config"
@@ -110,7 +108,6 @@ var _ = Describe("Node Metrics", func() {
 	It("should update the allocatable metric", func() {
 		ExpectApplied(ctx, env.Client, node)
 		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
-		ExpectSingletonReconciled(ctx, metricsStateController)
 
 		for k, v := range resources {
 			// A plain node with no NodeClaim is not managed by Karpenter.
@@ -137,7 +134,6 @@ var _ = Describe("Node Metrics", func() {
 
 		ExpectApplied(ctx, env.Client, managedNode, nodeClaim)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeController, nodeClaimController, []*corev1.Node{managedNode}, []*v1.NodeClaim{nodeClaim})
-		ExpectSingletonReconciled(ctx, metricsStateController)
 
 		for k, v := range resources {
 			metric, found := FindMetricWithLabelValues("karpenter_nodes_allocatable", map[string]string{
@@ -153,7 +149,6 @@ var _ = Describe("Node Metrics", func() {
 
 		ExpectApplied(ctx, env.Client, node)
 		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
-		ExpectSingletonReconciled(ctx, metricsStateController)
 
 		metric, found := FindMetricWithLabelValues("karpenter_nodes_current_lifetime_seconds", map[string]string{
 			"node_name": node.GetName(),
@@ -173,7 +168,6 @@ var _ = Describe("Node Metrics", func() {
 	It("should remove the node metric gauge when the node is deleted", func() {
 		ExpectApplied(ctx, env.Client, node)
 		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
-		ExpectSingletonReconciled(ctx, metricsStateController)
 
 		_, found := FindMetricWithLabelValues("karpenter_nodes_allocatable", map[string]string{
 			"node_name": node.GetName(),
@@ -182,62 +176,11 @@ var _ = Describe("Node Metrics", func() {
 
 		ExpectDeleted(ctx, env.Client, node)
 		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
-		ExpectSingletonReconciled(ctx, metricsStateController)
 
 		_, found = FindMetricWithLabelValues("karpenter_nodes_allocatable", map[string]string{
 			"node_name": node.GetName(),
 		})
 		Expect(found).To(BeFalse())
-	})
-})
-
-var _ = Describe("Node Metrics Wakes", func() {
-	var queue workqueue.TypedRateLimitingInterface[reconcile.Request]
-	var n *corev1.Node
-	var nodeClaim *v1.NodeClaim
-	BeforeEach(func() {
-		cluster.Reset()
-		c := metricsStateController
-		queue = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
-		DeferCleanup(queue.ShutDown)
-		started, stop := context.WithCancel(ctx)
-		DeferCleanup(stop)
-		Expect(c.Wakes().Start(started, queue)).To(Succeed())
-		nodeClaim, n = test.NodeClaimAndNode()
-		ExpectApplied(ctx, env.Client, nodeClaim, n)
-		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
-		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(n))
-		Expect(woken(queue)).To(BeTrue(), "want a wake for the new node")
-	})
-	It("should wake when a pod binds to a node or leaves it, and not when its status changes", func() {
-		pod := test.Pod(test.PodOptions{NodeName: n.Name, ResourceRequirements: corev1.ResourceRequirements{
-			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
-		}})
-		ExpectApplied(ctx, env.Client, pod)
-		cluster.PodStore.Observe(pod)
-		Expect(woken(queue)).To(BeTrue(), "want a wake for the pod binding")
-
-		pod.Status.Phase = corev1.PodRunning
-		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
-		Expect(env.Client.Status().Update(ctx, pod)).To(Succeed())
-		cluster.PodStore.Observe(pod)
-		Expect(lo.Must(cluster.PodStore.Get(client.ObjectKeyFromObject(pod))).Object.Status.Phase).To(Equal(corev1.PodRunning))
-		Expect(woken(queue)).To(BeFalse(), "want nothing for the pod's status")
-
-		ExpectDeleted(ctx, env.Client, pod)
-		cluster.PodStore.Forget(client.ObjectKeyFromObject(pod))
-		Expect(woken(queue)).To(BeTrue(), "want a wake for the pod leaving the node")
-	})
-	It("should not wake when a NodeClaim's status or intent changes", func() {
-		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
-		ExpectApplied(ctx, env.Client, nodeClaim)
-		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
-		cs.Nomination.Nominate(ctx, nodeClaim.Name)
-		cs.Deletion.Mark(nodeClaim.Name)
-		Expect(woken(queue)).To(BeFalse(), "want nothing for the NodeClaim's status, nomination or deletion mark")
-	})
-	It("should rebuild by the lifetime refresh while nothing changes", func() {
-		Expect(ExpectSingletonReconciled(ctx, metricsStateController).RequeueAfter).To(Equal(node.LifetimeRefresh))
 	})
 })
 
@@ -257,7 +200,6 @@ var _ = Describe("Cluster State Node Count", func() {
 				ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(obj))
 			}
 		}
-		ExpectSingletonReconciled(ctx, metricsStateController)
 	}
 	It("should keep the contribution laws for the node count", func() {
 		for _, b := range []node.NodeCounts{{}, {LaunchedNodeClaims: 2, UnmanagedNodes: 1}} {
@@ -274,32 +216,29 @@ var _ = Describe("Cluster State Node Count", func() {
 		unlaunched.Status.ProviderID = ""
 		unmanaged := test.Node(test.NodeOptions{ProviderID: test.RandomProviderID()})
 		apply(nodeClaim, unlaunched, unmanaged)
-		ExpectMetricGaugeValue(node.ClusterStateNodesCount, 2, nil)
+		expectNodeCount(2)
 
 		// A Node that registers with its NodePool label is its NodeClaim's node before the owner reference lands.
 		apply(registering)
-		ExpectMetricGaugeValue(node.ClusterStateNodesCount, 2, nil)
+		expectNodeCount(2)
 		// Without the label, it reads as unmanaged until the owner reference lands.
 		registering = ExpectExists(ctx, env.Client, registering)
 		delete(registering.Labels, v1.NodePoolLabelKey)
 		apply(registering)
-		ExpectMetricGaugeValue(node.ClusterStateNodesCount, 3, nil)
+		expectNodeCount(3)
 		apply(nodeclaimutils.UpdateNodeOwnerReferences(ExpectExists(ctx, env.Client, nodeClaim), ExpectExists(ctx, env.Client, registering)))
-		ExpectMetricGaugeValue(node.ClusterStateNodesCount, 2, nil)
+		expectNodeCount(2)
 
 		ExpectDeleted(ctx, env.Client, unmanaged)
 		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(unmanaged))
-		ExpectSingletonReconciled(ctx, metricsStateController)
-		ExpectMetricGaugeValue(node.ClusterStateNodesCount, 1, nil)
+		expectNodeCount(1)
 	})
 })
 
-// woken returns whether the queue holds a request, and empties it.
-func woken(queue workqueue.TypedRateLimitingInterface[reconcile.Request]) bool {
-	found := queue.Len() > 0
-	for queue.Len() > 0 {
-		req, _ := queue.Get()
-		queue.Done(req)
-	}
-	return found
+// expectNodeCount expects the cluster state node count gauge, as a scrape reads it.
+func expectNodeCount(n int) {
+	GinkgoHelper()
+	metric, found := FindMetricWithLabelValues("karpenter_cluster_state_node_count", map[string]string{})
+	Expect(found).To(BeTrue())
+	Expect(metric.GetGauge().GetValue()).To(BeNumerically("==", n))
 }

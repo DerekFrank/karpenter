@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/metrics/nodepool"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
@@ -47,6 +48,7 @@ var ctx context.Context
 var env *test.Environment
 var cp *fake.CloudProvider
 var cc *cost.ClusterCost
+var cs karpentercluster.State
 
 func TestAPIs(t *testing.T) {
 	ctx = TestContextWithLogger(t)
@@ -58,7 +60,9 @@ var _ = BeforeSuite(func() {
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...))
 	cp = fake.NewCloudProvider()
 	cc = cost.NewClusterCost(ctx, cp, env.Client)
-	nodePoolController = nodepool.NewController(env.Client, cp, cc)
+	cs = karpentercluster.New(ctx, env.Clock, nil, nil, cp)
+	nodePoolController = nodepool.NewController(cs.NodePoolState, cp, cc)
+	Expect(nodePoolController.Register(ctx, nil)).To(Succeed())
 })
 
 var _ = AfterSuite(func() {
@@ -99,7 +103,7 @@ var _ = Describe("Metrics", func() {
 				}
 			}
 			ExpectApplied(ctx, env.Client, nodePool)
-			ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
+			cs.NodePoolState.Observe(nodePool)
 
 			for k, v := range limits {
 				m, found := FindMetricWithLabelValues("karpenter_nodepools_limit", map[string]string{
@@ -124,7 +128,7 @@ var _ = Describe("Metrics", func() {
 		nodePool.Status.Resources = resources
 
 		ExpectApplied(ctx, env.Client, nodePool)
-		ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
+		cs.NodePoolState.Observe(nodePool)
 
 		for k, v := range resources {
 			m, found := FindMetricWithLabelValues("karpenter_nodepools_usage", map[string]string{
@@ -148,7 +152,7 @@ var _ = Describe("Metrics", func() {
 			corev1.ResourceEphemeralStorage: resource.MustParse("100Gi"),
 		}
 		ExpectApplied(ctx, env.Client, nodePool)
-		ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
+		cs.NodePoolState.Observe(nodePool)
 
 		for _, name := range expectedMetrics {
 			_, found := FindMetricWithLabelValues(name, map[string]string{
@@ -158,7 +162,7 @@ var _ = Describe("Metrics", func() {
 		}
 
 		ExpectDeleted(ctx, env.Client, nodePool)
-		ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
+		cs.NodePoolState.Forget(nodePool.Name)
 
 		for _, name := range expectedMetrics {
 			_, found := FindMetricWithLabelValues(name, map[string]string{
@@ -215,9 +219,5 @@ var _ = Describe("NodePool Metrics Wakes", func() {
 
 		Expect(cc.DeleteNodeClaim(ctx, client.ObjectKeyFromObject(nodeClaim))).To(Succeed())
 		Expect(drain()).To(Equal([]string{nodePool.Name}), "want the NodePool for its NodeClaim going away")
-	})
-	It("should update its metrics without a periodic requeue", func() {
-		ExpectApplied(ctx, env.Client, nodePool)
-		Expect(ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool)).RequeueAfter).To(BeZero())
 	})
 })

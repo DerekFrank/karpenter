@@ -17,6 +17,7 @@ limitations under the License.
 package cluster
 
 import (
+	"iter"
 	"maps"
 
 	"github.com/samber/lo"
@@ -174,6 +175,10 @@ func (n *NodePoolState) Get(nodePoolName string) NodePoolFields {
 	e, _ := n.store.Get(nodePoolName)
 	return e.Derived
 }
+
+// List returns each NodePool's entry, by name. The entries share the store's NodePools, which must not be modified:
+// it's for a reader that walks every entry, such as a scrape, which can't afford a copy of each.
+func (n *NodePoolState) List() iter.Seq2[string, NodePoolEntry] { return n.store.List() }
 
 // Source is the NodePools' entries as a source, which enqueues each NodePool whose entry changes.
 func (n *NodePoolState) Source() source.SyncingSource { return n.store.Source() }
