@@ -20,8 +20,8 @@ import (
 	"context"
 	"testing"
 
+	"sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/nodepool/registrationhealth"
-	"sigs.k8s.io/karpenter/pkg/state/nodepoolhealth"
 
 	"github.com/awslabs/operatorpkg/object"
 	. "github.com/onsi/ginkgo/v2"
@@ -29,10 +29,15 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/workqueue"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpstate "sigs.k8s.io/karpenter/pkg/state"
+	"sigs.k8s.io/karpenter/pkg/state/statetest"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
@@ -46,7 +51,9 @@ var (
 	cloudProvider *fake.CloudProvider
 	nodePool      *v1.NodePool
 	nodeClass     *v1alpha1.TestNodeClass
-	npState       *nodepoolhealth.State
+	npState       *cluster.NodePoolState
+	registrations *cluster.Registrations
+	nodePools     *cluster.NodePools
 )
 
 func TestAPIs(t *testing.T) {
@@ -58,8 +65,10 @@ func TestAPIs(t *testing.T) {
 var _ = BeforeSuite(func() {
 	cloudProvider = fake.NewCloudProvider()
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...))
-	npState = nodepoolhealth.NewState()
-	controller = registrationhealth.NewController(env.Clock, env.Client, cloudProvider, npState)
+	cs := cluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
+	npState, registrations = cs.NodePoolState, cs.Registrations
+	nodePools = cluster.NewNodePools(env.Overlay, npState)
+	controller = registrationhealth.NewController(env.Clock, env.Overlay, cloudProvider, npState)
 })
 var _ = AfterEach(func() {
 	ExpectCleanedUp(ctx, env.Client)
@@ -68,6 +77,31 @@ var _ = AfterEach(func() {
 var _ = AfterSuite(func() {
 	Expect(env.Stop()).To(Succeed(), "Failed to stop environment")
 })
+
+// record records a launch outcome for the NodePool's current spec, as the NodeClaim lifecycle controller does.
+func record(registered bool) {
+	outcome := cluster.RegistrationOutcome{Registered: registered}
+	if !registered {
+		outcome.Reason, outcome.Message = "InsufficientCapacity", "no capacity"
+	}
+	registrations.Record(nodePool, nodeClass.GetGeneration(), outcome)
+}
+
+// expectRecordUntouched expects nothing recorded for the NodePool, so the controller wrote no outcome.
+func expectRecordUntouched() {
+	GinkgoHelper()
+	np, err := nodePools.Get(ctx, client.ObjectKeyFromObject(nodePool))
+	Expect(err).ToNot(HaveOccurred())
+	Expect(np.Intent.Registration.Value).To(BeZero(), "the controller recorded launch outcomes")
+}
+
+func expectCondition(want metav1.ConditionStatus) {
+	GinkgoHelper()
+	nodePool = ExpectExists(ctx, env.Client, nodePool)
+	cond := nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy)
+	Expect(cond).ToNot(BeNil(), "NodeRegistrationHealthy is unset")
+	Expect(cond.Status).To(Equal(want), "NodeRegistrationHealthy = %+v", cond)
+}
 
 var _ = Describe("RegistrationHealth", func() {
 	BeforeEach(func() {
@@ -79,6 +113,12 @@ var _ = Describe("RegistrationHealth", func() {
 		nodePool.Spec.Template.Spec.NodeClassRef.Kind = object.GVK(nodeClass).Kind
 		_ = nodePool.StatusConditions().Clear(v1.ConditionTypeNodeRegistrationHealthy)
 	})
+	// apply applies the NodePool and its NodeClass; env.Client waits until the NodePool store has seen the NodePool.
+	apply := func() {
+		GinkgoHelper()
+		ExpectApplied(ctx, env.Client, nodePool, nodeClass)
+		nodePool = ExpectExists(ctx, env.Client, nodePool)
+	}
 	It("should ignore setting NodeRegistrationHealthy status condition on NodePools which aren't managed by this instance of Karpenter", func() {
 		nodePool.Spec.Template.Spec.NodeClassRef = &v1.NodeClassReference{
 			Group: "karpenter.test.sh",
@@ -96,47 +136,188 @@ var _ = Describe("RegistrationHealth", func() {
 		nodePool = ExpectExists(ctx, env.Client, nodePool)
 		Expect(nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy)).To(BeNil())
 	})
-	It("should set NodeRegistrationHealthy status condition on nodePool as Unknown and reset the NodeRegistrationHealthBuffer if the nodeClass observed generation doesn't match with that on nodePool", func() {
+	It("should set NodeRegistrationHealthy status condition on a new nodePool as Unknown", func() {
+		apply()
+		_ = ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+		expectCondition(metav1.ConditionUnknown)
+		Expect(nodePool.Status.NodeClassObservedGeneration).To(Equal(nodeClass.GetGeneration()))
+		expectRecordUntouched()
+	})
+	It("should set NodeRegistrationHealthy status condition to True once a recorded NodeClaim registers", func() {
+		apply()
+		record(true)
+		_ = ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+		expectCondition(metav1.ConditionTrue)
+	})
+	It("should set NodeRegistrationHealthy status condition to False with the newest failure's reason once recorded failures reach the threshold", func() {
+		nodePool.StatusConditions().SetTrue(v1.ConditionTypeNodeRegistrationHealthy)
+		apply()
+		record(true)
+		record(false)
+		_ = ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+		expectCondition(metav1.ConditionTrue)
+
+		registrations.Record(nodePool, nodeClass.GetGeneration(), cluster.RegistrationOutcome{Reason: "RegistrationFailed", Message: "Failed to register node"})
+		_ = ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+		expectCondition(metav1.ConditionFalse)
+		cond := nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy)
+		Expect(cond.Reason).To(Equal("RegistrationFailed"))
+		Expect(cond.Message).To(Equal("Failed to register node"))
+	})
+	It("should keep NodeRegistrationHealthy status condition False until registrations bring the failures under the threshold", func() {
+		apply()
+		record(false)
+		record(false)
+		record(true)
+		_ = ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+		expectCondition(metav1.ConditionFalse)
+
+		record(true)
+		record(true)
+		_ = ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+		expectCondition(metav1.ConditionTrue)
+	})
+	It("should set NodeRegistrationHealthy status condition on nodePool as Unknown, ignoring the recorded outcomes, if the nodeClass generation changes", func() {
 		nodePool.StatusConditions().SetFalse(v1.ConditionTypeNodeRegistrationHealthy, "unhealthy", "unhealthy")
 		nodePool.Status.NodeClassObservedGeneration = int64(1)
-		ExpectApplied(ctx, env.Client, nodePool, nodeClass)
+		apply()
+		record(false)
+		record(false)
+		_ = ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+		expectCondition(metav1.ConditionFalse)
 
 		nodeClass.Spec.Tags = map[string]string{"keyTag-1": "valueTag-1"}
 		ExpectApplied(ctx, env.Client, nodeClass)
+		Expect(nodeClass.GetGeneration()).To(Equal(int64(2)))
 		_ = ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
-		nodePool = ExpectExists(ctx, env.Client, nodePool)
-		Expect(nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy).IsUnknown()).To(BeTrue())
+		expectCondition(metav1.ConditionUnknown)
 		Expect(nodePool.Status.NodeClassObservedGeneration).To(Equal(int64(2)))
-		Expect(npState.Status(nodePool.UID)).To(BeEquivalentTo(nodepoolhealth.StatusUnknown))
+
+		// Outcomes recorded for the new NodeClass generation decide the condition.
+		record(true)
+		_ = ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+		expectCondition(metav1.ConditionTrue)
 	})
-	It("should set NodeRegistrationHealthy status condition on nodePool as Unknown if the nodePool is updated", func() {
+	It("should set NodeRegistrationHealthy status condition on nodePool as Unknown, ignoring the recorded outcomes, if the nodePool is updated", func() {
 		nodePool.StatusConditions().SetFalse(v1.ConditionTypeNodeRegistrationHealthy, "unhealthy", "unhealthy")
 		nodePool.Status.NodeClassObservedGeneration = int64(1)
-		ExpectApplied(ctx, env.Client, nodePool, nodeClass)
+		apply()
+		record(false)
+		record(false)
 
 		nodePool.Spec.Limits = map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("14")}
-		ExpectApplied(ctx, env.Client, nodePool, nodeClass)
+		apply()
 		_ = ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
-		nodePool = ExpectExists(ctx, env.Client, nodePool)
-		Expect(nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy).IsUnknown()).To(BeTrue())
-		Expect(npState.Status(nodePool.UID)).To(BeEquivalentTo(nodepoolhealth.StatusUnknown))
+		expectCondition(metav1.ConditionUnknown)
+		Expect(npState.RegistrationHealth(nodePool, nodeClass.GetGeneration()).Status).To(Equal(cluster.RegistrationUnknown))
 	})
-	It("should not set NodeRegistrationHealthy status condition on nodePool as Unknown if it is already set to true", func() {
-		nodePool.StatusConditions().SetTrue(v1.ConditionTypeNodeRegistrationHealthy)
-		nodePool.Status.NodeClassObservedGeneration = int64(1)
-		ExpectApplied(ctx, env.Client, nodePool, nodeClass)
-		_ = ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
-		nodePool = ExpectExists(ctx, env.Client, nodePool)
-		Expect(nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy).IsUnknown()).To(BeFalse())
-		Expect(npState.Status(nodePool.UID)).To(BeEquivalentTo(nodepoolhealth.StatusHealthy))
+	// After a restart nothing is recorded, and a condition observed for the current spec stands.
+	DescribeTable("should keep a persisted NodeRegistrationHealthy status condition when no outcomes are recorded",
+		func(set func(*v1.NodePool), want metav1.ConditionStatus) {
+			set(nodePool)
+			nodePool.Status.NodeClassObservedGeneration = int64(1)
+			apply()
+			_ = ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+			expectCondition(want)
+			expectRecordUntouched()
+
+			// A single failure doesn't decide the health, so the persisted condition still stands.
+			record(false)
+			_ = ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+			expectCondition(want)
+		},
+		Entry("True", func(np *v1.NodePool) { np.StatusConditions().SetTrue(v1.ConditionTypeNodeRegistrationHealthy) }, metav1.ConditionTrue),
+		Entry("False", func(np *v1.NodePool) {
+			np.StatusConditions().SetFalse(v1.ConditionTypeNodeRegistrationHealthy, "unhealthy", "unhealthy")
+		}, metav1.ConditionFalse),
+	)
+	It("should drop the NodePool's launch outcomes once the NodePool is deleted", func() {
+		apply()
+		record(false)
+		record(false)
+		Expect(npState.RegistrationHealth(nodePool, nodeClass.GetGeneration()).Status).To(Equal(cluster.RegistrationUnhealthy))
+
+		ExpectDeleted(ctx, env.Client, nodePool)
+		Expect(npState.RegistrationHealth(nodePool, nodeClass.GetGeneration()).Status).To(Equal(cluster.RegistrationUnknown))
 	})
-	It("should not set NodeRegistrationHealthy status condition on nodePool as Unknown if it is already set to false", func() {
-		nodePool.StatusConditions().SetFalse(v1.ConditionTypeNodeRegistrationHealthy, "unhealthy", "unhealthy")
-		nodePool.Status.NodeClassObservedGeneration = int64(1)
-		ExpectApplied(ctx, env.Client, nodePool, nodeClass)
-		_ = ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
-		nodePool = ExpectExists(ctx, env.Client, nodePool)
-		Expect(nodePool.StatusConditions().Get(v1.ConditionTypeNodeRegistrationHealthy).IsUnknown()).To(BeFalse())
-		Expect(npState.Status(nodePool.UID)).To(BeEquivalentTo(nodepoolhealth.StatusUnhealthy))
+	It("should drop the launch outcomes of a NodePool replaced by another of the same name", func() {
+		apply()
+		record(false)
+		record(false)
+
+		// Delete and re-create the NodePool under the same name; the API server gives it a new UID, so the recorded
+		// outcomes, keyed by the original UID, no longer count for either the old or the replacement spec.
+		ExpectDeleted(ctx, env.Client, nodePool)
+		replacement := test.NodePool(v1.NodePool{
+			ObjectMeta: metav1.ObjectMeta{Name: nodePool.Name},
+			Spec:       nodePool.Spec,
+		})
+		ExpectApplied(ctx, env.Client, replacement)
+		replacement = ExpectExists(ctx, env.Client, replacement)
+		Expect(npState.RegistrationHealth(replacement, nodeClass.GetGeneration()).Status).To(Equal(cluster.RegistrationUnknown))
+		Expect(npState.RegistrationHealth(nodePool, nodeClass.GetGeneration()).Status).To(Equal(cluster.RegistrationUnknown))
+	})
+})
+
+var _ = Describe("RegistrationHealth Wakes", func() {
+	var state *cluster.NodePoolState
+	var recorder *cluster.Registrations
+	var srcs *statetest.Sources
+	var queue workqueue.TypedRateLimitingInterface[reconcile.Request]
+	BeforeEach(func() {
+		// Build a fresh state per spec over an in-memory source, so this spec drives the source it reads from without
+		// the main suite's overlay or cache in the loop.
+		srcs = statetest.NewSources()
+		cs := cluster.New(ctx, env.Clock, nil, cloudProvider, cluster.WithSources(func(o client.Object) karpstate.Newest { return srcs.For(o) }))
+		state, recorder = cs.NodePoolState, cs.Registrations
+		c := registrationhealth.NewController(env.Clock, env.Overlay, cloudProvider, state)
+		queue = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+		DeferCleanup(queue.ShutDown)
+		started, stop := context.WithCancel(ctx)
+		DeferCleanup(stop)
+		Expect(c.Registrations().Start(started, queue)).To(Succeed())
+	})
+	drain := func() []string {
+		var names []string
+		for queue.Len() > 0 {
+			req, _ := queue.Get()
+			names = append(names, req.Name)
+			queue.Done(req)
+		}
+		return names
+	}
+	It("should wake for a NodePool when it appears, its spec or registration health changes, or it goes, and not on its status", func() {
+		np := test.NodePool()
+		np.UID = "wakes-np"
+		np.ResourceVersion = "1"
+		np.Generation = 1
+		srcs.Put(np.DeepCopy())
+		Expect(drain()).To(Equal([]string{np.Name}), "want the NodePool once it's seen")
+
+		recorder.Record(np, 1, cluster.RegistrationOutcome{Registered: true})
+		Expect(drain()).To(Equal([]string{np.Name}), "want the NodePool once an outcome makes it healthy")
+		recorder.Record(np, 1, cluster.RegistrationOutcome{Registered: true})
+		recorder.Record(np, 1, cluster.RegistrationOutcome{Reason: "Failed"})
+		Expect(drain()).To(BeEmpty(), "want nothing for outcomes that leave its health")
+		recorder.Record(np, 1, cluster.RegistrationOutcome{Reason: "Failed"})
+		Expect(drain()).To(Equal([]string{np.Name}), "want the NodePool once an outcome makes it unhealthy")
+		recorder.Record(np, 2, cluster.RegistrationOutcome{Reason: "Failed"})
+		Expect(drain()).To(Equal([]string{np.Name}), "want the NodePool once outcomes are recorded for a new spec")
+
+		statusOnly := np.DeepCopy()
+		statusOnly.StatusConditions().SetTrue(v1.ConditionTypeNodeRegistrationHealthy)
+		statusOnly.ResourceVersion = "2"
+		srcs.Put(statusOnly)
+		Expect(drain()).To(BeEmpty(), "want nothing for the NodePool's status")
+
+		specChange := statusOnly.DeepCopy()
+		specChange.Spec.Limits = map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("14")}
+		specChange.ResourceVersion = "3"
+		specChange.Generation = 2
+		srcs.Put(specChange)
+		Expect(drain()).To(Equal([]string{np.Name}), "want the NodePool once its spec changes")
+
+		srcs.Remove(np)
+		Expect(drain()).To(Equal([]string{np.Name}), "want the NodePool once it's gone")
 	})
 })

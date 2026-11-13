@@ -41,17 +41,19 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
-	"sigs.k8s.io/karpenter/pkg/state/nodepoolhealth"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
+	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 )
 
 type Registration struct {
 	kubeClient        client.Client
+	cloudProvider     cloudprovider.CloudProvider
 	recorder          events.Recorder
-	npState           *nodepoolhealth.State
+	registrations     *karpentercluster.Registrations
 	registrationHooks []cloudprovider.NodeLifecycleHook
 	clock             clock.Clock
 }
@@ -124,10 +126,7 @@ func (r *Registration) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (
 		metrics.NodePoolLabel: nodeClaim.Labels[v1.NodePoolLabelKey],
 		metrics.ZoneLabel:     nodeClaim.Labels[corev1.LabelTopologyZone],
 	})
-	if err := r.updateNodePoolRegistrationHealth(ctx, nodeClaim); client.IgnoreNotFound(err) != nil {
-		if errors.IsConflict(err) {
-			return reconcile.Result{Requeue: true}, nil
-		}
+	if err := recordLaunchOutcome(ctx, r.kubeClient, r.cloudProvider, r.registrations, nodeClaim, karpentercluster.RegistrationOutcome{Registered: true}); client.IgnoreNotFound(err) != nil {
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
@@ -160,7 +159,7 @@ func (r *Registration) checkRegistrationHooks(ctx context.Context, nodeClaim *v1
 			pendingHooks = append(pendingHooks, r.registrationHooks[i].Name())
 			if errs[i] == nil {
 				if mergedResult.RequeueAfter == 0 || (result.RequeueAfter > 0 && result.RequeueAfter < mergedResult.RequeueAfter) {
-					mergedResult.RequeueAfter = result.RequeueAfter
+					mergedResult.RequeueAfter = result.RequeueAfter //storelint:deadline the earliest of the registration hooks' deadlines
 				}
 				mergedResult.Requeue = mergedResult.Requeue || result.Requeue //nolint:staticcheck
 			}
@@ -175,31 +174,34 @@ func (r *Registration) checkRegistrationHooks(ctx context.Context, nodeClaim *v1
 	return reconcile.Result{}, nil
 }
 
-// updateNodePoolRegistrationHealth adds a positive value to the nodepool buffer that stores node
-// registration results and sets NodeRegistrationHealthy=True on the NodePool if IsHealthy() > 0
-func (r *Registration) updateNodePoolRegistrationHealth(ctx context.Context, nodeClaim *v1.NodeClaim) error {
+// recordLaunchOutcome records the NodeClaim's launch outcome against the spec of the NodePool that owns it and its
+// NodeClass. It writes only the NodePool's Registration intent: the registration health controller derives the
+// NodePool's NodeRegistrationHealthy condition from it. A NodeClaim whose NodePool is gone, or was replaced by another
+// of the same name, records nothing.
+func recordLaunchOutcome(ctx context.Context, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, registrations *karpentercluster.Registrations,
+	nodeClaim *v1.NodeClaim, outcome karpentercluster.RegistrationOutcome) error {
 	nodePoolName := nodeClaim.Labels[v1.NodePoolLabelKey]
-	if nodePoolName != "" {
-		nodePool := &v1.NodePool{}
-		if err := r.kubeClient.Get(ctx, types.NamespacedName{Name: nodePoolName}, nodePool); err != nil {
-			return serrors.Wrap(fmt.Errorf("getting nodepool, %w", err), "NodePool", klog.KRef("", nodePoolName))
-		}
-		if _, found := lo.Find(nodeClaim.GetOwnerReferences(), func(o metav1.OwnerReference) bool {
-			return o.Kind == object.GVK(nodePool).Kind && o.UID == nodePool.UID
-		}); !found {
-			return nil
-		}
-		stored := nodePool.DeepCopy()
-		if r.npState.DryRun(nodePool.UID, true).Status() == nodepoolhealth.StatusHealthy && nodePool.StatusConditions(status.WithClock(r.clock)).SetTrue(v1.ConditionTypeNodeRegistrationHealthy) {
-			// We use client.MergeFromWithOptimisticLock because patching a list with a JSON merge patch
-			// can cause races due to the fact that it fully replaces the list on a change
-			// Here, we are updating the status condition list
-			if err := r.kubeClient.Status().Patch(ctx, nodePool, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); client.IgnoreNotFound(err) != nil {
-				return serrors.Wrap(fmt.Errorf("patching nodepool status, %w", err), "NodePool", klog.KObj(nodePool))
-			}
-		}
-		r.npState.Update(nodePool.UID, true)
+	if nodePoolName == "" {
+		return nil
 	}
+	nodePool := &v1.NodePool{}
+	if err := kubeClient.Get(ctx, types.NamespacedName{Name: nodePoolName}, nodePool); err != nil {
+		return serrors.Wrap(fmt.Errorf("getting nodepool, %w", err), "NodePool", klog.KRef("", nodePoolName))
+	}
+	if _, found := lo.Find(nodeClaim.GetOwnerReferences(), func(o metav1.OwnerReference) bool {
+		return o.Kind == object.GVK(nodePool).Kind && o.UID == nodePool.UID
+	}); !found {
+		return nil
+	}
+	nodeClass, err := nodepoolutils.GetNodeClass(ctx, kubeClient, nodePool, cloudProvider)
+	if err != nil {
+		return serrors.Wrap(fmt.Errorf("getting nodeclass, %w", err), "NodePool", klog.KObj(nodePool))
+	}
+	// A NodePool without a supported NodeClass has no registration health.
+	if nodeClass == nil {
+		return nil
+	}
+	registrations.Record(nodePool, nodeClass.GetGeneration(), outcome)
 	return nil
 }
 
