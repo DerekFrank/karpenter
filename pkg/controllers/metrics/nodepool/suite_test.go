@@ -135,6 +135,15 @@ var _ = Describe("Metrics", func() {
 			Expect(found).To(BeTrue())
 			Expect(m.GetGauge().GetValue()).To(BeNumerically("~", v.AsApproximateFloat64()))
 		}
+
+		delete(nodePool.Status.Resources, corev1.ResourceEphemeralStorage)
+		ExpectApplied(ctx, env.Client, nodePool)
+		ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
+		_, found := FindMetricWithLabelValues("karpenter_nodepools_usage", map[string]string{
+			metrics.NodePoolLabel:     nodePool.GetName(),
+			metrics.ResourceTypeLabel: "ephemeral_storage",
+		})
+		Expect(found).To(BeFalse())
 	})
 	It("should delete the nodepool state metrics on nodepool delete", func() {
 		expectedMetrics := []string{"karpenter_nodepools_limit", "karpenter_nodepools_usage"}

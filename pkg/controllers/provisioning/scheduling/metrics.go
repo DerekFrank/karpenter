@@ -39,6 +39,10 @@ var SchedulingID = opmetrics.Label{
 	Help: "A unique identifier for a scheduling simulation run.",
 }
 
+// controllerKey is the controller dimension as a Key, so Solve can delete the
+// previous run's series for its controller with DeleteByKey.
+var controllerKey = func() opmetrics.Label { l := metrics.Controller; l.Key = true; return l }()
+
 var (
 	DurationSeconds = opmetrics.NewPrometheusHistogram(
 		crmetrics.Registry,
@@ -77,7 +81,7 @@ var (
 			Help:      "The number of pods currently waiting to be scheduled.",
 		},
 		[]opmetrics.Label{
-			metrics.Controller,
+			controllerKey,
 			SchedulingID,
 		},
 		opmetrics.Beta,
@@ -129,7 +133,7 @@ var (
 			Help:      "Pending pods dimensioned by effective zone constraint, or the intersection of pod-level zone signals, volume topology (PVC zones), and topology constraints. Values: specific zone name (e.g., 'us-west-2a'), 'flexible' (multiple zones), or 'none' (no valid intersection).",
 		},
 		[]opmetrics.Label{
-			metrics.Controller,
+			controllerKey,
 			metrics.Zone,
 		},
 		opmetrics.Alpha,

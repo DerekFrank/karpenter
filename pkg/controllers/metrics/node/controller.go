@@ -29,9 +29,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/sets"
 	controllerruntime "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -52,7 +52,7 @@ const (
 // provider's well-known labels, which are self-describing and wrapped without
 // help text (see nodeLabelNames).
 var (
-	nodeNameLabel  = opmetrics.Label{Name: nodeName, Help: "The name of the node."}
+	nodeNameLabel  = opmetrics.Label{Name: nodeName, Help: "The name of the node.", Key: true}
 	nodePhaseLabel = opmetrics.Label{Name: nodePhase, Help: "The node's lifecycle phase, e.g. `Pending`, `Running`."}
 	managedLabel   = opmetrics.Label{Name: managed, Help: "Whether the node is managed by Karpenter.", Values: metrics.BoolValues}
 )
@@ -183,15 +183,19 @@ func nodeLabelNames() []opmetrics.Label {
 }
 
 type Controller struct {
-	cluster     *state.Cluster
-	metricStore *metrics.Store
+	cluster *state.Cluster
+	// nodes and resourceTypes are the node names and cluster utilization resource types
+	// the last reconcile emitted, so the next can delete the series of those now gone.
+	nodes         sets.Set[string]
+	resourceTypes sets.Set[string]
 }
 
 func NewController(cluster *state.Cluster) *Controller {
 	initializeMetrics()
 	return &Controller{
-		cluster:     cluster,
-		metricStore: metrics.NewStore(),
+		cluster:       cluster,
+		nodes:         sets.New[string](),
+		resourceTypes: sets.New[string](),
 	}
 }
 
@@ -202,15 +206,28 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return n.Node == nil
 	})
 
-	// Build per-node metrics
-	metricsMap := lo.SliceToMap(nodes, func(n *state.StateNode) (string, []*metrics.StoreMetric) {
-		return client.ObjectKeyFromObject(n.Node).String(), buildMetrics(n)
-	})
+	names := sets.New[string]()
+	for _, n := range nodes {
+		names.Insert(n.Node.Name)
+		for gauge, series := range buildMetrics(n) {
+			gauge.ReplaceByKey(map[string]string{nodeName: n.Node.Name}, series...)
+		}
+	}
+	for name := range c.nodes.Difference(names) {
+		for _, gauge := range []opmetrics.GaugeMetric{Allocatable, TotalPodRequests, TotalPodLimits, TotalDaemonRequests, TotalDaemonLimits, SystemOverhead, Lifetime} {
+			gauge.DeleteByKey(map[string]string{nodeName: name})
+		}
+	}
+	c.nodes = names
 
-	// Build cluster level metric
-	metricsMap["clusterUtilization"] = buildClusterUtilizationMetric(nodes)
-
-	c.metricStore.ReplaceAll(metricsMap)
+	utilization := buildClusterUtilization(nodes)
+	for resourceType, v := range utilization {
+		ClusterUtilization.Set(v, map[string]string{metrics.ResourceTypeLabel: resourceType})
+	}
+	for resourceType := range c.resourceTypes.Difference(sets.KeySet(utilization)) {
+		ClusterUtilization.Delete(map[string]string{metrics.ResourceTypeLabel: resourceType})
+	}
+	c.resourceTypes = sets.KeySet(utilization)
 
 	return reconciler.Result{RequeueAfter: time.Second * 5}, nil
 }
@@ -226,7 +243,8 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 		Complete(singleton.AsReconciler(c))
 }
 
-func buildClusterUtilizationMetric(nodes state.StateNodes) []*metrics.StoreMetric {
+// buildClusterUtilization returns the utilization percent of each resource type.
+func buildClusterUtilization(nodes state.StateNodes) map[string]float64 {
 
 	// Aggregate resources allocated/utilized for all the nodes and pods inside the nodes
 	allocatableAggregate, utilizedAggregate := corev1.ResourceList{}, corev1.ResourceList{}
@@ -236,7 +254,7 @@ func buildClusterUtilizationMetric(nodes state.StateNodes) []*metrics.StoreMetri
 		resources.MergeInto(utilizedAggregate, node.PodRequests())
 	}
 
-	res := make([]*metrics.StoreMetric, 0, len(allocatableAggregate))
+	res := make(map[string]float64, len(allocatableAggregate))
 
 	for resourceName, allocatableResource := range allocatableAggregate {
 
@@ -253,17 +271,18 @@ func buildClusterUtilizationMetric(nodes state.StateNodes) []*metrics.StoreMetri
 			float64(utilizedResource.MilliValue())/float64(allocatableResource.MilliValue()),
 			float64(utilizedResource.Value())/float64(allocatableResource.Value()))
 
-		res = append(res, &metrics.StoreMetric{
-			GaugeMetric: ClusterUtilization,
-			Value:       utilizationPercentage,
-			Labels:      map[string]string{metrics.ResourceTypeLabel: resourceNameToString(resourceName)},
-		})
+		res[resourceNameToString(resourceName)] = utilizationPercentage
 	}
 
 	return res
 }
 
-func buildMetrics(n *state.StateNode) (res []*metrics.StoreMetric) {
+// buildMetrics returns the series of each node gauge for n. Every gauge is present, even
+// without series, so that ReplaceByKey deletes series n no longer has.
+func buildMetrics(n *state.StateNode) map[opmetrics.GaugeMetric][]opmetrics.Sample {
+	res := map[opmetrics.GaugeMetric][]opmetrics.Sample{
+		Lifetime: {{Value: time.Since(n.Node.GetCreationTimestamp().Time).Seconds(), Labels: getNodeLabels(n)}},
+	}
 	for gaugeMetric, resourceList := range map[opmetrics.GaugeMetric]corev1.ResourceList{
 		SystemOverhead:      resources.Subtract(n.Node.Status.Capacity, n.Node.Status.Allocatable),
 		TotalPodRequests:    n.PodRequests(),
@@ -272,20 +291,14 @@ func buildMetrics(n *state.StateNode) (res []*metrics.StoreMetric) {
 		TotalDaemonLimits:   n.DaemonSetLimits(),
 		Allocatable:         n.Node.Status.Allocatable,
 	} {
-		for resourceName, quantity := range resourceList {
-			res = append(res, &metrics.StoreMetric{
-				GaugeMetric: gaugeMetric,
-				Value:       lo.Ternary(resourceName == corev1.ResourceCPU, float64(quantity.MilliValue())/float64(1000), float64(quantity.Value())),
-				Labels:      getNodeLabelsWithResourceType(n, resourceNameToString(resourceName)),
-			})
-		}
-	}
-	return append(res,
-		&metrics.StoreMetric{
-			GaugeMetric: Lifetime,
-			Value:       time.Since(n.Node.GetCreationTimestamp().Time).Seconds(),
-			Labels:      getNodeLabels(n),
+		res[gaugeMetric] = lo.MapToSlice(resourceList, func(resourceName corev1.ResourceName, quantity resource.Quantity) opmetrics.Sample {
+			return opmetrics.Sample{
+				Value:  lo.Ternary(resourceName == corev1.ResourceCPU, float64(quantity.MilliValue())/float64(1000), float64(quantity.Value())),
+				Labels: getNodeLabelsWithResourceType(n, resourceNameToString(resourceName)),
+			}
 		})
+	}
+	return res
 }
 
 func getNodeLabelsWithResourceType(n *state.StateNode, resourceTypeName string) prometheus.Labels {
