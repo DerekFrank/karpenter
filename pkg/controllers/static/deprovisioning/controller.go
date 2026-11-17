@@ -26,6 +26,8 @@ import (
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
@@ -122,9 +124,7 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 		}
 
 		log.FromContext(ctx).WithValues("NodeClaim", klog.KObj(candidate)).V(1).Info("deleting nodeclaim")
-
-		// Mark the NodeClaim as Deleting in StateNodePool
-		c.cluster.NodePoolState.MarkNodeClaimDeleting(np.Name, candidate.Name)
+		c.observeDeleted(ctx, candidate)
 	})
 
 	if scaleDownErr := multierr.Combine(scaleDownErrs...); scaleDownErr != nil {
@@ -132,6 +132,21 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 	}
 
 	return reconcile.Result{RequeueAfter: time.Minute}, nil
+}
+
+// observeDeleted feeds a NodeClaim this controller deleted back to cluster state, so that it counts as deleting before
+// the informer sees it.
+func (c *Controller) observeDeleted(ctx context.Context, candidate *v1.NodeClaim) {
+	nodeClaim := candidate.DeepCopy()
+	if err := c.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate), nodeClaim); errors.IsNotFound(err) {
+		c.cluster.DeleteNodeClaim(candidate.Name)
+		return
+	}
+	// The read may not reflect the delete yet, but the delete succeeded.
+	if nodeClaim.DeletionTimestamp.IsZero() {
+		nodeClaim.DeletionTimestamp = &metav1.Time{Time: c.clock.Now()}
+	}
+	c.cluster.UpdateNodeClaim(nodeClaim)
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
@@ -155,6 +170,8 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 					return false
 				},
 			})).
+		// NodePoolState's counts changing, such as a NodeClaim that stops deleting, can put the NodePool over its replicas.
+		WatchesRawSource(c.cluster.NodePoolState.Source()).
 		// We care about Static NodeClaims creating as we might have over provisioned and need to deprovision
 		Watches(&v1.NodeClaim{}, nodepoolutils.NodeClaimEventHandler(nodepoolutils.WithClient(c.kubeClient), nodepoolutils.WithStaticOnly), builder.WithPredicates(predicate.Funcs{
 			CreateFunc: func(e event.CreateEvent) bool {

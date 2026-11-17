@@ -411,9 +411,10 @@ var _ = Describe("Static Provisioning Controller", func() {
 			ExpectStateNodePoolCount(cluster, nodePool.Name, 3, 0, 0)
 
 			// Should be able to reserve remaining 7 NodeCounts
-			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 10, 10)).To(BeEquivalentTo(7))
+			reservations := cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 10, 10)
+			Expect(reservations).To(HaveLen(7))
 			// Release the 7 NodeCount we held
-			cluster.NodePoolState.ReleaseNodeCount(nodePool.Name, 7)
+			reservations.Release()
 
 			// Size up the replicas to 15 with limit 10
 			nodePool.Spec.Replicas = new(int64(15))
@@ -433,8 +434,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			Expect(nodeClaims.Items).To(HaveLen(10))
 
 			// Should not be able to Reserve more
-			cluster.NodePoolState.ReleaseNodeCount(nodePool.Name, 10)
-			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 10, 100)).To(BeEquivalentTo(0))
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 10, 100)).To(BeEmpty())
 
 			ExpectStateNodePoolCount(cluster, nodePool.Name, 10, 0, 0)
 		})

@@ -195,16 +195,10 @@ func (p *Provisioner) CreateNodeClaims(ctx context.Context, nodeClaims []*schedu
 		// create a new context to avoid a data race on the ctx variable
 		if name, err := p.Create(ctx, nodeClaims[i], opts...); err != nil {
 			errs[i] = fmt.Errorf("creating node claim, %w", err)
+			nodeClaims[i].Reservation.Release()
 		} else {
 			nodeClaimNames[i] = name
-		}
-
-		// Regardless of if we successfully created the NodeClaim or not, we should release the reservation. If the NodeClaim
-		// was successfully created, we've updated the active node count in Create already. If we failed, we should release
-		// the reservation and allow the provisioner to create new NodeClaims in a subsequent attempt.
-		// NOTE: Only applies to static NodePools since node limits are not supported for dynamic NodePools
-		if nodeClaims[i].IsStaticNodeClaim {
-			p.cluster.NodePoolState.ReleaseNodeCount(nodeClaims[i].NodePoolName, 1)
+			nodeClaims[i].Reservation.Bind(name)
 		}
 	})
 	return nodeClaimNames, multierr.Combine(errs...)

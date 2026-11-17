@@ -32,6 +32,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	opts "sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
@@ -42,6 +43,9 @@ import (
 // will be turned into one or more actual node instances within the cluster after bin packing.
 type NodeClaim struct {
 	NodeClaimTemplate
+	// Reservation, for a static NodePool's NodeClaim, holds its node against the NodePool until the NodePool counts it.
+	// CreateNodeClaims binds it to the created NodeClaim, or releases it.
+	Reservation *state.Reservation
 
 	Pods                 []*corev1.Pod
 	volumes              scheduling.Volumes

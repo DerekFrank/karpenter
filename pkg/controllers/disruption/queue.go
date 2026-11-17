@@ -174,7 +174,7 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 		})
 		stateNodes := lo.Map(cmd.Candidates, func(c *Candidate, _ int) *state.StateNode { return c.StateNode })
 		multiErr := multierr.Combine(err, state.RequireNoScheduleTaint(ctx, q.kubeClient, false, stateNodes...))
-		multiErr = multierr.Combine(multiErr, state.ClearNodeClaimsCondition(ctx, q.kubeClient, q.clock, v1.ConditionTypeDisruptionReason, stateNodes...))
+		multiErr = multierr.Combine(multiErr, q.cluster.ClearNodeClaimsCondition(ctx, q.kubeClient, q.clock, v1.ConditionTypeDisruptionReason, stateNodes...))
 		// Log the error
 		log.FromContext(ctx).Error(multiErr, "failed terminating nodes while executing a disruption command")
 	} else {
@@ -225,7 +225,7 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 	retryDuration := q.GetMaxRetryDuration()
 	// Wrap an error in an unrecoverable error if it timed out
 	defer func() {
-		if q.clock.Since(cmd.CreationTimestamp) > retryDuration {
+		if err != nil && q.clock.Since(cmd.CreationTimestamp) > retryDuration {
 			err = NewUnrecoverableError(serrors.Wrap(fmt.Errorf("command reached timeout, %w", err), "duration", q.clock.Since(cmd.CreationTimestamp)))
 		}
 	}()
@@ -340,7 +340,7 @@ func recordCandidateDisrupted(cmd *Command, candidate *Candidate) {
 }
 
 // markDisrupted taints the node and adds the Disrupted condition to the NodeClaim for a candidate that is about to be disrupted
-// For static NodeClaims, we mark NodeClaims as pendingdisruption in statenodepool
+// The patched NodeClaim is fed back to NodePoolState, which counts it as deleting before the informer does.
 func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, error) {
 	errs := make([]error, len(cmd.Candidates))
 	workqueue.ParallelizeUntil(ctx, len(cmd.Candidates), len(cmd.Candidates), func(i int) {
@@ -361,6 +361,7 @@ func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, 
 			errs[i] = client.IgnoreNotFound(err)
 			return
 		}
+		q.cluster.NodePoolState.Apply(nodeClaim)
 	})
 	var markedCandidates []*Candidate
 	for i := range errs {
@@ -368,11 +369,6 @@ func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, 
 			continue
 		}
 		markedCandidates = append(markedCandidates, cmd.Candidates[i])
-
-		// Mark all StaticNodeClaims as pendingdisruption in nodepoolstate
-		if cmd.Candidates[i].OwnedByStaticNodePool() {
-			q.cluster.NodePoolState.MarkNodeClaimPendingDisruption(cmd.Candidates[i].NodePool.Name, cmd.Candidates[i].NodeClaim.Name)
-		}
 	}
 	return markedCandidates, multierr.Combine(errs...)
 }
@@ -405,13 +401,8 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 		if !queueOwnsStaticReservation {
 			return
 		}
-		staticReplacements := lo.Filter(cmd.Replacements, func(replacement *Replacement, _ int) bool {
-			return replacement.IsStaticNodeClaim
-		})
-		for nodePoolName, replacements := range lo.GroupBy(staticReplacements, func(replacement *Replacement) string {
-			return replacement.NodePoolName
-		}) {
-			q.cluster.NodePoolState.ReleaseNodeCount(nodePoolName, int64(len(replacements)))
+		for _, replacement := range cmd.Replacements {
+			replacement.Reservation.Release()
 		}
 	}()
 	// First check if we can add the command.
@@ -456,6 +447,10 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 		if cmd.Reason() == v1.DisruptionReasonDrifted {
 			q.observeDriftOutcome(ctx, cmd, false)
 		}
+		// Undo markDisrupted, so that the candidates stop counting as deleting toward their NodePools.
+		stateNodes := lo.Map(cmd.Candidates, func(c *Candidate, _ int) *state.StateNode { return c.StateNode })
+		err = multierr.Combine(err, state.RequireNoScheduleTaint(ctx, q.kubeClient, false, stateNodes...),
+			q.cluster.ClearNodeClaimsCondition(ctx, q.kubeClient, q.clock, v1.ConditionTypeDisruptionReason, stateNodes...))
 		return serrors.Wrap(fmt.Errorf("launching replacement nodeclaim, %w", err), "command-id", cmd.ID)
 	}
 	// IMPORTANT
