@@ -1114,11 +1114,12 @@ func ExpectParallelized(fs ...func()) {
 	wg.Wait()
 }
 
-func ExpectStateNodePoolCount(cluster *state.Cluster, npName string, r, d, pd int) {
+// ExpectStateNodePoolCount expects the NodePool's active and deleting NodeClaims, and its reserved nodes, in cluster state.
+func ExpectStateNodePoolCount(cluster *state.Cluster, npName string, a, d, r int) {
 	GinkgoHelper()
 
-	running, deleting, pendingdisruption := cluster.NodePoolState.GetNodeCount(npName)
-	Expect(running).To(Equal(r))
+	active, deleting, reserved := cluster.NodePoolState.GetNodeCount(npName)
+	Expect(active).To(Equal(a))
 	Expect(deleting).To(Equal(d))
-	Expect(pendingdisruption).To(Equal(pd))
+	Expect(reserved).To(Equal(r))
 }

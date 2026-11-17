@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -51,32 +52,26 @@ var _ = Describe("NodePoolState", func() {
 
 	Context("ReserveNodeCount", func() {
 		It("should reserve requested capacity when available", func() {
-			granted := cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 3)
-			Expect(granted).To(Equal(int64(3)))
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 3)).To(HaveLen(3))
 
 			// Should be able to reserve remaining capacity
-			granted = cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 2)
-			Expect(granted).To(Equal(int64(2)))
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 2)).To(HaveLen(2))
 		})
 
 		It("should grant partial capacity when requested exceeds available", func() {
 			// Reserve most capacity first
-			granted := cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 4)
-			Expect(granted).To(Equal(int64(4)))
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 4)).To(HaveLen(4))
 
 			// Request more than available, should get only what's left
-			granted = cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 5)
-			Expect(granted).To(Equal(int64(1)))
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 5)).To(HaveLen(1))
 		})
 
 		It("should return zero when no capacity available", func() {
 			// Reserve all capacity
-			granted := cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 5)
-			Expect(granted).To(Equal(int64(5)))
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 5)).To(HaveLen(5))
 
 			// No more capacity available
-			granted = cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 1)
-			Expect(granted).To(Equal(int64(0)))
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 1)).To(BeEmpty())
 		})
 
 		It("should account for running NodeClaims", func() {
@@ -85,12 +80,10 @@ var _ = Describe("NodePoolState", func() {
 			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 
 			// Should have 4 slots available (5 limit - 1 running)
-			granted := cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 4)
-			Expect(granted).To(Equal(int64(4)))
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 4)).To(HaveLen(4))
 
 			// No more capacity
-			granted = cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 1)
-			Expect(granted).To(Equal(int64(0)))
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 1)).To(BeEmpty())
 		})
 
 		It("should account for deleting NodeClaims", func() {
@@ -100,8 +93,7 @@ var _ = Describe("NodePoolState", func() {
 			cluster.MarkForDeletion(nodeClaim.Status.ProviderID)
 
 			// Should have 4 slots available (5 limit - 1 deleting)
-			granted := cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 4)
-			Expect(granted).To(Equal(int64(4)))
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 4)).To(HaveLen(4))
 		})
 
 		It("should be thread-safe with concurrent reservations", func() {
@@ -113,7 +105,7 @@ var _ = Describe("NodePoolState", func() {
 
 			for range numGoroutines {
 				wg.Go(func() {
-					granted := cluster.NodePoolState.ReserveNodeCount(nodePool.Name, limit, requestPerGoroutine)
+					granted := int64(len(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, limit, requestPerGoroutine)))
 					atomic.AddInt64(&totalGranted, granted)
 				})
 			}
@@ -125,62 +117,72 @@ var _ = Describe("NodePoolState", func() {
 		})
 	})
 
-	Context("ReleaseNodeCount", func() {
+	Context("Reservations", func() {
 		It("should release reserved capacity", func() {
-			// Reserve some capacity
-			granted := cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 3)
-			Expect(granted).To(Equal(int64(3)))
+			reservations := cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 3)
+			Expect(reservations).To(HaveLen(3))
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 3)).To(HaveLen(2))
 
-			// Should have 2 slots available
-			granted = cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 3)
-			Expect(granted).To(Equal(int64(2)))
-
-			// Release 1 slot
-			cluster.NodePoolState.ReleaseNodeCount(nodePool.Name, 4)
-
-			// Should now have 4 slots available
-			granted = cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 4)
-			Expect(granted).To(Equal(int64(4)))
+			reservations.Release()
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 4)).To(HaveLen(3))
 		})
 
-		It("should not panic when the NodePool is untracked", func() {
-			// This scenario can come up if, for example, Cleanup drops the entry between reserve and release.
-			Expect(func() { cluster.NodePoolState.ReleaseNodeCount("does-not-exist", 1) }).ToNot(Panic())
+		It("should not release a reservation twice", func() {
+			reservations := cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 2)
+			Expect(reservations).To(HaveLen(2))
+			reservations[0].Release()
+			reservations[0].Release()
+			_, _, reserved := cluster.NodePoolState.GetNodeCount(nodePool.Name)
+			Expect(reserved).To(Equal(1))
 		})
 
-		It("should handle releasing more than reserved", func() {
-			// Reserve some capacity
-			granted := cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 2)
-			Expect(granted).To(Equal(int64(2)))
+		It("should hand a bound reservation off to the NodeClaim's count", func() {
+			reservations := cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 1)
+			Expect(reservations).To(HaveLen(1))
+			ExpectApplied(ctx, env.Client, nodeClaim)
+			reservations[0].Bind(nodeClaim.Name)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 1)
 
-			// Release more than reserved - should not go negative
-			cluster.NodePoolState.ReleaseNodeCount(nodePool.Name, 5)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 0)
+		})
 
-			// Should have full capacity available
-			granted = cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 5)
-			Expect(granted).To(Equal(int64(5)))
+		It("should expire a reservation that is never counted", func() {
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 2)).To(HaveLen(2))
+			env.Clock.Step(state.ReservationTTL)
+			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 0)
 		})
 
 		It("should be thread-safe with concurrent releases", func() {
-			// Reserve capacity first
-			granted := cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 10, 10)
-			Expect(granted).To(Equal(int64(10)))
+			reservations := cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 10, 10)
+			Expect(reservations).To(HaveLen(10))
 
 			var wg sync.WaitGroup
-			numGoroutines := 50
-			releasePerGoroutine := int64(2)
-
-			for range numGoroutines {
-				wg.Go(func() {
-					cluster.NodePoolState.ReleaseNodeCount(nodePool.Name, releasePerGoroutine)
-				})
+			for range 50 {
+				wg.Go(func() { reservations.Release() })
 			}
-
 			wg.Wait()
 
-			// Should have full capacity available after releases
-			granted = cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 10, 100)
-			Expect(granted).To(Equal(int64(10)))
+			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 10, 100)).To(HaveLen(10))
 		})
+	})
+
+	It("should ignore stale versions, versions that drop a deletionTimestamp, and versions of removed NodeClaims", func() {
+		version := func(rv string, deleting bool) *v1.NodeClaim {
+			nc := nodeClaim.DeepCopy()
+			nc.ResourceVersion = rv
+			if deleting {
+				nc.DeletionTimestamp = &metav1.Time{Time: env.Clock.Now()}
+			}
+			return nc
+		}
+		cluster.NodePoolState.Apply(version("5", true))
+		cluster.NodePoolState.Apply(version("4", false))
+		cluster.NodePoolState.Apply(version("5", false))
+		ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 1, 0)
+
+		cluster.NodePoolState.Remove(nodeClaim.Name)
+		cluster.NodePoolState.Apply(version("6", true))
+		ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 0)
 	})
 })

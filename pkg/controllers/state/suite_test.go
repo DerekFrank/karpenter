@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/awslabs/operatorpkg/status"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -2655,33 +2656,24 @@ var _ = Describe("NodePoolState Tracking", func() {
 				Expect(deleting).To(Equal(0))
 				Expect(pendingdisruption).To(Equal(0))
 
-				// Old ProviderID should not be tracked for deletion
-				cluster.MarkForDeletion(originalProviderID)
+				// Marking either ProviderID for deletion marks only the StateNode; the NodePool counts follow the NodeClaim
+				cluster.MarkForDeletion(originalProviderID, newProviderID)
 				running, deleting, pendingdisruption = cluster.NodePoolState.GetNodeCount(nodePool.Name)
-				Expect(running).To(Equal(1)) // Should not change
+				Expect(running).To(Equal(1))
 				Expect(deleting).To(Equal(0))
 				Expect(pendingdisruption).To(Equal(0))
-
-				// New ProviderID should work for deletion
-				cluster.MarkForDeletion(newProviderID)
-				running, deleting, pendingdisruption = cluster.NodePoolState.GetNodeCount(nodePool.Name)
-				Expect(running).To(Equal(0))
-				Expect(deleting).To(Equal(1))
-				Expect(pendingdisruption).To(Equal(0))
+				Expect(originalProviderID).ToNot(Equal(newProviderID))
 			})
 
-			It("should move NodeClaim to deleting state when Node is marked for deletion", func() {
+			It("should move NodeClaim to deleting state when its DisruptionReason condition is true", func() {
 				// Verify initial running state
 				running, deleting, pendingdisruption := cluster.NodePoolState.GetNodeCount(nodePool.Name)
 				Expect(running).To(Equal(1))
 				Expect(deleting).To(Equal(0))
 				Expect(pendingdisruption).To(Equal(0))
 
-				// Mark the node for deletion via cluster state
-				cluster.MarkForDeletion(nodeClaim.Status.ProviderID)
-
-				// Update NodeClaim - should detect it's marked for deletion
-				nodeClaim.Annotations = map[string]string{"updated": "true"}
+				// The disruption queue marks the NodeClaim disrupted
+				nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDisruptionReason)
 				ExpectApplied(ctx, env.Client, nodeClaim)
 				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 
@@ -2712,7 +2704,7 @@ var _ = Describe("NodePoolState Tracking", func() {
 			})
 		})
 
-		Context("Mark NodeClaims pendingdisruption", func() {
+		Context("Mark NodeClaims disrupted", func() {
 			BeforeEach(func() {
 				ExpectApplied(ctx, env.Client, nodeClaim)
 				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
@@ -2740,19 +2732,23 @@ var _ = Describe("NodePoolState Tracking", func() {
 				Expect(deleting).To(Equal(0))
 				Expect(pendingdisruption).To(Equal(0))
 
-				cluster.NodePoolState.MarkNodeClaimPendingDisruption(nodePool.Name, nodeClaim.Name)
+				nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDisruptionReason)
+				ExpectApplied(ctx, env.Client, nodeClaim)
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 				running, deleting, pendingdisruption = cluster.NodePoolState.GetNodeCount(nodePool.Name)
 
 				Expect(running).To(Equal(1))
-				Expect(deleting).To(Equal(0))
-				Expect(pendingdisruption).To(Equal(1))
+				Expect(deleting).To(Equal(1))
+				Expect(pendingdisruption).To(Equal(0))
 
-				cluster.NodePoolState.MarkNodeClaimPendingDisruption(nodePool.Name, nodeClaim2.Name)
+				nodeClaim2.StatusConditions().SetTrue(v1.ConditionTypeDisruptionReason)
+				ExpectApplied(ctx, env.Client, nodeClaim2)
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim2))
 				running, deleting, pendingdisruption = cluster.NodePoolState.GetNodeCount(nodePool.Name)
 
 				Expect(running).To(Equal(0))
-				Expect(deleting).To(Equal(0))
-				Expect(pendingdisruption).To(Equal(2))
+				Expect(deleting).To(Equal(2))
+				Expect(pendingdisruption).To(Equal(0))
 			})
 		})
 
@@ -2781,13 +2777,13 @@ var _ = Describe("NodePoolState Tracking", func() {
 
 		})
 
-		Context("MarkForDeletion", func() {
+		Context("Deleting", func() {
 			BeforeEach(func() {
 				ExpectApplied(ctx, env.Client, nodeClaim)
 				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 			})
 
-			It("should handle marking multiple NodeClaims for deletion", func() {
+			It("should count multiple NodeClaims with a deletionTimestamp as deleting", func() {
 				nodeClaim2 := test.NodeClaim(v1.NodeClaim{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: "test-nodeclaim-2",
@@ -2809,7 +2805,10 @@ var _ = Describe("NodePoolState Tracking", func() {
 				Expect(deleting).To(Equal(0))
 				Expect(pendingdisruption).To(Equal(0))
 
-				cluster.MarkForDeletion(nodeClaim.Status.ProviderID, nodeClaim2.Status.ProviderID)
+				ExpectDeletionTimestampSet(ctx, env.Client, nodeClaim)
+				ExpectDeletionTimestampSet(ctx, env.Client, nodeClaim2)
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim2))
 				running, deleting, pendingdisruption = cluster.NodePoolState.GetNodeCount(nodePool.Name)
 
 				Expect(running).To(Equal(0))
@@ -2824,7 +2823,8 @@ var _ = Describe("NodePoolState Tracking", func() {
 				Expect(deleting).To(Equal(0))
 				Expect(pendingdisruption).To(Equal(0))
 
-				cluster.MarkForDeletion(nodeClaim.Status.ProviderID)
+				ExpectDeletionTimestampSet(ctx, env.Client, nodeClaim)
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 				running, deleting, pendingdisruption = cluster.NodePoolState.GetNodeCount(nodePool.Name)
 
 				Expect(running).To(Equal(0))
@@ -2834,11 +2834,11 @@ var _ = Describe("NodePoolState Tracking", func() {
 		})
 	})
 
-	Context("UnmarkForDeletion", func() {
+	Context("Clearing DisruptionReason", func() {
 		BeforeEach(func() {
+			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDisruptionReason)
 			ExpectApplied(ctx, env.Client, nodeClaim)
 			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
-			cluster.MarkForDeletion(nodeClaim.Status.ProviderID)
 		})
 
 		It("should move NodeClaim from deleting to running state", func() {
@@ -2847,7 +2847,9 @@ var _ = Describe("NodePoolState Tracking", func() {
 			Expect(deleting).To(Equal(1))
 			Expect(pendingdisruption).To(Equal(0))
 
-			cluster.UnmarkForDeletion(nodeClaim.Status.ProviderID)
+			Expect(nodeClaim.StatusConditions().Clear(v1.ConditionTypeDisruptionReason)).To(Succeed())
+			ExpectApplied(ctx, env.Client, nodeClaim)
+			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 			running, deleting, pendingdisruption = cluster.NodePoolState.GetNodeCount(nodePool.Name)
 
 			Expect(running).To(Equal(1))
@@ -2869,17 +2871,20 @@ var _ = Describe("NodePoolState Tracking", func() {
 				},
 			})
 
+			nodeClaim2.StatusConditions().SetTrue(v1.ConditionTypeDisruptionReason)
 			ExpectApplied(ctx, env.Client, nodeClaim2)
 			ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim2))
-
-			cluster.MarkForDeletion(nodeClaim2.Status.ProviderID)
 			running, deleting, pendingdisruption := cluster.NodePoolState.GetNodeCount(nodePool.Name)
 
 			Expect(running).To(Equal(0))
 			Expect(deleting).To(Equal(2))
 			Expect(pendingdisruption).To(Equal(0))
 
-			cluster.UnmarkForDeletion(nodeClaim.Status.ProviderID, nodeClaim2.Status.ProviderID)
+			for _, nc := range []*v1.NodeClaim{nodeClaim, nodeClaim2} {
+				Expect(nc.StatusConditions().Clear(v1.ConditionTypeDisruptionReason)).To(Succeed())
+				ExpectApplied(ctx, env.Client, nc)
+				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nc))
+			}
 			running, deleting, pendingdisruption = cluster.NodePoolState.GetNodeCount(nodePool.Name)
 
 			Expect(running).To(Equal(2))
@@ -2918,7 +2923,9 @@ var _ = Describe("NodePoolState Tracking", func() {
 					case 0:
 						cluster.MarkForDeletion(nodeClaim.Status.ProviderID)
 					case 1:
-						cluster.NodePoolState.MarkNodeClaimPendingDisruption(nodePool.Name, nodeClaim.Name)
+						disrupted := nodeClaim.DeepCopy()
+						disrupted.Status.Conditions = []status.Condition{{Type: v1.ConditionTypeDisruptionReason, Status: metav1.ConditionTrue}}
+						cluster.NodePoolState.Apply(disrupted)
 					case 2:
 						cluster.UnmarkForDeletion(nodeClaim.Status.ProviderID)
 					}

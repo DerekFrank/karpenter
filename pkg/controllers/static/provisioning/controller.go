@@ -87,31 +87,29 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 		return reconcile.Result{RequeueAfter: time.Second}, nil
 	}
 
-	runningNodeClaims, _, nodesPendingDisruptionCount := c.cluster.NodePoolState.GetNodeCount(np.Name)
 	desiredReplicas := lo.FromPtr(np.Spec.Replicas)
-	// Size down of replicas will be handled in deprovisioning controller to drain nodes and delete NodeClaims
-	// If there are drifting NodeClaims we need to count them as Active as disruption controller is in the process of creating replacements
-	if int64(runningNodeClaims)+int64(nodesPendingDisruptionCount) >= desiredReplicas {
+	limit, ok := np.Spec.Limits[resources.Node]
+	nodeLimit := lo.Ternary(ok, limit.Value(), int64(math.MaxInt64))
+	// Size down of replicas is handled in the deprovisioning controller. ReserveReplicas admits each NodeClaim against
+	// replicas and the node limit, counting what other controllers, such as disruption, reserved meanwhile.
+	reservations := c.cluster.NodePoolState.ReserveReplicas(np.Name, desiredReplicas, nodeLimit)
+	if len(reservations) == 0 {
+		if active, _, reserved := c.cluster.NodePoolState.GetNodeCount(np.Name); int64(active+reserved) < desiredReplicas {
+			log.FromContext(ctx).Info("nodepool node limit reached")
+			return reconcile.Result{RequeueAfter: time.Second * 30}, nil
+		}
 		return reconcile.Result{RequeueAfter: time.Minute}, nil
 	}
 
-	limit, ok := np.Spec.Limits[resources.Node]
-	nodeLimit := lo.Ternary(ok, limit.Value(), int64(math.MaxInt64))
-	countNodeClaimsToProvision := c.cluster.NodePoolState.ReserveNodeCount(np.Name, nodeLimit, desiredReplicas-int64(runningNodeClaims))
-
-	if countNodeClaimsToProvision <= 0 {
-		log.FromContext(ctx).Info("nodepool node limit reached")
-		return reconcile.Result{RequeueAfter: time.Second * 30}, nil
-	}
-
-	log.FromContext(ctx).WithValues("current", runningNodeClaims, "desired", desiredReplicas, "provision-count", countNodeClaimsToProvision).
+	log.FromContext(ctx).WithValues("desired", desiredReplicas, "provision-count", len(reservations)).
 		Info("provisioning nodeclaims to satisfy replica count")
 
-	nodeClaims := make([]*scheduling.NodeClaim, 0, countNodeClaimsToProvision)
-	for range countNodeClaimsToProvision {
+	nodeClaims := make([]*scheduling.NodeClaim, 0, len(reservations))
+	for _, reservation := range reservations {
 		nct := scheduling.NewNodeClaimTemplate(np)
 		nodeClaims = append(nodeClaims, &scheduling.NodeClaim{
 			NodeClaimTemplate: *nct,
+			Reservation:       reservation,
 		})
 	}
 
@@ -144,6 +142,9 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 					return false
 				},
 			})).
+		// NodePoolState's counts and reservations changing, such as a NodeClaim counted as deleting or a reservation
+		// ending, can leave the NodePool short of its replicas.
+		WatchesRawSource(c.cluster.NodePoolState.Source()).
 		// We care about Static NodeClaims Deleting (Delete and Update event that has DeletionTimeStamp newly set) as we might have to provision
 		Watches(&v1.NodeClaim{}, nodepoolutils.NodeClaimEventHandler(nodepoolutils.WithClient(c.kubeClient), nodepoolutils.WithStaticOnly), builder.WithPredicates(predicate.Funcs{
 			CreateFunc: func(e event.CreateEvent) bool {
