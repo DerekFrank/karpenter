@@ -102,12 +102,29 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 	if nodeClaimsToDeprovision <= 0 {
 		return reconcile.Result{RequeueAfter: time.Minute}, nil
 	}
+	// Cluster state can briefly count a NodeClaim that no longer exists, such as one the provisioner added after it was
+	// deleted while the informer was relisting, until state.nodeclaimgc removes it. Deleting to make up for it would
+	// delete a real NodeClaim, so never deprovision more than the NodeClaims that exist and aren't deleting.
+	nodeClaims, err := nodeclaimutils.ListManaged(ctx, c.kubeClient, c.cloudProvider, nodeclaimutils.ForNodePool(np.Name))
+	if err != nil {
+		return reconcile.Result{}, fmt.Errorf("listing nodeclaims, %w", err)
+	}
+	existing := lo.CountBy(nodeClaims, func(nc *v1.NodeClaim) bool { return nc.DeletionTimestamp.IsZero() })
+	if nodeClaimsToDeprovision = min(nodeClaimsToDeprovision, int64(existing)-desiredReplicas); nodeClaimsToDeprovision <= 0 {
+		return reconcile.Result{RequeueAfter: time.Second}, nil
+	}
 
 	log.FromContext(ctx).WithValues("current", runningNodeClaims, "desired", desiredReplicas, "deprovision-count", nodeClaimsToDeprovision).
 		Info("deprovisioning nodeclaims to satisfy replica count")
 
 	// Get deprovisioning candidates
-	candidates := c.getDeprovisioningCandidates(ctx, np, int(nodeClaimsToDeprovision))
+	candidates := c.getDeprovisioningCandidates(ctx, np, nodeClaims, int(nodeClaimsToDeprovision))
+	// Mark the NodeClaims for deletion before deleting them, so they never count as active once they are deleted.
+	// Otherwise a reconcile that runs before the informer sees a deletion would delete another NodeClaim to make up for
+	// it. The mark also claims a NodeClaim: skip it if another controller already marked it, or if cluster state hasn't
+	// observed it and so doesn't count it.
+	marked := sets.New(c.cluster.MarkNodeClaimsForDeletion(lo.Map(candidates, func(nc *v1.NodeClaim, _ int) string { return nc.Name })...)...)
+	candidates = lo.Filter(candidates, func(nc *v1.NodeClaim, _ int) bool { return marked.Has(nc.Name) })
 
 	scaleDownErrs := make([]error, len(candidates))
 	// Terminate selected NodeClaims
@@ -117,14 +134,12 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 		if err := retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
 			return c.kubeClient.Delete(ctx, candidate)
 		}); err != nil && client.IgnoreNotFound(err) != nil {
+			c.cluster.UnmarkNodeClaimsForDeletion(candidate.Name)
 			scaleDownErrs[i] = err
 			return
 		}
 
 		log.FromContext(ctx).WithValues("NodeClaim", klog.KObj(candidate)).V(1).Info("deleting nodeclaim")
-
-		// Mark the NodeClaim as Deleting in StateNodePool
-		c.cluster.NodePoolState.MarkNodeClaimDeleting(np.Name, candidate.Name)
 	})
 
 	if scaleDownErr := multierr.Combine(scaleDownErrs...); scaleDownErr != nil {
@@ -182,11 +197,11 @@ func HasNodePoolReplicaCountChanged(oldNP, newNP *v1.NodePool) bool {
 // 1. Unresolved NodeClaims (no ProviderID yet - haven't launched)
 // 2. Empty nodes (nodes with no pods or only DaemonSet pods without do-not-disrupt annotation)
 // 3. If more nodes needed, nodes with lowest disruption cost (nodes with pods that have do-not-disrupt will have highest cost)
-func (c *Controller) getDeprovisioningCandidates(ctx context.Context, np *v1.NodePool, count int) []*v1.NodeClaim {
+func (c *Controller) getDeprovisioningCandidates(ctx context.Context, np *v1.NodePool, nodeClaims []*v1.NodeClaim, count int) []*v1.NodeClaim {
 	candidates := make([]*v1.NodeClaim, 0, count)
 
 	// Unresolved NodeClaims (haven't launched yet or that failed Create call)
-	unresolvedCandidates := c.unresolvedDeprovisioningCandidates(ctx, np.Name, count)
+	unresolvedCandidates := c.unresolvedDeprovisioningCandidates(nodeClaims, count)
 	candidates = append(candidates, unresolvedCandidates...)
 	remaining := count - len(candidates)
 
@@ -210,13 +225,7 @@ func (c *Controller) getDeprovisioningCandidates(ctx context.Context, np *v1.Nod
 }
 
 // unResolvedDeprovisioningCandidates returns unresolved NodeClaims (those without ProviderID) up to the specified count
-func (c *Controller) unresolvedDeprovisioningCandidates(ctx context.Context, nodePoolName string, count int) []*v1.NodeClaim {
-	nodeClaimList, err := nodeclaimutils.ListManaged(ctx, c.kubeClient, c.cloudProvider, nodeclaimutils.ForNodePool(nodePoolName))
-	if err != nil {
-		log.FromContext(ctx).Error(err, "failed to list nodeclaims")
-		return nil
-	}
-
+func (c *Controller) unresolvedDeprovisioningCandidates(nodeClaimList []*v1.NodeClaim, count int) []*v1.NodeClaim {
 	unresolvedNodeClaims := make([]*v1.NodeClaim, 0)
 	for _, nc := range nodeClaimList {
 		if nc.Status.ProviderID == "" && nc.DeletionTimestamp.IsZero() {

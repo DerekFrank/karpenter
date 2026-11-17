@@ -1076,6 +1076,7 @@ var _ = Describe("Repair", func() {
 			},
 		})
 		ExpectApplied(ctx, env.Client, nodePool)
+		cluster.UpdateNodePool(nodePool)
 		nodeClaims, nodes := test.NodeClaimsAndNodes(5, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
 		for i := range nodes {
 			initNode(nodeClaims[i], nodes[i])
@@ -1104,6 +1105,7 @@ var _ = Describe("Repair", func() {
 			},
 		})
 		ExpectApplied(ctx, env.Client, nodePool)
+		cluster.UpdateNodePool(nodePool)
 		nodeClaims, nodes := test.NodeClaimsAndNodes(5, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
 		for i := range nodes {
 			initNode(nodeClaims[i], nodes[i])
@@ -1127,6 +1129,7 @@ var _ = Describe("Repair", func() {
 			},
 		})
 		ExpectApplied(ctx, env.Client, nodePool)
+		cluster.UpdateNodePool(nodePool)
 		nodeClaims, nodes := test.NodeClaimsAndNodes(5, v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels()}})
 		for i := range nodes {
 			initNode(nodeClaims[i], nodes[i])

@@ -161,6 +161,11 @@ settings:
     # -- nodeRepair is ALPHA and is disabled by default.
     # Setting this to true will enable node repair.
     nodeRepair: false
+    # -- staticCapacity is ALPHA and is disabled by default. Its node accounting compares NodeClaim resourceVersions,
+    # which Kubernetes only formalized as comparable in 1.35 (KEP-5504). etcd-backed API servers have always provided
+    # comparable resourceVersions; other API server implementations may not.
+    # Setting this to true will enable static NodePools, which maintain a fixed number of nodes set by spec.replicas.
+    staticCapacity: false
     # -- podDeletionCostManagement is ALPHA and is disabled by default.
     # Setting this to true will enable Karpenter to manage pod-deletion-cost annotations
     # on pods it schedules, influencing which pod(s) the replica set controller prefers
