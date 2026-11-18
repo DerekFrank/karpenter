@@ -83,7 +83,7 @@ func removeNodeClaimImmutabilityValidation(crds ...*apiextensionsv1.CustomResour
 
 var _ = BeforeSuite(func() {
 	recorder = test.NewEventRecorder()
-	env = test.NewEnvironment(test.WithCRDs(removeNodeClaimImmutabilityValidation(apis.CRDs...)...), test.WithCRDs(v1alpha1.CRDs...), test.WithFieldIndexers(test.NodeProviderIDFieldIndexer(ctx)))
+	env = test.NewEnvironment(test.WithCRDs(removeNodeClaimImmutabilityValidation(apis.CRDs...)...), test.WithCRDs(v1alpha1.CRDs...), test.WithFieldIndexers(test.NodeProviderIDFieldIndexer(ctx), test.ResourceSliceNodeFieldIndexer(ctx)))
 	ctx = options.ToContext(ctx, test.Options())
 
 	cloudProvider = fake.NewCloudProvider()
@@ -382,6 +382,37 @@ var _ = Describe("DRA Initialization Gating", func() {
 		ExpectApplied(ctx, env.Client, nodeSlice(node, driverB, "pool-b", 1, 1, "dev-0"))
 		nodeClaim = reconcile(nodeClaim)
 		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue()).To(BeTrue())
+	})
+
+	It("counts a slice the node owns without spec.nodeName", func() {
+		nodeClaim, node := registeredReadyNodeClaim(driverA)
+
+		slice := nodeSlice(node, driverA, "pool-a", 1, 1, "dev-0")
+		slice.Spec.NodeName = nil
+		slice.Spec.AllNodes = new(true)
+		ExpectApplied(ctx, env.Client, slice)
+		nodeClaim = reconcile(nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue()).To(BeTrue())
+	})
+
+	It("counts a slice pinned by spec.nodeName without a Node owner reference", func() {
+		nodeClaim, node := registeredReadyNodeClaim(driverA)
+
+		slice := nodeSlice(node, driverA, "pool-a", 1, 1, "dev-0")
+		slice.OwnerReferences = nil
+		ExpectApplied(ctx, env.Client, slice)
+		nodeClaim = reconcile(nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue()).To(BeTrue())
+	})
+
+	It("ignores slices that belong to another node", func() {
+		nodeClaim, _ := registeredReadyNodeClaim(driverA)
+
+		otherNode := test.Node()
+		ExpectApplied(ctx, env.Client, otherNode)
+		ExpectApplied(ctx, env.Client, nodeSlice(otherNode, driverA, "pool-a", 1, 1, "dev-0"))
+		nodeClaim = reconcile(nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsUnknown()).To(BeTrue())
 	})
 
 	It("initializes a NodeClaim with no requested-dra-drivers annotation (d)", func() {

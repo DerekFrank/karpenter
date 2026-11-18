@@ -26,8 +26,10 @@ import (
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -127,6 +129,24 @@ func NodePoolNodeClassRefFieldIndexer(ctx context.Context) func(cache.Cache) err
 			return []string{obj.(*v1.NodePool).Spec.Template.Spec.NodeClassRef.Name}
 		}))
 		return err
+	}
+}
+
+func ResourceSliceNodeFieldIndexer(ctx context.Context) func(cache.Cache) error {
+	return func(c cache.Cache) error {
+		return c.IndexField(ctx, &resourcev1.ResourceSlice{}, "node", func(o client.Object) []string {
+			slice := o.(*resourcev1.ResourceSlice)
+			nodes := sets.New[string]()
+			if nodeName := lo.FromPtr(slice.Spec.NodeName); nodeName != "" {
+				nodes.Insert(nodeName)
+			}
+			for _, ref := range slice.OwnerReferences {
+				if ref.Kind == "Node" {
+					nodes.Insert(ref.Name)
+				}
+			}
+			return sets.List(nodes)
+		})
 	}
 }
 
