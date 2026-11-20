@@ -114,6 +114,15 @@ func NodeClaimNodeClassRefFieldIndexer(ctx context.Context) func(cache.Cache) er
 	}
 }
 
+func NodeClaimNodePoolFieldIndexer(ctx context.Context) func(cache.Cache) error {
+	return func(c cache.Cache) error {
+		return c.IndexField(ctx, &v1.NodeClaim{}, "metadata.labels.karpenter.sh/nodepool", func(obj client.Object) []string {
+			nodePool, ok := obj.GetLabels()[v1.NodePoolLabelKey]
+			return lo.Ternary(ok, []string{nodePool}, nil)
+		})
+	}
+}
+
 func NodePoolNodeClassRefFieldIndexer(ctx context.Context) func(cache.Cache) error {
 	return func(c cache.Cache) error {
 		var err error
