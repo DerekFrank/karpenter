@@ -437,7 +437,11 @@ controllerruntime.NewControllerManagedBy(m).
   it enqueues it, for a controller that skips work while nothing it wakes on
   changed, as disruption's consolidation does.
 - **`state.After(delay, sources...)`** batches each request's changes for
-  `delay`, for a watcher such as metrics.
+  `delay`, for a watcher that tolerates the delay.
+- **Metrics are built at scrape time, not reconciled.** A metrics controller
+  registers a `metrics.Collector` whose collect reads its stores with
+  `client.UnsafeDisableDeepCopy` on each scrape, and never polls; a duration
+  is observed by a subscriber on the change that ends it.
 - **`RequeueAfter` is for wall-clock deadlines only,** such as a TTL or a
   timeout, marked `//storelint:deadline <reason>`. A controller reacting to
   state wakes through a source. A controller that must poll something no

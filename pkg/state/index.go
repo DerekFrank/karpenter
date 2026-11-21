@@ -124,16 +124,17 @@ func listOptionsOf[O any](opts []client.ListOption) listOptions {
 }
 
 // getOptionsOf parses the options a Reader's Get takes, client.UnsafeDisableDeepCopy, and returns whether it's set. Any
-// other option panics, naming it.
+// other option panics, naming it. It reads the option's value rather than applying it to a client.GetOptions, which
+// allocates, since a hot read such as a scrape's per-pod Node lookup takes it.
 func getOptionsOf(opts []client.GetOption) (unsafeDisableDeepCopy bool) {
-	var parsed client.GetOptions
 	for _, opt := range opts {
-		if _, ok := opt.(client.UnsafeDisableDeepCopyOption); !ok {
+		o, ok := opt.(client.UnsafeDisableDeepCopyOption)
+		if !ok {
 			panic(fmt.Sprintf("a store's Get doesn't take a %T", opt))
 		}
-		opt.ApplyToGet(&parsed)
+		unsafeDisableDeepCopy = bool(o)
 	}
-	return parsed.UnsafeDisableDeepCopy != nil && *parsed.UnsafeDisableDeepCopy
+	return unsafeDisableDeepCopy
 }
 
 // matches returns whether obj is one the options select.

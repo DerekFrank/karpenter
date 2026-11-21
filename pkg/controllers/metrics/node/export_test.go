@@ -16,12 +16,7 @@ limitations under the License.
 
 package node
 
-import (
-	"sigs.k8s.io/controller-runtime/pkg/source"
-)
-
-// Wakes is what Register wakes the controller on, without the BatchWindow, for tests to start on a queue.
-func (c *Controller) Wakes() source.SyncingSource { return c.wakes() }
+import "github.com/prometheus/client_golang/prometheus"
 
 // The node count's contributions, for their law checks.
 type (
@@ -29,3 +24,6 @@ type (
 	LaunchedNodeClaim = launchedNodeClaim
 	UnmanagedNode     = unmanagedNode
 )
+
+// SyncedCollector is the collector of whether cluster state is synced, for a test to register on its own registry.
+func (c *Controller) SyncedCollector() prometheus.Collector { return c.syncedCollector() }

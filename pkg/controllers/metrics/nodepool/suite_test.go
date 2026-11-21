@@ -62,7 +62,8 @@ var _ = BeforeSuite(func() {
 	cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cp)
 	cc = cs.Cost
 	pricingController = pricing.NewController(env.Clock, cs.NodePoolState, cc)
-	nodePoolController = nodepool.NewController(env.Overlay, cp, cc)
+	nodePoolController = nodepool.NewController(cs.NodePoolState, cp, cc)
+	Expect(nodePoolController.Register(ctx, nil)).To(Succeed())
 })
 
 var _ = AfterSuite(func() {
@@ -103,7 +104,6 @@ var _ = Describe("Metrics", func() {
 				}
 			}
 			ExpectApplied(ctx, env.Client, nodePool)
-			ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
 
 			for k, v := range limits {
 				m, found := FindMetricWithLabelValues("karpenter_nodepools_limit", map[string]string{
@@ -128,7 +128,6 @@ var _ = Describe("Metrics", func() {
 		nodePool.Status.Resources = resources
 
 		ExpectApplied(ctx, env.Client, nodePool)
-		ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
 
 		for k, v := range resources {
 			m, found := FindMetricWithLabelValues("karpenter_nodepools_usage", map[string]string{
@@ -152,7 +151,6 @@ var _ = Describe("Metrics", func() {
 			corev1.ResourceEphemeralStorage: resource.MustParse("100Gi"),
 		}
 		ExpectApplied(ctx, env.Client, nodePool)
-		ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
 
 		for _, name := range expectedMetrics {
 			_, found := FindMetricWithLabelValues(name, map[string]string{
@@ -162,7 +160,6 @@ var _ = Describe("Metrics", func() {
 		}
 
 		ExpectDeleted(ctx, env.Client, nodePool)
-		ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool))
 
 		for _, name := range expectedMetrics {
 			_, found := FindMetricWithLabelValues(name, map[string]string{
@@ -219,9 +216,5 @@ var _ = Describe("NodePool Metrics Wakes", func() {
 
 		ExpectDeleted(ctx, env.Client, nodeClaim)
 		Expect(drain()).To(Equal([]string{nodePool.Name}), "want the NodePool for its NodeClaim going away")
-	})
-	It("should update its metrics without a periodic requeue", func() {
-		ExpectApplied(ctx, env.Client, nodePool)
-		Expect(ExpectReconcileSucceeded(ctx, nodePoolController, client.ObjectKeyFromObject(nodePool)).RequeueAfter).To(BeZero())
 	})
 })
