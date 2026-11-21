@@ -53,7 +53,7 @@ func BenchmarkFeedIndexed(b *testing.B) {
 		b.Run(fmt.Sprintf("indexed=%t/moved=%t", indexed, moved), func(b *testing.B) {
 			pods := NewFedStore[types.NamespacedName, testPod, struct{}, struct{}]()
 			if indexed {
-				pods.Index(byPVC, pvcsOf)
+				NewIndex(pods, mountsPVC)
 			}
 			names := make([]types.NamespacedName, 1000)
 			objects := [2][]testPod{make([]testPod, len(names)), make([]testPod, len(names))}

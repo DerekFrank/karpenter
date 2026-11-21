@@ -86,17 +86,16 @@ type core[K comparable, O, D, I any] struct {
 	sources map[any]func() bool
 	// cleared drop what each Derive, Claims and expiring Intent of the store recorded, when a test clears the store.
 	cleared map[any]func()
-	// indexes are the store's indexes, kept under mu; indexByName holds them by name for Lookup, which takes no lock.
-	indexes     []*index[K, O, D, I]
-	indexByName sync.Map // string -> *index[K, O, D, I]
+	// indexes are the store's Indexes, kept under mu.
+	indexes []indexer[K, O, D, I]
 }
 
-// Reader reads a store: Get, List, Lookup, ListMatching, Subscribe, Synced, Source and SourceOn. pkg/cluster exports Readers, so that a
+// Reader reads a store: Get, List, Subscribe, Synced, Source and SourceOn. pkg/cluster exports Readers, so that a
 // store's entries are written only by the writers the model names.
 type Reader[K comparable, O, D, I any] struct{ s *core[K, O, D, I] }
 
-// Store is a store and its writes: a fed store's Feed and FeedAll, and Index. A Derive's target, a Claims' and an intent
-// handle's take a Store, and TouchOn and DependsOn re-notify one.
+// Store is a store and its writes: a fed store's Feed and FeedAll. A Derive's target, a Claims', an intent handle's and
+// an Index's take a Store, and TouchOn and DependsOn re-notify one.
 type Store[K comparable, O, D, I any] struct{ Reader[K, O, D, I] }
 
 func newCore[K comparable, O, D, I any](k kind, build func(K) O) *core[K, O, D, I] {
