@@ -319,7 +319,7 @@ func (env *Environment) ConsistentlyExpectDisruptionsUntilNoneLeft(nodesAtStart,
 			return ok
 		})
 		if len(nodes) > maxNodesDisrupting {
-			StopTrying(fmt.Sprintf("Too many disruptions detected. Expected no more than %d, got %d", maxNodesDisrupting, len(nodeList.Items))).Now()
+			StopTrying(fmt.Sprintf("Too many disruptions detected. Expected no more than %d, got %d", maxNodesDisrupting, len(nodes))).Now()
 		}
 
 		g.Expect(nodes).To(HaveLen(0))
@@ -706,7 +706,7 @@ func (env *Environment) EventuallyExpectUniqueNodeNames(selector labels.Selector
 
 	Eventually(func(g Gomega) {
 		pods := env.Monitor.RunningPods(selector)
-		nodeNames := sets.NewString()
+		nodeNames := sets.New[string]()
 		for _, pod := range pods {
 			nodeNames.Insert(pod.Spec.NodeName)
 		}
@@ -1409,7 +1409,9 @@ func (env *Environment) ExpectPodMetrics() (res []PrometheusMetric) {
 	localPort := rand.IntnRange(1025, 49151)
 	env.ExpectPodPortForwarded(ctx, env.ExpectActiveKarpenterPod(), 8080, localPort)
 
-	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", localPort))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/metrics", localPort), nil)
+	Expect(err).ToNot(HaveOccurred())
+	resp, err := http.DefaultClient.Do(req)
 	Expect(err).ToNot(HaveOccurred())
 	reader := bufio.NewReader(resp.Body)
 	defer resp.Body.Close()

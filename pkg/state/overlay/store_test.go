@@ -171,7 +171,6 @@ var _ = Describe("overlay", func() {
 		Expect(ok).To(BeFalse(), "a is visible after the informer delivered its tombstone")
 		Expect(o.len()).To(Equal(0), "a is stored after the informer delivered its tombstone")
 	})
-	//nolint:gocyclo
 	It("should stay consistent under concurrency", func() {
 		var (
 			apiMu            sync.Mutex

@@ -26,6 +26,7 @@ import (
 	"github.com/awslabs/operatorpkg/status"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/samber/lo"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clock "k8s.io/utils/clock/testing"
@@ -40,8 +41,6 @@ var _ = Describe("NodePoolState Recount", func() {
 	// Applies random NodeClaim updates, deletes, NodePool moves and stale versions through the NodeClaim store's own
 	// source, and checks the NodePools' counts against a recount of the latest version of each NodeClaim after every
 	// change. A stale version arriving late is what an informer can deliver and the API server can't be made to.
-	//
-	//nolint:gocyclo
 	It("should match a recount of the latest version of each NodeClaim after every change", func() {
 		r := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // deterministic seed for reproducible test inputs
 		clk := clock.NewFakeClock(time.Now())
@@ -83,27 +82,37 @@ var _ = Describe("NodePoolState Recount", func() {
 				if r.IntN(3) == 0 {
 					nc.Status.Conditions = []status.Condition{{Type: v1.ConditionTypeDisruptionReason, Status: metav1.ConditionTrue}}
 				}
+				if r.IntN(2) == 0 {
+					nc.Status.Conditions = append(nc.Status.Conditions, status.Condition{Type: v1.ConditionTypeDrifted, Status: metav1.ConditionTrue})
+				}
 				c.NodeClaims.Put(nc)
 				latest[name] = nc
 			}
 			want := map[string]NodeClaimCounts{}
+			wantDrifted := map[string]int{}
 			for _, nc := range latest {
 				np := nc.Labels[v1.NodePoolLabelKey]
 				if np == "" {
 					continue
 				}
 				counts := want[np]
-				if !nc.DeletionTimestamp.IsZero() || len(nc.Status.Conditions) > 0 {
+				disrupted := lo.ContainsBy(nc.Status.Conditions, func(c status.Condition) bool { return c.Type == v1.ConditionTypeDisruptionReason })
+				if !nc.DeletionTimestamp.IsZero() || disrupted {
 					counts.Deleting++
 				} else {
 					counts.Active++
 				}
 				want[np] = counts
+				if nc.DeletionTimestamp.IsZero() && lo.ContainsBy(nc.Status.Conditions, func(c status.Condition) bool { return c.Type == v1.ConditionTypeDrifted }) {
+					wantDrifted[np]++
+				}
 			}
 			for _, np := range []string{"a", "b", "stale"} {
 				active, deleting, _ := cs.NodePoolState.GetNodeCount(np)
 				Expect(NodeClaimCounts{Active: active, Deleting: deleting}).To(Equal(want[np]),
 					"after change %d, %s counts %d active and %d deleting, want %+v", i, np, active, deleting, want[np])
+				Expect(cs.NodePoolState.Fields(np).Drifted).To(Equal(wantDrifted[np]),
+					"after change %d, %s counts %d drifted, want %d", i, np, cs.NodePoolState.Fields(np).Drifted, wantDrifted[np])
 			}
 		}
 	})

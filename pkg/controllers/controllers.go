@@ -104,8 +104,6 @@ func WithRegistrationHook(hook cloudprovider.NodeLifecycleHook) option.Function[
 
 // NewControllers returns Karpenter's controllers, which read the cluster's state from s. The caller builds s with
 // cluster.New and starts its stores with s.Register.
-//
-//nolint:gocyclo
 func NewControllers(
 	ctx context.Context,
 	mgr manager.Manager,
@@ -125,7 +123,8 @@ func NewControllers(
 	p := provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, provisioning.StoresOf(s), s.NodePoolState, s.CapacityQuotaState, clock,
 		deviceAllocationController, virtualPodCache, predictionStore, s.Nomination, s.BufferPods, s.PodScheduling)
 	evictionQueue := terminator.NewQueue(clock, kubeClient, recorder)
-	disruptionQueue := disruption.NewQueue(kubeClient, recorder, s.NodeClaims, clock, p, s.Deletion)
+	disruptionQueue := disruption.NewQueue(kubeClient, recorder, s.NodeClaims, clock, p, s.Deletion,
+		disruption.NewDriftBackoff(clock, s.NodePoolState, s.DriftBackoffs))
 	controllers := []controller.Controller{
 		p, evictionQueue, disruptionQueue,
 		disruption.NewController(ctx, clock, kubeClient, p, cloudProvider, recorder, disruption.StoresOf(s), s.NodePoolState, disruptionQueue, s.Cost),
@@ -156,7 +155,7 @@ func NewControllers(
 	if !options.FromContext(ctx).DisableClusterStateObservability {
 		controllers = append(controllers,
 			metricspod.NewController(s.Pods, s.Nodes),
-			metricsnodepool.NewController(s.NodePoolState, cloudProvider, s.Cost),
+			metricsnodepool.NewController(clock, s.NodePoolState, cloudProvider, s.Cost),
 			metricsnode.NewController(s.NodeClaims, s.Nodes),
 			status.NewController[*v1.NodeClaim](
 				kubeClient,

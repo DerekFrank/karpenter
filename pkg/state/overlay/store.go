@@ -92,7 +92,6 @@ func (o *overlay) standsIn(key types.NamespacedName, e *entry) bool {
 	return e.created || (o.cached != nil && o.cached(key))
 }
 
-//nolint:gocyclo
 func (o *overlay) record(obj client.Object, indexers map[string]client.IndexerFunc, created bool) {
 	rv := parseResourceVersion(obj.GetResourceVersion())
 	if rv == 0 || rv <= o.w.Load() {
@@ -156,7 +155,6 @@ func (o *overlay) indexedKeys(k indexKey) []types.NamespacedName {
 	return slices.Collect(maps.Keys(o.indexed[k]))
 }
 
-//nolint:gocyclo
 func (o *overlay) observe(raw any) {
 	if tombstone, ok := raw.(toolscache.DeletedFinalStateUnknown); ok {
 		raw = tombstone.Obj

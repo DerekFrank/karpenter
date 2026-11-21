@@ -18,6 +18,7 @@ package disruption_test
 
 import (
 	"context"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -102,6 +103,16 @@ var _ = Describe("Wakes", func() {
 
 		cs.Deletion.Mark(nodeClaim.Name)
 		Expect(drain()).To(BeTrue(), "want a wake for the node's deletion mark")
+	})
+	It("should wake when a NodePool's drift back-off window arms, and when it lapses", func() {
+		Expect(driftBackoff.Fail(nodePool, env.Clock.Now())).To(BeTrue())
+		Expect(drain()).To(BeTrue(), "want a wake for the window arming")
+
+		_, until, _ := driftBackoff.Get(nodePool)
+		env.Clock.Step(until.Sub(env.Clock.Now()) + time.Second)
+		// The window lapses on the intent's timer, which fires on its own goroutine once the clock steps past it.
+		Eventually(func() bool { return wakes.Len() > 0 }).Should(BeTrue(), "want a wake for the window lapsing")
+		Expect(driftBackedOff(nodePool)).To(BeFalse())
 	})
 	It("should skip consolidation until a change, and revalidate once the revalidation period passes", func() {
 		nothingToDo()

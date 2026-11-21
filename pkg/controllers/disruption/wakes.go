@@ -20,8 +20,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/samber/lo"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
 )
 
@@ -44,10 +46,16 @@ type changeTracker interface{ trackChanges(*changes) }
 
 // wakes are the sources the controller wakes on. Each change of the NodeClaim and Node stores' inputs counts, as the
 // sources enqueue it, so the run it wakes sees it; a NodeClaim launching, which can end the wait on NodeClaimsLaunched,
-// doesn't count, since a launch also changes the NodeClaim's inputs.
+// doesn't count, since a launch also changes the NodeClaim's inputs, and neither does a NodePool's drift back-off
+// window arming or lapsing, which only drift reads.
 func (c *Controller) wakes() source.SyncingSource {
 	return karpenterstate.Wake(
 		c.cluster.NodeClaims.UnlaunchedSource(),
+		c.nodePools.SourceOn(func(_ string, e karpentercluster.NodePoolEntry) any {
+			// The window's level and end, as values the semantic comparison can compare.
+			w := e.Intent.DriftBackoffWindow
+			return [2]int64{int64(w.Value), lo.Ternary(w.Until.IsZero(), 0, w.Until.UnixNano())}
+		}),
 		karpenterstate.WakeCounting(c.changes.add, c.cluster.NodeClaims.DisruptionSource()),
 	)
 }

@@ -54,7 +54,7 @@ var _ = Describe("NodePool", func() {
 		}
 		notReady := nodeClaimContribution{
 			usage: nodeResources("4"), capacityCounted: true, counts: NodeClaimCounts{Active: 1},
-			disruption: NodePoolDisruption{Nodes: 1, NotReady: 1},
+			disruption: NodePoolDisruption{Nodes: 1, NotReady: 1}, drifted: 1,
 		}
 		// A NodeClaim being deleted counts only as deleting, and as disrupting.
 		deleting := nodeClaimContribution{counts: NodeClaimCounts{Deleting: 1}, disruption: NodePoolDisruption{Nodes: 1, Disrupting: 1}}
@@ -118,8 +118,6 @@ func contributionBase() NodePoolFields {
 }
 
 // changeAtRandom makes one random change to a NodeClaim, its Node or its deletion mark.
-//
-//nolint:gocyclo
 func changeAtRandom(r *rand.Rand, s State, rv string) {
 	// Each NodeClaim keeps one NodePool label; the NodePool members spec covers NodeClaims that move. Its Node sometimes
 	// carries another, which moves the node's health but not its NodeClaim's counts.
@@ -183,8 +181,6 @@ func changeAtRandom(r *rand.Rand, s State, rv string) {
 }
 
 // recountNodePools recounts each NodePool's fields from the NodeClaim and Node stores, by each field's definition.
-//
-//nolint:gocyclo
 func recountNodePools(s State) map[string]NodePoolFields {
 	want := map[string]NodePoolFields{}
 	update := func(name string, fn func(NodePoolFields) NodePoolFields) {
@@ -253,3 +249,47 @@ func nonzeroFields(f NodePoolFields) NodePoolFields {
 	f.Usage = nonzero(f.Usage)
 	return f
 }
+
+var _ = Describe("NodePool Disruption Reboot", func() {
+	// rebooted returns a launched NodeClaim entry, linked to a Ready Node, whose Rebooting condition carries the
+	// status and reason, and whose Initialized condition is true when initialized.
+	rebooted := func(rebootStatus metav1.ConditionStatus, reason string, initialized bool) NodeClaimEntry {
+		nc := test.NodeClaim()
+		nc.StatusConditions().SetTrue(v1.ConditionTypeLaunched)
+		switch rebootStatus {
+		case metav1.ConditionTrue:
+			nc.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, reason, "rebooting")
+		case metav1.ConditionFalse:
+			nc.StatusConditions().SetFalse(v1.ConditionTypeRebooting, reason, "done")
+		}
+		if initialized {
+			nc.StatusConditions().SetTrue(v1.ConditionTypeInitialized)
+		} else {
+			nc.StatusConditions().SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRebooting, "node is rebooting")
+		}
+		node := test.Node()
+		node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}
+		return NodeClaimEntry{Object: nc, Derived: NodeClaimDerived{Node: node}}
+	}
+	disruptionOf := func(e NodeClaimEntry) NodePoolDisruption {
+		if !countsForDisruption(e) {
+			return NodePoolDisruption{}
+		}
+		return nodeClaimDisruption(e, e.Derived.Node)
+	}
+	It("should count a node as disrupting after a successful reboot while it's uninitialized", func() {
+		Expect(disruptionOf(rebooted(metav1.ConditionFalse, v1.RebootReasonSucceeded, false))).To(Equal(NodePoolDisruption{Nodes: 1, Disrupting: 1}))
+	})
+	It("should count a node normally once it re-initializes after a reboot", func() {
+		Expect(disruptionOf(rebooted(metav1.ConditionFalse, v1.RebootReasonSucceeded, true))).To(Equal(NodePoolDisruption{Nodes: 1}))
+	})
+	It("should not count an uninitialized node after a failed reboot", func() {
+		Expect(disruptionOf(rebooted(metav1.ConditionFalse, v1.RebootReasonFailed, false))).To(Equal(NodePoolDisruption{}))
+	})
+	It("should count a node as disrupting while its reboot is in progress", func() {
+		Expect(disruptionOf(rebooted(metav1.ConditionTrue, v1.RebootReasonIssued, false))).To(Equal(NodePoolDisruption{Nodes: 1, Disrupting: 1}))
+	})
+	It("should not count an uninitialized node that never rebooted", func() {
+		Expect(disruptionOf(rebooted("", "", false))).To(Equal(NodePoolDisruption{}))
+	})
+})

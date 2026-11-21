@@ -117,8 +117,6 @@ func podContributionOf(ctx context.Context, pvcs *PVCs) func(types.NamespacedNam
 }
 
 // Update replaces prev's contribution with p's, copying each map at most once.
-//
-//nolint:gocyclo
 func (p podContribution) Update(d NodeDerived, prev podContribution) NodeDerived {
 	f := d.Usage
 	if prev.pod == nil {
@@ -213,8 +211,6 @@ func countVolumes(counts map[volume]int, volumes []volume, by int) map[volume]in
 }
 
 // Equal reports whether Update would leave the fields the same with either contribution.
-//
-//nolint:gocyclo
 func (p podContribution) Equal(o podContribution) bool {
 	if (p.pod == nil) != (o.pod == nil) || (p.pod != nil && client.ObjectKeyFromObject(p.pod) != client.ObjectKeyFromObject(o.pod)) {
 		return false

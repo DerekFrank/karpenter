@@ -40,6 +40,12 @@ type NodePoolIntent struct {
 	// Registration is the NodePool's recent launch outcomes, recorded by the NodeClaim lifecycle controller through the
 	// Registrations handle.
 	Registration state.Intended[Registration]
+	// DriftBackoff is the NodePool's drift replacement back-off level and its last failure, which hold until they're
+	// reset, written by disruption through the DriftBackoffs handle.
+	DriftBackoff state.Intended[DriftBackoff]
+	// DriftBackoffWindow is the level of the NodePool's drift back-off window while it holds, which lapses at the
+	// window's end, written with DriftBackoff.
+	DriftBackoffWindow state.Intended[int]
 }
 
 type nodePoolStore = state.Store[string, *v1.NodePool, NodePoolFields, NodePoolIntent]
@@ -62,10 +68,13 @@ type NodePoolFields struct {
 	// launched or not, since each holds or will hold an instance against the limit. It isn't Disruption, which counts
 	// only the nodes a budget protects.
 	NodeClaims NodeClaimCounts
-	// Disruption counts the NodePool's nodes for its disruption budgets: only launched NodeClaims that are initialized
-	// or rebooting, until their instance terminates, disrupting by the deletion mark rather than DisruptionReason. It
+	// Disruption counts the NodePool's nodes for its disruption budgets: only launched NodeClaims that are initialized,
+	// rebooting or re-initializing after a reboot, until their instance terminates, disrupting by the deletion mark rather than DisruptionReason. It
 	// isn't NodeClaims, which counts every NodeClaim against the node limit.
 	Disruption NodePoolDisruption
+	// Drifted counts the NodePool's NodeClaims whose Drifted condition is true, until they're deleting: they have a
+	// deletionTimestamp or their instance is terminating.
+	Drifted int
 	// NodeHealth counts the NodePool's tracked Nodes by their NodePool label, and those with a condition that matches
 	// a repair policy, fed by the Node store. A Node counts once cluster state tracks it, and until it's gone.
 	NodeHealth NodeCounts
@@ -157,6 +166,7 @@ type nodeClaimContribution struct {
 	capacityCounted bool
 	counts          NodeClaimCounts
 	disruption      NodePoolDisruption
+	drifted         int
 }
 
 // nodeClaimContributionOf returns a NodeClaim's contribution to its NodePool, which reads its linked Node from its
@@ -174,6 +184,9 @@ func nodeClaimContributionOf(_ string, e NodeClaimEntry) nodeClaimContribution {
 	if countsForDisruption(e) {
 		c.disruption = nodeClaimDisruption(e, e.Derived.Node)
 	}
+	if !deleted(nodeClaim) && conditionTrue(nodeClaim, v1.ConditionTypeDrifted) {
+		c.drifted = 1
+	}
 	return c
 }
 
@@ -186,6 +199,7 @@ func (c nodeClaimContribution) Update(f NodePoolFields, prev nodeClaimContributi
 	f.Disruption.Nodes += c.disruption.Nodes - prev.disruption.Nodes
 	f.Disruption.Disrupting += c.disruption.Disrupting - prev.disruption.Disrupting
 	f.Disruption.NotReady += c.disruption.NotReady - prev.disruption.NotReady
+	f.Drifted += c.drifted - prev.drifted
 	return f
 }
 
@@ -195,7 +209,7 @@ func (c nodeClaimContribution) Delete(f NodePoolFields) NodePoolFields {
 
 func (c nodeClaimContribution) Equal(o nodeClaimContribution) bool {
 	return c.counts == o.counts && c.capacityCounted == o.capacityCounted && c.disruption == o.disruption &&
-		resourcesEqual(c.usage, o.usage)
+		c.drifted == o.drifted && resourcesEqual(c.usage, o.usage)
 }
 
 // replaceResources returns total with add in place of sub, without the resources it zeroes, in a new list.

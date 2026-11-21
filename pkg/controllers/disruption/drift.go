@@ -42,14 +42,16 @@ type Drift struct {
 	provisioner *provisioning.Provisioner
 	recorder    events.Recorder
 	clock       clock.Clock
+	backoff     *DriftBackoff
 }
 
-func NewDrift(kubeClient client.Client, provisioner *provisioning.Provisioner, recorder events.Recorder, clk clock.Clock) *Drift {
+func NewDrift(kubeClient client.Client, provisioner *provisioning.Provisioner, recorder events.Recorder, clk clock.Clock, backoff *DriftBackoff) *Drift {
 	return &Drift{
 		kubeClient:  kubeClient,
 		provisioner: provisioner,
 		recorder:    recorder,
 		clock:       clk,
+		backoff:     backoff,
 	}
 }
 
@@ -60,6 +62,8 @@ func (d *Drift) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 
 // ComputeCommand generates a disruption command given candidates
 func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
+	initDriftBackoffMetrics(ctx, d.backoff, lo.Uniq(lo.Map(candidates, func(c *Candidate, _ int) string { return c.NodePool.Name }))...)
+
 	sort.Slice(candidates, func(i int, j int) bool {
 		return candidates[i].NodeClaim.StatusConditions(status.WithObservedOnly()).Get(string(d.Reason())).LastTransitionTime.Time.Before(
 			candidates[j].NodeClaim.StatusConditions(status.WithObservedOnly()).Get(string(d.Reason())).LastTransitionTime.Time)
@@ -77,6 +81,9 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 		// continue to the next candidate. We don't need to decrement any budget
 		// counter since drift commands can only have one candidate.
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
+			continue
+		}
+		if isDriftBackedOff(ctx, d.backoff, d.recorder, candidate.NodePool) {
 			continue
 		}
 		// Simulate rescheduling the candidate's pods. When they can't be replaced-first and the candidate holds a full

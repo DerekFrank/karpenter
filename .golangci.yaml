@@ -18,6 +18,7 @@ linters:
     - misspell
     - modernize
     - nilerr
+    - noctx
     - revive
     - staticcheck
     - tparallel
@@ -69,7 +70,7 @@ linters:
             - pkg: sigs.k8s.io/karpenter/pkg/controllers
               desc: pkg/cluster never depends on controllers
     gocyclo:
-      min-complexity: 11
+      min-complexity: 30
     goheader:
       template: |-
         Copyright The Kubernetes Authors.

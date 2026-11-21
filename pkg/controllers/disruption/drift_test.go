@@ -227,6 +227,58 @@ var _ = Describe("Drift", func() {
 			}
 			Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(7))
 		})
+		It("should not drift a node while a rebooted node in the same nodepool is re-initializing", func() {
+			nodeClaims, nodes = test.NodeClaimsAndNodes(3, v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						v1.NodePoolLabelKey:            nodePool.Name,
+						corev1.LabelInstanceTypeStable: mostExpensiveInstance.Name,
+						v1.CapacityTypeLabelKey:        mostExpensiveOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+						corev1.LabelTopologyZone:       mostExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+					},
+				},
+				Status: v1.NodeClaimStatus{
+					Allocatable: map[corev1.ResourceName]resource.Quantity{
+						corev1.ResourceCPU:  resource.MustParse("32"),
+						corev1.ResourcePods: resource.MustParse("100"),
+					},
+				},
+			})
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "1"}}
+			ExpectApplied(ctx, env.Client, nodePool)
+			nodeClaims[1].StatusConditions().SetTrue(v1.ConditionTypeDrifted)
+			for i := range nodeClaims {
+				ExpectApplied(ctx, env.Client, nodeClaims[i], nodes[i])
+			}
+			ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, nodes, nodeClaims)
+
+			// nodes[0] just rebooted successfully and is waiting on initialization to re-run, so it isn't serving yet.
+			nodeClaims[0] = ExpectExists(ctx, env.Client, nodeClaims[0])
+			nodeClaims[0].StatusConditions(status.WithClock(env.Clock)).SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster")
+			nodeClaims[0].StatusConditions(status.WithClock(env.Clock)).SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRebooting, "node is rebooting")
+			ExpectApplied(ctx, env.Client, nodeClaims[0])
+			nodes[0] = ExpectExists(ctx, env.Client, nodes[0])
+			delete(nodes[0].Labels, v1.NodeInitializedLabelKey)
+			ExpectApplied(ctx, env.Client, nodes[0])
+
+			// The reboot still holds the nodepool's only disruption, so the drifted node waits.
+			ExpectSingletonReconciled(ctx, disruptionController)
+			Expect(queue.GetCommands()).To(BeEmpty())
+			Expect(ExpectExists(ctx, env.Client, nodes[1]).Spec.Taints).ToNot(ContainElement(v1.DisruptedNoScheduleTaint))
+
+			// Once the rebooted node re-initializes, the budget frees up and drift proceeds.
+			nodeClaims[0] = ExpectExists(ctx, env.Client, nodeClaims[0])
+			nodeClaims[0].StatusConditions(status.WithClock(env.Clock)).SetTrue(v1.ConditionTypeInitialized)
+			ExpectApplied(ctx, env.Client, nodeClaims[0])
+			nodes[0] = ExpectExists(ctx, env.Client, nodes[0])
+			nodes[0].Labels[v1.NodeInitializedLabelKey] = "true"
+			ExpectApplied(ctx, env.Client, nodes[0])
+			ExpectSingletonReconciled(ctx, disruptionController)
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Candidates[0].NodeClaim.Name).To(Equal(nodeClaims[1].Name))
+			Expect(ExpectExists(ctx, env.Client, nodes[1]).Spec.Taints).To(ContainElement(v1.DisruptedNoScheduleTaint))
+		})
 		It("should respect budgets for multiple nodepools", func() {
 			// Create 10 nodepools
 			nps := test.NodePools(10, v1.NodePool{
@@ -951,6 +1003,7 @@ var _ = Describe("Drift", func() {
 			currentInstance := fake.NewInstanceType("current-on-demand",
 				fake.WithOfferings(cloudprovider.Offering{
 					Available:    false,
+					Compatible:   true,
 					Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"}),
 					Price:        0.5,
 				}),
@@ -958,6 +1011,7 @@ var _ = Describe("Drift", func() {
 			replacementInstance := fake.NewInstanceType("replacement-on-demand",
 				fake.WithOfferings(cloudprovider.Offering{
 					Available:    true,
+					Compatible:   true,
 					Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"}),
 					Price:        0.3,
 				}),
@@ -1132,7 +1186,7 @@ var _ = Describe("Drift", func() {
 			for _, nc := range nodeClaims {
 				nc.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
 			}
-			drift := disruption.NewDrift(env.Overlay, prov, recorder, env.Clock)
+			drift := disruption.NewDrift(env.Overlay, prov, recorder, env.Clock, driftBackoff)
 
 			ExpectApplied(ctx, env.Client, staticNp, nodeClaims[0], nodeClaims[1], nodes[0], nodes[1])
 

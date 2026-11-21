@@ -55,6 +55,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
@@ -104,12 +105,14 @@ type Queue struct {
 	provisioner        *provisioning.Provisioner
 	// deletion is the handle of the deletion marks, which the queue holds while a command disrupts its candidates.
 	deletion *karpentercluster.Deletion
+	// backoff is the NodePools' drift back-off, which the queue records each drift command's outcome in.
+	backoff *DriftBackoff
 }
 
 // NewQueue creates a queue that will asynchronously orchestrate disruption commands, marking their candidates for
-// deletion with deletion.
+// deletion with deletion, and recording drift outcomes in backoff.
 func NewQueue(kubeClient client.Client, recorder events.Recorder, nodeClaims *karpentercluster.NodeClaims, clock clock.Clock,
-	provisioner *provisioning.Provisioner, deletion *karpentercluster.Deletion,
+	provisioner *provisioning.Provisioner, deletion *karpentercluster.Deletion, backoff *DriftBackoff,
 ) *Queue {
 	queue := &Queue{
 		// nolint:staticcheck
@@ -122,6 +125,7 @@ func NewQueue(kubeClient client.Client, recorder events.Recorder, nodeClaims *ka
 		clock:              clock,
 		provisioner:        provisioner,
 		deletion:           deletion,
+		backoff:            backoff,
 	}
 	return queue
 }
@@ -181,13 +185,44 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 		log.FromContext(ctx).V(1).Info("command succeeded")
 		cmd.Succeeded = true
 	}
+	// Record the outcome against per-NodePool drift back-off. A successful drift replacement
+	// resets the pool; an unrecoverable failure (ICE, timeout) arms/escalates its back-off.
+	if cmd.Reason() == v1.DisruptionReasonDrifted {
+		q.observeDriftOutcome(ctx, cmd, cmd.Succeeded)
+	}
 	q.CompleteCommand(cmd)
 	return reconcile.Result{}, nil
 }
 
+// observeDriftOutcome updates the per-NodePool drift back-off tracker for a completed drift
+// command. Per the single-NodePool-per-command invariant, the key is the command's candidate
+// NodePool.
+func (q *Queue) observeDriftOutcome(ctx context.Context, cmd *Command, succeeded bool) {
+	if !options.FromContext(ctx).FeatureGates.NodePoolDriftBackoff || q.backoff == nil {
+		return
+	}
+	if len(cmd.Candidates) == 0 || cmd.Candidates[0].NodePool == nil {
+		panic(fmt.Sprintf("drift command %s has no candidate NodePool", cmd.ID))
+	}
+	nodePool := cmd.Candidates[0].NodePool
+	if succeeded {
+		// A delete-only drift command can succeed by placing pods on existing capacity, which
+		// doesn't demonstrate that replacement capacity has recovered.
+		if len(cmd.Replacements) > 0 {
+			q.backoff.Reset(nodePool.Name)
+		}
+		return
+	}
+	if !q.backoff.Fail(nodePool, cmd.CreationTimestamp) {
+		return
+	}
+	DriftBackoffsTotal.Inc(map[string]string{metrics.NodePoolLabel: nodePool.Name})
+	level, until, _ := q.backoff.Get(nodePool)
+	log.FromContext(ctx).V(1).Info("backing off drift disruption for nodepool", "NodePool", klog.KObj(nodePool), "level", level, "until", until)
+}
+
 // waitOrTerminate will wait until launched nodeclaims are ready.
 // Once the replacements are ready, it will terminate the candidates.
-// nolint:gocyclo
 func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 	// We use the number of commands in the queue as a proxy for cloud provider traffic.
 	// As the number of commands increase, we expect more delays and scale the retry duration accordingly.
@@ -265,7 +300,7 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 			errs[i] = client.IgnoreNotFound(err)
 			return
 		}
-		q.recorder.Publish(disruptionevents.Terminating(cmd.Candidates[i].Node, cmd.Candidates[i].NodeClaim, string(cmd.Reason()))...)
+		q.recorder.Publish(disruptionevents.Terminating(cmd.Candidates[i].Node, cmd.Candidates[i].NodeClaim, string(cmd.Reason()), cmd.TerminateFirstReason.Explanation())...)
 		recordCandidateDisrupted(cmd, cmd.Candidates[i])
 	})
 	// If there were any deletion failures, we should requeue.
@@ -392,6 +427,11 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	// the replacements launch, so they're credited.
 	if err := q.provisioner.ReserveLimits(ctx, lo.Map(cmd.Replacements, func(r *Replacement, _ int) *pscheduling.NodeClaim { return r.NodeClaim }),
 		candidateNodeClaims(cmd)); err != nil {
+		// A replacement that doesn't fit its NodePool's limits can't launch, so drift backs off as it does for a failed
+		// launch.
+		if cmd.Reason() == v1.DisruptionReasonDrifted {
+			q.observeDriftOutcome(ctx, cmd, false)
+		}
 		return serrors.Wrap(fmt.Errorf("reserving replacements against limits, %w", err), "command-id", cmd.ID)
 	}
 
@@ -411,6 +451,11 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	if err := q.createReplacementNodeClaims(ctx, cmd); err != nil {
 		// If we failed to launch the replacement, don't disrupt.  If this is some permanent failure,
 		// we don't want to disrupt workloads with no way to provision new nodes for them.
+		// The command never enters the queue, so no success/failure will be observed later; arm
+		// drift back-off here so a launch failure is treated like any other unrecoverable failure.
+		if cmd.Reason() == v1.DisruptionReasonDrifted {
+			q.observeDriftOutcome(ctx, cmd, false)
+		}
 		return serrors.Wrap(fmt.Errorf("launching replacement nodeclaim, %w", err), "command-id", cmd.ID)
 	}
 	// IMPORTANT

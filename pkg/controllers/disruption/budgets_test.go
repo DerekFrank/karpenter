@@ -38,11 +38,10 @@ import (
 )
 
 // recountNodePoolStats recounts what NodePoolStats derives, from every node and every Node: a launched NodeClaim
-// counts once it's initialized or rebooting, until its instance is terminating; it's disrupting while it's marked for
-// deletion, deleting or rebooting; and otherwise it consumes every budget but repair's while the tracked Node whose
+// counts once it's initialized, rebooting or re-initializing after a successful reboot, until its instance is
+// terminating; it's disrupting while it's marked for deletion, deleting, rebooting or re-initializing after a
+// successful reboot; and otherwise it consumes every budget but repair's while the tracked Node whose
 // owner reference names it is missing or isn't Ready.
-//
-//nolint:gocyclo
 func recountNodePoolStats(nodeClaims *karpentercluster.NodeClaims, nodeObjects map[string]*corev1.Node, reason v1.DisruptionReason) (numNodes, disrupting map[string]int) {
 	numNodes = map[string]int{}
 	disrupting = map[string]int{}
@@ -53,7 +52,10 @@ func recountNodePoolStats(nodeClaims *karpentercluster.NodeClaims, nodeObjects m
 		}
 		node := karpentercluster.ViewOfNodeClaim(e)
 		nodeClaim := e.Object
-		if !nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue() && !node.RebootInProgress() {
+		initialized := nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue()
+		reboot := nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting)
+		rebootDisrupting := node.RebootInProgress() || (!initialized && reboot != nil && reboot.IsFalse() && reboot.Reason == v1.RebootReasonSucceeded)
+		if !initialized && !rebootDisrupting {
 			continue
 		}
 		if nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() {
@@ -61,7 +63,7 @@ func recountNodePoolStats(nodeClaims *karpentercluster.NodeClaims, nodeObjects m
 		}
 		nodePool := nodeClaim.Labels[v1.NodePoolLabelKey]
 		numNodes[nodePool]++
-		if karpentercluster.Deleting(e) || node.RebootInProgress() {
+		if karpentercluster.Deleting(e) || rebootDisrupting {
 			disrupting[nodePool]++
 			continue
 		}
@@ -81,8 +83,6 @@ var _ = Describe("NodePoolStats", func() {
 	// Applies random Node and NodeClaim updates, deletes, NodePool moves, reboots, readiness changes and deletion marks
 	// through the API server, and checks the derived disruption counts against the loop over every node after each
 	// change.
-	//
-	//nolint:gocyclo
 	It("should match a recount over every node after each change", func() {
 		r := rand.New(rand.NewPCG(3, 4)) //nolint:gosec // deterministic seed for reproducible test inputs
 		nodePools := []string{"a", "b", ""}
