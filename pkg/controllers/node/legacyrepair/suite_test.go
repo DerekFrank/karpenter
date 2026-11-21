@@ -366,7 +366,8 @@ var _ = Describe("Node Health", func() {
 			nodePool.Spec.Disruption = v1.Disruption{
 				Budgets: []v1.Budget{
 					{
-						Nodes: "0",
+						Nodes:   "0",
+						Reasons: []v1.DisruptionReason{v1.DisruptionReasonUnhealthy},
 					},
 				},
 			}

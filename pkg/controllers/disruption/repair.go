@@ -45,12 +45,12 @@ import (
 
 const (
 	// repairUnhealthyThreshold stops repair for a NodePool when a correlated failure makes more than this fraction of
-	// its nodes unhealthy. Disruption budgets continue to pace concurrent repairs below this safety threshold.
+	// its nodes unhealthy. Disruption budgets that list Unhealthy continue to pace concurrent repairs below this safety threshold.
 	repairUnhealthyThreshold = "20%"
 )
 
 // Repair is a voluntary disruption method that remediates unhealthy nodes. It replaces the standalone node.health
-// controller: repair rides the shared disruption budget (reason "Unhealthy"), verifies rescheduling capacity before
+// controller: repair is paced by disruption budgets that list the reason "Unhealthy", verifies rescheduling capacity before
 // terminating workload-bearing nodes, orders candidates by rank + age/τ, and is vetoed by do-not-repair.
 type Repair struct {
 	consolidation

@@ -1300,7 +1300,7 @@ var _ = Describe("Repair", func() {
 		})
 
 		It("should repair without disruption budget", func() {
-			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "0"}}
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "0", Reasons: []v1.DisruptionReason{v1.DisruptionReasonUnhealthy}}}
 			ExpectApplied(ctx, env.Client, nodePool)
 			registerNode(nodeClaim, node)
 			markUnhealthy(node, "BadNode")
@@ -1311,7 +1311,7 @@ var _ = Describe("Repair", func() {
 		})
 
 		It("should not consume disruption budget for initialized nodes", func() {
-			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "1"}}
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "1", Reasons: []v1.DisruptionReason{v1.DisruptionReasonUnhealthy}}}
 			ExpectApplied(ctx, env.Client, nodePool)
 			registerNode(nodeClaim, node)
 			markUnhealthy(node, "BadNode")
