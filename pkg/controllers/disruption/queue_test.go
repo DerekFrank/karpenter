@@ -17,12 +17,16 @@ limitations under the License.
 package disruption_test
 
 import (
+	"context"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/samber/lo"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
@@ -39,6 +43,9 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
+	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
+	staticdeprovisioning "sigs.k8s.io/karpenter/pkg/controllers/static/deprovisioning"
+	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -132,6 +139,98 @@ var _ = Describe("Queue", func() {
 			Expect(ExpectExists(ctx, env.Client, nodeClaim1).StatusConditions().Get(v1.ConditionTypeDisruptionReason)).To(BeNil())
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
 			Expect(cluster.NodePoolState.Get(nodePool.Name).ReservedResources).To(BeEmpty())
+		})
+	})
+	// kubernetes-sigs/karpenter#3250 and P567286943: static deprovisioning deleting drift replacements, and healthy nodes
+	// after drift replacements fail, because a candidate read as running again.
+	Context("Static drift and static deprovisioning", func() {
+		var staticDeprovisioning *staticdeprovisioning.Controller
+		var drift func(stateNode *karpentercluster.StateNode) *disruption.Command
+		BeforeEach(func() {
+			nodePool.Spec.Limits = nil
+			node1.Spec.Taints = nil
+			node2.Spec.Taints = nil
+			staticDeprovisioning = staticdeprovisioning.NewController(env.Overlay, cluster, cloudProvider, env.Clock, recorder)
+			drift = func(stateNode *karpentercluster.StateNode) *disruption.Command {
+				nct := scheduling.NewNodeClaimTemplate(nodePool)
+				nct.InstanceTypeOptions = append([]*cloudprovider.InstanceType{}, cloudProvider.InstanceTypes...)
+				return &disruption.Command{
+					Method:            disruption.NewDrift(env.Overlay, cluster, prov, recorder, env.Clock),
+					CreationTimestamp: env.Clock.Now(),
+					ID:                uuid.New(),
+					Results:           scheduling.Results{},
+					Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
+					Replacements:      []*disruption.Replacement{{NodeClaim: &scheduling.NodeClaim{NodeClaimTemplate: *nct}}},
+				}
+			}
+		})
+		expectNoneDeleted := func(nodeClaims ...*v1.NodeClaim) {
+			GinkgoHelper()
+			for _, nc := range nodeClaims {
+				Expect(ExpectExists(ctx, env.Client, nc).DeletionTimestamp.IsZero()).To(BeTrue(), "NodeClaim %s was deleted", nc.Name)
+			}
+		}
+		It("should keep a drift candidate out of the replica count while its replacement launches", func() {
+			nodePool.Spec.Replicas = lo.ToPtr(int64(1))
+			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
+			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+
+			// Run the informer and static deprovisioning in the window #3250 hits: after the queue has patched the
+			// candidate's DisruptionReason and created the replacement, before it marks the candidate for deletion.
+			hook := &afterCreateClient{Client: env.Overlay}
+			p := provisioning.NewProvisioner(hook, recorder, cloudProvider, cluster, env.Clock, deviceallocation.NewController(hook), virtualpods.NewVirtualPodCache(hook), store, cs.Nomination, cs.BufferPods)
+			q := disruption.NewQueue(hook, recorder, cluster, env.Clock, p, cs.Deletion)
+			var running, deleting int
+			hook.after = func() {
+				defer GinkgoRecover()
+				// The informer delivers an unrelated update of the candidate: the update that reset PendingDisruption to
+				// Active in #3250.
+				candidate := ExpectExists(ctx, env.Client, nodeClaim1)
+				candidate.Labels["test.karpenter.sh/unrelated"] = "update"
+				ExpectApplied(ctx, env.Client, candidate)
+				running, deleting, _ = cluster.NodePoolState.GetNodeCount(nodePool.Name)
+				ExpectObjectReconciled(ctx, env.Client, staticDeprovisioning, nodePool)
+			}
+
+			cmd := drift(stateNode)
+			Expect(q.StartCommand(ctx, cmd)).To(Succeed())
+			Expect(hook.called.Load()).To(BeTrue())
+			Expect(running).To(Equal(1), "only the replacement is running")
+			Expect(deleting).To(Equal(1), "the candidate is disrupting")
+
+			replacement := &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: cmd.Replacements[0].Name}}
+			expectNoneDeleted(nodeClaim1, replacement)
+		})
+		It("should not delete healthy nodes when drift replacements fail to launch", func() {
+			nodePool.Spec.Replicas = lo.ToPtr(int64(2))
+			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodeClaim2, node2, nodePool)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node1, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2})
+			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+
+			cmd := drift(stateNode)
+			Expect(queue.StartCommand(ctx, cmd)).To(Succeed())
+			replacement := ExpectExists(ctx, env.Client, &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: cmd.Replacements[0].Name}})
+			ExpectObjectReconciled(ctx, env.Client, staticDeprovisioning, nodePool)
+			expectNoneDeleted(nodeClaim1, nodeClaim2, replacement)
+
+			// The replacement fails to launch (InsufficientCapacityError), so the NodeClaim lifecycle deletes it, through
+			// the client every controller writes with.
+			ExpectDeleted(ctx, env.Overlay, replacement)
+			ExpectObjectReconciled(ctx, env.Client, staticDeprovisioning, nodePool)
+			expectNoneDeleted(nodeClaim1, nodeClaim2)
+
+			// The queue sees the replacement gone, fails the command and moves the candidate back to running.
+			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			Expect(queue.HasAny(nodeClaim1.Name)).To(BeFalse())
+			Expect(ExpectExists(ctx, env.Client, nodeClaim1).StatusConditions().Get(v1.ConditionTypeDisruptionReason)).To(BeNil())
+
+			running, deleting, _ := cluster.NodePoolState.GetNodeCount(nodePool.Name)
+			Expect(running).To(Equal(2))
+			Expect(deleting).To(Equal(0))
+			ExpectObjectReconciled(ctx, env.Client, staticDeprovisioning, nodePool)
+			expectNoneDeleted(nodeClaim1, nodeClaim2)
+			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(2))
 		})
 	})
 	Context("Reconcile", func() {
@@ -547,3 +646,22 @@ var _ = Describe("Queue", func() {
 		})
 	})
 })
+
+// afterCreateClient runs after once, right after its first NodeClaim create returns, to interleave other controllers
+// with the caller at that point.
+type afterCreateClient struct {
+	client.Client
+	once   sync.Once
+	called atomic.Bool
+	after  func()
+}
+
+func (c *afterCreateClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if err := c.Client.Create(ctx, obj, opts...); err != nil {
+		return err
+	}
+	if _, ok := obj.(*v1.NodeClaim); ok && c.after != nil {
+		c.once.Do(func() { c.called.Store(true); c.after() })
+	}
+	return nil
+}
