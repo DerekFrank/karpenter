@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package state_test
+package cluster_test
 
 import (
 	"time"
@@ -40,20 +40,20 @@ var _ = Describe("Claim expiry", func() {
 	})
 
 	reservedNodes := func() int {
-		_, _, reserved := cluster.NodePoolState.GetNodeCount(nodePool.Name)
+		_, _, reserved := cs.NodePoolState.GetNodeCount(nodePool.Name)
 		return reserved
 	}
 	It("should expire a node reservation that's never bound at its TTL, and count it", func() {
-		Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(HaveLen(1))
+		Expect(cs.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(HaveLen(1))
 		Expect(reservedNodes()).To(Equal(1))
 
 		env.Clock.Step(karpentercluster.ReservationTTL)
 		Eventually(reservedNodes).Should(Equal(0), "an expired reservation is held without another Reserve")
 		ExpectMetricCounterValue(karpentercluster.ClaimsExpiredTotal, 1, map[string]string{metrics.ClaimStoreLabel: metrics.NodePoolClaimStore.Name})
 	})
-	reservedResources := func() corev1.ResourceList { return cluster.NodePoolState.ReservedResources(nodePool.Name) }
+	reservedResources := func() corev1.ResourceList { return cs.NodePoolState.ReservedResources(nodePool.Name) }
 	It("should expire a resource reservation that's never bound at its TTL", func() {
-		Expect(cluster.NodePoolState.ReserveResources(nodePool.Name, limits, held, nil)).ToNot(BeNil())
+		Expect(cs.NodePoolState.ReserveResources(nodePool.Name, limits, held, nil)).ToNot(BeNil())
 		env.Clock.Step(karpentercluster.ReservationTTL)
 		Eventually(reservedResources).Should(BeEmpty())
 		ExpectMetricCounterValue(karpentercluster.ClaimsExpiredTotal, 1, map[string]string{metrics.ClaimStoreLabel: metrics.NodePoolClaimStore.Name})
@@ -62,7 +62,7 @@ var _ = Describe("Claim expiry", func() {
 		nodeClaim := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}}})
 		nodeClaim.Status = v1.NodeClaimStatus{}
 		ExpectApplied(ctx, env.Client, nodeClaim)
-		reservation := cluster.NodePoolState.ReserveResources(nodePool.Name, limits, held, nil)
+		reservation := cs.NodePoolState.ReserveResources(nodePool.Name, limits, held, nil)
 		Expect(reservation).ToNot(BeNil())
 		reservation.Bind(nodeClaim.Name)
 
@@ -75,10 +75,10 @@ var _ = Describe("Claim expiry", func() {
 
 		ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
 		ExpectDeleted(ctx, env.Client, nodeClaim)
-		Expect(cluster.NodePoolState.ReservedResources(nodePool.Name)).To(BeEmpty())
+		Expect(cs.NodePoolState.ReservedResources(nodePool.Name)).To(BeEmpty())
 	})
 	It("should expire a reservation bound to a NodeClaim that went before cluster state saw it", func() {
-		reservation := cluster.NodePoolState.ReserveResources(nodePool.Name, limits, held, nil)
+		reservation := cs.NodePoolState.ReserveResources(nodePool.Name, limits, held, nil)
 		Expect(reservation).ToNot(BeNil())
 		reservation.Bind("never-seen")
 		env.Clock.Step(karpentercluster.ReservationTTL)

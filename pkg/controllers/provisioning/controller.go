@@ -29,7 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	"sigs.k8s.io/karpenter/pkg/utils/pod"
@@ -42,17 +42,18 @@ const (
 
 // PodController for the resource
 type PodController struct {
-	kubeClient  client.Client
-	provisioner *Provisioner
-	cluster     *state.Cluster
+	kubeClient    client.Client
+	provisioner   *Provisioner
+	podScheduling *karpentercluster.PodScheduling
 }
 
-// NewPodController constructs a controller instance
-func NewPodController(kubeClient client.Client, provisioner *Provisioner, cluster *state.Cluster) *PodController {
+// NewPodController constructs a controller instance. It acks each provisionable pod through podScheduling, the
+// provisioner's handle of what it decides about each pod.
+func NewPodController(kubeClient client.Client, provisioner *Provisioner, podScheduling *karpentercluster.PodScheduling) *PodController {
 	return &PodController{
-		kubeClient:  kubeClient,
-		provisioner: provisioner,
-		cluster:     cluster,
+		kubeClient:    kubeClient,
+		provisioner:   provisioner,
+		podScheduling: podScheduling,
 	}
 }
 
@@ -69,7 +70,7 @@ func (c *PodController) Reconcile(ctx context.Context, p *corev1.Pod) (reconcile
 	}
 	c.provisioner.Trigger(p.UID)
 	// ACK the pending pod when first observed so that total time spent pending due to Karpenter is tracked.
-	c.cluster.AckPods(p)
+	c.podScheduling.Ack(p)
 	// Continue to requeue until the pod is no longer provisionable. Pods may
 	// not be scheduled as expected if new pods are created while nodes are
 	// coming online. Even if a provisioning loop is successful, the pod may

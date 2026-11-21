@@ -26,7 +26,7 @@ import (
 
 // TestStoresAreBuiltAndStartedWhereTheDesignSays checks each rule with a passing and a failing case: where stores are
 // built, constructors that subscribe or derive, shared stores added to the manager, held objects written, RequeueAfter
-// without a deadline, Contributions without a law test, unbounded collections in a store's fields, raw stores
+// without a deadline or a poll, Contributions without a law test, unbounded collections in a store's fields, raw stores
 // exported from pkg/cluster, and Derives read only as a source.
 func TestStoresAreBuiltAndStartedWhereTheDesignSays(t *testing.T) {
 	analysistest.Run(t, analysistest.TestData(), storelint.Analyzer, "controllers", "sigs.k8s.io/karpenter/pkg/cluster", "sigs.k8s.io/karpenter/pkg/state")

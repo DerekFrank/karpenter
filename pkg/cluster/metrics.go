@@ -43,3 +43,18 @@ var ClaimsExpiredTotal = opmetrics.NewPrometheusCounter(
 func countExpiry[K, H any](store opmetrics.Value) func(K, H) {
 	return func(K, H) { ClaimsExpiredTotal.Inc(map[string]string{metrics.ClaimStoreLabel: store.Name}) }
 }
+
+var (
+	PodSchedulingDecisionSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: metrics.PodSubsystem,
+			Name:      "scheduling_decision_duration_seconds",
+			Help:      "The time it takes for Karpenter to first try to schedule a pod after it's been seen.",
+			Buckets:   metrics.DurationBuckets(),
+		},
+		[]opmetrics.Label{},
+		opmetrics.Alpha,
+	)
+)

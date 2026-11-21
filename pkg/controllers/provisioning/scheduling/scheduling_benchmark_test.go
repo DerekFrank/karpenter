@@ -43,7 +43,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/operator/logging"
@@ -232,7 +231,7 @@ func setupScheduler(ctx context.Context, pods []*corev1.Pod, opts ...scheduling.
 	client := fakecr.NewFakeClient()
 	clock := &clock.RealClock{}
 	cs := emptyState(ctx, clock, cloudProvider)
-	cluster = state.NewCluster(clock, client, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
+	cluster = cs.Nodes
 	topology, err := scheduling.NewTopology(ctx, client, cluster, nil, []*v1.NodePool{nodePool}, map[string][]*cloudprovider.InstanceType{
 		nodePool.Name: instanceTypes,
 	}, pods, opts...)
@@ -245,6 +244,8 @@ func setupScheduler(ctx context.Context, pods []*corev1.Pod, opts ...scheduling.
 		client,
 		[]*v1.NodePool{nodePool},
 		cluster,
+		cs.NodePoolState,
+		cs.CapacityQuotaState,
 		nil,
 		topology,
 		map[string][]*cloudprovider.InstanceType{nodePool.Name: instanceTypes},

@@ -66,8 +66,8 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		useRepairPolicies([]cloudprovider.RepairPolicy{
 			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, TerminationGracePeriod: lo.ToPtr(repairTGP), Action: cloudprovider.ReplaceNode},
 		})
-		repairController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, queue, clusterCost,
-			disruption.WithMethods(disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue))))
+		repairController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost,
+			disruption.WithMethods(disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue))))
 	})
 
 	// staticNodePoolAtLimit: limit == replicas, so the pool is at its limit and can't stage a replacement.
@@ -145,7 +145,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 		// Simulate an outstanding reservation (an in-flight replacement from another command) consuming the only spare
 		// slot under the limit. A naive active-node count (1 < 2) would wrongly see headroom and replace-first. It's
 		// taken after the clock step, which would otherwise expire it.
-		Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(HaveLen(1))
+		Expect(cs.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(HaveLen(1))
 
 		ExpectSingletonReconciled(ctx, repairController)
 
@@ -236,7 +236,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 				cloudprovider.ReservationIDLabel: reservationID,
 			}),
 		})
-		ExpectSingletonReconciled(ctx, pricingController)
+		expectPriced()
 		nodePool := test.NodePool(v1.NodePool{Spec: v1.NodePoolSpec{Template: v1.NodeClaimTemplate{Spec: v1.NodeClaimTemplateSpec{
 			Requirements: []v1.NodeSelectorRequirementWithMinValues{
 				{Key: corev1.LabelInstanceTypeStable, Operator: corev1.NodeSelectorOpIn, Values: []string{mostExpensiveInstance.Name}},
@@ -347,7 +347,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 				cloudprovider.ReservationIDLabel: reservationID,
 			}),
 		})
-		ExpectSingletonReconciled(ctx, pricingController)
+		expectPriced()
 
 		nodePool := test.NodePool(v1.NodePool{Spec: v1.NodePoolSpec{Template: v1.NodeClaimTemplate{Spec: v1.NodeClaimTemplateSpec{
 			Requirements: []v1.NodeSelectorRequirementWithMinValues{
@@ -412,7 +412,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 				cloudprovider.ReservationIDLabel: reservationID,
 			}),
 		})
-		ExpectSingletonReconciled(ctx, pricingController)
+		expectPriced()
 
 		nodePool := test.NodePool(v1.NodePool{Spec: v1.NodePoolSpec{Template: v1.NodeClaimTemplate{Spec: v1.NodeClaimTemplateSpec{
 			Requirements: []v1.NodeSelectorRequirementWithMinValues{
@@ -606,7 +606,7 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			ExpectMetricCounterValue(disruption.TerminateFirstDecisionsTotal, 1, map[string]string{metrics.NodePoolLabel: nodePool.Name, metrics.ReasonLabel: "unhealthy", disruption.TerminateFirstReasonDim.Name: string(disruption.TerminateFirstNoReservedCapacity)})
 			Expect(cmds[0].Replacements).To(HaveLen(0))
 			// The delete-only path must not hold the limits.nodes slot it never uses.
-			Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(HaveLen(1))
+			Expect(cs.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(HaveLen(1))
 		})
 
 		// A node whose reservation is no longer offered frees no slot a refill could launch into, so terminating it first
@@ -651,8 +651,8 @@ var _ = Describe("Repair/TerminateFirst", func() {
 			markUnhealthy(dynamicNode)
 			env.Clock.Step(31 * time.Minute)
 			erroring := &instanceTypesErrorCloudProvider{CloudProvider: cloudProvider, nodePools: []string{staticPool.Name}}
-			repairController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, queue, clusterCost,
-				disruption.WithMethods(disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, erroring, recorder, queue))))
+			repairController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost,
+				disruption.WithMethods(disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, erroring, recorder, queue))))
 
 			ExpectSingletonReconciled(ctx, repairController)
 

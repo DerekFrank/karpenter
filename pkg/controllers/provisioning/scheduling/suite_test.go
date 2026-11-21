@@ -43,26 +43,22 @@ import (
 	cloudproviderapi "k8s.io/cloud-provider/api"
 	"k8s.io/csi-translation-lib/plugins"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
+	"sigs.k8s.io/karpenter/pkg/cluster/virtualpods"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
+	"sigs.k8s.io/karpenter/pkg/cluster/prediction"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
-	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	pscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
-	"sigs.k8s.io/karpenter/pkg/state/cost"
-	"sigs.k8s.io/karpenter/pkg/state/prediction"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
@@ -73,11 +69,9 @@ var ctx context.Context
 var prov *provisioning.Provisioner
 var predictionStore *prediction.Store
 var env *test.Environment
-var clusterCost *cost.ClusterCost
-var cluster *state.Cluster
+var clusterCost *karpentercluster.ClusterCost
+var cluster *karpentercluster.NodeState
 var cloudProvider *fake.CloudProvider
-var nodeClaimStateController reconcile.Reconciler
-var podStateController reconcile.Reconciler
 var podController *provisioning.PodController
 
 const csiProvider = "fake.csi.provider"
@@ -100,14 +94,12 @@ var _ = BeforeSuite(func() {
 	instanceTypes, _ := cloudProvider.GetInstanceTypes(ctx, nil)
 	// set these on the cloud provider, so we can manipulate them if needed
 	cloudProvider.InstanceTypes = instanceTypes
-	clusterCost = cost.NewClusterCost(ctx, cloudProvider, env.Overlay)
+	clusterCost = cs.Cost
 	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = state.NewCluster(env.Clock, env.Overlay, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
-	nodeClaimStateController = informer.NewNodeClaimController(env.Overlay, cloudProvider, clusterCost)
-	podStateController = informer.NewPodController(env.Overlay, cluster)
+	cluster = cs.Nodes
 	predictionStore = prediction.NewStore(env.Overlay)
-	prov = provisioning.NewProvisioner(env.Overlay, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(env.Overlay), virtualpods.NewVirtualPodCache(env.Overlay), predictionStore, cs.Nomination, cs.BufferPods)
-	podController = provisioning.NewPodController(env.Overlay, prov, cluster)
+	prov = provisioning.NewProvisioner(env.Overlay, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, cs.NodePoolState, cs.CapacityQuotaState, env.Clock, deviceallocation.NewController(env.Overlay), virtualpods.NewVirtualPodCache(env.Overlay), predictionStore, cs.Nomination, cs.BufferPods, cs.PodScheduling)
+	podController = provisioning.NewPodController(env.Overlay, prov, cs.PodScheduling)
 })
 
 var _ = AfterSuite(func() {
@@ -121,14 +113,14 @@ var _ = BeforeEach(func() {
 	cloudProvider.InstanceTypes, _ = newCP.GetInstanceTypes(ctx, nil)
 	cloudProvider.CreateCalls = nil
 	scheduling.MaxInstanceTypes = 60
-	state.PodSchedulingDecisionSeconds.Reset()
+	karpentercluster.PodSchedulingDecisionSeconds.Reset()
 	scheduling.UnsupportedProvisioners = sets.New[string]()
 	scheduling.UnsupportedTopologyKeys = sets.New[string]()
 })
 
 var _ = AfterEach(func() {
 	ExpectCleanedUp(ctx, env.Client)
-	cluster.Reset()
+	cs.Reset()
 	scheduling.QueueDepth.Reset()
 	scheduling.DurationSeconds.Reset()
 	scheduling.UnschedulablePodsCount.Reset()
@@ -436,11 +428,12 @@ var _ = Context("Scheduling", func() {
 							{Key: label, Operator: corev1.NodeSelectorOpIn, Values: []string{"test"}},
 						}})
 					nn := client.ObjectKeyFromObject(pod)
-					cluster.AckPods(pod)
+					ExpectApplied(ctx, env.Client, pod)
+					cs.PodScheduling.Ack(pod)
 					ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
 					ExpectNotScheduled(ctx, env.Client, pod)
-					Expect(cluster.PodSchedulingSuccessTime(nn).IsZero()).To(BeTrue())
-					Expect(cluster.PodSchedulingDecisionTime(nn).IsZero()).To(BeFalse())
+					Expect(PodSchedulingOf(cluster.PodStore, nn).SchedulableAt.IsZero()).To(BeTrue())
+					Expect(PodSchedulingOf(cluster.PodStore, nn).DecidedAt.IsZero()).To(BeFalse())
 					ExpectMetricHistogramSampleCountValue("karpenter_pods_scheduling_decision_duration_seconds", 1, nil)
 				}
 			})
@@ -1947,7 +1940,6 @@ var _ = Context("Scheduling", func() {
 			node1.Finalizers = nil
 			ExpectApplied(ctx, env.Client, nodeClaim1, node1)
 			ExpectDeleted(ctx, env.Client, nodeClaim1, node1)
-			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim1))
 
 			secondPod := test.UnschedulablePod(opts)
 			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, secondPod)
@@ -2230,7 +2222,6 @@ var _ = Context("Scheduling", func() {
 					Expect(available.Cpu().AsApproximateFloat64()).To(BeNumerically("~", 15.9))
 				}
 				ExpectManualBinding(ctx, env.Client, dsPod, node1)
-				ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(dsPod))
 
 				for f := range cluster.Nodes() {
 					dsRequests := f.DaemonSetRequests()
@@ -2315,7 +2306,6 @@ var _ = Context("Scheduling", func() {
 					Expect(available.Cpu().AsApproximateFloat64()).To(BeNumerically("~", 15.9))
 				}
 				ExpectManualBinding(ctx, env.Client, dsPod, node1)
-				ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(dsPod))
 
 				for n := range cluster.Nodes() {
 					dsRequests := n.DaemonSetRequests()
@@ -2452,10 +2442,8 @@ var _ = Context("Scheduling", func() {
 
 				// manually bind the daemonset pods to the node
 				ExpectManualBinding(ctx, env.Client, ds1Pod, node1)
-				ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(ds1Pod))
 
 				ExpectManualBinding(ctx, env.Client, ds2Pod, node1)
-				ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(ds2Pod))
 
 				for n := range cluster.Nodes() {
 					dsRequests := n.DaemonSetRequests()
@@ -2555,7 +2543,6 @@ var _ = Context("Scheduling", func() {
 			// Make one of the nodes and nodeClaims initialized
 			ExpectMakeNodeClaimsInitialized(ctx, env.Client, env.Clock, nodeClaims[elem])
 			ExpectMakeNodesInitialized(ctx, env.Client, env.Clock, node)
-			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaims[elem]))
 
 			pod := test.UnschedulablePod()
 			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
@@ -2654,7 +2641,6 @@ var _ = Context("Scheduling", func() {
 			elem := rand.Intn(100) //nolint:gosec
 			ExpectMakeNodeClaimsInitialized(ctx, env.Client, env.Clock, nodeClaims[elem])
 			ExpectMakeNodesInitialized(ctx, env.Client, env.Clock, nodes[elem])
-			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaims[elem]))
 
 			pod := test.UnschedulablePod()
 			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
@@ -2676,8 +2662,6 @@ var _ = Context("Scheduling", func() {
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
 			ExpectMakeNodeClaimsInitialized(ctx, env.Client, env.Clock, nodeClaim)
 			ExpectMakeNodesInitialized(ctx, env.Client, env.Clock, node)
-
-			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim))
 
 			pod := test.UnschedulablePod(test.PodOptions{
 				NodeRequirements: []corev1.NodeSelectorRequirement{
@@ -2726,8 +2710,6 @@ var _ = Context("Scheduling", func() {
 				node = ExpectRegistered(ctx, env.Client, nodeClaim, node)
 				ExpectMakeNodeClaimsInitialized(ctx, env.Client, env.Clock, nodeClaim)
 				ExpectMakeNodesInitialized(ctx, env.Client, env.Clock, node)
-
-				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim))
 
 				pod := test.UnschedulablePod(test.PodOptions{
 					ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{
@@ -5689,7 +5671,7 @@ var _ = Context("Scheduling", func() {
 			topology1, err := scheduling.NewTopology(ctx1, env.Client, cluster, nil, []*v1.NodePool{nodePool},
 				map[string][]*cloudprovider.InstanceType{nodePool.Name: cloudProvider.InstanceTypes}, []*corev1.Pod{appPod})
 			Expect(err).ToNot(HaveOccurred())
-			scheduler1 := scheduling.NewScheduler(ctx1, env.Client, []*v1.NodePool{nodePool}, cluster, nil, topology1,
+			scheduler1 := scheduling.NewScheduler(ctx1, env.Client, []*v1.NodePool{nodePool}, cluster, cs.NodePoolState, cs.CapacityQuotaState, nil, topology1,
 				map[string][]*cloudprovider.InstanceType{nodePool.Name: cloudProvider.InstanceTypes},
 				[]*corev1.Pod{draDaemonPod}, events.NewRecorder(&record.FakeRecorder{}), env.Clock, nil, nil, nil, nil)
 			results1, err := scheduler1.Solve(ctx1, []*corev1.Pod{appPod})
@@ -5702,7 +5684,7 @@ var _ = Context("Scheduling", func() {
 			topology2, err := scheduling.NewTopology(ctx2, env.Client, cluster, nil, []*v1.NodePool{nodePool},
 				map[string][]*cloudprovider.InstanceType{nodePool.Name: cloudProvider.InstanceTypes}, []*corev1.Pod{appPod})
 			Expect(err).ToNot(HaveOccurred())
-			scheduler2 := scheduling.NewScheduler(ctx2, env.Client, []*v1.NodePool{nodePool}, cluster, nil, topology2,
+			scheduler2 := scheduling.NewScheduler(ctx2, env.Client, []*v1.NodePool{nodePool}, cluster, cs.NodePoolState, cs.CapacityQuotaState, nil, topology2,
 				map[string][]*cloudprovider.InstanceType{nodePool.Name: cloudProvider.InstanceTypes},
 				[]*corev1.Pod{draDaemonPod}, events.NewRecorder(&record.FakeRecorder{}), env.Clock, nil, nil, nil, nil)
 			results2, err := scheduler2.Solve(ctx2, []*corev1.Pod{appPod})

@@ -66,13 +66,13 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	pscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
 	"sigs.k8s.io/karpenter/pkg/test"
 	testv1alpha1 "sigs.k8s.io/karpenter/pkg/test/v1alpha1"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
+	volumeutil "sigs.k8s.io/karpenter/pkg/utils/volume"
 )
 
 const (
@@ -346,7 +346,7 @@ func ExpectFinalizersRemoved(ctx context.Context, c client.Client, objs ...clien
 	}
 }
 
-func ExpectProvisioned(ctx context.Context, c client.Client, cluster *state.Cluster, cloudProvider cloudprovider.CloudProvider, provisioner *provisioning.Provisioner, pods ...*corev1.Pod) ProvisioningResult {
+func ExpectProvisioned(ctx context.Context, c client.Client, cluster *karpentercluster.NodeState, cloudProvider cloudprovider.CloudProvider, provisioner *provisioning.Provisioner, pods ...*corev1.Pod) ProvisioningResult {
 	GinkgoHelper()
 	result := ExpectProvisionedNoBinding(ctx, c, cluster, cloudProvider, provisioner, pods...)
 	podKeys := sets.NewString(lo.Map(pods, func(p *corev1.Pod, _ int) string { return client.ObjectKeyFromObject(p).String() })...)
@@ -362,7 +362,7 @@ func ExpectProvisioned(ctx context.Context, c client.Client, cluster *state.Clus
 			} else {
 				ExpectManualBinding(ctx, c, pod, binding.Node)
 			}
-			Expect(cluster.ResolvePVCDrivers(ctx, pod)).To(Succeed())
+			ExpectPVCDriversResolved(ctx, c, cluster.PVCStore, pod)
 
 			if result.ResourceClaimAllocationMetadata != nil {
 				expectDRAClaimsAllocated(ctx, c, pod, binding, result.ResourceClaimAllocationMetadata)
@@ -372,8 +372,28 @@ func ExpectProvisioned(ctx context.Context, c client.Client, cluster *state.Clus
 	return result
 }
 
+// ExpectPVCDriversResolved resolves the drivers of the PVCs the pods mount, as the PVC driver controller does once it
+// sees them.
+func ExpectPVCDriversResolved(ctx context.Context, c client.Client, pvcs *karpentercluster.PVCs, pods ...*corev1.Pod) {
+	GinkgoHelper()
+	for _, pod := range pods {
+		for _, volume := range pod.Spec.Volumes {
+			name := volumeutil.PersistentVolumeClaimName(pod, volume)
+			if name == "" {
+				continue
+			}
+			pvc := &corev1.PersistentVolumeClaim{}
+			if err := c.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: name}, pvc); err != nil {
+				Expect(client.IgnoreNotFound(err)).To(Succeed())
+				continue
+			}
+			Expect(pvcs.Resolve(ctx, c, pvc)).To(Succeed())
+		}
+	}
+}
+
 //nolint:gocyclo
-func ExpectProvisionedNoBinding(ctx context.Context, c client.Client, cluster *state.Cluster, cloudProvider cloudprovider.CloudProvider, provisioner *provisioning.Provisioner, pods ...*corev1.Pod) ProvisioningResult {
+func ExpectProvisionedNoBinding(ctx context.Context, c client.Client, cluster *karpentercluster.NodeState, cloudProvider cloudprovider.CloudProvider, provisioner *provisioning.Provisioner, pods ...*corev1.Pod) ProvisioningResult {
 	GinkgoHelper()
 	// Persist objects
 	for _, pod := range pods {
@@ -425,7 +445,7 @@ func ExpectProvisionedNoBinding(ctx context.Context, c client.Client, cluster *s
 	return result
 }
 
-func ExpectProvisionedResults(ctx context.Context, c client.Client, cluster *state.Cluster, cloudProvider cloudprovider.CloudProvider, provisioner *provisioning.Provisioner, pods ...*corev1.Pod) scheduling.Results {
+func ExpectProvisionedResults(ctx context.Context, c client.Client, cluster *karpentercluster.NodeState, cloudProvider cloudprovider.CloudProvider, provisioner *provisioning.Provisioner, pods ...*corev1.Pod) scheduling.Results {
 	GinkgoHelper()
 	// Persist objects
 	for _, pod := range pods {
@@ -999,7 +1019,13 @@ func ExpectNodeClaims(ctx context.Context, c client.Client) []*v1.NodeClaim {
 	return lo.ToSlicePtr(nodeClaims.Items)
 }
 
-func ExpectStateNodeExists(cluster *state.Cluster, node *corev1.Node) *karpentercluster.StateNode {
+// PodSchedulingOf returns what the provisioner decided about the pod, from the Scheduling intent on its entry.
+func PodSchedulingOf(pods *karpentercluster.Pods, pod types.NamespacedName) karpentercluster.PodSchedulingFields {
+	e, _ := pods.Get(pod)
+	return e.Intent.Scheduling.Value
+}
+
+func ExpectStateNodeExists(cluster *karpentercluster.NodeState, node *corev1.Node) *karpentercluster.StateNode {
 	GinkgoHelper()
 	var ret *karpentercluster.StateNode
 	for n := range cluster.Nodes() {
@@ -1012,7 +1038,7 @@ func ExpectStateNodeExists(cluster *state.Cluster, node *corev1.Node) *karpenter
 	return ret
 }
 
-func ExpectStateNodeExistsForNodeClaim(cluster *state.Cluster, nodeClaim *v1.NodeClaim) *karpentercluster.StateNode {
+func ExpectStateNodeExistsForNodeClaim(cluster *karpentercluster.NodeState, nodeClaim *v1.NodeClaim) *karpentercluster.StateNode {
 	GinkgoHelper()
 	var ret *karpentercluster.StateNode
 	for n := range cluster.Nodes() {
@@ -1105,10 +1131,10 @@ func ExpectParallelized(fs ...func()) {
 	wg.Wait()
 }
 
-func ExpectStateNodePoolCount(cluster *state.Cluster, npName string, r, d, reservedNodes int) {
+func ExpectStateNodePoolCount(nodePools *karpentercluster.NodePoolState, npName string, r, d, reservedNodes int) {
 	GinkgoHelper()
 
-	running, deleting, reserved := cluster.NodePoolState.GetNodeCount(npName)
+	running, deleting, reserved := nodePools.GetNodeCount(npName)
 	Expect(running).To(Equal(r))
 	Expect(deleting).To(Equal(d))
 	Expect(reserved).To(Equal(reservedNodes))

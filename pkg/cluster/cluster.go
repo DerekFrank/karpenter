@@ -45,13 +45,19 @@ type ClusterEntry = state.Entry[Cluster, ClusterDerived, struct{}]
 type Clusters struct {
 	state.Reader[Cluster, Cluster, ClusterDerived, struct{}]
 	store *state.Store[Cluster, Cluster, ClusterDerived, struct{}]
+	// unmanagedIndex is the target of unmanaged, keyed by TheCluster.
+	unmanagedIndex *state.Store[Cluster, Cluster, struct{}, struct{}]
 	// unmanaged is the Derive from the Node store whose Sources are the unmanaged Nodes.
-	unmanaged *state.Derivation[string, Cluster, ClusterDerived, unmanagedNode]
+	unmanaged *state.Derivation[string, Cluster, struct{}, member]
 }
 
 func newClusters() *Clusters {
 	store := state.NewSyntheticStore[Cluster, Cluster, ClusterDerived, struct{}](func(c Cluster) Cluster { return c })
-	return &Clusters{Reader: store.Reader, store: store}
+	return &Clusters{
+		Reader:         store.Reader,
+		store:          store,
+		unmanagedIndex: state.NewSyntheticStore[Cluster, Cluster, struct{}, struct{}](func(c Cluster) Cluster { return c }),
+	}
 }
 
 // Counts returns the cluster's counts.
@@ -73,22 +79,14 @@ func (n unlaunchedNodeClaim) Delete(d ClusterDerived) ClusterDerived {
 	return d
 }
 
-// unmanagedNode is an unmanaged Node's contribution to the cluster's entry: nothing but its place among the unmanaged
-// Derive's Sources, which UnmanagedNodes reads.
-type unmanagedNode struct{}
-
-func (unmanagedNode) Update(d ClusterDerived, _ unmanagedNode) ClusterDerived { return d }
-
-func (unmanagedNode) Delete(d ClusterDerived) ClusterDerived { return d }
-
 // derive keeps the cluster's counts, and the index of unmanaged Nodes, from the NodeClaim and Node stores.
 func (c *Clusters) derive(nodeClaims *NodeClaims, nodes *Nodes) {
 	state.Derive(nodeClaims.Reader, c.store,
 		func(_ string, e NodeClaimEntry) Cluster { return lo.Ternary(!Launched(e), TheCluster, Cluster{}) },
 		func(string, NodeClaimEntry) unlaunchedNodeClaim { return 1 })
-	c.unmanaged = state.DeriveObject(nodes.Reader, c.store,
+	c.unmanaged = state.DeriveObject(nodes.Reader, c.unmanagedIndex,
 		func(_ string, node *corev1.Node) Cluster { return lo.Ternary(Unmanaged(node), TheCluster, Cluster{}) },
-		func(string, *corev1.Node) unmanagedNode { return unmanagedNode{} })
+		func(string, *corev1.Node) member { return member{} })
 }
 
 // UnmanagedNodes returns the names of the unmanaged Nodes.

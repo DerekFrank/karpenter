@@ -42,7 +42,6 @@ import (
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	nodeclaimlifecycle "sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
 	"sigs.k8s.io/karpenter/pkg/controllers/nodepool/registrationhealth"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -59,7 +58,8 @@ var (
 	nodeClaimController *nodeclaimlifecycle.Controller
 	env                 *test.Environment
 	cloudProvider       *fake.CloudProvider
-	cluster             *state.Cluster
+	cluster             *karpentercluster.NodeState
+	cs                  karpentercluster.State
 	recorder            *test.EventRecorder
 	npState             *karpentercluster.NodePoolState
 	registrations       *karpentercluster.Registrations
@@ -91,11 +91,11 @@ var _ = BeforeSuite(func() {
 	ctx = options.ToContext(ctx, test.Options())
 
 	cloudProvider = fake.NewCloudProvider()
-	cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = state.NewCluster(env.Clock, env.Overlay, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
-	npState = cluster.NodePoolState
+	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
+	cluster = cs.Nodes
+	npState = cs.NodePoolState
 	registrations = cs.Registrations
-	nodeClaimController = nodeclaimlifecycle.NewController(env.Clock, env.Overlay, cloudProvider, recorder, cluster, registrations, nil)
+	nodeClaimController = nodeclaimlifecycle.NewController(env.Clock, env.Overlay, cloudProvider, recorder, cluster.PodStore, registrations, nil)
 	registrationHealthController = registrationhealth.NewController(env.Clock, env.Overlay, cloudProvider, npState)
 })
 
@@ -130,7 +130,7 @@ var _ = AfterEach(func() {
 	env.Clock.SetTime(time.Now())
 	ExpectCleanedUp(ctx, env.Client)
 	cloudProvider.Reset()
-	cluster.Reset()
+	cs.Reset()
 })
 
 var _ = Describe("Finalizer", func() {

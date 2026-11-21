@@ -33,10 +33,10 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
@@ -53,7 +53,8 @@ type consolidation struct {
 	// Consolidation needs to be aware of the queue for validation
 	queue         *Queue
 	clock         clock.Clock
-	cluster       *state.Cluster
+	cluster       *karpentercluster.NodeState
+	nodePools     *karpentercluster.NodePoolState
 	kubeClient    client.Client
 	provisioner   *provisioning.Provisioner
 	cloudProvider cloudprovider.CloudProvider
@@ -79,12 +80,13 @@ func (c *consolidation) SetNodePoolTotals(totals map[string]NodePoolTotals) {
 	c.evaluator = NewBalancedEvaluator(totals, c.recorder)
 }
 
-func MakeConsolidation(clock clock.Clock, cluster *state.Cluster, kubeClient client.Client, provisioner *provisioning.Provisioner,
+func MakeConsolidation(clock clock.Clock, cluster *karpentercluster.NodeState, nodePools *karpentercluster.NodePoolState, kubeClient client.Client, provisioner *provisioning.Provisioner,
 	cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue) consolidation {
 	return consolidation{
 		queue:         queue,
 		clock:         clock,
 		cluster:       cluster,
+		nodePools:     nodePools,
 		kubeClient:    kubeClient,
 		provisioner:   provisioner,
 		cloudProvider: cloudProvider,

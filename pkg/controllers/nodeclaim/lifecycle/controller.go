@@ -43,7 +43,6 @@ import (
 
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	terminatorevents "sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator/events"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -77,14 +76,14 @@ type Controller struct {
 	liveness       *Liveness
 }
 
-func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, cluster *state.Cluster, registrations *karpentercluster.Registrations, registrationHooks []cloudprovider.NodeLifecycleHook) *Controller {
+func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, pods *karpentercluster.Pods, registrations *karpentercluster.Registrations, registrationHooks []cloudprovider.NodeLifecycleHook) *Controller {
 	return &Controller{
 		clock:         clk,
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
 		recorder:      recorder,
 
-		launch:         &Launch{kubeClient: kubeClient, cloudProvider: cloudProvider, cluster: cluster, cache: cache.New(time.Hour, time.Minute), recorder: recorder, clock: clk},
+		launch:         &Launch{kubeClient: kubeClient, cloudProvider: cloudProvider, pods: pods, cache: cache.New(time.Hour, time.Minute), recorder: recorder, clock: clk},
 		registration:   &Registration{kubeClient: kubeClient, cloudProvider: cloudProvider, recorder: recorder, registrations: registrations, registrationHooks: registrationHooks, clock: clk},
 		initialization: &Initialization{kubeClient: kubeClient, clock: clk},
 		liveness:       &Liveness{clock: clk, kubeClient: kubeClient, cloudProvider: cloudProvider, registrations: registrations},

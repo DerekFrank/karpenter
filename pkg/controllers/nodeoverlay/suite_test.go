@@ -39,8 +39,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/apis/v1alpha1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
-	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -54,7 +52,6 @@ var (
 	cloudProvider         *fake.CloudProvider
 	nodePool              *v1.NodePool
 	nodePoolTwo           *v1.NodePool
-	cluster               *state.Cluster
 	nodeOverlayController *Controller
 	store                 *InstanceTypeStore
 )
@@ -69,9 +66,7 @@ var _ = BeforeSuite(func() {
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(testv1alpha1.CRDs...))
 	cloudProvider = fake.NewCloudProvider()
 	store = NewInstanceTypeStore()
-	cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = state.NewCluster(env.Clock, env.Overlay, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
-	nodeOverlayController = NewController(env.Clock, env.Overlay, cloudProvider, store, cluster)
+	nodeOverlayController = NewController(env.Clock, env.Overlay, cloudProvider, store)
 })
 
 var _ = BeforeEach(func() {

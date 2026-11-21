@@ -26,10 +26,10 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 
@@ -38,15 +38,15 @@ import (
 
 // StaticDrift is a subreconciler that deletes drifted static candidates.
 type StaticDrift struct {
-	cluster       *state.Cluster
+	nodePools     *karpentercluster.NodePoolState
 	provisioner   *provisioning.Provisioner
 	cloudprovider cloudprovider.CloudProvider
 	recorder      events.Recorder
 }
 
-func NewStaticDrift(cluster *state.Cluster, provisioner *provisioning.Provisioner, cloudprovider cloudprovider.CloudProvider, recorder events.Recorder) *StaticDrift {
+func NewStaticDrift(nodePools *karpentercluster.NodePoolState, provisioner *provisioning.Provisioner, cloudprovider cloudprovider.CloudProvider, recorder events.Recorder) *StaticDrift {
 	return &StaticDrift{
-		cluster:       cluster,
+		nodePools:     nodePools,
 		provisioner:   provisioner,
 		cloudprovider: cloudprovider,
 		recorder:      recorder,
@@ -75,7 +75,7 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 		limit, ok := np.Spec.Limits[resources.Node]
 		nodeLimit := lo.Ternary(ok, limit.Value(), int64(math.MaxInt64))
 		// Current nodes (includes in‑flight per your cluster state)
-		runningNodes, _, _ := d.cluster.NodePoolState.GetNodeCount(npName)
+		runningNodes, _, _ := d.nodePools.GetNodeCount(npName)
 
 		// We dont want to disrupt nodes until scale down is complete
 		if int64(runningNodes) > lo.FromPtr(np.Spec.Replicas) {
@@ -112,7 +112,7 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 		// Acquire limits from cluster state without bursting over. maxAllowedDrifts is how many candidates we can drift
 		// while staging a replacement for each without exceeding the NodePool's node limit; 0 means the pool is at its
 		// limit and can't stage any replacement.
-		reservations := d.cluster.NodePoolState.ReserveNodeCount(npName, nodeLimit, maxDrifts)
+		reservations := d.nodePools.ReserveNodeCount(npName, nodeLimit, maxDrifts)
 		maxAllowedDrifts := len(reservations)
 
 		// Terminate-first (RFC #3203): when the NodePool is at its node limit it can't stage a replacement first — a

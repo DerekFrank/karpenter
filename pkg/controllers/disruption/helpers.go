@@ -40,12 +40,10 @@ import (
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	operatorlogging "sigs.k8s.io/karpenter/pkg/operator/logging"
 	pkgscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
-	"sigs.k8s.io/karpenter/pkg/state/cost"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/pdb"
 )
@@ -61,7 +59,7 @@ type SimulationOptions struct {
 // SimulateScheduling determines whether candidate workloads can be rescheduled after disruption.
 //
 //nolint:gocyclo
-func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, clk clock.Clock, recorder events.Recorder,
+func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *karpentercluster.NodeState, provisioner *provisioning.Provisioner, clk clock.Clock, recorder events.Recorder,
 	schedulerOpts []scheduling.Options, simulationOpts SimulationOptions, candidates ...*Candidate,
 ) (scheduling.Results, error) {
 	candidateNames := sets.NewString(lo.Map(candidates, func(t *Candidate, i int) string { return t.Name() })...)
@@ -192,7 +190,7 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 func SimulateSchedulingWithReservedFallback(
 	ctx context.Context,
 	kubeClient client.Client,
-	cluster *state.Cluster,
+	cluster *karpentercluster.NodeState,
 	provisioner *provisioning.Provisioner,
 	clk clock.Clock,
 	recorder events.Recorder,
@@ -238,7 +236,7 @@ func instanceTypesAreSubset(lhs []*cloudprovider.InstanceType, rhs []*cloudprovi
 }
 
 // GetCandidates returns nodes that appear to be currently deprovisionable based off of their nodePool.
-func GetCandidates(ctx context.Context, cluster *state.Cluster, kubeClient client.Client, recorder events.Recorder, clk clock.Clock,
+func GetCandidates(ctx context.Context, cluster *karpentercluster.NodeState, kubeClient client.Client, recorder events.Recorder, clk clock.Clock,
 	cloudProvider cloudprovider.CloudProvider, shouldDisrupt CandidateFilter, disruptionClass string, queue *Queue,
 ) ([]*Candidate, error) {
 	candidates, _, err := GetCandidatesWithTotals(ctx, cluster, kubeClient, recorder, clk, cloudProvider, shouldDisrupt, disruptionClass, queue, nil)
@@ -249,8 +247,8 @@ func GetCandidates(ctx context.Context, cluster *state.Cluster, kubeClient clien
 // candidates before filtering, so balanced scoring normalizes against the full pool.
 // When clusterCost is non-nil, TotalCost is read from precomputed cluster state
 // rather than re-summed from candidates.
-func GetCandidatesWithTotals(ctx context.Context, cluster *state.Cluster, kubeClient client.Client, recorder events.Recorder, clk clock.Clock,
-	cloudProvider cloudprovider.CloudProvider, shouldDisrupt CandidateFilter, disruptionClass string, queue *Queue, clusterCost *cost.ClusterCost,
+func GetCandidatesWithTotals(ctx context.Context, cluster *karpentercluster.NodeState, kubeClient client.Client, recorder events.Recorder, clk clock.Clock,
+	cloudProvider cloudprovider.CloudProvider, shouldDisrupt CandidateFilter, disruptionClass string, queue *Queue, clusterCost *karpentercluster.ClusterCost,
 ) ([]*Candidate, map[string]NodePoolTotals, error) {
 	nodePoolMap, nodePoolToInstanceTypesMap, err := BuildNodePoolMap(ctx, kubeClient, cloudProvider)
 	if err != nil {
@@ -333,16 +331,16 @@ func BuildNodePoolMap(ctx context.Context, kubeClient client.Client, cloudProvid
 // Other reasons keep the reason-agnostic "unhealthy nodes consume budget" semantics introduced for consolidation/drift
 // (kubernetes-sigs/karpenter#981). Cluster state derives the counts as nodes change; karpentercluster.NodePoolFields.Disruption
 // says which nodes count.
-func NodePoolStats(cluster *state.Cluster, nodePool string, reason v1.DisruptionReason) (numNodes, disrupting int) {
-	d := cluster.NodePoolState.Disruption(nodePool)
+func NodePoolStats(nodePools *karpentercluster.NodePoolState, nodePool string, reason v1.DisruptionReason) (numNodes, disrupting int) {
+	d := nodePools.Disruption(nodePool)
 	return d.Nodes, d.Disrupting + lo.Ternary(reason == v1.DisruptionReasonUnhealthy, 0, d.NotReady)
 }
 
 // NodePoolBudgetMap returns the disruptions each NodePool still allows for reason, clamped to zero.
-func NodePoolBudgetMap(ctx context.Context, clk clock.Clock, cluster *state.Cluster, nodePools map[string]*v1.NodePool, reason v1.DisruptionReason) map[string]int {
+func NodePoolBudgetMap(ctx context.Context, clk clock.Clock, nodePoolState *karpentercluster.NodePoolState, nodePools map[string]*v1.NodePool, reason v1.DisruptionReason) map[string]int {
 	out := map[string]int{}
 	for name, np := range nodePools {
-		numNodes, disrupting := NodePoolStats(cluster, name, reason)
+		numNodes, disrupting := NodePoolStats(nodePoolState, name, reason)
 		allowed := np.MustGetAllowedDisruptions(clk, numNodes, reason)
 		remaining := allowed - disrupting
 		if remaining < 0 {
@@ -361,14 +359,14 @@ func NodePoolBudgetMap(ctx context.Context, clk clock.Clock, cluster *state.Clus
 
 // BuildDisruptionBudgets prepares our disruption budget mapping. The disruption budget maps each disruption reason to the number of allowed disruptions.
 // We calculate allowed disruptions by taking the max disruptions allowed by disruption reason and subtracting the number of nodes that are NotReady and already being deleted by that disruption reason.
-func BuildDisruptionBudgetMapping(ctx context.Context, cluster *state.Cluster, clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, reason v1.DisruptionReason) (map[string]int, error) {
+func BuildDisruptionBudgetMapping(ctx context.Context, nodePoolState *karpentercluster.NodePoolState, clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, reason v1.DisruptionReason) (map[string]int, error) {
 	disruptionBudgetMapping := map[string]int{}
 	nodePools, err := nodepoolutils.ListManaged(ctx, kubeClient, cloudProvider)
 	if err != nil {
 		return disruptionBudgetMapping, fmt.Errorf("listing node pools, %w", err)
 	}
 	for _, nodePool := range nodePools {
-		numNodes, disrupting := NodePoolStats(cluster, nodePool.Name, reason)
+		numNodes, disrupting := NodePoolStats(nodePoolState, nodePool.Name, reason)
 		allowedDisruptions := nodePool.MustGetAllowedDisruptions(clk, numNodes, reason)
 		disruptionBudgetMapping[nodePool.Name] = lo.Max([]int{allowedDisruptions - disrupting, 0})
 		NodePoolAllowedDisruptions.Set(float64(allowedDisruptions), map[string]string{

@@ -32,7 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
+	"sigs.k8s.io/karpenter/pkg/cluster/virtualpods"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	autoscalingv1beta1 "sigs.k8s.io/karpenter/pkg/apis/autoscaling/v1beta1"

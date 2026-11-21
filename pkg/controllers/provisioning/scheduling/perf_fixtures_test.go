@@ -45,7 +45,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
@@ -65,7 +64,8 @@ type Scenario struct {
 type ScenarioFixture struct {
 	ctx           context.Context
 	client        client.Client
-	cluster       *state.Cluster
+	cluster       *karpentercluster.NodeState
+	clusterState  karpentercluster.State
 	nodePools     []*v1.NodePool
 	itsByNP       map[string][]*cloudprovider.InstanceType
 	topology      *scheduling.Topology
@@ -179,7 +179,7 @@ func buildScenario(tb testing.TB, s Scenario) *ScenarioFixture {
 	c := fakecr.NewFakeClient()
 	clk := &clock.RealClock{}
 	cs := emptyState(ctx, clk, cp)
-	cl := state.NewCluster(clk, c, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
+	cl := cs.Nodes
 
 	nodePools := benchNodePools(s.NodePools)
 	itsByNP := map[string][]*cloudprovider.InstanceType{}
@@ -194,7 +194,7 @@ func buildScenario(tb testing.TB, s Scenario) *ScenarioFixture {
 	daemonSetPods := benchDaemonSetPods(s.DaemonSets)
 
 	f := &ScenarioFixture{
-		ctx: ctx, client: c, cluster: cl, nodePools: nodePools, itsByNP: itsByNP,
+		ctx: ctx, client: c, cluster: cl, clusterState: cs, nodePools: nodePools, itsByNP: itsByNP,
 		topology: topology, stateNodes: stateNodes, daemonSetPods: daemonSetPods,
 		recorder: events.NewRecorder(&record.FakeRecorder{}), clk: clk,
 	}
@@ -209,6 +209,8 @@ func newSchedulerFromScenario(f *ScenarioFixture) *scheduling.Scheduler {
 		f.client,
 		f.nodePools,
 		f.cluster,
+		f.clusterState.NodePoolState,
+		f.clusterState.CapacityQuotaState,
 		f.stateNodes,
 		f.topology,
 		f.itsByNP,

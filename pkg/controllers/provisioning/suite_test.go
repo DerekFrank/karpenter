@@ -24,9 +24,9 @@ import (
 	"time"
 
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
+	"sigs.k8s.io/karpenter/pkg/cluster/virtualpods"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/metrics"
-	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -44,13 +44,12 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	"sigs.k8s.io/karpenter/pkg/cluster/prediction"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
-	"sigs.k8s.io/karpenter/pkg/state/prediction"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
@@ -62,7 +61,7 @@ import (
 var (
 	cs            karpentercluster.State
 	ctx           context.Context
-	cluster       *state.Cluster
+	cluster       *karpentercluster.NodeState
 	cloudProvider *fake.CloudProvider
 	prov          *provisioning.Provisioner
 	// provClock is the provisioner's view of env.Clock, which counts only what the provisioner waits on, not cluster
@@ -84,10 +83,10 @@ var _ = BeforeSuite(func() {
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
 	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = state.NewCluster(env.Clock, env.Overlay, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
+	cluster = cs.Nodes
 	predictionStore = prediction.NewStore(env.Overlay)
 	provClock = test.NewClockView(env.Clock)
-	prov = provisioning.NewProvisioner(env.Overlay, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, provClock, deviceallocation.NewController(env.Overlay), virtualpods.NewVirtualPodCache(env.Overlay), predictionStore, cs.Nomination, cs.BufferPods)
+	prov = provisioning.NewProvisioner(env.Overlay, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, cs.NodePoolState, cs.CapacityQuotaState, provClock, deviceallocation.NewController(env.Overlay), virtualpods.NewVirtualPodCache(env.Overlay), predictionStore, cs.Nomination, cs.BufferPods, cs.PodScheduling)
 	instanceTypes, _ := cloudProvider.GetInstanceTypes(ctx, nil)
 	instanceTypeMap = map[string]*cloudprovider.InstanceType{}
 	for _, it := range instanceTypes {
@@ -105,7 +104,7 @@ var _ = BeforeEach(func() {
 		env.Clock.Step(1 * time.Minute)
 	}
 	env.Clock.SetTime(time.Now())
-	state.PodSchedulingDecisionSeconds.Reset()
+	karpentercluster.PodSchedulingDecisionSeconds.Reset()
 	pscheduling.DefaultTerminationGracePeriod = nil
 })
 
@@ -116,7 +115,7 @@ var _ = AfterSuite(func() {
 var _ = AfterEach(func() {
 	ExpectCleanedUp(ctx, env.Client)
 	cloudProvider.Reset()
-	cluster.Reset()
+	cs.Reset()
 	pscheduling.IgnoredPodCount.Set(0, nil)
 })
 
@@ -259,7 +258,8 @@ var _ = Describe("Provisioning", func() {
 	It("should provision nodes", func() {
 		ExpectApplied(ctx, env.Client, test.NodePool())
 		pod := test.UnschedulablePod()
-		cluster.AckPods(pod)
+		ExpectApplied(ctx, env.Client, pod)
+		cs.PodScheduling.Ack(pod)
 		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
 		nodes := &corev1.NodeList{}
 		Expect(env.Client.List(ctx, nodes)).To(Succeed())
@@ -270,7 +270,10 @@ var _ = Describe("Provisioning", func() {
 	It("Should provision nodes for multiple pods", func() {
 		ExpectApplied(ctx, env.Client, test.NodePool())
 		pods := test.UnschedulablePods(test.PodOptions{}, 100)
-		cluster.AckPods(pods...)
+		for _, pod := range pods {
+			ExpectApplied(ctx, env.Client, pod)
+		}
+		cs.PodScheduling.Ack(pods...)
 		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pods...)
 		nodes := &corev1.NodeList{}
 		Expect(env.Client.List(ctx, nodes)).To(Succeed())
@@ -330,13 +333,14 @@ var _ = Describe("Provisioning", func() {
 		ExpectApplied(ctx, env.Client, nodePool)
 		ExpectDeletionTimestampSet(ctx, env.Client, nodePool)
 		pod := test.UnschedulablePod()
-		cluster.AckPods(pod)
+		ExpectApplied(ctx, env.Client, pod)
+		cs.PodScheduling.Ack(pod)
 		nn := client.ObjectKeyFromObject(pod)
 		// Provisioning should fail here since there are no valid nodePools to schedule the pod
 		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
 		ExpectNotScheduled(ctx, env.Client, pod)
-		Expect(cluster.PodSchedulingSuccessTime(nn).IsZero()).To(BeTrue())
-		Expect(cluster.PodSchedulingDecisionTime(nn).IsZero()).To(BeFalse())
+		Expect(PodSchedulingOf(cluster.PodStore, nn).SchedulableAt.IsZero()).To(BeTrue())
+		Expect(PodSchedulingOf(cluster.PodStore, nn).DecidedAt.IsZero()).To(BeFalse())
 		ExpectMetricHistogramSampleCountValue("karpenter_pods_scheduling_decision_duration_seconds", 1, nil)
 	})
 	It("should provision nodes for pods with supported node selectors", func() {
@@ -491,7 +495,7 @@ var _ = Describe("Provisioning", func() {
 
 		nodeClaim := &v1.NodeClaim{}
 		Expect(env.Client.Get(ctx, types.NamespacedName{Name: nodeClaims[0]}, nodeClaim)).To(Succeed())
-		Expect(cluster.PodNodeClaimMapping(client.ObjectKeyFromObject(pod))).To(BeEquivalentTo(nodeClaim.Name))
+		Expect(PodSchedulingOf(cluster.PodStore, client.ObjectKeyFromObject(pod)).NodeClaim).To(BeEquivalentTo(nodeClaim.Name))
 
 		Expect(nodeClaim.Annotations).To(HaveKeyWithValue(v1.NodePoolHashAnnotationKey, hash))
 	})
@@ -931,8 +935,8 @@ var _ = Describe("Provisioning", func() {
 				Expect(err).To(HaveOccurred())
 				Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
 				// The refused NodeClaim's reservation is released, and the created one's still holds.
-				Expect(cluster.NodePoolState.Get(nodePool.Name).ReservedResources).To(HaveKey(corev1.ResourceCPU))
-				Expect(cluster.NodePoolState.Get(nodePool.Name).ReservedResources[resources.Node]).To(BeComparableTo(resource.MustParse("1")))
+				Expect(cs.NodePoolState.Get(nodePool.Name).ReservedResources).To(HaveKey(corev1.ResourceCPU))
+				Expect(cs.NodePoolState.Get(nodePool.Name).ReservedResources[resources.Node]).To(BeComparableTo(resource.MustParse("1")))
 			})
 			It("should count a NodeClaim's launched capacity in place of its reservation once it launches", func() {
 				results := ExpectProvisionedResults(ctx, env.Client, cluster, cloudProvider, prov, pod())
@@ -943,7 +947,7 @@ var _ = Describe("Provisioning", func() {
 				nodeClaim.Status.Capacity = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}
 				ExpectApplied(ctx, env.Client, nodeClaim)
 
-				fields := cluster.NodePoolState.Get(nodePool.Name)
+				fields := cs.NodePoolState.Get(nodePool.Name)
 				Expect(fields.Usage[corev1.ResourceCPU]).To(BeComparableTo(resource.MustParse("2")))
 				Expect(fields.ReservedResources).To(BeEmpty())
 			})

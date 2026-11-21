@@ -45,14 +45,13 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/cluster/prediction"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	karpopts "sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
-	"sigs.k8s.io/karpenter/pkg/state/prediction"
 
 	"sigs.k8s.io/karpenter/pkg/utils/disruption"
 	"sigs.k8s.io/karpenter/pkg/utils/pod"
@@ -146,7 +145,9 @@ func NewScheduler(
 	ctx context.Context,
 	kubeClient client.Client,
 	nodePools []*v1.NodePool,
-	cluster *state.Cluster,
+	cluster *karpentercluster.NodeState,
+	nodePoolState *karpentercluster.NodePoolState,
+	capacityQuotas *karpentercluster.CapacityQuotaState,
 	stateNodes []*karpentercluster.StateNode,
 	topology *Topology,
 	instanceTypes map[string][]*cloudprovider.InstanceType,
@@ -202,7 +203,6 @@ func NewScheduler(
 		kubeClient:           kubeClient,
 		nodeClaimTemplates:   templates,
 		topology:             topology,
-		cluster:              cluster,
 		daemonOverheadGroups: buildDaemonOverheadGroups(ctx, predictionStore, templates, daemonSetPods),
 		cachedPodData:        map[types.UID]*PodData{}, // cache pod data to avoid having to continually recompute it
 		volumeReqsByPod:      volumeReqsByPod,          // Volume requirements per pod
@@ -211,7 +211,7 @@ func NewScheduler(
 		// What's held against a NodePool's limits is for NodeClaims whose launched capacity no node counts yet, so it
 		// starts out spent. The reservation is the admission; planning around it only avoids refusals.
 		remainingResources: lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, corev1.ResourceList) {
-			return np.Name, resources.Subtract(corev1.ResourceList(np.Spec.Limits), cluster.NodePoolState.ReservedResources(np.Name))
+			return np.Name, resources.Subtract(corev1.ResourceList(np.Spec.Limits), nodePoolState.ReservedResources(np.Name))
 		}),
 		clock:                     clock,
 		reservationManager:        reservationManager,
@@ -245,7 +245,7 @@ func NewScheduler(
 	}
 	s.deletingNodeNames = deletingNodeNames
 	if karpopts.FromContext(ctx).FeatureGates.CapacityQuota {
-		s.quotaLimits, s.quotaMatches = newQuotaLimits(cluster, s.nodeClaimTemplates)
+		s.quotaLimits, s.quotaMatches = newQuotaLimits(capacityQuotas, s.nodeClaimTemplates)
 	}
 	s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods, nodeToNodePool, resolved.enforceConsolidateAfter)
 	return s
@@ -280,7 +280,6 @@ type Scheduler struct {
 	volumeReqsByPod      map[types.UID][]scheduling.Requirements // Volume topology requirement alternatives per pod
 	preferences          *Preferences
 	topology             *Topology
-	cluster              *state.Cluster
 	recorder             events.Recorder
 	kubeClient           client.Client
 	clock                clock.Clock

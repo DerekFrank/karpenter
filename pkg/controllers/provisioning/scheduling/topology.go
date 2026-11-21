@@ -39,7 +39,6 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
@@ -62,14 +61,14 @@ type Topology struct {
 	// excludedPods are the pod UIDs of pods that are excluded from counting.  This is used so we can simulate
 	// moving pods to prevent them from being double counted.
 	excludedPods sets.Set[string]
-	cluster      *state.Cluster
+	cluster      *karpentercluster.NodeState
 	stateNodes   []*karpentercluster.StateNode
 }
 
 func NewTopology(
 	ctx context.Context,
 	kubeClient client.Client,
-	cluster *state.Cluster,
+	cluster *karpentercluster.NodeState,
 	stateNodes []*karpentercluster.StateNode,
 	nodePools []*v1.NodePool,
 	instanceTypes map[string][]*cloudprovider.InstanceType,

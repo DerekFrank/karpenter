@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package state_test
+package cluster_test
 
 import (
 	"fmt"
@@ -59,10 +59,8 @@ var _ = Describe("Registering window", func() {
 		for _, obj := range objs {
 			switch obj.(type) {
 			case *v1.NodeClaim:
-				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(obj))
 			case *corev1.Node:
 			case *corev1.Pod:
-				ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(obj))
 			}
 		}
 	}
@@ -86,8 +84,8 @@ var _ = Describe("Registering window", func() {
 				c.SchedulerNodeClaims++
 			}
 		}
-		c.Active, _, _ = cluster.NodePoolState.GetNodeCount(nodePool.Name)
-		c.Launches = len(cluster.NodePoolState.LaunchedNodes(nodePool.Name))
+		c.Active, _, _ = cs.NodePoolState.GetNodeCount(nodePool.Name)
+		c.Launches = len(cs.NodePoolState.LaunchedNodes(nodePool.Name))
 		return c
 	}
 

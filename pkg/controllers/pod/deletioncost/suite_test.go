@@ -31,7 +31,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/pod/deletioncost"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -74,7 +73,7 @@ func totalRanked(groupA, groupBC, groupD []*karpentercluster.StateNode) int {
 
 var ctx context.Context
 var env *test.Environment
-var cluster *state.Cluster
+var cluster *karpentercluster.NodeState
 var cloudProvider *fake.CloudProvider
 var queue *deletioncost.Queue
 
@@ -94,7 +93,7 @@ var _ = BeforeSuite(func() {
 	ctx = options.ToContext(ctx, opts)
 	cloudProvider = fake.NewCloudProvider()
 	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = state.NewCluster(env.Clock, env.Overlay, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
+	cluster = cs.Nodes
 })
 
 var _ = AfterSuite(func() {
@@ -109,7 +108,7 @@ var _ = BeforeEach(func() {
 
 var _ = AfterEach(func() {
 	ExpectCleanedUp(ctx, env.Client)
-	cluster.Reset()
+	cs.Reset()
 })
 
 func rsOwnedPod(opts ...test.PodOptions) *corev1.Pod {

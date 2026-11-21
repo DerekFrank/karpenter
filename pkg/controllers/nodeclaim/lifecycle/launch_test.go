@@ -104,7 +104,7 @@ var _ = Describe("Launch", func() {
 		pod := test.Pod()
 		scheduledPod := test.Pod(test.PodOptions{NodeName: "scheduled-node"})
 		ExpectApplied(ctx, env.Client, nodeClaim, pod, scheduledPod)
-		cluster.UpdatePodToNodeClaimMapping(map[string][]*corev1.Pod{nodeClaim.Name: {pod, scheduledPod}})
+		cs.PodScheduling.MapToNodeClaims(map[string][]*corev1.Pod{nodeClaim.Name: {pod, scheduledPod}})
 
 		ExpectObjectReconciled(ctx, env.Client, nodeClaimController, nodeClaim)
 		ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)

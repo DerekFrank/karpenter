@@ -23,16 +23,14 @@ limitations under the License.
 //   - An object a store holds is the informer cache's, so it's never passed to a client write, nor read through
 //     StatusConditions() without options.
 //   - A controller that reads stores requeues after a wall-clock deadline only, on a line that says so with
-//     //storelint:deadline <reason>.
+//     //storelint:deadline <reason>, or polls what no store holds, on a line that says so with
+//     //storelint:poll <what it polls>.
 //   - Every Contribution has a statetest.ExpectContribution test in its package.
 //   - A map or slice field of a store's Derived or Intent fields says what bounds it with a // bounded: comment.
 //   - pkg/cluster exports no raw *state.Store, only Readers and intent handles.
 //   - A Derive's target has a reader besides a source: waking a controller on part of an entry is SourceOn's job.
-//   - A store is cleared, and cluster state reset, only by tests: Clear and Reset are called from a test, pkg/test, or
-//     another Clear or Reset of pkg/state, pkg/cluster, pkg/controllers/state or cost, which compose them.
-//
-// A line carrying //storelint:allow <reason> is exempt from the first two rules, for code that predates them and is
-// being moved, such as cost's stores.
+//   - A store is cleared, and cluster state reset, only by tests: Clear and cluster.State's Reset are called from a
+//     test, pkg/test, or another Clear or Reset of pkg/state or pkg/cluster, which compose them.
 package storelint
 
 import (
@@ -53,10 +51,8 @@ import (
 const (
 	statePkg     = "sigs.k8s.io/karpenter/pkg/state"
 	statetestPkg = "sigs.k8s.io/karpenter/pkg/state/statetest"
-	costPkg      = "sigs.k8s.io/karpenter/pkg/state/cost"
 	testPkg      = "sigs.k8s.io/karpenter/pkg/test"
 	clusterPkg   = "sigs.k8s.io/karpenter/pkg/cluster"
-	facadePkg    = "sigs.k8s.io/karpenter/pkg/controllers/state"
 	managerPkg   = "sigs.k8s.io/controller-runtime/pkg/manager"
 	clientPkg    = "sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -86,7 +82,7 @@ var Analyzer = &analysis.Analyzer{
 
 func run(pass *analysis.Pass) (any, error) {
 	in := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
-	readsStores := importsAny(pass.Pkg, statePkg, clusterPkg, facadePkg) && pass.Pkg.Path() != statePkg
+	readsStores := importsAny(pass.Pkg, statePkg, clusterPkg) && pass.Pkg.Path() != statePkg
 	in.WithStack([]ast.Node{(*ast.CallExpr)(nil), (*ast.KeyValueExpr)(nil), (*ast.AssignStmt)(nil)}, func(n ast.Node, push bool, stack []ast.Node) bool {
 		if !push || isTest(pass, n.Pos()) {
 			return true
@@ -117,7 +113,7 @@ func run(pass *analysis.Pass) (any, error) {
 func checkCall(pass *analysis.Pass, call *ast.CallExpr, stack []ast.Node) {
 	fn := enclosingFunc(stack)
 	constructor := isConstructor(fn) && !holdsState(pass.Pkg.Path())
-	if name, ok := builder(pass, call); ok && !allowed(pass, call.Pos()) {
+	if name, ok := builder(pass, call); ok {
 		switch {
 		case constructor:
 			pass.Reportf(call.Pos(), "state.%s in a constructor: build it in the controller's Register(context.Context, manager.Manager) error", name)
@@ -125,7 +121,7 @@ func checkCall(pass *analysis.Pass, call *ast.CallExpr, stack []ast.Node) {
 			pass.Reportf(call.Pos(), "state.%s builds a store: call it in pkg/cluster, or in a controller's Register(context.Context, manager.Manager) error", name)
 		}
 	}
-	if constructor && subscribes(pass, call) && !allowed(pass, call.Pos()) {
+	if constructor && subscribes(pass, call) {
 		pass.Reportf(call.Pos(), "Subscribe in a constructor: subscribe in the controller's Register(context.Context, manager.Manager) error, or wake on a source")
 	}
 	if store, ok := addedSharedStore(pass, call); ok && !stateRegister(pass, fn) {
@@ -155,8 +151,8 @@ func builder(pass *analysis.Pass, call *ast.CallExpr) (string, bool) {
 }
 
 // clears returns the name of the Clear or Reset method call calls, if it's one that wipes cluster state: a Clear() of a
-// type pkg/state or pkg/cluster declares, or a Reset() of a type pkg/controllers/state or cost declares. An intent
-// handle's Clear(key) ends one value, and isn't one.
+// type pkg/state or pkg/cluster declares, or cluster.State's Reset(). An intent handle's Clear(key) ends one value, and
+// isn't one.
 func clears(pass *analysis.Pass, call *ast.CallExpr) (string, bool) {
 	fn, ok := typeutil.Callee(pass.TypesInfo, call).(*types.Func)
 	if !ok || fn.Pkg() == nil {
@@ -168,7 +164,7 @@ func clears(pass *analysis.Pass, call *ast.CallExpr) (string, bool) {
 	}
 	path := fn.Pkg().Path()
 	switch {
-	case fn.Name() == "Clear" && holdsState(path), fn.Name() == "Reset" && (path == facadePkg || path == costPkg):
+	case fn.Name() == "Clear" && holdsState(path), fn.Name() == "Reset" && named(sig.Recv().Type(), clusterPkg, "State"):
 		return fn.Name(), true
 	}
 	return "", false
@@ -181,8 +177,7 @@ func clearsAllowed(pass *analysis.Pass, fn *ast.FuncDecl) bool {
 	if path == testPkg || strings.HasPrefix(path, testPkg+"/") {
 		return true
 	}
-	composes := holdsState(path) || path == facadePkg || path == costPkg
-	return composes && fn != nil && fn.Recv != nil && (fn.Name.Name == "Clear" || fn.Name.Name == "Reset")
+	return holdsState(path) && fn != nil && fn.Recv != nil && (fn.Name.Name == "Clear" || fn.Name.Name == "Reset")
 }
 
 // subscribes returns whether call calls a Subscribe method declared in pkg/state or pkg/cluster.
@@ -297,16 +292,12 @@ func heldObject(pass *analysis.Pass, e ast.Expr) (ast.Expr, bool) {
 	return e, true
 }
 
-// checkDeadline reports a RequeueAfter at pos unless its line carries //storelint:deadline with a reason.
+// checkDeadline reports a RequeueAfter at pos unless its line carries //storelint:deadline with a reason, or
+// //storelint:poll with what it polls.
 func checkDeadline(pass *analysis.Pass, pos token.Pos) {
-	if !lineHas(pass, pos, "//storelint:deadline ") {
-		pass.Reportf(pos, "RequeueAfter in a controller that reads stores: wake on a source, or mark a wall-clock deadline with //storelint:deadline <reason>")
+	if !lineHas(pass, pos, "//storelint:deadline ") && !lineHas(pass, pos, "//storelint:poll ") {
+		pass.Reportf(pos, "RequeueAfter in a controller that reads stores: wake on a source, mark a wall-clock deadline with //storelint:deadline <reason>, or a poll of what no store holds with //storelint:poll <what it polls>")
 	}
-}
-
-// allowed returns whether the line at pos carries //storelint:allow with a reason.
-func allowed(pass *analysis.Pass, pos token.Pos) bool {
-	return lineHas(pass, pos, "//storelint:allow ")
 }
 
 // lineHas returns whether a comment on the line at pos, or the line before it, starts with directive.

@@ -28,7 +28,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8stypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/clock"
+
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
@@ -110,6 +113,39 @@ var _ = Describe("NodeHealth", func() {
 		e, _ := nodePools.store.Get("b")
 		Expect(e.Derived).To(BeZero(), "NodePool b has fields after its last Node went")
 		Expect(nodePools.NodeHealth("a")).To(Equal(NodeCounts{Nodes: 3, Unhealthy: 0}))
+	})
+	It("should enqueue the unhealthy Nodes counted where the counts change, with Source", func() {
+		c := s.Nodes
+		h := c.DeriveNodeHealth(func(node *corev1.Node) bool { return len(node.Status.Conditions) != 0 })
+		c.NodeStore.Put(healthNode("a-1", "a", true))
+		c.NodeStore.Put(healthNode("a-2", "a", true))
+		c.NodeStore.Put(healthNode("a-3", "a", false))
+		c.NodeStore.Put(healthNode("b-1", "b", true))
+		queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
+		DeferCleanup(queue.ShutDown)
+		ctx, cancel := context.WithCancel(context.Background())
+		DeferCleanup(cancel)
+		Expect(h.Source().Start(ctx, queue)).To(Succeed())
+		drain := func() []string {
+			var names []string
+			for queue.Len() > 0 {
+				req, _ := queue.Get()
+				names = append(names, req.Name)
+				queue.Done(req)
+			}
+			return names
+		}
+		Expect(drain()).To(BeEmpty(), "want nothing until the counts change")
+
+		// a-1 recovering changes NodePool a's counts and the cluster's: the unhealthy Nodes of each are enqueued.
+		c.NodeStore.Put(withResourceVersion(healthNode("a-1", "a", false), "2"))
+		Expect(drain()).To(ConsistOf("a-2", "b-1"))
+
+		// A Node's change that leaves the counts as they were enqueues nothing.
+		updated := withResourceVersion(healthNode("a-3", "a", false), "2")
+		updated.Annotations = map[string]string{"changed": "true"}
+		c.NodeStore.Put(updated)
+		Expect(drain()).To(BeEmpty())
 	})
 	It("should derive node health that counts with its own predicate and the Nodes already held", func() {
 		c := s.Nodes

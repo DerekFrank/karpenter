@@ -36,7 +36,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/legacyrepair"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
@@ -52,7 +51,8 @@ var env *test.Environment
 var cloudProvider *fake.CloudProvider
 var recorder *test.EventRecorder
 var queue *terminator.Queue
-var cluster *state.Cluster
+var cluster *karpentercluster.NodeState
+var cs karpentercluster.State
 
 // expectApplied applies the objects; env.Client waits for cluster state's Node and NodeClaim stores to see each write.
 func expectApplied(objects ...client.Object) {
@@ -84,8 +84,8 @@ var _ = BeforeSuite(func() {
 	cloudProvider = fake.NewCloudProvider()
 	recorder = test.NewEventRecorder()
 	queue = terminator.NewQueue(env.Clock, env.Overlay, recorder)
-	cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = state.NewCluster(env.Clock, env.Overlay, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
+	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
+	cluster = cs.Nodes
 })
 
 var _ = AfterSuite(func() {
@@ -112,7 +112,7 @@ var _ = Describe("Node Health", func() {
 
 	AfterEach(func() {
 		ExpectCleanedUp(ctx, env.Client)
-		cluster.Reset()
+		cs.Reset()
 
 		// Reset the metrics collectors
 		metrics.NodeClaimsDisruptedTotal.Reset()
@@ -449,14 +449,14 @@ var _ = Describe("Node Health", func() {
 			nodeOne := nodes[0]
 			nodeClaimOne := nodeClaims[0]
 			result := ExpectObjectReconciled(ctx, env.Client, healthController, nodeOne)
-			Expect(result.RequeueAfter).To(BeNumerically("~", time.Minute*5, time.Second))
+			Expect(result.RequeueAfter).To(BeZero())
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaimOne)
 			Expect(nodeClaim.DeletionTimestamp).To(BeNil())
 
 			nodeTwo := nodes[1]
 			nodeClaimTwo := nodeClaims[1]
 			result = ExpectObjectReconciled(ctx, env.Client, healthController, nodeTwo)
-			Expect(result.RequeueAfter).To(BeNumerically("~", time.Minute*5, time.Second))
+			Expect(result.RequeueAfter).To(BeZero())
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaimTwo)
 			Expect(nodeClaim.DeletionTimestamp).To(BeNil())
 		})
@@ -479,21 +479,21 @@ var _ = Describe("Node Health", func() {
 			nodeOne := nodes[0]
 			nodeClaimOne := nodeClaims[0]
 			result := ExpectObjectReconciled(ctx, env.Client, healthController, nodeOne)
-			Expect(result.RequeueAfter).To(BeNumerically("~", time.Minute*5, time.Second))
+			Expect(result.RequeueAfter).To(BeZero())
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaimOne)
 			Expect(nodeClaim.DeletionTimestamp).To(BeNil())
 
 			nodeTwo := nodes[1]
 			nodeClaimTwo := nodeClaims[1]
 			result = ExpectObjectReconciled(ctx, env.Client, healthController, nodeTwo)
-			Expect(result.RequeueAfter).To(BeNumerically("~", time.Minute*5, time.Second))
+			Expect(result.RequeueAfter).To(BeZero())
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaimTwo)
 			Expect(nodeClaim.DeletionTimestamp).To(BeNil())
 
 			nodeThree := nodes[2]
 			nodeClaimThree := nodeClaims[2]
 			result = ExpectObjectReconciled(ctx, env.Client, healthController, nodeThree)
-			Expect(result.RequeueAfter).To(BeNumerically("~", time.Minute*5, time.Second))
+			Expect(result.RequeueAfter).To(BeZero())
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaimThree)
 			Expect(nodeClaim.DeletionTimestamp).To(BeNil())
 		})

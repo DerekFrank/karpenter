@@ -122,7 +122,7 @@ func (s *NodeState) stores() []interface {
 		Synced() bool
 	}{
 		s.NodeClaimStore.store, s.NodeStore.store, s.PodStore.store, s.CSINodeStore.store, s.PVCStore.store,
-		s.DaemonSets.store, s.Cluster.store,
+		s.DaemonSets.store, s.Cluster.store, s.Cluster.unmanagedIndex,
 	}
 }
 
@@ -237,15 +237,6 @@ func (s *NodeState) HasBufferPods(nodeClaimName string) bool {
 	return e.Intent.BufferPods.Value > 0
 }
 
-// PVCDriverResolved returns whether cluster state holds the CSI driver of the PVC.
-func (s *NodeState) PVCDriverResolved(key types.NamespacedName) bool { return s.PVCStore.Resolved(key) }
-
-// FeedPVCDriver reports the CSI driver of the PVC: ResolvedPVCDriver("") for a PVC whose volume no driver limits, and
-// the zero PVCDriver for a PVC that's gone, which drops it.
-func (s *NodeState) FeedPVCDriver(key types.NamespacedName, driver PVCDriver) {
-	s.PVCStore.Feed(key, driver)
-}
-
 // GetDaemonSetPod returns a copy of the DaemonSet's newest pod, or nil if cluster state holds none.
 func (s *NodeState) GetDaemonSetPod(daemonset *appsv1.DaemonSet) *corev1.Pod {
 	return s.DaemonSets.GetDaemonSetPod(daemonset)
@@ -272,22 +263,9 @@ func (s *NodeState) RepairPolicyMatcher() *repair.RepairPolicyMatcher {
 	return s.matcher
 }
 
-// Subscribe calls fn after each change to a node that may make consolidation possible: a node added or removed, or
-// one whose initialization, deletion mark or pod count changes. fn must not block.
-func (s *NodeState) Subscribe(fn func()) {
-	s.NodeClaimStore.Subscribe(func(c state.Change[string, *v1.NodeClaim, NodeClaimDerived, NodeClaimIntent]) {
-		if c.Existed != c.Exists || Launched(c.Old) != Launched(c.New) || c.Old.Intent.Deletion.Value != c.New.Intent.Deletion.Value ||
-			(c.Existed && c.Exists && deleted(c.Old.Object) != deleted(c.New.Object)) {
-			fn()
-		}
-	})
-	s.NodeStore.Subscribe(func(c state.Change[string, *corev1.Node, NodeDerived, struct{}]) {
-		if c.Existed != c.Exists || initialized(c.Old.Object) != initialized(c.New.Object) || c.Old.Derived.Usage.Pods != c.New.Derived.Usage.Pods {
-			fn()
-		}
-	})
-}
-
-func initialized(node *corev1.Node) bool {
-	return node != nil && node.Labels[v1.NodeInitializedLabelKey] == "true"
+// NodeClaimsLaunched returns whether every NodeClaim has launched, for a decision that counts the cluster's nodes,
+// which waits until none is launching since an unlaunched NodeClaim isn't a node yet. A controller calling it declares
+// the node state with state.Requires and wakes on NodeClaimStore.UnlaunchedSource.
+func (s *NodeState) NodeClaimsLaunched() bool {
+	return !s.HasUnlaunchedNodeClaims()
 }

@@ -33,9 +33,10 @@ import (
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/metrics/nodepool"
+	"sigs.k8s.io/karpenter/pkg/controllers/nodepool/pricing"
 	"sigs.k8s.io/karpenter/pkg/metrics"
-	"sigs.k8s.io/karpenter/pkg/state/cost"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
@@ -46,7 +47,8 @@ var nodePoolController *nodepool.Controller
 var ctx context.Context
 var env *test.Environment
 var cp *fake.CloudProvider
-var cc *cost.ClusterCost
+var cc *karpentercluster.ClusterCost
+var pricingController *pricing.Controller
 
 func TestAPIs(t *testing.T) {
 	ctx = TestContextWithLogger(t)
@@ -57,7 +59,9 @@ func TestAPIs(t *testing.T) {
 var _ = BeforeSuite(func() {
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...))
 	cp = fake.NewCloudProvider()
-	cc = cost.NewClusterCost(ctx, cp, env.Overlay)
+	cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cp)
+	cc = cs.Cost
+	pricingController = pricing.NewController(env.Clock, cs.NodePools, cs.NodePoolState, cc)
 	nodePoolController = nodepool.NewController(env.Overlay, cp, cc)
 })
 
@@ -173,7 +177,7 @@ var _ = Describe("NodePool Metrics Wakes", func() {
 	var queue workqueue.TypedRateLimitingInterface[reconcile.Request]
 	var nodePool *v1.NodePool
 	BeforeEach(func() {
-		cc.Reset()
+		cc.Clear()
 		cp.InstanceTypes = fake.InstanceTypesAssorted()
 		nodePool = test.NodePool()
 		ExpectApplied(ctx, env.Client, nodePool)
@@ -204,13 +208,13 @@ var _ = Describe("NodePool Metrics Wakes", func() {
 			corev1.LabelTopologyZone:       offering.Zone(),
 		}}})
 		ExpectApplied(ctx, env.Client, nodeClaim)
-		Expect(cc.UpdateNodeClaim(ctx, nodeClaim)).To(Succeed())
+		ExpectReconcileSucceeded(ctx, pricingController, client.ObjectKeyFromObject(nodePool))
 		Expect(drain()).To(Equal([]string{nodePool.Name}), "want the NodePool for its NodeClaim's offering and its price")
 		Expect(cc.GetNodepoolCost(nodePool)).To(BeNumerically(">", 0))
 
 		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeInitialized)
 		ExpectApplied(ctx, env.Client, nodeClaim)
-		Expect(cc.UpdateNodeClaim(ctx, nodeClaim)).To(Succeed())
+		ExpectReconcileSucceeded(ctx, pricingController, client.ObjectKeyFromObject(nodePool))
 		Expect(drain()).To(BeEmpty(), "want nothing for the NodeClaim's status")
 
 		ExpectDeleted(ctx, env.Client, nodeClaim)

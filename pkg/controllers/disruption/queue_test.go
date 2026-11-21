@@ -131,7 +131,7 @@ var _ = Describe("Queue", func() {
 			Expect(ExpectNodeExists(ctx, env.Client, node1.Name).Spec.Taints).ToNot(ContainElement(v1.DisruptedNoScheduleTaint))
 			Expect(ExpectExists(ctx, env.Client, nodeClaim1).StatusConditions().Get(v1.ConditionTypeDisruptionReason)).To(BeNil())
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
-			Expect(cluster.NodePoolState.Get(nodePool.Name).ReservedResources).To(BeEmpty())
+			Expect(cs.NodePoolState.Get(nodePool.Name).ReservedResources).To(BeEmpty())
 		})
 	})
 	Context("Reconcile", func() {
@@ -291,7 +291,7 @@ var _ = Describe("Queue", func() {
 			// A single-node consolidation command's Decision() is "replace" (it has both
 			// candidates and replacements) while its ConsolidationType() is "single". The
 			// failures metric must report the consolidation type, not the decision.
-			c := disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue)
+			c := disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)
 			cmd := &disruption.Command{
 				Method:            disruption.NewSingleNodeConsolidation(c),
 				CreationTimestamp: env.Clock.Now(),

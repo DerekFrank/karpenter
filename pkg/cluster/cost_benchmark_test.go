@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package cost_test
+package cluster
 
 import (
 	"context"
@@ -24,14 +24,15 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	fakecr "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
-	"sigs.k8s.io/karpenter/pkg/state/cost"
+	"sigs.k8s.io/karpenter/pkg/state"
 	"sigs.k8s.io/karpenter/pkg/state/statetest"
+	"sigs.k8s.io/karpenter/pkg/test"
 )
 
 // freshCloudProvider returns a new instance type list on every call, like a provider that resolves offerings per
@@ -47,21 +48,18 @@ func (freshCloudProvider) GetInstanceTypes(context.Context, *v1.NodePool) ([]*cl
 type costBenchmark struct {
 	nodePools  []*v1.NodePool
 	nodeClaims []*v1.NodeClaim
-	kubeClient client.Client
-	// source holds every NodeClaim, as the overlay's does in production, so that a cost tracker built over it
+	// store holds every NodeClaim, as cluster state's does in production, so that a cost tracker derived from it
 	// counts them all as it's constructed, without the objects counting toward the heap it retains.
-	source *statetest.Objects
+	store *NodeClaims
 }
 
 // newCostBenchmark creates wide-open NodePools with nodeClaimsPerNodePool NodeClaims each, spread over
 // instanceTypesPerNodePool instance types.
 func newCostBenchmark(nodePools, nodeClaimsPerNodePool, instanceTypesPerNodePool int) *costBenchmark {
 	instanceTypes := fake.InstanceTypesAssorted()
-	bm := &costBenchmark{source: statetest.NewObjects()}
-	builder := fakecr.NewClientBuilder()
+	bm := &costBenchmark{}
 	for i := range nodePools {
 		np := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("nodepool-%d", i)}}
-		builder = builder.WithObjects(np)
 		bm.nodePools = append(bm.nodePools, np)
 		for j := range nodeClaimsPerNodePool {
 			it := instanceTypes[(i*instanceTypesPerNodePool+j%instanceTypesPerNodePool)%len(instanceTypes)]
@@ -73,35 +71,30 @@ func newCostBenchmark(nodePools, nodeClaimsPerNodePool, instanceTypesPerNodePool
 					v1.CapacityTypeLabelKey:        it.Offerings[0].CapacityType(),
 					corev1.LabelTopologyZone:       it.Offerings[0].Zone(),
 				},
-			}})
+			}, Spec: v1.NodeClaimSpec{NodeClassRef: test.NodeClaim().Spec.NodeClassRef}})
 		}
 	}
-	bm.kubeClient = builder.Build()
+	srcs := statetest.NewSources()
+	s := New(context.Background(), clock.RealClock{}, nil, fake.NewCloudProvider(), WithSources(func(obj client.Object) state.Newest { return srcs.For(obj) }))
 	for _, nodeClaim := range bm.nodeClaims {
-		bm.source.Put(nodeClaim)
+		srcs.Put(nodeClaim)
 	}
+	bm.store = s.Nodes.NodeClaimStore
 	return bm
 }
 
 // newClusterCost returns a cost tracker counting every one of the benchmark's NodeClaims.
-func (bm *costBenchmark) newClusterCost(ctx context.Context, cloudProvider cloudprovider.CloudProvider) *cost.ClusterCost {
-	return cost.NewClusterCost(ctx, cloudProvider, bm.kubeClient, cost.WithNodeClaimSource(bm.source))
+func (bm *costBenchmark) newClusterCost(ctx context.Context, cloudProvider cloudprovider.CloudProvider) *ClusterCost {
+	return newClusterCost(ctx, cloudProvider, bm.store)
 }
 
 // price reads each NodePool's instance types and prices the offerings it counts with them.
-func (bm *costBenchmark) price(ctx context.Context, b *testing.B, clusterCost *cost.ClusterCost) {
+func (bm *costBenchmark) price(ctx context.Context, b *testing.B, clusterCost *ClusterCost) {
 	for _, np := range bm.nodePools {
 		if err := clusterCost.RefreshPrices(ctx, np); err != nil {
 			b.Fatal(err)
 		}
 	}
-}
-
-func heapInUse() float64 {
-	runtime.GC()
-	var stats runtime.MemStats
-	runtime.ReadMemStats(&stats)
-	return float64(stats.HeapAlloc)
 }
 
 // BenchmarkClusterCostRetained reports the heap the cost tracker keeps after tracking every NodeClaim and one pricing

@@ -23,6 +23,7 @@ import (
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+
 	"sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/state"
 )
@@ -46,12 +47,6 @@ func NewController(usage *cluster.NodePoolUsage) *Controller {
 		usage: usage,
 		local: state.NewSyntheticStore[string, string, int, struct{}](func(k string) string { return k }), // want `state.NewSyntheticStore in a constructor`
 	}
-}
-
-// NewMoving builds a store it's being moved off, on a line that says so.
-func NewMoving() *state.Store[string, string, int, struct{}] {
-	//storelint:allow moving to pkg/cluster
-	return state.NewSyntheticStore[string, string, int, struct{}](func(k string) string { return k })
 }
 
 // Register builds the controller's local stores and adds one, but not the shared store it derives from.
@@ -80,6 +75,11 @@ func (c *Controller) Expire() Result {
 	return Result{RequeueAfter: time.Minute} //storelint:deadline a reservation's TTL
 }
 
+// Poll requeues to poll what no store holds, on a line that says so.
+func (c *Controller) Poll() Result {
+	return Result{RequeueAfter: time.Minute} //storelint:poll an API that may not be installed
+}
+
 func (c *Controller) Requeue(r *Result) {
 	r.RequeueAfter = time.Second // want `RequeueAfter in a controller that reads stores`
 }
@@ -103,6 +103,10 @@ var _ = state.NewObjectStore[string, string, struct{}, struct{}]() // want `stat
 
 func wipe(s *state.Store[string, int, struct{}, struct{}]) {
 	s.Clear() // want `Clear wipes cluster state: only tests clear stores`
+}
+
+func reset(s cluster.State) {
+	s.Reset() // want `Reset wipes cluster state: only tests clear stores`
 }
 
 // tested is a Contribution with a law test.

@@ -44,7 +44,6 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	disruptionutils "sigs.k8s.io/karpenter/pkg/utils/disruption"
@@ -60,7 +59,7 @@ const (
 type Controller struct {
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
-	cluster       *state.Cluster
+	nodePools     *karpentercluster.NodePoolState
 	clock         clock.Clock
 	recorder      events.Recorder
 	// active wakes the controller on each NodePool's active NodeClaims, built in Register.
@@ -73,11 +72,11 @@ func activeNodeClaims(_ string, e karpentercluster.NodePoolEntry) any {
 	return e.Derived.NodeClaims.Active
 }
 
-func NewController(kubeClient client.Client, cluster *state.Cluster, cloudProvider cloudprovider.CloudProvider, clock clock.Clock, recorder events.Recorder) *Controller {
+func NewController(kubeClient client.Client, nodePools *karpentercluster.NodePoolState, cloudProvider cloudprovider.CloudProvider, clock clock.Clock, recorder events.Recorder) *Controller {
 	return &Controller{
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
-		cluster:       cluster,
+		nodePools:     nodePools,
 		clock:         clock,
 		recorder:      recorder,
 	}
@@ -96,7 +95,7 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 
 	// We dont have to wait for cluster sync as we cannot really have internal state representing more NodeClaims than actual
 	// During controller crashes we gradually populate our cluster/NodePoolState, as and when we populate we delete NC if we are over-provisioned
-	runningNodeClaims, _, _ := c.cluster.NodePoolState.GetNodeCount(np.Name)
+	runningNodeClaims, _, _ := c.nodePools.GetNodeCount(np.Name)
 	desiredReplicas := lo.FromPtr(np.Spec.Replicas)
 	// To avoid race conditions between deprovisioning and the disruption controller,
 	// we only include running NodeClaims when counting for deprovisioning purposes.
@@ -139,7 +138,7 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	// active narrows the NodePool fields to the count this controller decides on, so it reconciles a NodePool that may
 	// be over its replicas, and not one whose deleting NodeClaims, reservations, usage or health changed.
-	c.active = c.cluster.NodePoolState.SourceOn(activeNodeClaims)
+	c.active = c.nodePools.SourceOn(activeNodeClaims)
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		// Reconcile on NodePool Create and Update (when replicas change)
@@ -178,7 +177,7 @@ func (c *Controller) getDeprovisioningCandidates(ctx context.Context, np *v1.Nod
 	candidates := make([]*v1.NodeClaim, 0, count)
 
 	// Unresolved NodeClaims (haven't launched yet or that failed Create call), from the NodePool's index in cluster state
-	for _, nc := range lo.Slice(c.cluster.NodePoolState.UnlaunchedNodeClaims(np.Name), 0, count) {
+	for _, nc := range lo.Slice(c.nodePools.UnlaunchedNodeClaims(np.Name), 0, count) {
 		candidates = append(candidates, nc.DeepCopy())
 	}
 	remaining := count - len(candidates)
@@ -188,7 +187,7 @@ func (c *Controller) getDeprovisioningCandidates(ctx context.Context, np *v1.Nod
 	}
 
 	// The NodePool's StateNodes, from its index in cluster state
-	nodes := lo.Filter(c.cluster.NodePoolState.LaunchedNodes(np.Name), func(n *karpentercluster.StateNode, _ int) bool { return !n.MarkedForDeletion() })
+	nodes := lo.Filter(c.nodePools.LaunchedNodes(np.Name), func(n *karpentercluster.StateNode, _ int) bool { return !n.MarkedForDeletion() })
 
 	// Resolved nodes (empty first, then by disruption cost)
 	for _, nc := range c.resolvedDeprovisioningCandidates(ctx, nodes, np, remaining) {

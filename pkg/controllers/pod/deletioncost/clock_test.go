@@ -30,7 +30,7 @@ import (
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
 
-// Guards the suite's choice to hand env.Clock to state.NewCluster. A second
+// Guards the suite's choice to hand env.Clock to cluster.New. A second
 // FakeClock still compiles but freezes state-layer time against env.Clock.Step.
 // Cluster.IsNodeNominated reads the cluster's own clock, so it tells them apart.
 var _ = Describe("Suite Clock Wiring", func() {

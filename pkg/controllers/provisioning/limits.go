@@ -82,7 +82,7 @@ func (p *Provisioner) reserveLimits(ctx context.Context, nodePool *v1.NodePool, 
 	var reservations scheduler.Reservations
 	// A static NodePool only limits its node count, which its NodeClaims' node count reservations hold.
 	if nodePool.Spec.Replicas == nil && len(nodePool.Spec.Limits) > 0 {
-		reservation := p.cluster.NodePoolState.ReserveResources(nodePool.Name, corev1.ResourceList(nodePool.Spec.Limits), value, replacing)
+		reservation := p.nodePools.ReserveResources(nodePool.Name, corev1.ResourceList(nodePool.Spec.Limits), value, replacing)
 		if reservation == nil {
 			return nil, serrors.Wrap(fmt.Errorf("all available instance types exceed limits for nodepool"), "NodePool", klog.KObj(nodePool))
 		}
@@ -91,11 +91,11 @@ func (p *Provisioner) reserveLimits(ctx context.Context, nodePool *v1.NodePool, 
 	if !options.FromContext(ctx).FeatureGates.CapacityQuota {
 		return reservations, nil
 	}
-	if !p.cluster.CapacityQuotaState.Synced() {
+	if !p.capacityQuotas.Synced() {
 		reservations.Release()
 		return nil, fmt.Errorf("waiting for capacityquotas to sync")
 	}
-	quotaReservations, refused := p.cluster.CapacityQuotaState.Reserve(karpentercluster.LaunchRequirements(n.Requirements, n.InstanceTypeOptions), value, replacing)
+	quotaReservations, refused := p.capacityQuotas.Reserve(karpentercluster.LaunchRequirements(n.Requirements, n.InstanceTypeOptions), value, replacing)
 	if refused != "" {
 		reservations.Release()
 		return nil, serrors.Wrap(fmt.Errorf("all available instance types exceed limits for capacityquota"), "NodePool", klog.KObj(nodePool), "CapacityQuota", klog.KRef("", refused))

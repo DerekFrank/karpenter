@@ -39,11 +39,8 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/metrics/node"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
-	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
-	"sigs.k8s.io/karpenter/pkg/state/cost"
 	"sigs.k8s.io/karpenter/pkg/state/statetest"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -54,8 +51,7 @@ import (
 
 var ctx context.Context
 var env *test.Environment
-var cluster *state.Cluster
-var nodeClaimController reconcile.Reconciler
+var cluster *karpentercluster.NodeState
 var metricsStateController *node.Controller
 var cloudProvider *fake.CloudProvider
 
@@ -74,10 +70,8 @@ var _ = BeforeSuite(func() {
 	cloudProvider = fake.NewCloudProvider()
 	cloudProvider.InstanceTypes = fake.InstanceTypesAssorted()
 	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = state.NewCluster(env.Clock, env.Overlay, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
-	clusterCost := cost.NewClusterCost(ctx, cloudProvider, env.Overlay)
-	nodeClaimController = informer.NewNodeClaimController(env.Overlay, cloudProvider, clusterCost)
-	metricsStateController = node.NewController(cluster.NodeState)
+	cluster = cs.Nodes
+	metricsStateController = node.NewController(cluster)
 	// Register derives the stores the controller wakes on, as the operator does, on a manager that never starts.
 	m, err := controllerruntime.NewManager(env.Config, controllerruntime.Options{
 		Scheme:     scheme.Scheme,
@@ -190,7 +184,7 @@ var _ = Describe("Node Metrics Wakes", func() {
 	var n *corev1.Node
 	var nodeClaim *v1.NodeClaim
 	BeforeEach(func() {
-		cluster.Reset()
+		cs.Reset()
 		c := metricsStateController
 		queue = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
 		DeferCleanup(queue.ShutDown)
@@ -199,7 +193,6 @@ var _ = Describe("Node Metrics Wakes", func() {
 		Expect(c.Wakes().Start(started, queue)).To(Succeed())
 		nodeClaim, n = test.NodeClaimAndNode()
 		ExpectApplied(ctx, env.Client, nodeClaim, n)
-		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 		Expect(woken(queue)).To(BeTrue(), "want a wake for the new node")
 	})
 	It("should wake when a pod binds to a node or leaves it, and not when its status changes", func() {
@@ -221,7 +214,6 @@ var _ = Describe("Node Metrics Wakes", func() {
 	It("should not wake when a NodeClaim's status or intent changes", func() {
 		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
 		ExpectApplied(ctx, env.Client, nodeClaim)
-		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 		cs.Nomination.Nominate(ctx, nodeClaim.Name)
 		cs.Deletion.Mark(nodeClaim.Name)
 		Expect(woken(queue)).To(BeFalse(), "want nothing for the NodeClaim's status, nomination or deletion mark")
@@ -234,16 +226,11 @@ var _ = Describe("Node Metrics Wakes", func() {
 var _ = Describe("Cluster State Node Count", func() {
 	BeforeEach(func() {
 		ExpectCleanedUp(ctx, env.Client)
-		cluster.Reset()
+		cs.Reset()
 	})
 	apply := func(objs ...client.Object) {
 		GinkgoHelper()
 		ExpectApplied(ctx, env.Client, objs...)
-		for _, obj := range objs {
-			if _, ok := obj.(*v1.NodeClaim); ok {
-				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(obj))
-			}
-		}
 		ExpectSingletonReconciled(ctx, metricsStateController)
 	}
 	It("should keep the contribution laws for the node count", func() {

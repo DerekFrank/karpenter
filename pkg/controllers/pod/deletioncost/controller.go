@@ -22,6 +22,7 @@ import (
 	"iter"
 	"math"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/awslabs/operatorpkg/reconciler"
@@ -30,23 +31,30 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/clock"
 	controllerruntime "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
+	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 )
 
 const (
-	reconcileInterval = time.Minute
+	// revalidationPeriod is the longest the controller skips its work while nothing it wakes on changes. Some inputs of
+	// the ranking show only with time, or aren't in a store it wakes on: disruption budget schedules, instance type
+	// prices, NodeOverlays, PodDisruptionBudgets and VPA predictions.
+	revalidationPeriod = 5 * time.Minute
 	// At ~30 pods/node this keeps worst-case per-cycle pod writes near the
 	// RFC's 1,500 write target.
 	maxNodesPerCycle = 50
@@ -56,35 +64,53 @@ type Controller struct {
 	clock         clock.Clock
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
-	cluster       *state.Cluster
+	nodes         *karpentercluster.NodeState
+	nodePools     *karpentercluster.NodePoolState
 	queue         *Queue
 
-	lastConsolidationState time.Time
+	// changes counts the changes of what the controller wakes on. ranked is whether a run has ranked the nodes, and
+	// rankedChanges and rankedAt the count it saw and when.
+	changes       atomic.Uint64
+	ranked        bool
+	rankedChanges uint64
+	rankedAt      time.Time
 }
 
 func NewController(
 	clk clock.Clock,
 	kubeClient client.Client,
 	cloudProvider cloudprovider.CloudProvider,
-	cluster *state.Cluster,
+	nodes *karpentercluster.NodeState,
+	nodePools *karpentercluster.NodePoolState,
 	queue *Queue,
 ) *Controller {
 	return &Controller{
 		clock:         clk,
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
-		cluster:       cluster,
+		nodes:         nodes,
+		nodePools:     nodePools,
 		queue:         queue,
 	}
 }
 
+// Register wakes the controller on what disruption wakes on, which decides how disruption would rank the nodes: the
+// NodeClaim and Node stores narrowed to disruption's inputs, and a managed NodePool's spec changing, through its
+// generation. Each change counts, so that the controller skips its work until one comes, or for revalidationPeriod.
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		WatchesRawSource(singleton.Source()).
-		WatchesRawSource(karpenterstate.Requires(c.cluster)).
+		WatchesRawSource(karpenterstate.Requires(c.nodes, c.nodePools)).
+		WatchesRawSource(karpenterstate.WakeCounting(c.countChange, c.nodes.DisruptionSources()...)).
+		Watches(&v1.NodePool{}, handler.EnqueueRequestsFromMapFunc(func(context.Context, client.Object) []reconcile.Request {
+			c.countChange()
+			return []reconcile.Request{{}}
+		}), builder.WithPredicates(predicate.GenerationChangedPredicate{}, nodepoolutils.IsManagedPredicateFuncs(c.cloudProvider))).
 		Complete(singleton.AsReconciler(c))
 }
+
+func (c *Controller) countChange() { c.changes.Add(1) }
 
 func (c *Controller) Name() string {
 	return "pod.deletioncost"
@@ -95,17 +121,18 @@ func (c *Controller) Name() string {
 func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
 
-	// Assigned only after enqueueing succeeds, so a mid-reconcile error retries
+	// Recorded only after enqueueing succeeds, so a mid-reconcile error retries
 	// against the same state. Do not hoist the assignment up here.
-	currentState := c.cluster.ConsolidationState()
-	if currentState.Equal(c.lastConsolidationState) {
+	changes := c.changes.Load()
+	if c.ranked && changes == c.rankedChanges && c.clock.Since(c.rankedAt) < revalidationPeriod {
 		log.FromContext(ctx).V(1).Info("no changes detected, skipping pod deletion cost update")
-		return reconciler.Result{RequeueAfter: reconcileInterval}, nil //storelint:deadline poll: until deletioncost wakes on disruption's sources (review 21)
+		return reconciler.Result{RequeueAfter: revalidationPeriod - c.clock.Since(c.rankedAt)}, nil //storelint:deadline revalidation period, for what shows only with time
 	}
 
-	// RankNodes reads the nodes from cluster state; skip the NodePool lookups when there are none.
-	if _, ok := first(c.cluster.Nodes()); !ok {
-		return reconciler.Result{RequeueAfter: reconcileInterval}, nil //storelint:deadline poll: until deletioncost wakes on disruption's sources (review 21)
+	// RankNodes reads the nodes from cluster state; skip the NodePool lookups when there are none. A node appearing
+	// wakes the controller.
+	if _, ok := first(c.nodes.Nodes()); !ok {
+		return reconciler.Result{}, nil
 	}
 
 	// Shared with consolidation so both resolve instance types identically.
@@ -114,7 +141,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return reconciler.Result{}, fmt.Errorf("building node pool map, %w", err)
 	}
 
-	groupA, groupBC, groupD, err := RankNodes(ctx, c.kubeClient, c.clock, c.cluster, nodePoolMap, nodePoolToInstanceTypesMap)
+	groupA, groupBC, groupD, err := RankNodes(ctx, c.kubeClient, c.clock, c.nodes, c.nodePools, nodePoolMap, nodePoolToInstanceTypesMap)
 	if err != nil {
 		return reconciler.Result{}, fmt.Errorf("ranking nodes, %w", err)
 	}
@@ -128,12 +155,12 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		total += count
 	}
 
-	c.lastConsolidationState = currentState
+	c.ranked, c.rankedChanges, c.rankedAt = true, changes, c.clock.Now()
 
 	if total > 0 {
 		log.FromContext(ctx).V(1).WithValues("nodeCount", total).Info("enqueued pod deletion cost annotation writes")
 	}
-	return reconciler.Result{RequeueAfter: reconcileInterval}, nil //storelint:deadline poll: until deletioncost wakes on disruption's sources (review 21)
+	return reconciler.Result{RequeueAfter: revalidationPeriod}, nil //storelint:deadline revalidation period, for what shows only with time
 }
 
 // Group A bypasses the per-cycle cap so nodes already being torn down always

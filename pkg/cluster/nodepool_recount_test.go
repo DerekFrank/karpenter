@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package state_test
+package cluster
 
 import (
+	"context"
 	"fmt"
 	"math/rand/v2"
 	"strconv"
@@ -28,12 +29,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clock "k8s.io/utils/clock/testing"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	fakecp "sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
-	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
 )
 
@@ -45,15 +44,15 @@ var _ = Describe("NodePoolState Recount", func() {
 	It("should match a recount of the latest version of each NodeClaim after every change", func() {
 		r := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // deterministic seed for reproducible test inputs
 		clk := clock.NewFakeClock(time.Now())
-		cs, srcs := inMemory(ctx, clk, fakecp.NewCloudProvider())
-		c := state.NewCluster(clk, fake.NewClientBuilder().Build(), cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
+		cs := newState(options.ToContext(context.Background(), test.Options()), clk, fakecp.NewCloudProvider())
+		c := cs.Nodes
 		latest := map[string]*v1.NodeClaim{}
 		var rv, uid uint64
 		for i := range 20000 {
 			name := fmt.Sprintf("nc-%d", r.IntN(50))
 			switch op := r.IntN(10); {
 			case op == 0:
-				forgetNodeClaim(srcs, name)
+				c.NodeClaimStore.Remove(name)
 				delete(latest, name)
 			case op == 1 && latest[name] != nil:
 				// A stale version arriving after a newer one doesn't count.
@@ -62,7 +61,7 @@ var _ = Describe("NodePoolState Recount", func() {
 					stale := latest[name].DeepCopy()
 					stale.ResourceVersion = strconv.FormatUint(1+r.Uint64N(current-1), 10)
 					stale.Labels[v1.NodePoolLabelKey] = "stale"
-					observe(srcs, stale)
+					c.NodeClaimStore.Put(stale)
 				}
 			default:
 				rv++
@@ -83,10 +82,10 @@ var _ = Describe("NodePoolState Recount", func() {
 				if r.IntN(3) == 0 {
 					nc.Status.Conditions = []status.Condition{{Type: v1.ConditionTypeDisruptionReason, Status: metav1.ConditionTrue}}
 				}
-				observe(srcs, nc)
+				c.NodeClaimStore.Put(nc)
 				latest[name] = nc
 			}
-			want := map[string]karpentercluster.NodeClaimCounts{}
+			want := map[string]NodeClaimCounts{}
 			for _, nc := range latest {
 				np := nc.Labels[v1.NodePoolLabelKey]
 				if np == "" {
@@ -101,8 +100,8 @@ var _ = Describe("NodePoolState Recount", func() {
 				want[np] = counts
 			}
 			for _, np := range []string{"a", "b", "stale"} {
-				active, deleting, _ := c.NodePoolState.GetNodeCount(np)
-				Expect(karpentercluster.NodeClaimCounts{Active: active, Deleting: deleting}).To(Equal(want[np]),
+				active, deleting, _ := cs.NodePoolState.GetNodeCount(np)
+				Expect(NodeClaimCounts{Active: active, Deleting: deleting}).To(Equal(want[np]),
 					"after change %d, %s counts %d active and %d deleting, want %+v", i, np, active, deleting, want[np])
 			}
 		}

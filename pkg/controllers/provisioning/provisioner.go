@@ -30,7 +30,7 @@ import (
 	"github.com/awslabs/operatorpkg/singleton"
 	"github.com/awslabs/operatorpkg/status"
 
-	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
+	"sigs.k8s.io/karpenter/pkg/cluster/virtualpods"
 
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
@@ -47,15 +47,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
+	"sigs.k8s.io/karpenter/pkg/cluster/prediction"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
-	"sigs.k8s.io/karpenter/pkg/state/prediction"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	scheduler "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
@@ -63,8 +62,8 @@ import (
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
 	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
 	"sigs.k8s.io/karpenter/pkg/utils/daemonset"
-	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
+	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
 
@@ -90,22 +89,27 @@ type Provisioner struct {
 	kubeClient                 client.Client
 	batcher                    *Batcher[types.UID]
 	volumeTopology             *scheduler.VolumeTopology
-	cluster                    *state.Cluster
+	cluster                    *karpentercluster.NodeState
+	nodePools                  *karpentercluster.NodePoolState
+	capacityQuotas             *karpentercluster.CapacityQuotaState
 	recorder                   events.Recorder
 	cm                         *pretty.ChangeMonitor
 	clock                      clock.Clock
 	deviceAllocationController *deviceallocation.Controller
 	virtualPodCache            *virtualpods.Cache
 	predictionStore            *prediction.Store
-	// nomination and bufferPods are the handles of the intents the provisioner writes on NodeClaims.
-	nomination *karpentercluster.Nomination
-	bufferPods *karpentercluster.BufferPods
+	// nomination and bufferPods are the handles of the intents the provisioner writes on NodeClaims, and
+	// podScheduling the handle of what it decides about each pod.
+	nomination    *karpentercluster.Nomination
+	bufferPods    *karpentercluster.BufferPods
+	podScheduling *karpentercluster.PodScheduling
 }
 
 func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
-	cloudProvider cloudprovider.CloudProvider, cluster *state.Cluster,
-	clock clock.Clock, deviceAllocationController *deviceallocation.Controller, virtualPodCache *virtualpods.Cache,
-	predictionStore *prediction.Store, nomination *karpentercluster.Nomination, bufferPods *karpentercluster.BufferPods,
+	cloudProvider cloudprovider.CloudProvider, cluster *karpentercluster.NodeState, nodePools *karpentercluster.NodePoolState,
+	capacityQuotas *karpentercluster.CapacityQuotaState, clock clock.Clock, deviceAllocationController *deviceallocation.Controller,
+	virtualPodCache *virtualpods.Cache, predictionStore *prediction.Store, nomination *karpentercluster.Nomination,
+	bufferPods *karpentercluster.BufferPods, podScheduling *karpentercluster.PodScheduling,
 ) *Provisioner {
 	p := &Provisioner{
 		batcher:                    NewBatcher[types.UID](clock),
@@ -113,6 +117,8 @@ func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 		kubeClient:                 kubeClient,
 		volumeTopology:             scheduler.NewVolumeTopology(kubeClient),
 		cluster:                    cluster,
+		nodePools:                  nodePools,
+		capacityQuotas:             capacityQuotas,
 		recorder:                   recorder,
 		cm:                         pretty.NewChangeMonitor(),
 		clock:                      clock,
@@ -121,6 +127,7 @@ func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 		predictionStore:            predictionStore,
 		nomination:                 nomination,
 		bufferPods:                 bufferPods,
+		podScheduling:              podScheduling,
 	}
 	return p
 }
@@ -147,7 +154,7 @@ func (p *Provisioner) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(p.Name()).
 		WatchesRawSource(singleton.Source()).
-		WatchesRawSource(karpenterstate.Requires(p.cluster)).
+		WatchesRawSource(karpenterstate.Requires(p.cluster, p.nodePools)).
 		Complete(singleton.AsReconciler(p))
 }
 
@@ -160,7 +167,7 @@ func (p *Provisioner) Reconcile(ctx context.Context) (result reconciler.Result, 
 	}
 	// A NodeClaim that's launching isn't a node in cluster state yet, so scheduling now would schedule pods off a smaller
 	// subset of nodes than actually exist, and provision for them again.
-	if !p.cluster.NodeClaimsLaunched(ctx) {
+	if !p.cluster.NodeClaimsLaunched() {
 		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil //storelint:deadline the batcher's loop runs again at once
 	}
 	if options.FromContext(ctx).FeatureGates.PredictionEnabled && !p.predictionStore.Hydrated(ctx) {
@@ -236,14 +243,11 @@ func (p *Provisioner) CreateNodeClaims(ctx context.Context, nodeClaims []*schedu
 func (p *Provisioner) GetPendingPods(ctx context.Context) ([]*corev1.Pod, error) {
 	// filter for provisionable pods first, so we don't check for validity/PVCs on pods we won't provision anyway
 	// (e.g. those owned by daemonsets)
-	pods, err := nodeutils.GetProvisionablePods(ctx, p.kubeClient)
-	if err != nil {
-		return nil, fmt.Errorf("listing pods, %w", err)
-	}
+	pods := p.provisionablePods()
 	rejectedPods, pods := lo.FilterReject(pods, func(po *corev1.Pod, _ int) bool {
 		if err := p.Validate(ctx, po); err != nil {
 			// Mark in memory that this pod is unschedulable
-			p.cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{po: fmt.Errorf("ignoring pod, %w", err)}, nil, nil)
+			p.podScheduling.MarkDecisions(map[*corev1.Pod]error{po: fmt.Errorf("ignoring pod, %w", err)}, nil, nil)
 			log.FromContext(ctx).WithValues("Pod", klog.KObj(po)).V(1).Info("ignoring pod", "error", err)
 			// Don't create pod events for pods that are specifically avoiding scheduling to Karpenter-managed capacity
 			if !errors.Is(err, KarpenterManagedLabelDoesNotExistError) {
@@ -262,6 +266,19 @@ func (p *Provisioner) GetPendingPods(ctx context.Context) ([]*corev1.Pod, error)
 		pods = append(pods, p.virtualPodCache.GetAll(ctx)...)
 	}
 	return pods, nil
+}
+
+// provisionablePods returns a copy of each provisionable pod the pod store holds, so that every pod the provisioner
+// decides about has an entry to hold the decision. The scheduler relaxes a pod's preferences in place, so it gets a
+// copy, never the store's object.
+func (p *Provisioner) provisionablePods() []*corev1.Pod {
+	var pods []*corev1.Pod
+	for _, e := range p.cluster.PodStore.List() {
+		if e.Object.Spec.NodeName == "" && podutils.IsProvisionable(e.Object) {
+			pods = append(pods, e.Object.DeepCopy())
+		}
+	}
+	return pods
 }
 
 // consolidationWarnings potentially writes logs warning about possible unexpected interactions
@@ -397,7 +414,7 @@ func (p *Provisioner) NewScheduler(
 
 	predictionStore := lo.Ternary(options.FromContext(ctx).FeatureGates.PredictionEnabled, p.predictionStore, nil)
 	// Pass volumeReqs to scheduler - added to nodeRequirements for NodeClaim zone selection
-	return scheduler.NewScheduler(ctx, p.kubeClient, nodePools, p.cluster, stateNodes, topology, instanceTypes, daemonSetPods, p.recorder, p.clock, volumeReqs, allocator, deletingPodUIDs, predictionStore, opts...), nil
+	return scheduler.NewScheduler(ctx, p.kubeClient, nodePools, p.cluster, p.nodePools, p.capacityQuotas, stateNodes, topology, instanceTypes, daemonSetPods, p.recorder, p.clock, volumeReqs, allocator, deletingPodUIDs, predictionStore, opts...), nil
 }
 
 func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
@@ -456,7 +473,7 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	if err != nil {
 		if errors.Is(err, ErrNodePoolsNotFound) {
 			log.FromContext(ctx).Info("no dynamic nodepools found")
-			p.cluster.MarkPodSchedulingDecisions(ctx, lo.SliceToMap(pods, func(p *corev1.Pod) (*corev1.Pod, error) {
+			p.podScheduling.MarkDecisions(lo.SliceToMap(pods, func(p *corev1.Pod) (*corev1.Pod, error) {
 				return p, fmt.Errorf("no dynamic nodepools found")
 			}), nil, nil)
 			return scheduler.Results{}, nil
@@ -500,7 +517,7 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	// Mark in memory when these pods were marked as schedulable or when we made a decision on the pods.
 	// Virtual buffer pods are excluded — they never exist in etcd, so their entries would never be
 	// cleaned up and would leak memory when buffers are deleted or scaled down.
-	p.cluster.MarkPodSchedulingDecisions(ctx,
+	p.podScheduling.MarkDecisions(
 		filterVirtualPodErrors(results.PodErrors),
 		filterVirtualPodMapping(results.NodePoolToPodMapping()),
 		// Only passing existing nodes here and not new nodeClaims because
@@ -544,7 +561,7 @@ func (p *Provisioner) Create(ctx context.Context, n *scheduler.NodeClaim, opts .
 
 	// Update pod to nodeClaim mapping for newly created nodeClaims. We do
 	// this here because nodeClaim does not have a name until it is created.
-	p.cluster.UpdatePodToNodeClaimMapping(map[string][]*corev1.Pod{nodeClaim.Name: n.Pods})
+	p.podScheduling.MapToNodeClaims(map[string][]*corev1.Pod{nodeClaim.Name: n.Pods})
 
 	instanceTypeRequirement, _ := lo.Find(nodeClaim.Spec.Requirements, func(req v1.NodeSelectorRequirementWithMinValues) bool {
 		return req.Key == corev1.LabelInstanceTypeStable

@@ -121,8 +121,8 @@ var _ = Describe("TerminateFirstDrift", func() {
 				},
 			})
 			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
-			staticDriftController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, queue, clusterCost,
-				disruption.WithMethods(disruption.NewStaticDrift(cluster, prov, cloudProvider, recorder)))
+			staticDriftController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost,
+				disruption.WithMethods(disruption.NewStaticDrift(cs.NodePoolState, prov, cloudProvider, recorder)))
 		})
 
 		It("issues a delete-only command for a static NodePool at its node limit when TerminateFirstDrift is enabled", func() {
@@ -231,7 +231,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 				ExpectMetricCounterValue(disruption.TerminateFirstDecisionsTotal, 1, map[string]string{metrics.NodePoolLabel: nodePool.Name, metrics.ReasonLabel: "drifted", disruption.TerminateFirstReasonDim.Name: string(disruption.TerminateFirstNoReservedCapacity)})
 				Expect(cmds[0].Replacements).To(HaveLen(0))
 				// The delete-only path must not hold the limits.nodes slot it never uses.
-				Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(HaveLen(1))
+				Expect(cs.NodePoolState.ReserveNodeCount(nodePool.Name, 2, 1)).To(HaveLen(1))
 			})
 
 			// One NodePool's lookup failure must neither stop drift for the others nor leak the limits.nodes slots they reserve.
@@ -257,8 +257,8 @@ var _ = Describe("TerminateFirstDrift", func() {
 				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock,
 					[]*corev1.Node{node, healthyNode}, []*v1.NodeClaim{nodeClaim, healthyNodeClaim})
 				erroring := &instanceTypesErrorCloudProvider{CloudProvider: cloudProvider, nodePools: []string{nodePool.Name}}
-				staticDriftController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, queue, clusterCost,
-					disruption.WithMethods(disruption.NewStaticDrift(cluster, prov, erroring, recorder)))
+				staticDriftController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost,
+					disruption.WithMethods(disruption.NewStaticDrift(cs.NodePoolState, prov, erroring, recorder)))
 
 				ExpectSingletonReconciled(ctx, staticDriftController)
 
@@ -463,7 +463,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 					cloudprovider.ReservationIDLabel: reservationID,
 				}),
 			})
-			ExpectSingletonReconciled(ctx, pricingController)
+			expectPriced()
 
 			nodePool = test.NodePool(v1.NodePool{Spec: v1.NodePoolSpec{
 				Disruption: v1.Disruption{ConsolidateAfter: v1.MustParseNillableDuration("1h"), Budgets: []v1.Budget{{Nodes: "100%"}}},
@@ -486,7 +486,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 				},
 			})
 			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
-			driftController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, queue, clusterCost,
+			driftController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost,
 				disruption.WithMethods(disruption.NewDrift(env.Overlay, cluster, prov, recorder, env.Clock)))
 		}
 

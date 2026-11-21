@@ -68,32 +68,6 @@ linters:
           deny:
             - pkg: sigs.k8s.io/karpenter/pkg/controllers
               desc: pkg/cluster never depends on controllers
-        # pkg/controllers/state is being emptied into pkg/cluster. These are its importers today; the list only shrinks.
-        controllers-state:
-          files:
-            - $all
-            - "!**/kwok/*.go"
-            - "!**/pkg/controllers/*.go"
-            - "!**/pkg/controllers/disruption/*.go"
-            - "!**/pkg/controllers/metrics/node/*.go"
-            - "!**/pkg/controllers/metrics/pod/*.go"
-            - "!**/pkg/controllers/nodeclaim/garbagecollection/*.go"
-            - "!**/pkg/controllers/nodeclaim/lifecycle/*.go"
-            - "!**/pkg/controllers/node/legacyrepair/*.go"
-            - "!**/pkg/controllers/nodeoverlay/*.go"
-            - "!**/pkg/controllers/pod/deletioncost/*.go"
-            - "!**/pkg/controllers/provisioning/*.go"
-            - "!**/pkg/controllers/provisioning/scheduling/*.go"
-            - "!**/pkg/controllers/state/*.go"
-            - "!**/pkg/controllers/state/**/*.go"
-            - "!**/pkg/controllers/static/deprovisioning/*.go"
-            - "!**/pkg/controllers/static/provisioning/*.go"
-            - "!**/pkg/state/cost/*_test.go"
-            - "!**/pkg/test/expectations/*.go"
-            - "!**/pkg/test/schedulingproperties/*.go"
-          deny:
-            - pkg: sigs.k8s.io/karpenter/pkg/controllers/state
-              desc: read cluster state through pkg/cluster; this list of importers only shrinks
     gocyclo:
       min-complexity: 11
     goheader:

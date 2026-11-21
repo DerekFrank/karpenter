@@ -33,7 +33,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	disruptionutils "sigs.k8s.io/karpenter/pkg/utils/disruption"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/pdb"
@@ -43,10 +42,10 @@ import (
 // RankNodes returns three slices whose position implies the pod-deletion-cost
 // annotation: groupA maps to math.MinInt32, groupBC is drifted then normal by
 // SavingsRatio DESC with the rank from RankForBC(i, len(groupBC)), and groupD
-// has its annotations cleared. cluster is the one source of both the nodes it
-// ranks and the disruption budgets bounding groupBC, which count the same
-// managed nodes per NodePool.
-func RankNodes(ctx context.Context, kubeClient client.Client, clk clock.Clock, cluster *state.Cluster, nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType) (groupA, groupBC, groupD []*karpentercluster.StateNode, err error) {
+// has its annotations cleared. nodeState holds the nodes it ranks, and nodePools
+// count the same managed nodes per NodePool for the disruption budgets
+// bounding groupBC.
+func RankNodes(ctx context.Context, kubeClient client.Client, clk clock.Clock, nodeState *karpentercluster.NodeState, nodePools *karpentercluster.NodePoolState, nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType) (groupA, groupBC, groupD []*karpentercluster.StateNode, err error) {
 	// PDC only annotates pods on nodes Karpenter owns, the nodes the budgets
 	// count. An unmanaged node with a deletion timestamp satisfies
 	// StateNode.Deleted(), so without this filter it reaches Group A and gets
@@ -54,7 +53,7 @@ func RankNodes(ctx context.Context, kubeClient client.Client, clk clock.Clock, c
 	// aliases, not deep copies: torn reads are acceptable, since the writes are
 	// best-effort and the next reconcile picks up any drift.
 	var nodes []*karpentercluster.StateNode
-	for n := range cluster.Nodes() {
+	for n := range nodeState.Nodes() {
 		if n.Managed() {
 			nodes = append(nodes, n)
 		}
@@ -80,8 +79,8 @@ func RankNodes(ctx context.Context, kubeClient client.Client, clk clock.Clock, c
 	normal := groups[partitionNormal]
 	cleanupOnly := groups[partitionCleanupOnly]
 
-	driftBudget := disruption.NodePoolBudgetMap(ctx, clk, cluster, nodePoolMap, v1.DisruptionReasonDrifted)
-	consolidationBudget := disruption.NodePoolBudgetMap(ctx, clk, cluster, nodePoolMap, v1.DisruptionReasonUnderutilized)
+	driftBudget := disruption.NodePoolBudgetMap(ctx, clk, nodePools, nodePoolMap, v1.DisruptionReasonDrifted)
+	consolidationBudget := disruption.NodePoolBudgetMap(ctx, clk, nodePools, nodePoolMap, v1.DisruptionReasonUnderutilized)
 	var driftOverflow, normalOverflow []*karpentercluster.StateNode
 	drifted, driftOverflow = applyPerNodePoolBudget(drifted, driftBudget)
 	normal, normalOverflow = applyPerNodePoolBudget(normal, consolidationBudget)

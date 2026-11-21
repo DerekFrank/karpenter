@@ -30,9 +30,9 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 )
@@ -40,13 +40,13 @@ import (
 // Drift is a subreconciler that deletes drifted candidates.
 type Drift struct {
 	kubeClient  client.Client
-	cluster     *state.Cluster
+	cluster     *karpentercluster.NodeState
 	provisioner *provisioning.Provisioner
 	recorder    events.Recorder
 	clock       clock.Clock
 }
 
-func NewDrift(kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, recorder events.Recorder, clk clock.Clock) *Drift {
+func NewDrift(kubeClient client.Client, cluster *karpentercluster.NodeState, provisioner *provisioning.Provisioner, recorder events.Recorder, clk clock.Clock) *Drift {
 	return &Drift{
 		kubeClient:  kubeClient,
 		cluster:     cluster,

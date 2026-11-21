@@ -37,26 +37,23 @@ in `Derived`. See [Claims](#claims).
   file and one type per object or synthetic object: `nodeclaim.go`
   (`NodeClaims`, and the `Deletion`, `Nomination` and `BufferPods` handles),
   `node.go` (`Nodes`, `CSINodes`), `nodeusage.go` (the pod usage on a Node's
-  entry), `pod.go` (`Pods`), `pvc.go` (PVCs and their drivers), `daemonset.go`
-  (`DaemonSets`), `cluster.go` (the synthetic `Cluster{}` and its counts),
-  `nodepool.go` (`NodePoolState` and the `NodePools` accessor) and
-  `capacityquota.go`. `nodestate.go` is the node accessor, which combines a
-  NodeClaim's entry with its Node's. `state.go` composes them.
+  entry), `pod.go` (`Pods`, and the `PodScheduling` handle), `pvc.go` (PVCs and
+  their drivers), `daemonset.go` (`DaemonSets`), `cluster.go` (the synthetic
+  `Cluster{}` and its counts), `nodepool.go` (`NodePoolState` and the
+  `NodePools` accessor), `capacityquota.go` and `cost.go` (`ClusterCost`).
+  `nodestate.go` is the node accessor, which combines a NodeClaim's entry with
+  its Node's. `state.go` composes them. `pkg/cluster/prediction` and
+  `pkg/cluster/virtualpods` hold the prediction store and the CapacityBuffer
+  virtual pods.
 - **`cluster.State`** holds every accessor, the stores behind them and the
   intent handles. `cluster.New` builds it once, where the operator is wired
   (`kwok/main.go`), and passes it to `controllers.NewControllers`, which gives
   each controller the accessors it reads and the handles it writes: the
-  disruption queue gets `Deletion`, and the provisioner gets `Nomination` and
-  `BufferPods`. See [Startup](#startup).
-- **`pkg/controllers/state`** holds `state.Cluster`, a façade over
-  `cluster.NodeState`, `cluster.NodePoolState` and `cluster.PodScheduling`,
-  with the wait on unlaunched NodeClaims, the pod scheduling telemetry and the
-  consolidation state. Its informer controllers keep what takes I/O to read:
-  PVC drivers and cost.
+  disruption queue gets `Deletion`, and the provisioner gets `Nomination`,
+  `BufferPods` and `PodScheduling`. See [Startup](#startup).
 - **Imports point one way:** controllers import `pkg/cluster`, which imports
-  `pkg/state`. depguard (`.golangci.yaml`) enforces it, and freezes the
-  importers of `pkg/controllers/state` with a list that only shrinks.
-  `hack/storelint`, run by `make verify`, enforces the rules in [Lint](#lint).
+  `pkg/state`. depguard (`.golangci.yaml`) enforces it. `hack/storelint`, run
+  by `make verify`, enforces the rules in [Lint](#lint).
 
 ## Stores
 
@@ -105,8 +102,8 @@ There are two kinds of store. They differ only in where the object comes from:
   operator overlays them. An object store holds the informer's own objects, or
   the overlay's copy of a write until the informer delivers its own.
 - **A store holds every object of its kind.** A `Derive`'s zero key does the
-  filtering, as cost's NodeClaim store does for NodeClaims of other providers'
-  node classes. `WithFilter` is for a kind whose readers would all have to
+  filtering, as cost's Derives do for NodeClaims without the labels that price
+  them. `WithFilter` is for a kind whose readers would all have to
   filter, or whose objects cost memory to hold, measured first: the NodeClaim
   store holds only the NodeClaims of the cloud provider's node classes.
 - **An object store is a manager runnable.** `Start` waits for its source to
@@ -127,7 +124,7 @@ There are two kinds of store. They differ only in where the object comes from:
 - **`Clear`** is a test helper: it empties a store in place and notifies each
   removal, so subscribers stay subscribed, and an object store then applies
   what its source holds again. `cluster.NodeState.Clear` and
-  `state.Cluster.Reset` compose it. Production code never wipes a store;
+  `cluster.State.Reset` compose it. Production code never wipes a store;
   storelint reports a `Clear` outside a test.
 - **`TouchOn(from, to, dependents)`** re-notifies `to`'s keys that `dependents`
   returns for each change of `from`, so the `Derive`s from `to` recompute.
@@ -280,10 +277,13 @@ request behind them.
   `Set`, `Clear`, `Get`, and `Update` for writers that race. `pkg/cluster`
   wraps each in a type its one writer holds: `Deletion` (`Mark`, `Unmark`) for
   the disruption queue, `Nomination` (`Nominate`) and `BufferPods`
-  (`Replace`) for the provisioner, and `Registrations` (`Record`) for the
-  NodeClaim lifecycle controller, whose recorded launch outcomes the
-  registration health controller reads to set `NodeRegistrationHealthy`. A
-  controller without the handle can't write the intent.
+  (`Replace`) for the provisioner, `PodScheduling` (`Ack`, `MarkDecisions`,
+  `MapToNodeClaims`, on the pods' entries) for the provisioner and the pod
+  controller that acks the pods it triggers it for, and `Registrations`
+  (`Record`) for the NodeClaim lifecycle controller, whose recorded launch
+  outcomes the registration health controller reads to set
+  `NodeRegistrationHealthy`. A controller without the handle can't write the
+  intent.
 - **`Set` on an entry that doesn't exist does nothing**, since intent about an
   object the store doesn't hold would outlive it.
 - **`WithExpiry(clock, ttl)`** makes a value lapse `ttl` after it's set, or at
@@ -421,7 +421,9 @@ controllerruntime.NewControllerManagedBy(m).
 - **`state.After(delay, sources...)`** batches each request's changes for
   `delay`, for a watcher such as metrics.
 - **`RequeueAfter` is for wall-clock deadlines only,** such as a TTL or a
-  timeout. A controller reacting to derived values wakes through a source.
+  timeout, marked `//storelint:deadline <reason>`. A controller reacting to
+  state wakes through a source. A controller that must poll something no
+  store holds marks it `//storelint:poll <what it polls>`.
 - **A subscriber is cheap and non-blocking.** It updates a counter, enqueues
   or `Touch`es. Work a change triggers runs in a controller that watches a
   source.
@@ -501,14 +503,14 @@ op.WithControllers(ctx, controllers.NewControllers(ctx, mgr, ..., s, ...)...).St
 - a write of a `Derive` or `Claims` target (`Store.Feed`, `FeedAll`, `Clear`)
   outside `pkg/state`;
 - a `Clear()` of a store or of `pkg/cluster` state, or a `Reset()` of
-  `state.Cluster` or the cost tracker, outside a test or `pkg/test`;
+  `cluster.State`, outside a test or `pkg/test`;
 - a `Subscribe`, `Derive`, `DeriveObject` or store constructor in a `New*`
   function outside `pkg/state` and `pkg/cluster`;
 - a store built anywhere but `pkg/state` itself, `pkg/cluster`, a
   `Register(context.Context, manager.Manager) error` method or a test;
 - a shared store added to a manager anywhere but `cluster.State.Register`;
 - a `RequeueAfter` in a controller that reads stores, unless the line carries
-  `//storelint:deadline <reason>`;
+  `//storelint:deadline <reason>` or `//storelint:poll <what it polls>`;
 - a `Contribution` type without a `statetest.ExpectContribution` test in its
   package;
 - a map or slice field of a store's fields without a `// bounded:` comment;
@@ -574,4 +576,4 @@ Tests are Ginkgo specs, one `RunSpecs` suite per package.
   failures and assert on them after it joins; a Gomega failure inside a
   goroutine holding a lock can hang the spec.
 - Drive a Node's registration window as "Registering window" in
-  `pkg/controllers/state` does.
+  `pkg/cluster` does.

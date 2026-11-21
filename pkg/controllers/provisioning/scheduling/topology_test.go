@@ -28,7 +28,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -2596,14 +2595,6 @@ var _ = Describe("Topology", func() {
 			ExpectScheduled(ctx, env.Client, zone2Pod)
 			ExpectScheduled(ctx, env.Client, zone3Pod)
 
-			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(zone1Pod))
-			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(zone2Pod))
-			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(zone3Pod))
-
-			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(zone1Pod))
-			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(zone2Pod))
-			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(zone3Pod))
-
 			// this pod with no anti-affinity rules can't schedule. It has no anti-affinity rules, but every zone has an
 			// existing pod (not from this batch) with anti-affinity rules that prevent it from scheduling
 			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, affPod)
@@ -2647,10 +2638,6 @@ var _ = Describe("Topology", func() {
 			ExpectScheduled(ctx, env.Client, zone1Pod)
 			ExpectScheduled(ctx, env.Client, zone2Pod)
 			ExpectScheduled(ctx, env.Client, zone3Pod)
-
-			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(zone1Pod))
-			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(zone2Pod))
-			ExpectReconcileSucceeded(ctx, podStateController, client.ObjectKeyFromObject(zone3Pod))
 
 			// this pod with no anti-affinity rules can schedule, though it couldn't if the anti-affinity were required
 			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, affPod)
@@ -2847,7 +2834,7 @@ var _ = Describe("Topology", func() {
 					ExpectScheduled(ctx, env.Client, pods[i])
 				}
 				ExpectCleanedUp(ctx, env.Client)
-				cluster.Reset()
+				cs.Reset()
 			}
 		})
 		It("should fail to schedule pods with unsatisfiable dependencies", func() {

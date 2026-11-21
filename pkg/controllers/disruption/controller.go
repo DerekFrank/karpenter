@@ -49,13 +49,11 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
-	"sigs.k8s.io/karpenter/pkg/state/cost"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
@@ -63,12 +61,13 @@ import (
 type Controller struct {
 	queue         *Queue
 	kubeClient    client.Client
-	cluster       *state.Cluster
+	cluster       *karpentercluster.NodeState
+	nodePools     *karpentercluster.NodePoolState
 	provisioner   *provisioning.Provisioner
 	recorder      events.Recorder
 	clock         clock.Clock
 	cloudProvider cloudprovider.CloudProvider
-	clusterCost   *cost.ClusterCost
+	clusterCost   *karpentercluster.ClusterCost
 	methods       []Method
 	mu            sync.Mutex
 	lastRun       map[string]time.Time
@@ -88,14 +87,15 @@ func WithMethods(methods ...Method) option.Function[ControllerOptions] {
 }
 
 func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
-	cp cloudprovider.CloudProvider, recorder events.Recorder, cluster *state.Cluster, queue *Queue, clusterCost *cost.ClusterCost, opts ...option.Function[ControllerOptions]) *Controller {
+	cp cloudprovider.CloudProvider, recorder events.Recorder, cluster *karpentercluster.NodeState, nodePools *karpentercluster.NodePoolState, queue *Queue, clusterCost *karpentercluster.ClusterCost, opts ...option.Function[ControllerOptions]) *Controller {
 
-	o := option.Resolve(append([]option.Function[ControllerOptions]{WithMethods(NewMethods(ctx, clk, cluster, kubeClient, provisioner, cp, recorder, queue)...)}, opts...)...)
+	o := option.Resolve(append([]option.Function[ControllerOptions]{WithMethods(NewMethods(ctx, clk, cluster, nodePools, kubeClient, provisioner, cp, recorder, queue)...)}, opts...)...)
 	return &Controller{
 		queue:         queue,
 		clock:         clk,
 		kubeClient:    kubeClient,
 		cluster:       cluster,
+		nodePools:     nodePools,
 		provisioner:   provisioner,
 		recorder:      recorder,
 		cloudProvider: cp,
@@ -106,8 +106,8 @@ func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Clien
 	}
 }
 
-func NewMethods(ctx context.Context, clk clock.Clock, cluster *state.Cluster, kubeClient client.Client, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue) []Method {
-	c := MakeConsolidation(clk, cluster, kubeClient, provisioner, cp, recorder, queue)
+func NewMethods(ctx context.Context, clk clock.Clock, cluster *karpentercluster.NodeState, nodePools *karpentercluster.NodePoolState, kubeClient client.Client, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue) []Method {
+	c := MakeConsolidation(clk, cluster, nodePools, kubeClient, provisioner, cp, recorder, queue)
 	methods := []Method{}
 	// Repair runs first: fixing a fault outranks any discretionary rebalance. Do not register the method while the
 	// feature gate is disabled, since candidate construction performs cluster-wide API and scheduling work.
@@ -119,7 +119,7 @@ func NewMethods(ctx context.Context, clk clock.Clock, cluster *state.Cluster, ku
 		// Delete empty nodes across all consolidation policies (WhenEmpty, WhenEmptyOrUnderutilized, Balanced).
 		NewEmptiness(c),
 		// Terminate and create replacement for drifted NodeClaims in Static NodePool
-		NewStaticDrift(cluster, provisioner, cp, recorder),
+		NewStaticDrift(nodePools, provisioner, cp, recorder),
 		// Terminate any NodeClaims that have drifted from provisioning specifications, allowing the pods to reschedule.
 		NewDrift(kubeClient, cluster, provisioner, recorder, clk),
 		// Attempt to identify multiple NodeClaims that we can consolidate simultaneously to reduce pod churn
@@ -135,14 +135,14 @@ func (c *Controller) Name() string {
 
 // Register wakes the controller on the changes that can open a disruption decision, and has the consolidation methods
 // skip their work until one comes, in place of a poll:
-//   - the NodeClaim store, narrowed to nodeClaimInputs: a NodeClaim coming, launching, linking its Node, starting to
-//     delete or going; being marked for deletion; its Drifted or Consolidatable condition or its do-not-disrupt
-//     annotation changing; or its buffer pods coming or going. Its nomination, status heartbeats and other conditions
-//     don't wake it.
-//   - the Node store, narrowed to nodeInputs: a Node initializing, its do-not-disrupt annotation or its repair policy
-//     matches changing in number; and its pods' usage, as a pod binds to it or leaves it, starts to terminate, or gains
-//     or loses the do-not-disrupt annotation. A pod's status, its other metadata, pods waiting to schedule, which have
-//     no Node, and the Node's heartbeat don't wake it.
+//   - the NodeClaim store, narrowed to disruption's inputs (NodeState.DisruptionSources): a NodeClaim coming,
+//     launching, linking its Node, starting to delete or going; being marked for deletion; its Drifted or
+//     Consolidatable condition or its do-not-disrupt annotation changing; or its buffer pods coming or going. Its
+//     nomination, status heartbeats and other conditions don't wake it.
+//   - the Node store, narrowed to disruption's inputs: a Node initializing, its do-not-disrupt annotation or its repair
+//     policy matches changing in number; and its pods' usage, as a pod binds to it or leaves it, starts to terminate,
+//     or gains or loses the do-not-disrupt annotation. A pod's status, its other metadata, pods waiting to schedule,
+//     which have no Node, and the Node's heartbeat don't wake it.
 //   - a managed NodePool's spec changing, through its generation.
 //   - the NodeClaim store's UnlaunchedSource: a NodeClaim launching, which can end the wait on NodeClaimsLaunched. It
 //     doesn't count as a change for consolidation, since a launch also changes the NodeClaim's inputs.
@@ -157,7 +157,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		WatchesRawSource(singleton.Source()).
-		WatchesRawSource(karpenterstate.Requires(c.cluster)).
+		WatchesRawSource(karpenterstate.Requires(c.cluster, c.nodePools)).
 		// Every source enqueues the same empty request, so the controller runs once for each burst of changes.
 		WatchesRawSource(c.wakes()).
 		Watches(&v1.NodePool{}, handler.EnqueueRequestsFromMapFunc(func(context.Context, client.Object) []reconcile.Request {
@@ -182,7 +182,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 
 	// A NodeClaim that's launching isn't a node in cluster state yet, so a decision made now would be made off a
 	// smaller subset of nodes than actually exist. The unlaunched NodeClaims wake the controller once they launch.
-	if !c.cluster.NodeClaimsLaunched(ctx) {
+	if !c.cluster.NodeClaimsLaunched() {
 		return reconciler.Result{}, nil
 	}
 
@@ -205,8 +205,9 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		}
 		return reconciler.Result{}, serrors.Wrap(fmt.Errorf("removing condition from nodeclaims, %w", err), "condition", v1.ConditionTypeDisruptionReason)
 	}
+	// PredictionStoreHydrated waits for the store to hydrate, and returns false only once ctx is done.
 	if options.FromContext(ctx).FeatureGates.PredictionEnabled && !c.provisioner.PredictionStoreHydrated(ctx) {
-		return reconciler.Result{RequeueAfter: time.Second}, nil //storelint:deadline poll: the prediction store hydrates without a source
+		return reconciler.Result{}, nil
 	}
 
 	// Attempt different disruption methods. We'll only let one method perform an action
@@ -249,7 +250,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 	if setter, ok := disruption.(NodePoolTotalsSetter); ok {
 		setter.SetNodePoolTotals(nodePoolTotals)
 	}
-	disruptionBudgetMapping, err := BuildDisruptionBudgetMapping(ctx, c.cluster, c.clock, c.kubeClient, c.cloudProvider, c.recorder, disruption.Reason())
+	disruptionBudgetMapping, err := BuildDisruptionBudgetMapping(ctx, c.nodePools, c.clock, c.kubeClient, c.cloudProvider, c.recorder, disruption.Reason())
 	if err != nil {
 		return false, fmt.Errorf("building disruption budgets, %w", err)
 	}

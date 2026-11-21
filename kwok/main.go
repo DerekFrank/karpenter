@@ -26,7 +26,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 	"sigs.k8s.io/karpenter/pkg/controllers"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator"
 )
 
@@ -44,7 +43,6 @@ func main() {
 	repairPolicyMatcher := lo.Must(repair.NewRepairPolicyMatcher(ctx, cloudProvider))
 	s := cluster.New(ctx, op.Clock, op.GetClient(), cloudProvider, cluster.WithRepairPolicyMatcher(repairPolicyMatcher))
 	lo.Must0(s.Register(op.Manager))
-	clusterState := state.NewCluster(op.Clock, op.GetClient(), s.Nodes, s.NodePoolState, s.CapacityQuotaState, s.PodScheduling)
 	op.
 		WithControllers(ctx, controllers.NewControllers(
 			ctx,
@@ -55,7 +53,6 @@ func main() {
 			cloudProvider,
 			overlayUndecoratedCloudProvider,
 			s,
-			clusterState,
 			op.InstanceTypeStore,
 			op.PredictionStore,
 			controllers.WithVPAPrediction(),

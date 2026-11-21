@@ -40,7 +40,6 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/apis/v1alpha1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
@@ -49,7 +48,6 @@ import (
 type Controller struct {
 	kubeClient        client.Client
 	cloudProvider     cloudprovider.CloudProvider
-	clusterState      *state.Cluster
 	instanceTypeStore *InstanceTypeStore
 	clock             clock.Clock
 }
@@ -59,12 +57,11 @@ func (c *Controller) Name() string {
 }
 
 // NewController constructs a controller for node overlay validation
-func NewController(clk clock.Clock, kubeClient client.Client, cp cloudprovider.CloudProvider, instanceTypeStore *InstanceTypeStore, clusterState *state.Cluster) *Controller {
+func NewController(clk clock.Clock, kubeClient client.Client, cp cloudprovider.CloudProvider, instanceTypeStore *InstanceTypeStore) *Controller {
 	return &Controller{
 		kubeClient:        kubeClient,
 		cloudProvider:     cp,
 		instanceTypeStore: instanceTypeStore,
-		clusterState:      clusterState,
 		clock:             clk,
 	}
 }
@@ -126,7 +123,6 @@ func (c *Controller) Reconcile(ctx context.Context, _ reconcile.Request) (reconc
 	}
 
 	c.instanceTypeStore.UpdateStore(temporaryStore)
-	c.clusterState.MarkUnconsolidated()
 
 	// If some NodePools failed to resolve instance types, return the
 	// aggregated errors so controller-runtime logs them via its standard

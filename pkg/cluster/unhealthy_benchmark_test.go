@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package state_test
+package cluster_test
 
 import (
 	"context"
@@ -33,7 +33,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	clock "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	fakecr "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
@@ -42,8 +41,8 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/cluster/repair"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
 	"sigs.k8s.io/karpenter/pkg/state/statetest"
 	"sigs.k8s.io/karpenter/pkg/test"
 )
@@ -130,17 +129,16 @@ func benchmarkNodeClaim(i int, now time.Time) *v1.NodeClaim {
 
 // benchmarkCluster returns cluster state holding n Nodes matched by matcher, each with its NodeClaim, the first
 // unhealthy of which are unhealthy.
-func benchmarkCluster(ctx context.Context, b *testing.B, provider *fake.CloudProvider, matcher *repair.RepairPolicyMatcher, n, unhealthy int, now time.Time) (*state.Cluster, *statetest.Sources) {
+func benchmarkCluster(ctx context.Context, b *testing.B, provider *fake.CloudProvider, matcher *repair.RepairPolicyMatcher, n, unhealthy int, now time.Time) (*karpentercluster.NodeState, *statetest.Sources) {
 	b.Helper()
-	kubeClient := fakecr.NewClientBuilder().WithIndex(&corev1.Pod{}, "spec.nodeName", func(o client.Object) []string {
-		return []string{o.(*corev1.Pod).Spec.NodeName}
-	}).Build()
 	clk := clock.NewFakeClock(now)
-	cs, srcs := inMemory(ctx, clk, provider, karpentercluster.WithRepairPolicyMatcher(matcher))
-	clusterState := state.NewCluster(clk, kubeClient, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
+	srcs := statetest.NewSources()
+	cs := karpentercluster.New(ctx, clk, nil, provider, karpentercluster.WithRepairPolicyMatcher(matcher),
+		karpentercluster.WithSources(func(obj client.Object) karpenterstate.Newest { return srcs.For(obj) }))
+	clusterState := cs.Nodes
 	for i := range n {
-		observe(srcs, benchmarkNodeClaim(i, now))
-		observe(srcs, benchmarkNode(i, i < unhealthy, benchmarkAcceleratorReason(i < unhealthy, 0), now, now))
+		srcs.Put(benchmarkNodeClaim(i, now))
+		srcs.Put(benchmarkNode(i, i < unhealthy, benchmarkAcceleratorReason(i < unhealthy, 0), now, now))
 	}
 	return clusterState, srcs
 }
@@ -189,7 +187,7 @@ func BenchmarkClusterUpdateNode(b *testing.B) {
 					b.ReportAllocs()
 					b.ResetTimer()
 					for i := 0; i < b.N; i++ {
-						observe(srcs, versions[(i/n)%2][i%n])
+						srcs.Put(versions[(i/n)%2][i%n])
 					}
 				})
 			}

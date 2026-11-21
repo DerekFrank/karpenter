@@ -33,13 +33,11 @@ import (
 	"k8s.io/utils/clock"
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	fakecp "sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
 	"sigs.k8s.io/karpenter/pkg/state/statetest"
@@ -90,16 +88,13 @@ var _ = Describe("NodePoolStats", func() {
 	It("should match a recount over every node after each change", func() {
 		statsCtx := options.ToContext(context.Background(), test.Options())
 		r := rand.New(rand.NewPCG(3, 4)) //nolint:gosec // deterministic seed for reproducible test inputs
-		statsClient := fake.NewClientBuilder().WithIndex(&corev1.Pod{}, "spec.nodeName", func(o client.Object) []string {
-			return []string{o.(*corev1.Pod).Spec.NodeName}
-		}).Build()
 		clk := clocktesting.NewFakeClock(time.Now())
 		// This spec drives the stores itself, without an API server: each one follows the Objects of its kind, which the
 		// spec fills as an informer would.
 		srcs := statetest.NewSources()
 		cs := karpentercluster.New(statsCtx, clk, nil, fakecp.NewCloudProvider(),
 			karpentercluster.WithSources(func(obj client.Object) karpenterstate.Newest { return srcs.For(obj) }))
-		c := state.NewCluster(clk, statsClient, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
+		c := cs.Nodes
 		nodePools := []string{"a", "b", ""}
 		var rv uint64
 		nextRV := func() string { rv++; return strconv.FormatUint(rv, 10) }
@@ -185,7 +180,7 @@ var _ = Describe("NodePoolStats", func() {
 				wantNodes, wantDisrupting := recountNodePoolStats(c.DeepCopyNodes(), nodeObjects, reason)
 				// NodePool names are never empty, so nodes without the label count toward none.
 				for _, np := range []string{"a", "b"} {
-					numNodes, disrupting := disruption.NodePoolStats(c, np, reason)
+					numNodes, disrupting := disruption.NodePoolStats(cs.NodePoolState, np, reason)
 					Expect([]int{numNodes, disrupting}).To(Equal([]int{wantNodes[np], wantDisrupting[np]}),
 						"after change %d, NodePool %s for %s counts %d nodes and %d disrupting, want %d and %d", i, np, reason, numNodes, disrupting, wantNodes[np], wantDisrupting[np])
 				}

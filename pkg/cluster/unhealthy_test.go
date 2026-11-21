@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package state_test
+package cluster_test
 
 import (
 	"time"
@@ -24,13 +24,11 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/cluster/repair"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -47,7 +45,6 @@ var _ = Describe("Unhealthy Nodes", func() {
 		}}})
 		node.Status.Conditions = append(node.Status.Conditions, conditions...)
 		node = ExpectRegistered(ctx, env.Client, nodeClaim, node)
-		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 		return nodeClaim, node
 	}
 	updateNode := func(node *corev1.Node, mutate func(*corev1.Node)) {
@@ -82,12 +79,12 @@ var _ = Describe("Unhealthy Nodes", func() {
 		return names
 	}
 
-	var suiteCluster *state.Cluster
+	var suiteCluster *karpentercluster.NodeState
 	var matcher *repair.RepairPolicyMatcher
 	// useMatcher builds cluster state around a matcher, as the operator does once at startup.
 	useMatcher := func(m *repair.RepairPolicyMatcher) {
 		cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider, karpentercluster.WithRepairPolicyMatcher(m))
-		cluster = state.NewCluster(env.Clock, env.Overlay, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
+		cluster = cs.Nodes
 	}
 
 	BeforeEach(func() {
@@ -161,7 +158,6 @@ var _ = Describe("Unhealthy Nodes", func() {
 		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 		nodeClaim.Labels["updated"] = "true"
 		ExpectApplied(ctx, env.Client, nodeClaim)
-		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 
 		heartbeat(node)
 		Expect(unhealthyNames()).To(ConsistOf(node.Name))
@@ -179,7 +175,7 @@ var _ = Describe("Unhealthy Nodes", func() {
 	It("should match nodes in a newly constructed cluster", func() {
 		managedNode(badNode())
 		cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider, karpentercluster.WithRepairPolicyMatcher(matcher))
-		fresh := state.NewCluster(env.Clock, env.Overlay, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
+		fresh := cs.Nodes
 
 		Expect(lo.SomeBy(fresh.DeepCopyNodes(), func(n *karpentercluster.StateNode) bool {
 			return n.GetRepairResult(env.Clock.Now().Add(24*time.Hour)).Action != ""

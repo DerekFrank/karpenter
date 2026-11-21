@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package informer
+package vpa
 
 import (
 	"context"
@@ -35,20 +35,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/cluster/prediction"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
-
-	"sigs.k8s.io/karpenter/pkg/state/prediction"
 )
 
 // Controller periodically lists VerticalPodAutoscaler objects and maintains a prediction
 // cache of post-recreation resources for VPA-managed pods. It uses a singleton (polling)
 // pattern rather than an informer to gracefully tolerate VPA CRD not being installed.
-type VPAController struct {
+type Controller struct {
 	kubeClient client.Client
 	store      *prediction.Store
-	cluster    *state.Cluster
 	recorder   events.Recorder
 	// lastSeen tracks the resourceVersion of each VPA we've processed,
 	// so we skip recomputation when nothing changed.
@@ -60,34 +57,30 @@ func init() {
 	utilruntime.Must(vpav1.AddToScheme(scheme.Scheme))
 }
 
-func NewVPAController(kubeClient client.Client, store *prediction.Store, cluster *state.Cluster, recorder events.Recorder) *VPAController {
-	return &VPAController{
+func NewController(kubeClient client.Client, store *prediction.Store, recorder events.Recorder) *Controller {
+	return &Controller{
 		kubeClient: kubeClient,
 		store:      store,
-		cluster:    cluster,
 		recorder:   recorder,
 		lastSeen:   make(map[types.NamespacedName]string),
 	}
 }
 
-func (c *VPAController) Reconcile(ctx context.Context) (reconciler.Result, error) {
+func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
 
 	var vpaList vpav1.VerticalPodAutoscalerList
 	if err := c.kubeClient.List(ctx, &vpaList); err != nil {
 		if meta.IsNoMatchError(err) {
-			if c.store.Reset() {
-				c.cluster.MarkUnconsolidated()
-			}
+			c.store.Reset()
 			c.lastSeen = make(map[types.NamespacedName]string)
 			c.store.MarkHydrated()
-			return reconciler.Result{RequeueAfter: 1 * time.Minute}, nil //storelint:deadline poll: VPA predictions (review 11)
+			return reconciler.Result{RequeueAfter: 1 * time.Minute}, nil //storelint:poll VPAs, whose CRD may not be installed
 		}
 		return reconciler.Result{}, err
 	}
 
 	seen := make(map[types.NamespacedName]bool, len(vpaList.Items))
-	changed := false
 	for i := range vpaList.Items {
 		vpa := &vpaList.Items[i]
 		key := client.ObjectKeyFromObject(vpa)
@@ -95,38 +88,33 @@ func (c *VPAController) Reconcile(ctx context.Context) (reconciler.Result, error
 		if c.lastSeen[key] == vpa.ResourceVersion {
 			continue
 		}
-		changed = c.processVPA(vpa, key) || changed
+		c.processVPA(vpa, key)
 	}
-	changed = c.deleteUnseen(seen) || changed
-	// A prediction change can make a node consolidatable, but isn't a cluster state change consolidation watches for
-	if changed {
-		c.cluster.MarkUnconsolidated()
-	}
+	c.deleteUnseen(seen)
 	c.store.MarkHydrated()
-	return reconciler.Result{RequeueAfter: 30 * time.Second}, nil //storelint:deadline poll: VPA predictions (review 11)
+	return reconciler.Result{RequeueAfter: 30 * time.Second}, nil //storelint:poll VPAs, whose CRD may not be installed
 }
 
-// deleteUnseen removes predictions of VPAs that no longer exist and reports whether the store's predictions changed.
-func (c *VPAController) deleteUnseen(seen map[types.NamespacedName]bool) bool {
-	changed := false
+// deleteUnseen removes predictions of VPAs that no longer exist.
+func (c *Controller) deleteUnseen(seen map[types.NamespacedName]bool) {
 	for key := range c.lastSeen {
 		if !seen[key] {
-			changed = c.store.Delete(key) || changed
+			c.store.Delete(key)
 			delete(c.lastSeen, key)
 		}
 	}
-	return changed
 }
 
-// processVPA reports whether the store's predictions changed.
-func (c *VPAController) processVPA(vpa *vpav1.VerticalPodAutoscaler, key types.NamespacedName) bool {
+// processVPA stores the VPA's prediction, or drops it.
+func (c *Controller) processVPA(vpa *vpav1.VerticalPodAutoscaler, key types.NamespacedName) {
 	c.lastSeen[key] = vpa.ResourceVersion
 	var p *prediction.Prediction
 	if vpa.Spec.TargetRef != nil {
 		p = computePrediction(vpa)
 	}
 	if p == nil {
-		return c.store.Delete(key)
+		c.store.Delete(key)
+		return
 	}
 	workload := prediction.WorkloadReference{
 		GroupKind:      schema.FromAPIVersionAndKind(vpa.Spec.TargetRef.APIVersion, vpa.Spec.TargetRef.Kind).GroupKind(),
@@ -134,20 +122,19 @@ func (c *VPAController) processVPA(vpa *vpav1.VerticalPodAutoscaler, key types.N
 	}
 	if !prediction.SupportedTargets.Has(workload.GroupKind) {
 		c.recorder.Publish(PredictionTargetUnsupportedEvent(vpa))
-		return c.store.Delete(key)
+		c.store.Delete(key)
+		return
 	}
-	if !c.store.Set(key, workload, p, vpa.CreationTimestamp.Time) {
-		return false
+	if c.store.Set(key, workload, p, vpa.CreationTimestamp.Time) {
+		c.recorder.Publish(PredictionStoredEvent(vpa))
 	}
-	c.recorder.Publish(PredictionStoredEvent(vpa))
-	return true
 }
 
-func (c *VPAController) Name() string {
+func (c *Controller) Name() string {
 	return "vpa.prediction"
 }
 
-func (c *VPAController) Register(ctx context.Context, m manager.Manager) error {
+func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 	if err := c.store.RegisterTargetKinds(ctx, m.GetCache(), prediction.SupportedTargets.UnsortedList()...); err != nil {
 		return err
 	}

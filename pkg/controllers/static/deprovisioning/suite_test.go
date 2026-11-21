@@ -43,7 +43,6 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	static "sigs.k8s.io/karpenter/pkg/controllers/static/deprovisioning"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
@@ -55,7 +54,7 @@ import (
 var (
 	cs            karpentercluster.State
 	ctx           context.Context
-	cluster       *state.Cluster
+	cluster       *karpentercluster.NodeState
 	cloudProvider *fake.CloudProvider
 	controller    *static.Controller
 	env           *test.Environment
@@ -84,15 +83,15 @@ var _ = BeforeSuite(func() {
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
 	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = state.NewCluster(env.Clock, env.Overlay, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
+	cluster = cs.Nodes
 	recorder = test.NewEventRecorder()
-	controller = static.NewController(env.Overlay, cluster, cloudProvider, env.Clock, recorder)
+	controller = static.NewController(env.Overlay, cs.NodePoolState, cloudProvider, env.Clock, recorder)
 })
 
 var _ = BeforeEach(func() {
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider.Reset()
-	cluster.Reset()
+	cs.Reset()
 
 	// ensure any waiters on our clock are allowed to proceed before resetting our clock time
 	for env.Clock.HasWaiters() {
@@ -109,7 +108,7 @@ var _ = AfterSuite(func() {
 var _ = AfterEach(func() {
 	ExpectCleanedUp(ctx, env.Client)
 	cloudProvider.Reset()
-	cluster.Reset()
+	cs.Reset()
 })
 
 var _ = Describe("Static Deprovisioning Controller", func() {
@@ -184,7 +183,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 			// Update cluster state to track the nodes
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{nodes[0], nodes[1]}, []*v1.NodeClaim{nodeClaims[0], nodeClaims[1]})
 			Expect(cluster.Nodes()).To(HaveLen(2))
-			ExpectStateNodePoolCount(cluster, nodePool.Name, 2, 0, 0)
+			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 2, 0, 0)
 
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 			Expect(result.RequeueAfter).To(BeZero())
@@ -221,7 +220,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{nodes[0], nodes[1]}, []*v1.NodeClaim{nodeClaims[0], nodeClaims[1]})
 			Expect(cluster.Nodes()).To(HaveLen(2))
 			// Verify StateNodePool Has been updated
-			ExpectStateNodePoolCount(cluster, nodePool.Name, 2, 0, 0)
+			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 2, 0, 0)
 
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 
@@ -261,7 +260,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 			Expect(cluster.Nodes()).To(HaveLen(4))
 
 			// Verify StateNodePool Has been updated
-			ExpectStateNodePoolCount(cluster, nodePool.Name, 4, 0, 0)
+			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 4, 0, 0)
 
 			// If 3 of the nodes are being disrupted then do not deprovision any
 			for i := range 3 {
@@ -270,7 +269,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 			}
 
 			// Verify StateNodePool Has been updated
-			ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 3, 0)
+			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 1, 3, 0)
 
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 			Expect(result.RequeueAfter).To(BeZero())
@@ -280,7 +279,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 			Expect(env.Client.List(ctx, remainingNodeClaims)).To(Succeed())
 			Expect(remainingNodeClaims.Items).To(HaveLen(4))
 			// Verify StateNodePool Has been updated
-			ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 3, 0)
+			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 1, 3, 0)
 		})
 		It("should terminate excess nodeclaims when current count exceeds desired replicas", func() {
 			nodePool := test.StaticNodePool()
@@ -309,7 +308,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 			Expect(cluster.Nodes()).To(HaveLen(4))
 			// Verify StateNodePool Has been updated
-			ExpectStateNodePoolCount(cluster, nodePool.Name, 4, 0, 0)
+			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 4, 0, 0)
 
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 			Expect(result.RequeueAfter).To(BeZero())
@@ -319,7 +318,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 			Expect(env.Client.List(ctx, remainingNodeClaims)).To(Succeed())
 			Expect(remainingNodeClaims.Items).To(HaveLen(2))
 			// Verify StateNodePool Has been updated
-			ExpectStateNodePoolCount(cluster, nodePool.Name, 2, 0, 0)
+			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 2, 0, 0)
 		})
 		It("should handle zero replicas by terminating all nodeclaims", func() {
 			nodePool := test.StaticNodePool()
@@ -349,7 +348,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 			Expect(cluster.Nodes()).To(HaveLen(3))
 			// Verify StateNodePool Has been updated
-			ExpectStateNodePoolCount(cluster, nodePool.Name, 3, 0, 0)
+			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 3, 0, 0)
 
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 			Expect(result.RequeueAfter).To(BeZero())
@@ -360,7 +359,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 			Expect(remainingNodeClaims.Items).To(HaveLen(0))
 
 			// Verify StateNodePool Has been updated
-			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 0)
+			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 0, 0, 0)
 		})
 		It("should handle no active nodeclaims gracefully", func() {
 			nodePool := test.StaticNodePool()
@@ -383,7 +382,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 				nodePool.Spec.Replicas = new(int64(1))
 				ExpectApplied(ctx, env.Client, nodePool)
 
-				failingController := static.NewController(&failingClient{Client: env.Overlay}, cluster, cloudProvider, env.Clock, recorder)
+				failingController := static.NewController(&failingClient{Client: env.Overlay}, cs.NodePoolState, cloudProvider, env.Clock, recorder)
 
 				// Create 3 nodeclaims, so 2 need to be terminated
 				nodeClaims, nodes := test.NodeClaimsAndNodes(3, v1.NodeClaim{
@@ -412,7 +411,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 				Expect(cluster.Nodes()).To(HaveLen(3))
 
 				// Verify StateNodePool Has been updated
-				ExpectStateNodePoolCount(cluster, nodePool.Name, 3, 0, 0)
+				ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 3, 0, 0)
 
 				_, err := failingController.Reconcile(ctx, nodePool)
 				Expect(err).To(HaveOccurred())
@@ -427,7 +426,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 				})
 				Expect(len(activeNodeClaims)).To(BeNumerically(">", 1)) // More than desired replicas (1)
 				// Verify StateNodePool Has been updated
-				ExpectStateNodePoolCount(cluster, nodePool.Name, 3, 0, 0)
+				ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 3, 0, 0)
 			})
 		})
 		Context("Deprovision Candidate Selection", func() {
@@ -483,7 +482,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 				Expect(ncCount.Items).To(HaveLen(4))
 
 				// Verify StateNodePool has been updated (resolved + unresolved)
-				ExpectStateNodePoolCount(cluster, nodePool.Name, 4, 0, 0)
+				ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 4, 0, 0)
 
 				result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 				Expect(result.RequeueAfter).To(BeZero())
@@ -499,7 +498,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 				Expect(activeNodeClaims[0].Status.ProviderID).NotTo(BeEmpty())
 				Expect(activeNodeClaims[1].Status.ProviderID).NotTo(BeEmpty())
 
-				ExpectStateNodePoolCount(cluster, nodePool.Name, 2, 0, 0)
+				ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 2, 0, 0)
 			})
 			It("should prioritize empty nodes (with only daemonset pods) for termination", func() {
 				nodePool := test.StaticNodePool()
@@ -547,7 +546,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 				Expect(cluster.Nodes()).To(HaveLen(4))
 
 				// Verify StateNodePool Has been updated
-				ExpectStateNodePoolCount(cluster, nodePool.Name, 4, 0, 0)
+				ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 4, 0, 0)
 
 				result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 				Expect(result.RequeueAfter).To(BeZero())
@@ -564,7 +563,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 				})
 				Expect(activeNodeClaimNames).To(HaveLen(2))
 				Expect(activeNodeClaimNames).To(ContainElements(nodeClaims[1].Name, nodeClaims[3].Name))
-				ExpectStateNodePoolCount(cluster, nodePool.Name, 2, 0, 0)
+				ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 2, 0, 0)
 
 			})
 			It("should terminate non-empty nodes when empty nodes are insufficient", func() {
@@ -605,7 +604,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 				// Update cluster state to track the nodes
 				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 				Expect(cluster.Nodes()).To(HaveLen(4))
-				ExpectStateNodePoolCount(cluster, nodePool.Name, 4, 0, 0)
+				ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 4, 0, 0)
 
 				result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 				Expect(result.RequeueAfter).To(BeZero())
@@ -614,7 +613,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 				remainingNodeClaims := &v1.NodeClaimList{}
 				Expect(env.Client.List(ctx, remainingNodeClaims)).To(Succeed())
 				Expect(remainingNodeClaims.Items).To(HaveLen(1))
-				ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 0)
+				ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 1, 0, 0)
 
 			})
 			Describe("candidates from the NodePool's index", func() {
@@ -677,7 +676,7 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 					ExpectApplied(ctx, env.Client, test.Pod(test.PodOptions{NodeName: nodes[1].Name}))
 					ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock,
 						append(nodes, otherNodes...), append(nodeClaims, otherNodeClaims...))
-					ExpectStateNodePoolCount(cluster, nodePool.Name, 3, 0, 0)
+					ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 3, 0, 0)
 
 					ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 
@@ -841,11 +840,11 @@ var _ = Describe("Static Deprovisioning Controller", func() {
 					func(replicas int64, expectIdx []int) {
 						nodePool.Spec.Replicas = new(replicas)
 						ExpectApplied(ctx, env.Client, nodePool)
-						ExpectStateNodePoolCount(cluster, nodePool.Name, 8, 0, 0)
+						ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 8, 0, 0)
 
 						res := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 						Expect(res.RequeueAfter).To(BeZero())
-						ExpectStateNodePoolCount(cluster, nodePool.Name, int(replicas), 0, 0)
+						ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, int(replicas), 0, 0)
 
 						want := make([]string, 0, len(expectIdx))
 						for _, i := range expectIdx {
@@ -910,7 +909,7 @@ var _ = Describe("Static Deprovisioning Wakes", func() {
 	var nodeClaim *v1.NodeClaim
 	var queue workqueue.TypedRateLimitingInterface[reconcile.Request]
 	BeforeEach(func() {
-		c := static.NewController(env.Overlay, cluster, cloudProvider, env.Clock, recorder)
+		c := static.NewController(env.Overlay, cs.NodePoolState, cloudProvider, env.Clock, recorder)
 		register(c)
 		nodePool = test.StaticNodePool()
 		nodePool.Spec.Replicas = new(int64(1))
@@ -937,17 +936,17 @@ var _ = Describe("Static Deprovisioning Wakes", func() {
 	It("should not wake for a NodePool whose deleting NodeClaims or reservations change", func() {
 		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDisruptionReason)
 		ExpectApplied(ctx, env.Client, nodeClaim)
-		ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 1, 0)
+		ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 0, 1, 0)
 		// The NodeClaim's create lands before its status, so it was active for that write, which wakes the NodePool.
 		Expect(drain(queue)).To(Equal([]string{nodePool.Name}), "want the NodePool for the NodeClaim its create made active")
 
 		ExpectDeleted(ctx, env.Client, nodeClaim)
-		ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 0)
+		ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 0, 0, 0)
 		Expect(drain(queue)).To(BeEmpty(), "want nothing for the NodePool's deleting NodeClaim going away")
 
-		reservations := cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 10, 1)
+		reservations := cs.NodePoolState.ReserveNodeCount(nodePool.Name, 10, 1)
 		Expect(reservations).To(HaveLen(1))
-		ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 1)
+		ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 0, 0, 1)
 		reservations.Release()
 		Expect(drain(queue)).To(BeEmpty(), "want nothing for the NodePool's reservation")
 	})

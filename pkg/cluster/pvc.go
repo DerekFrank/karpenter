@@ -17,15 +17,21 @@ limitations under the License.
 package cluster
 
 import (
+	"context"
+	"fmt"
+
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/state"
 	volumeutil "sigs.k8s.io/karpenter/pkg/utils/volume"
 )
 
 // PVCDriver is a PersistentVolumeClaim's CSI driver, which Karpenter resolves with I/O from the PVC's
-// PersistentVolume or StorageClass: a synthetic object, fed by the PVC informer controller. Driver is empty for a PVC
+// PersistentVolume or StorageClass: a synthetic object, fed by the PVC driver controller. Driver is empty for a PVC
 // whose volume no driver limits.
 type PVCDriver struct {
 	Driver string
@@ -49,15 +55,20 @@ func newPVCs() *PVCs {
 	return &PVCs{Reader: store.Reader, store: store}
 }
 
-// ResolvedPVCDriver is the driver the caller resolved, which the feed reports; "" is a PVC whose volume no driver
-// limits, and is held, because Resolved makes it other than the zero object.
-func ResolvedPVCDriver(driver string) PVCDriver {
-	return PVCDriver{Driver: driver, Resolved: true}
+// Resolve resolves the PVC's CSI driver from its PersistentVolume or StorageClass, read through kubeClient, and feeds
+// it. "" is a PVC whose volume no driver limits, and is held, because Resolved makes it other than the zero object.
+func (p *PVCs) Resolve(ctx context.Context, kubeClient client.Client, pvc *corev1.PersistentVolumeClaim) error {
+	driver, err := scheduling.ResolveDriver(ctx, kubeClient, nil, "", pvc, lo.FromPtr(pvc.Spec.StorageClassName))
+	if err != nil {
+		return fmt.Errorf("tracking volume usage, %w", err)
+	}
+	p.store.Feed(client.ObjectKeyFromObject(pvc), PVCDriver{Driver: driver, Resolved: true})
+	return nil
 }
 
-// Feed reports the PVC's driver. The zero PVCDriver, which a feed reports for a PVC that's gone, drops the entry.
-func (p *PVCs) Feed(pvc types.NamespacedName, driver PVCDriver) {
-	p.store.Feed(pvc, driver)
+// Forget drops the driver of a PVC that's gone: the feed of the zero PVCDriver.
+func (p *PVCs) Forget(pvc types.NamespacedName) {
+	p.store.Feed(pvc, PVCDriver{})
 }
 
 // Resolved returns whether cluster state holds the PVC's driver.

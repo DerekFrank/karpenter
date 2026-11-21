@@ -34,7 +34,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/metrics/pod"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -45,7 +44,8 @@ import (
 var podController *pod.Controller
 var ctx context.Context
 var env *test.Environment
-var cluster *state.Cluster
+var cluster *karpentercluster.NodeState
+var cs karpentercluster.State
 var cloudProvider *fake.CloudProvider
 
 func TestAPIs(t *testing.T) {
@@ -59,13 +59,13 @@ var _ = BeforeSuite(func() {
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...))
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
-	cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = state.NewCluster(env.Clock, env.Overlay, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
-	podController = pod.NewController(env.Overlay, cluster)
+	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
+	cluster = cs.Nodes
+	podController = pod.NewController(env.Overlay, cluster.PodStore)
 })
 
 var _ = AfterEach(func() {
-	cluster.Reset()
+	cs.Reset()
 	pod.PodStartupDurationSeconds.Reset()
 	pod.PodProvisioningStartupDurationSeconds.Reset()
 })
@@ -141,7 +141,8 @@ var _ = Describe("Pod Metrics", func() {
 		p.Status.Phase = corev1.PodPending
 
 		env.Clock.Step(1 * time.Hour)
-		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{}, map[string][]*corev1.Pod{"n1": {p}}, map[string][]*corev1.Pod{"nc1": {p}})
+		ExpectApplied(ctx, env.Client, p)
+		cs.PodScheduling.MarkDecisions(map[*corev1.Pod]error{}, map[string][]*corev1.Pod{"n1": {p}}, map[string][]*corev1.Pod{"nc1": {p}})
 
 		// PodScheduled condition does not exist, emit pods_unbound_time_seconds metric
 		ExpectApplied(ctx, env.Client, p)
@@ -221,7 +222,8 @@ var _ = Describe("Pod Metrics", func() {
 			pod.Status.Phase = corev1.PodPending
 
 			env.Clock.Step(1 * time.Hour)
-			cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{}, map[string][]*corev1.Pod{"n1": {pod}}, map[string][]*corev1.Pod{"nc1": {pod}})
+			ExpectApplied(ctx, env.Client, pod)
+			cs.PodScheduling.MarkDecisions(map[*corev1.Pod]error{}, map[string][]*corev1.Pod{"n1": {pod}}, map[string][]*corev1.Pod{"nc1": {pod}})
 
 			// PodScheduled condition does not exist yet, so the unbound metrics are emitted labeled by dynamic_resources.
 			ExpectApplied(ctx, env.Client, pod)
@@ -262,7 +264,8 @@ var _ = Describe("Pod Metrics", func() {
 		p.Status.Phase = corev1.PodPending
 
 		env.Clock.Step(1 * time.Hour)
-		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{}, map[string][]*corev1.Pod{"n1": {p}}, map[string][]*corev1.Pod{"nc1": {p}})
+		ExpectApplied(ctx, env.Client, p)
+		cs.PodScheduling.MarkDecisions(map[*corev1.Pod]error{}, map[string][]*corev1.Pod{"n1": {p}}, map[string][]*corev1.Pod{"nc1": {p}})
 		ExpectApplied(ctx, env.Client, p)
 		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(p)) //This will add pod to pending pods and unscheduled pods set
 		_, found := FindMetricWithLabelValues("karpenter_pods_unstarted_time_seconds", map[string]string{
@@ -332,7 +335,8 @@ var _ = Describe("Pod Metrics", func() {
 		p.Status.Phase = corev1.PodPending
 
 		env.Clock.Step(1 * time.Hour)
-		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{}, map[string][]*corev1.Pod{"n1": {p}}, map[string][]*corev1.Pod{"nc1": {p}})
+		ExpectApplied(ctx, env.Client, p)
+		cs.PodScheduling.MarkDecisions(map[*corev1.Pod]error{}, map[string][]*corev1.Pod{"n1": {p}}, map[string][]*corev1.Pod{"nc1": {p}})
 		ExpectApplied(ctx, env.Client, p)
 		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(p)) //This will add pod to pending pods and unscheduled pods set
 		_, found := FindMetricWithLabelValues("karpenter_pods_unstarted_time_seconds", map[string]string{
@@ -375,7 +379,8 @@ var _ = Describe("Pod Metrics", func() {
 		p.Status.Phase = corev1.PodPending
 
 		env.Clock.Step(1 * time.Hour)
-		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{}, map[string][]*corev1.Pod{"n1": {p}}, map[string][]*corev1.Pod{"nc1": {p}})
+		ExpectApplied(ctx, env.Client, p)
+		cs.PodScheduling.MarkDecisions(map[*corev1.Pod]error{}, map[string][]*corev1.Pod{"n1": {p}}, map[string][]*corev1.Pod{"nc1": {p}})
 		ExpectApplied(ctx, env.Client, p)
 		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(p)) //This will add pod to pending pods and unscheduled pods set
 		_, found := FindMetricWithLabelValues("karpenter_pods_unstarted_time_seconds", map[string]string{
@@ -427,7 +432,7 @@ var _ = Describe("Pod Metrics", func() {
 		Expect(found).To(BeFalse())
 
 		// Expect the metric to exist now that we've ack'd the pod
-		cluster.AckPods(p)
+		cs.PodScheduling.Ack(p)
 		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(p))
 		env.Clock.Step(1 * time.Hour)
 
@@ -437,7 +442,7 @@ var _ = Describe("Pod Metrics", func() {
 		})
 		Expect(found).To(BeTrue())
 
-		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{}, map[string][]*corev1.Pod{"n1": {p}}, map[string][]*corev1.Pod{"nc1": {p}})
+		cs.PodScheduling.MarkDecisions(map[*corev1.Pod]error{}, map[string][]*corev1.Pod{"n1": {p}}, map[string][]*corev1.Pod{"nc1": {p}})
 		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(p))
 
 		_, found = FindMetricWithLabelValues("karpenter_pods_provisioning_scheduling_undecided_time_seconds", map[string]string{
@@ -460,7 +465,7 @@ var _ = Describe("Pod Metrics", func() {
 		Expect(found).To(BeFalse())
 
 		// Expect the metric to exist now that we've ack'd the pod
-		cluster.AckPods(p)
+		cs.PodScheduling.Ack(p)
 		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(p))
 		env.Clock.Step(1 * time.Hour)
 
@@ -484,7 +489,7 @@ var _ = Describe("Pod Metrics", func() {
 		p.Status.Phase = corev1.PodPending
 		ExpectApplied(ctx, env.Client, p)
 
-		cluster.AckPods(p)
+		cs.PodScheduling.Ack(p)
 		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(p))
 		env.Clock.Step(1 * time.Hour)
 
@@ -509,7 +514,7 @@ var _ = Describe("Pod Metrics", func() {
 		p.Status.Phase = corev1.PodPending
 		ExpectApplied(ctx, env.Client, p)
 
-		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{}, map[string][]*corev1.Pod{"n1": {p}}, map[string][]*corev1.Pod{"nc1": {p}})
+		cs.PodScheduling.MarkDecisions(map[*corev1.Pod]error{}, map[string][]*corev1.Pod{"n1": {p}}, map[string][]*corev1.Pod{"nc1": {p}})
 		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(p))
 
 		_, found := FindMetricWithLabelValues("karpenter_pods_unbound_time_seconds", map[string]string{
@@ -561,7 +566,7 @@ var _ = Describe("Pod Metrics", func() {
 		p.Status.Phase = corev1.PodPending
 		ExpectApplied(ctx, env.Client, p)
 
-		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{}, map[string][]*corev1.Pod{"n1": {p}}, map[string][]*corev1.Pod{"nc1": {p}})
+		cs.PodScheduling.MarkDecisions(map[*corev1.Pod]error{}, map[string][]*corev1.Pod{"n1": {p}}, map[string][]*corev1.Pod{"nc1": {p}})
 		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(p))
 		_, found := FindMetricWithLabelValues("karpenter_pods_provisioning_unbound_time_seconds", map[string]string{
 			"name":      p.GetName(),
@@ -573,7 +578,7 @@ var _ = Describe("Pod Metrics", func() {
 			"namespace": p.GetNamespace(),
 		})
 		Expect(found).To(BeTrue())
-		cluster.MarkPodSchedulingDecisions(ctx, map[*corev1.Pod]error{p: fmt.Errorf("ignoring pod")}, map[string][]*corev1.Pod{}, map[string][]*corev1.Pod{"nc1": {p}})
+		cs.PodScheduling.MarkDecisions(map[*corev1.Pod]error{p: fmt.Errorf("ignoring pod")}, map[string][]*corev1.Pod{}, map[string][]*corev1.Pod{"nc1": {p}})
 		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(p))
 		_, found = FindMetricWithLabelValues("karpenter_pods_provisioning_unbound_time_seconds", map[string]string{
 			"name":      p.GetName(),
@@ -593,7 +598,7 @@ var _ = Describe("Pod Metrics", func() {
 		p.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: "Unschedulable", LastTransitionTime: metav1.Now()}}
 		ExpectApplied(ctx, env.Client, node, p)
 
-		cluster.AckPods(p)
+		cs.PodScheduling.Ack(p)
 		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(p))
 
 		_, found := FindMetricWithLabelValues("karpenter_pods_provisioning_scheduling_undecided_time_seconds", map[string]string{
@@ -617,7 +622,7 @@ var _ = Describe("Pod Metrics", func() {
 		p.Status.Phase = corev1.PodPending
 		ExpectApplied(ctx, env.Client, p)
 
-		cluster.AckPods(p)
+		cs.PodScheduling.Ack(p)
 		ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(p))
 
 		_, found := FindMetricWithLabelValues("karpenter_pods_provisioning_scheduling_undecided_time_seconds", map[string]string{

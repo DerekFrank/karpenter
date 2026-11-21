@@ -52,7 +52,6 @@ import (
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
@@ -100,7 +99,7 @@ type Queue struct {
 	source             chan event.TypedGenericEvent[*v1.NodeClaim]
 	kubeClient         client.Client
 	recorder           events.Recorder
-	cluster            *state.Cluster
+	cluster            *karpentercluster.NodeState
 	clock              clock.Clock
 	provisioner        *provisioning.Provisioner
 	// deletion is the handle of the deletion marks, which the queue holds while a command disrupts its candidates.
@@ -109,7 +108,7 @@ type Queue struct {
 
 // NewQueue creates a queue that will asynchronously orchestrate disruption commands, marking their candidates for
 // deletion with deletion.
-func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clock clock.Clock,
+func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *karpentercluster.NodeState, clock clock.Clock,
 	provisioner *provisioning.Provisioner, deletion *karpentercluster.Deletion,
 ) *Queue {
 	queue := &Queue{

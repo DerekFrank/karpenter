@@ -186,17 +186,6 @@ func GetCurrentlyReschedulablePods(ctx context.Context, kubeClient client.Client
 	}), nil
 }
 
-// GetProvisionablePods grabs all the pods from the passed nodes that satisfy the IsProvisionable criteria
-func GetProvisionablePods(ctx context.Context, kubeClient client.Client) ([]*corev1.Pod, error) {
-	var podList corev1.PodList
-	if err := kubeClient.List(ctx, &podList, client.MatchingFields{"spec.nodeName": ""}); err != nil {
-		return nil, fmt.Errorf("listing pods, %w", err)
-	}
-	return lo.FilterMap(podList.Items, func(p corev1.Pod, _ int) (*corev1.Pod, bool) {
-		return &p, pod.IsProvisionable(&p)
-	}), nil
-}
-
 // GetVolumeAttachments grabs all volumeAttachments associated with the passed node
 func GetVolumeAttachments(ctx context.Context, kubeClient client.Client, node *corev1.Node) ([]*storagev1.VolumeAttachment, error) {
 	var volumeAttachmentList storagev1.VolumeAttachmentList

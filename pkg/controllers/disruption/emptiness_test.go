@@ -718,7 +718,7 @@ var _ = Describe("Emptiness", func() {
 		ExpectExists(ctx, env.Client, node)
 	})
 	It("should wait for the node TTL for empty nodes before consolidating", func() {
-		disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, queue, clusterCost, disruption.WithMethods(NewMethodsWithRealValidator()...))
+		disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost, disruption.WithMethods(NewMethodsWithRealValidator()...))
 		ExpectApplied(ctx, env.Client, nodeClaims[0], nodes[0], nodePool)
 
 		// inform cluster state about nodes and nodeclaims
@@ -781,7 +781,7 @@ var _ = Describe("Emptiness", func() {
 			for _, nc := range nodeClaims {
 				nc.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
 			}
-			c := disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue)
+			c := disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)
 			emptyConsolidation := disruption.NewEmptiness(c)
 			singleNodeConsolidation := disruption.NewSingleNodeConsolidation(c)
 			multiNodeConsolidation := disruption.NewMultiNodeConsolidation(c)

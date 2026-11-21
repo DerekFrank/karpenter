@@ -56,7 +56,7 @@ var _ = Describe("CapacityQuota", func() {
 		ExpectApplied(ctx, env.Client, q)
 		quotas = append(quotas, q)
 		// The quota controller enforces each CapacityQuota the store holds.
-		ExpectReconciled(ctx, cluster.CapacityQuotaState.Controller(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(q)})
+		ExpectReconciled(ctx, cs.CapacityQuotaState.Controller(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(q)})
 	}
 	nodePool := func(name string) {
 		ExpectApplied(ctx, env.Client, test.NodePool(v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: name}}))
@@ -107,13 +107,13 @@ var _ = Describe("CapacityQuota", func() {
 
 		_, err := prov.CreateNodeClaims(ctx, first.NewNodeClaims)
 		Expect(err).ToNot(HaveOccurred())
-		heldByFirst := cluster.NodePoolState.Get("a").ReservedResources.DeepCopy()
+		heldByFirst := cs.NodePoolState.Get("a").ReservedResources.DeepCopy()
 
 		// The second fits the NodePool's limits but not the quota, so its NodePool reservation is released.
 		_, err = prov.CreateNodeClaims(ctx, second.NewNodeClaims)
 		Expect(err).To(MatchError(ContainSubstring("capacityquota")))
 		Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
-		Expect(cluster.NodePoolState.Get("a").ReservedResources[corev1.ResourceCPU]).To(BeComparableTo(heldByFirst[corev1.ResourceCPU]))
+		Expect(cs.NodePoolState.Get("a").ReservedResources[corev1.ResourceCPU]).To(BeComparableTo(heldByFirst[corev1.ResourceCPU]))
 	})
 	It("should hold a quota on a zone against a NodeClaim that may launch in it", func() {
 		nodePool("a")
@@ -132,7 +132,7 @@ var _ = Describe("CapacityQuota", func() {
 		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod("a"))
 		nodeClaims := ExpectNodeClaims(ctx, env.Client)
 		Expect(nodeClaims).To(HaveLen(1))
-		fields := cluster.CapacityQuotaState.Get("team-a")
+		fields := cs.CapacityQuotaState.Get("team-a")
 		Expect(fields.Reserved).To(BeEmpty())
 		Expect(fields.Used[corev1.ResourceCPU]).To(BeComparableTo(nodeClaims[0].Status.Capacity[corev1.ResourceCPU]))
 	})
@@ -144,10 +144,10 @@ var _ = Describe("CapacityQuota", func() {
 		ExpectNotScheduled(ctx, env.Client, blocked)
 
 		ExpectDeleted(ctx, env.Client, quotas[0])
-		ExpectReconciled(ctx, cluster.CapacityQuotaState.Controller(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(quotas[0])})
+		ExpectReconciled(ctx, cs.CapacityQuotaState.Controller(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(quotas[0])})
 		quotas = nil
 		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, blocked)
 		ExpectScheduled(ctx, env.Client, blocked)
-		Expect(cluster.CapacityQuotaState.Get("team-a")).To(BeZero())
+		Expect(cs.CapacityQuotaState.Get("team-a")).To(BeZero())
 	})
 })

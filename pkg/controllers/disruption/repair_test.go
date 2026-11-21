@@ -36,13 +36,13 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/cluster/virtualpods"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	karpenterevents "sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
-	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
@@ -54,13 +54,13 @@ type terminationTimestampPatchErrorClient struct {
 	failNext bool
 }
 
-type podListErrorClient struct {
+type nodePoolListErrorClient struct {
 	client.Client
 	err error
 }
 
-func (c *podListErrorClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
-	if _, ok := list.(*corev1.PodList); ok {
+func (c *nodePoolListErrorClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if _, ok := list.(*v1.NodePoolList); ok {
 		return c.err
 	}
 	return c.Client.List(ctx, list, opts...)
@@ -156,8 +156,8 @@ var _ = Describe("Repair", func() {
 	// newRepairController builds an isolated repair-only disruption controller around the suite's repair policy matcher,
 	// which useRepairPolicies recompiles in place, so a spec that changes policies needn't build the controller again.
 	newRepairController := func() {
-		repair = disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue))
-		repairController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, queue, clusterCost,
+		repair = disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue))
+		repairController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost,
 			disruption.WithMethods(repair))
 	}
 
@@ -346,7 +346,6 @@ var _ = Describe("Repair", func() {
 			Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeRebooting).Reason).To(Equal(v1.RebootReasonRequested))
 			nodeClaim.StatusConditions().SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster")
 			ExpectApplied(ctx, env.Client, nodeClaim)
-			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim))
 			node = ExpectExists(ctx, env.Client, node)
 			for i := range node.Status.Conditions {
 				if node.Status.Conditions[i].Type == "BadNode" {
@@ -925,8 +924,8 @@ var _ = Describe("Repair", func() {
 		injectedErr := errors.New("injected termination timestamp patch failure")
 		failingClient := &terminationTimestampPatchErrorClient{Client: env.Overlay, err: injectedErr, failNext: true}
 		failingQueue := disruption.NewQueue(failingClient, recorder, cluster, env.Clock, prov, cs.Deletion)
-		failingRepair := disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, failingClient, prov, cloudProvider, recorder, failingQueue))
-		failingController := disruption.NewController(ctx, env.Clock, failingClient, prov, cloudProvider, recorder, cluster, failingQueue, clusterCost,
+		failingRepair := disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, failingClient, prov, cloudProvider, recorder, failingQueue))
+		failingController := disruption.NewController(ctx, env.Clock, failingClient, prov, cloudProvider, recorder, cluster, cs.NodePoolState, failingQueue, clusterCost,
 			disruption.WithMethods(failingRepair))
 
 		nodeClaim.Finalizers = append(nodeClaim.Finalizers, "karpenter.sh/test-finalizer")
@@ -1144,7 +1143,7 @@ var _ = Describe("Repair", func() {
 		delete(queue.NodeClaimToCommand, candidates[0].NodeClaim.Name)
 		queue.Unlock()
 
-		reservations := cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 6, 1)
+		reservations := cs.NodePoolState.ReserveNodeCount(nodePool.Name, 6, 1)
 		Expect(reservations).To(HaveLen(1))
 		reservations.Release()
 	})
@@ -1157,23 +1156,27 @@ var _ = Describe("Repair", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(candidates).To(HaveLen(1))
 
-		injectedErr := errors.New("injected pending pod list failure")
-		failingClient := &podListErrorClient{Client: env.Overlay, err: injectedErr}
+		injectedErr := errors.New("injected nodepool list failure")
+		failingClient := &nodePoolListErrorClient{Client: env.Overlay, err: injectedErr}
 		failingProvisioner := provisioning.NewProvisioner(
 			failingClient,
 			recorder,
 			cloudProvider,
 			cluster,
+			cs.NodePoolState,
+			cs.CapacityQuotaState,
 			env.Clock,
 			deviceallocation.NewController(failingClient),
 			virtualpods.NewVirtualPodCache(failingClient),
 			store,
 			cs.Nomination,
 			cs.BufferPods,
+			cs.PodScheduling,
 		)
 		failingRepair := disruption.NewRepair(disruption.MakeConsolidation(
 			env.Clock,
 			cluster,
+			cs.NodePoolState,
 			failingClient,
 			failingProvisioner,
 			cloudProvider,
@@ -1240,7 +1243,6 @@ var _ = Describe("Repair", func() {
 			nc.StatusConditions().SetTrue(v1.ConditionTypeLaunched)
 			nc.StatusConditions().SetTrue(v1.ConditionTypeRegistered)
 			*n = *ExpectRegistered(ctx, env.Client, nc, n)
-			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nc))
 		}
 
 		It("should repair an unhealthy node that never initialized", func() {
@@ -1267,7 +1269,6 @@ var _ = Describe("Repair", func() {
 			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeLaunched)
 			// Linked by its owner reference, without the registered label.
 			node = ExpectRegistered(ctx, env.Client, nodeClaim, node)
-			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim))
 			markUnhealthy(node, "BadNode")
 			env.Clock.Step(31 * time.Minute)
 
@@ -1323,7 +1324,6 @@ var _ = Describe("Repair", func() {
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			nodeClaim.StatusConditions(status.WithClock(env.Clock)).SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster")
 			ExpectApplied(ctx, env.Client, nodeClaim)
-			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim))
 
 			env.Clock.Step(29 * time.Minute)
 			ExpectSingletonReconciled(ctx, repairController)
@@ -1340,7 +1340,6 @@ var _ = Describe("Repair", func() {
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonIssued, "rebooting")
 			ExpectApplied(ctx, env.Client, nodeClaim)
-			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim))
 			env.Clock.Step(31 * time.Minute)
 
 			ExpectSingletonReconciled(ctx, repairController)

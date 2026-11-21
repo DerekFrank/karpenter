@@ -45,7 +45,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
@@ -66,7 +65,7 @@ type Controller struct {
 	recorder      events.Recorder
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
-	cluster       *state.Cluster
+	cluster       *karpentercluster.NodeState
 	policies      []replacePolicy
 	// health counts the Nodes, and those a replace policy matches, per NodePool and across the cluster. Register
 	// derives it.
@@ -81,7 +80,7 @@ type replacePolicy struct {
 }
 
 // NewController constructs a controller instance
-func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, cluster *state.Cluster, clock clock.Clock, recorder events.Recorder) *Controller {
+func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, cluster *karpentercluster.NodeState, clock clock.Clock, recorder events.Recorder) *Controller {
 	var policies []replacePolicy
 	for _, policy := range cloudProvider.RepairPolicies() {
 		if policy.Action != cloudprovider.ReplaceNode {
@@ -163,6 +162,8 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 		}).
 		// The node counts that guard repair are only whole once cluster state has synced.
 		WatchesRawSource(karpenterstate.Requires(c.cluster)).
+		// A change of the counts that guard repair reconciles the unhealthy Nodes they may have held back.
+		WatchesRawSource(c.health.Source()).
 		Complete(reconcile.AsReconciler(m.GetClient(), c))
 }
 
@@ -197,12 +198,12 @@ func (c *Controller) Reconcile(ctx context.Context, node *corev1.Node) (reconcil
 			if err := c.publishNodePoolHealthEvent(ctx, node, nodeClaim, nodePoolName); err != nil {
 				return reconcile.Result{}, err
 			}
-			return reconcile.Result{RequeueAfter: 5 * time.Minute}, nil //storelint:deadline poll: until legacyrepair wakes on its node health store (review 11)
+			return reconcile.Result{}, nil
 		}
 	} else {
 		if !c.isClusterHealthy() {
 			c.recorder.Publish(NodeRepairBlockedUnmanagedNodeClaim(node, nodeClaim, fmt.Sprintf("more then %s nodes are unhealthy in the cluster", allowedUnhealthyPercent.String()))...)
-			return reconcile.Result{RequeueAfter: 5 * time.Minute}, nil //storelint:deadline poll: until legacyrepair wakes on its node health store (review 11)
+			return reconcile.Result{}, nil
 		}
 	}
 	// For unhealthy past the tolerationDisruption window we can forcefully terminate the node

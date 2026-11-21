@@ -25,7 +25,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -90,7 +89,7 @@ var _ = Describe("SingleNodeConsolidation", func() {
 		}
 
 		// Create a single node consolidation controller
-		c := disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue)
+		c := disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)
 		consolidation = disruption.NewSingleNodeConsolidation(c)
 	})
 
@@ -248,7 +247,6 @@ func createCandidates(disruptionCost float64, nodesPerNodePool ...int) ([]*disru
 			ExpectApplied(ctx, env.Client, nodeClaim)
 
 			// Ensure the state is updated after all changes
-			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim))
 
 			nodeClaims = append(nodeClaims, nodeClaim)
 		}

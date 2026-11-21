@@ -47,7 +47,6 @@ var _ = Describe("Contributions", func() {
 	It("should keep the contribution laws for the cluster's counts", func() {
 		for _, b := range []ClusterDerived{{}, {UnlaunchedNodeClaims: 1}} {
 			statetest.ExpectContribution(GinkgoT(), b, unlaunchedNodeClaim(1), unlaunchedNodeClaim(1))
-			statetest.ExpectContribution(GinkgoT(), b, unmanagedNode{}, unmanagedNode{})
 		}
 		for _, b := range []NodeCounts{{}, {Nodes: 3, Unhealthy: 1}} {
 			statetest.ExpectContribution(GinkgoT(), b, nodeCount{nodes: 1}, nodeCount{nodes: 1, unhealthy: 1})
@@ -57,8 +56,8 @@ var _ = Describe("Contributions", func() {
 		}
 		for _, b := range []int{0, 5} {
 			statetest.ExpectContribution(GinkgoT(), b, mountsPVCs(1), mountsPVCs(1))
-			statetest.ExpectContribution(GinkgoT(), b, podOnNodeClaim(1), podOnNodeClaim(1))
 		}
+		statetest.ExpectContribution(GinkgoT(), struct{}{}, member{}, member{})
 	})
 	It("should keep the contribution laws for Node side contributions", func() {
 		matcher := testMatcher()

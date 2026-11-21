@@ -17,8 +17,16 @@ limitations under the License.
 package cluster
 
 import (
+	"context"
+	"time"
+
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/workqueue"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	"sigs.k8s.io/karpenter/pkg/state"
 )
@@ -41,7 +49,9 @@ type nodeHealthKey struct {
 // (DeriveNodeHealth), derived from the Node store. A Node counts once cluster state tracks it (Tracked), and stops
 // counting once it's gone. The counts per NodePool by the repair policy matcher are NodePoolFields.NodeHealth.
 type NodeHealth struct {
-	store *state.Store[nodeHealthKey, nodeHealthKey, NodeCounts, struct{}]
+	store     *state.Store[nodeHealthKey, nodeHealthKey, NodeCounts, struct{}]
+	nodes     *Nodes
+	unhealthy func(*corev1.Node) bool
 }
 
 // NodePool returns the counts of the Nodes labeled with the NodePool.
@@ -83,7 +93,11 @@ func (n nodeCount) Delete(f NodeCounts) NodeCounts {
 // the cluster, kept from now on, for a caller whose idea of unhealthy isn't the matcher's. It builds a store, so a
 // controller calls it from its Register. unhealthy must be pure: it runs on every change of a Node.
 func (s *NodeState) DeriveNodeHealth(unhealthy func(*corev1.Node) bool) *NodeHealth {
-	h := &NodeHealth{store: state.NewSyntheticStore[nodeHealthKey, nodeHealthKey, NodeCounts, struct{}](func(k nodeHealthKey) nodeHealthKey { return k })}
+	h := &NodeHealth{
+		store:     state.NewSyntheticStore[nodeHealthKey, nodeHealthKey, NodeCounts, struct{}](func(k nodeHealthKey) nodeHealthKey { return k }),
+		nodes:     s.NodeStore,
+		unhealthy: unhealthy,
+	}
 	value := func(_ string, node *corev1.Node) nodeCount { return newNodeCount(unhealthy(node)) }
 	state.DeriveObject(s.NodeStore.Reader, h.store, func(_ string, node *corev1.Node) nodeHealthKey {
 		if np := nodePoolOfNode("", node); np != "" {
@@ -95,6 +109,36 @@ func (s *NodeState) DeriveNodeHealth(unhealthy func(*corev1.Node) bool) *NodeHea
 		return nodeHealthKey{Cluster: Tracked(node)}
 	}, value)
 	return h
+}
+
+// Source enqueues, by name, the unhealthy Nodes counted under a NodePool, or across the cluster, whenever those counts
+// change: the Nodes a threshold over the counts may hold back from repair, or release.
+func (h *NodeHealth) Source() source.SyncingSource { return nodeHealthSource{h} }
+
+type nodeHealthSource struct{ h *NodeHealth }
+
+func (src nodeHealthSource) Start(ctx context.Context, queue workqueue.TypedRateLimitingInterface[reconcile.Request]) error {
+	h := src.h
+	context.AfterFunc(ctx, h.store.Subscribe(func(c state.Change[nodeHealthKey, nodeHealthKey, NodeCounts, struct{}]) {
+		if c.Existed == c.Exists && c.Old.Derived == c.New.Derived {
+			return
+		}
+		for name, e := range h.nodes.List() {
+			if !h.unhealthy(e.Object) {
+				continue
+			}
+			if np := nodePoolOfNode("", e.Object); (c.Key.Cluster && Tracked(e.Object)) || (np != "" && c.Key.NodePool == np) {
+				queue.Add(reconcile.Request{NamespacedName: types.NamespacedName{Name: name}})
+			}
+		}
+	}))
+	return nil
+}
+
+func (src nodeHealthSource) WaitForSync(ctx context.Context) error {
+	return wait.PollUntilContextCancel(ctx, 10*time.Millisecond, true, func(context.Context) (bool, error) {
+		return src.h.store.Synced(), nil
+	})
 }
 
 // NodeHealth returns the counts of the tracked Nodes labeled with the NodePool, and of those with a condition that

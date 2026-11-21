@@ -14,73 +14,40 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package cost
+package cluster
 
 import (
 	"context"
 	"fmt"
 	"maps"
-	"slices"
 
-	opmetrics "github.com/awslabs/operatorpkg/metrics"
-	"github.com/awslabs/operatorpkg/object"
-	"github.com/awslabs/operatorpkg/option"
 	"github.com/awslabs/operatorpkg/serrors"
-	"github.com/awslabs/operatorpkg/status"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
-	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/state"
-	"sigs.k8s.io/karpenter/pkg/state/overlay"
 )
 
 // NecessaryLabels defines the set of required Kubernetes labels that must be present
 // on NodeClaim objects for cost tracking to function properly.
 var NecessaryLabels = []string{corev1.LabelInstanceTypeStable, v1.CapacityTypeLabelKey, corev1.LabelTopologyZone, v1.NodePoolLabelKey}
 
-var (
-	CostTrackingErrorsTotal = opmetrics.NewPrometheusCounter(
-		crmetrics.Registry,
-		prometheus.CounterOpts{
-			Namespace: metrics.Namespace,
-			Subsystem: metrics.NodePoolSubsystem,
-			Name:      "cost_tracker_errors_total",
-			Help:      "Number of errors encountered during cost tracking operations. Labeled by nodepool.",
-		},
-		[]opmetrics.Label{
-			metrics.NodePool,
-		},
-		opmetrics.Alpha,
-	)
-)
-
 // ClusterCost tracks the cost of compute resources across all NodePools in a cluster.
 // This is an alpha-level component and its API may change without notice.
 //
-// It keeps three stores, and combines the last two when it's read:
-//   - nodeClaims, an object store of the NodeClaims the NodeClaim informer observes and forgets;
-//   - offerings, a synthetic store derived from nodeClaims, each NodePool's NodeClaims by offering;
+// It keeps two stores, and combines them when it's read:
+//   - offerings, a synthetic store derived from the NodeClaim store, each NodePool's NodeClaims by offering;
 //   - prices, a fed store of each NodePool's price of the offerings it counts, fed by RefreshPrices.
 type ClusterCost struct {
-	nodeClaims *state.Store[types.NamespacedName, *v1.NodeClaim, struct{}, struct{}]
-	offerings  *state.Store[string, string, NodePoolOfferings, struct{}]
-	prices     *state.Store[string, NodePoolPrices, struct{}, struct{}]
+	offerings *state.Store[string, string, NodePoolOfferings, struct{}]
+	prices    *state.Store[string, NodePoolPrices, struct{}, struct{}]
 
 	cloudProvider cloudprovider.CloudProvider
-	client        client.Client
 }
 
 // OfferingKey uniquely identifies a specific compute offering by its zone,
@@ -91,7 +58,7 @@ type OfferingKey struct {
 }
 
 // NodePoolOfferings are a NodePool's NodeClaims, derived from the NodeClaims with every NecessaryLabel. A NodeClaim
-// stops counting once it's forgotten, or once it loses one of the labels.
+// stops counting once it's gone, or once it loses one of the labels.
 type NodePoolOfferings struct {
 	// Offerings counts the NodeClaims priced by their offering, by offering.
 	Offerings map[OfferingKey]int // bounded: offerings of the NodePool's instance types
@@ -162,50 +129,23 @@ func (f NodePoolOfferings) orNothing() NodePoolOfferings {
 	return f
 }
 
-// Options configure the cost tracker NewClusterCost builds.
-type Options struct {
-	nodeClaims state.Newest
-}
-
-// WithNodeClaimSource reads the newest NodeClaims from src rather than from the overlay client, for a benchmark or unit
-// test that tracks cost without an API server, as cluster.WithSources does for cluster state.
-func WithNodeClaimSource(src state.Newest) option.Function[Options] {
-	return func(o *Options) { o.nodeClaims = src }
-}
-
-// NewClusterCost creates and initializes a new ClusterCost instance for tracking
-// compute costs across the cluster. It requires a cloud provider for accessing
-// instance type and pricing information, and a Kubernetes client for NodePool lookups.
-// ctx is the context NodeClaims are priced with by the NodeClaimPriceProvider.
-func NewClusterCost(ctx context.Context, cloudProvider cloudprovider.CloudProvider, kubeClient client.Client, opts ...option.Function[Options]) *ClusterCost {
-	nodeClaims := option.Resolve(opts...).nodeClaims
-	if nodeClaims == nil {
-		overlaid, ok := kubeClient.(*overlay.Client)
-		if !ok {
-			panic("cost reads NodeClaims through an overlay.Client")
-		}
-		nodeClaims = lo.Must(overlaid.Source(&v1.NodeClaim{}))
-	}
-	managed := lo.Map(cloudProvider.GetSupportedNodeClasses(), func(nodeClass status.Object, _ int) schema.GroupKind {
-		return object.GVK(nodeClass).GroupKind()
-	})
+// newClusterCost returns the cost of the NodeClaims the NodeClaim store holds, priced through cloudProvider. ctx is the
+// context NodeClaims are priced with by the NodeClaimPriceProvider.
+func newClusterCost(ctx context.Context, cloudProvider cloudprovider.CloudProvider, nodeClaims *NodeClaims) *ClusterCost {
 	cc := &ClusterCost{
-		nodeClaims:    state.NewObjectStore[types.NamespacedName, *v1.NodeClaim, struct{}, struct{}](nodeClaims),                      //storelint:allow cost moves to pkg/cluster (review 18)
-		offerings:     state.NewSyntheticStore[string, string, NodePoolOfferings, struct{}](func(name string) string { return name }), //storelint:allow cost moves to pkg/cluster (review 18)
-		prices:        state.NewFedStore[string, NodePoolPrices, struct{}, struct{}](),                                                //storelint:allow cost moves to pkg/cluster (review 18)
+		offerings:     state.NewSyntheticStore[string, string, NodePoolOfferings, struct{}](func(name string) string { return name }),
+		prices:        state.NewFedStore[string, NodePoolPrices, struct{}, struct{}](),
 		cloudProvider: cloudProvider,
-		client:        kubeClient,
 	}
-	// The store holds every NodeClaim; one of a node class the cloud provider doesn't manage counts toward nothing.
-	//storelint:allow cost moves to pkg/cluster (review 18)
-	state.DeriveObject(cc.nodeClaims.Reader, cc.offerings,
-		func(_ types.NamespacedName, nodeClaim *v1.NodeClaim) string {
-			if nodeClaim.Spec.NodeClassRef == nil || !slices.Contains(managed, nodeClaim.Spec.NodeClassRef.GroupKind()) || nodeClaimMissingLabels(nodeClaim) {
+	// A NodeClaim without every NecessaryLabel counts toward nothing until it has them.
+	state.DeriveObject(nodeClaims.Reader, cc.offerings,
+		func(_ string, nodeClaim *v1.NodeClaim) string {
+			if nodeClaimMissingLabels(nodeClaim) {
 				return ""
 			}
 			return nodeClaim.Labels[v1.NodePoolLabelKey]
 		},
-		func(_ types.NamespacedName, nodeClaim *v1.NodeClaim) nodeClaimOffering {
+		func(_ string, nodeClaim *v1.NodeClaim) nodeClaimOffering {
 			// A price the NodeClaim carries itself, such as one recorded at launch, is tracked as is. Other NodeClaims
 			// are priced by their offering.
 			if price, ok := cloudprovider.PriceNodeClaim(ctx, nodeClaim, nil); ok {
@@ -216,51 +156,26 @@ func NewClusterCost(ctx context.Context, cloudProvider cloudprovider.CloudProvid
 	return cc
 }
 
-// UpdateNodeClaim refreshes the prices of a NodeClaim's NodePool if they don't price its offering yet. The cost tracker
-// follows each NodeClaim's newest version through the overlay itself; a NodeClaim without every NecessaryLabel counts
-// nothing until it has them.
-func (cc *ClusterCost) UpdateNodeClaim(ctx context.Context, nodeClaim *v1.NodeClaim) error {
-	if nodeClaimMissingLabels(nodeClaim) {
-		// not a failure mode, as we expect to retry once the labels are propagated
-		return nil
-	}
-	nodePoolName := nodeClaim.Labels[v1.NodePoolLabelKey]
-	offering := offeringOf(nodeClaim)
-	if counted, _ := cc.offerings.Get(nodePoolName); counted.Derived.Offerings[offering] == 0 {
-		return nil
-	}
-	if prices, _ := cc.prices.Get(nodePoolName); priced(prices.Object, offering) {
-		return nil
-	}
-	np := &v1.NodePool{}
-	if err := cc.client.Get(ctx, client.ObjectKey{Name: nodePoolName}, np); err != nil {
-		if errors.IsNotFound(err) {
-			return nil
+// Priced returns whether the NodePool's prices price every offering it counts, found or not.
+func (cc *ClusterCost) Priced(nodePoolName string) bool {
+	counted, _ := cc.offerings.Get(nodePoolName)
+	prices, _ := cc.prices.Get(nodePoolName)
+	for offering := range counted.Derived.Offerings {
+		if _, ok := prices.Object[offering]; !ok {
+			return false
 		}
-		CostTrackingErrorsTotal.Inc(map[string]string{metrics.NodePoolLabel: nodePoolName})
-		return serrors.Wrap(err, "NodeClaim", klog.KObj(nodeClaim), "NodePool", klog.KRef("", nodePoolName))
 	}
-	if err := cc.RefreshPrices(ctx, np); err != nil {
-		CostTrackingErrorsTotal.Inc(map[string]string{metrics.NodePoolLabel: nodePoolName})
-		return serrors.Wrap(err, "NodeClaim", klog.KObj(nodeClaim))
-	}
-	return nil
+	return true
 }
 
-// priced returns whether prices holds offering, found or not.
-func priced(prices NodePoolPrices, offering OfferingKey) bool {
-	_, ok := prices[offering]
-	return ok
-}
-
-// DeleteNodePool drops a deleted NodePool's prices. Its NodeClaims count until they're deleted too, those priced by
-// their offering at nothing, since nothing prices the NodePool's offerings any more.
-func (cc *ClusterCost) DeleteNodePool(_ context.Context, npName string) {
-	cc.dropPrices(npName)
+// DropPrices drops a deleted NodePool's prices. Its NodeClaims count until they're deleted too, those priced by their
+// offering at nothing, since nothing prices the NodePool's offerings any more.
+func (cc *ClusterCost) DropPrices(nodePoolName string) {
+	cc.prices.Feed(nodePoolName, nil)
 }
 
 // RefreshPrices reads a NodePool's instance types and prices the offerings it counts with them. It's the only reader
-// of instance types, and runs from the pricing controller and for a NodeClaim of an offering its NodePool hasn't priced.
+// of instance types, and runs from the pricing controller.
 func (cc *ClusterCost) RefreshPrices(ctx context.Context, np *v1.NodePool) error {
 	instanceTypes, err := cc.cloudProvider.GetInstanceTypes(ctx, np)
 	if err != nil {
@@ -301,25 +216,8 @@ func (cc *ClusterCost) UpdateOfferings(ctx context.Context, np *v1.NodePool, ins
 	}
 }
 
-// RetainPrices drops the prices of every NodePool not in names, the NodePools that exist, so prices set for a NodePool
-// as it was deleted don't stay.
-func (cc *ClusterCost) RetainPrices(names sets.Set[string]) {
-	for name := range cc.prices.List() {
-		if !names.Has(name) {
-			cc.dropPrices(name)
-		}
-	}
-}
-
-// dropPrices drops the NodePool's prices.
-func (cc *ClusterCost) dropPrices(name string) {
-	cc.prices.Feed(name, nil)
-}
-
-// Reset empties the cost tracker's stores in place. It's for tests, between specs; storelint reports a Reset outside a
-// test.
-func (cc *ClusterCost) Reset() {
-	cc.nodeClaims.Clear()
+// Clear empties the cost's stores in place. It's for tests, between specs; storelint reports a Clear outside a test.
+func (cc *ClusterCost) Clear() {
 	cc.offerings.Clear()
 	cc.prices.Clear()
 }
@@ -339,6 +237,14 @@ func (cc *ClusterCost) GetClusterCost() float64 {
 // offerings or their prices change, which is whenever GetNodepoolCost may return something new.
 func (cc *ClusterCost) Sources() []source.SyncingSource {
 	return []source.SyncingSource{cc.offerings.Source(), cc.prices.Source()}
+}
+
+// OfferingsSource enqueues a NodePool, by name, whenever the set of offerings it counts changes, such as when a
+// NodeClaim of an offering its prices don't price yet appears.
+func (cc *ClusterCost) OfferingsSource() source.SyncingSource {
+	return cc.offerings.SourceOn(func(_ string, e state.Entry[string, NodePoolOfferings, struct{}]) any {
+		return sets.KeySet(e.Derived.Offerings)
+	})
 }
 
 // GetNodepoolCost returns the total cost of compute resources for a specific

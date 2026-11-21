@@ -32,7 +32,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
@@ -49,7 +49,7 @@ const (
 type Launch struct {
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
-	cluster       *state.Cluster
+	pods          *karpentercluster.Pods
 	cache         *cache.Cache // exists due to eventual consistency on the cache
 	recorder      events.Recorder
 	clock         clock.Clock
@@ -145,7 +145,7 @@ func (l *Launch) launchNodeClaim(ctx context.Context, nodeClaim *v1.NodeClaim) (
 // against the NodeClaim, so that users can discover that insufficient capacity is preventing their pods from
 // scheduling without requiring access to the Karpenter logs.
 func (l *Launch) publishPodInsufficientCapacityEvents(ctx context.Context, nodeClaim *v1.NodeClaim, launchErr error) {
-	for _, podKey := range l.cluster.PodsMappedToNodeClaim(nodeClaim.Name) {
+	for _, podKey := range l.pods.SimulatedOn(nodeClaim.Name) {
 		pod := &corev1.Pod{}
 		// This also skips CapacityBuffer virtual pods since they never exist in the API server
 		if err := l.kubeClient.Get(ctx, podKey, pod); err != nil {

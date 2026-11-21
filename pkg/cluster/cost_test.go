@@ -14,14 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package cost_test
+package cluster_test
 
 import (
 	"context"
 	"fmt"
 	"strconv"
 	"sync"
-	"testing"
 	"time"
 
 	"github.com/awslabs/operatorpkg/object"
@@ -30,66 +29,16 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/apis/v1alpha1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
-	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
-	"sigs.k8s.io/karpenter/pkg/controllers/nodeoverlay"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
-	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
-	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
-	"sigs.k8s.io/karpenter/pkg/state/cost"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
-	testv1alpha1 "sigs.k8s.io/karpenter/pkg/test/v1alpha1"
-	. "sigs.k8s.io/karpenter/pkg/utils/testing"
 )
-
-var ctx context.Context
-var env *test.Environment
-var cluster *state.Cluster
-var nodeOverlayStore *nodeoverlay.InstanceTypeStore
-var nodeOverlayController *nodeoverlay.Controller
-var pricingController *informer.PricingController
-var cloudProvider *fake.CloudProvider
-var clusterCost *cost.ClusterCost
-
-func TestAPIs(t *testing.T) {
-	ctx = TestContextWithLogger(t)
-	RegisterFailHandler(Fail)
-	RunSpecs(t, "State/Cost")
-}
-
-var _ = BeforeSuite(func() {
-	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(testv1alpha1.CRDs...), test.WithConfigOptions(func(config *rest.Config) {
-		config.QPS = -1
-	}))
-	ctx = options.ToContext(ctx, test.Options())
-	cloudProvider = fake.NewCloudProvider()
-	cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = state.NewCluster(env.Clock, env.Overlay, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
-	nodeOverlayStore = nodeoverlay.NewInstanceTypeStore()
-	nodeOverlayController = nodeoverlay.NewController(env.Clock, env.Overlay, cloudProvider, nodeOverlayStore, cluster)
-	clusterCost = cost.NewClusterCost(ctx, cloudProvider, env.Overlay)
-	pricingController = informer.NewPricingController(env.Overlay, cloudProvider, clusterCost)
-})
-
-var _ = AfterSuite(func() {
-	Expect(env.Stop()).To(Succeed(), "Failed to stop environment")
-})
-
-var _ = AfterEach(func() {
-	ExpectCleanedUp(ctx, env.Client)
-	clusterCost.Reset()
-	cluster.Reset()
-	cloudProvider.Reset()
-})
 
 var _ = Describe("ClusterCost", func() {
 	var testNodePool *v1.NodePool
@@ -134,12 +83,12 @@ var _ = Describe("ClusterCost", func() {
 
 		ExpectApplied(ctx, env.Client, testNodePool, testNodePool2)
 	})
-	Context("UpdateNodeClaim", func() {
+	Context("Pricing new offerings", func() {
 		It("should update costs correctly for single spot offering to empty nodepool", func() {
 			initialClusterCost := clusterCost.GetClusterCost()
 			Expect(initialClusterCost).To(BeNumerically("~", 0.0, 0.001),
 				"Cluster cost should start at 0")
-			RunUpdateNodeClaimTest(
+			RunTrackNodeClaimTest(
 				clusterCost,
 				testNodePool,
 				testInstanceType.Name,
@@ -152,7 +101,7 @@ var _ = Describe("ClusterCost", func() {
 		It("should update costs correctly for single on-demand offering to empty nodepool", func() {
 			// Setup: Empty cluster cost (no existing offerings)
 			// No setup needed - starting with clean state
-			RunUpdateNodeClaimTest(
+			RunTrackNodeClaimTest(
 				clusterCost,
 				testNodePool,
 				testInstanceType.Name,
@@ -168,7 +117,7 @@ var _ = Describe("ClusterCost", func() {
 			nodeClaim := createTestNodeClaim(testNodePool, testInstanceType.Name, spotOffering.CapacityType(), spotOffering.Zone())
 			trackNodeClaim(nodeClaim)
 
-			RunUpdateNodeClaimTest(
+			RunTrackNodeClaimTest(
 				clusterCost,
 				testNodePool,
 				testInstanceType.Name,
@@ -184,7 +133,7 @@ var _ = Describe("ClusterCost", func() {
 			nodeClaim := createTestNodeClaim(testNodePool, testInstanceType.Name, spotOffering.CapacityType(), spotOffering.Zone())
 			trackNodeClaim(nodeClaim)
 
-			RunUpdateNodeClaimTest(
+			RunTrackNodeClaimTest(
 				clusterCost,
 				testNodePool,
 				testInstanceType.Name,
@@ -200,7 +149,7 @@ var _ = Describe("ClusterCost", func() {
 			nodeClaim := createTestNodeClaim(testNodePool, testInstanceType.Name, spotOffering.CapacityType(), spotOffering.Zone())
 			trackNodeClaim(nodeClaim)
 
-			RunUpdateNodeClaimTest(
+			RunTrackNodeClaimTest(
 				clusterCost,
 				testNodePool2,
 				testInstanceType.Name,
@@ -494,26 +443,26 @@ var _ = Describe("ClusterCost", func() {
 		})
 	})
 
-	Context("DeleteNodePool", func() {
+	Context("DropPrices", func() {
 		It("should drop a deleted NodePool's prices and count nothing once its NodeClaims are gone", func() {
 			nodeClaim := createTestNodeClaim(testNodePool, testInstanceType.Name, spotOffering.CapacityType(), spotOffering.Zone())
 			other := createTestNodeClaim(testNodePool2, testInstanceType.Name, onDemandOffering.CapacityType(), onDemandOffering.Zone())
 			trackNodeClaim(nodeClaim)
 			trackNodeClaim(other)
 
-			clusterCost.DeleteNodePool(ctx, testNodePool.Name)
+			clusterCost.DropPrices(testNodePool.Name)
 			Expect(clusterCost.GetNodepoolCost(testNodePool)).To(BeNumerically("==", 0))
 			Expect(clusterCost.GetNodepoolCost(testNodePool2)).To(BeNumerically("~", 3.00, 0.001))
 
 			ExpectDeleted(ctx, env.Client, nodeClaim)
 			Expect(clusterCost.GetClusterCost()).To(BeNumerically("~", 3.00, 0.001))
 		})
-		It("should drop the prices of a NodePool the pricing refresh doesn't find", func() {
+		It("should drop the prices of a NodePool the pricing controller doesn't find", func() {
 			nodeClaim := createTestNodeClaim(testNodePool, testInstanceType.Name, spotOffering.CapacityType(), spotOffering.Zone())
 			trackNodeClaim(nodeClaim)
 			ExpectDeleted(ctx, env.Client, testNodePool)
 
-			ExpectSingletonReconciled(ctx, pricingController)
+			ExpectReconcileSucceeded(ctx, pricingController, client.ObjectKeyFromObject(testNodePool))
 			Expect(clusterCost.GetNodepoolCost(testNodePool)).To(BeNumerically("==", 0))
 		})
 	})
@@ -532,7 +481,10 @@ var _ = Describe("ClusterCost", func() {
 			trackNodeClaim(spot)
 			Expect(clusterCost.GetClusterCost()).To(BeNumerically("~", 4.50, 0.001))
 
-			ExpectSingletonReconciled(ctx, pricingController)
+			// The prices hold for the refresh period.
+			env.Clock.Step(time.Hour)
+			ExpectReconcileSucceeded(ctx, pricingController, client.ObjectKeyFromObject(testNodePool))
+			ExpectReconcileSucceeded(ctx, pricingController, client.ObjectKeyFromObject(testNodePool2))
 			Expect(clusterCost.GetNodepoolCost(testNodePool)).To(BeNumerically("~", 2.00, 0.001))
 			Expect(clusterCost.GetNodepoolCost(testNodePool2)).To(BeNumerically("~", 5.00, 0.001))
 			Expect(clusterCost.GetClusterCost()).To(BeNumerically("~", 7.00, 0.001))
@@ -546,7 +498,11 @@ var _ = Describe("ClusterCost", func() {
 				Name:      "unknown-instance",
 				Offerings: []*cloudprovider.Offering{spotOffering},
 			})
-			ExpectSingletonReconciled(ctx, pricingController)
+			// An offering priced as not found holds until the refresh period passes.
+			ExpectReconcileSucceeded(ctx, pricingController, client.ObjectKeyFromObject(testNodePool))
+			Expect(clusterCost.GetNodepoolCost(testNodePool)).To(BeNumerically("==", 0))
+			env.Clock.Step(time.Hour)
+			ExpectReconcileSucceeded(ctx, pricingController, client.ObjectKeyFromObject(testNodePool))
 			Expect(clusterCost.GetNodepoolCost(testNodePool)).To(BeNumerically("~", 1.50, 0.001))
 		})
 	})
@@ -592,45 +548,6 @@ var _ = Describe("ClusterCost", func() {
 		})
 	})
 	Context("Concurrency", func() {
-		It("should be thread-safe with concurrent UpdateNodeClaim calls", func() {
-			GinkgoHelper()
-			numGoroutines := 5
-			numOperationsPerGoroutine := 10
-			var nodeClaims []*v1.NodeClaim
-
-			// Pre-create nodeclaims for concurrent operations
-			for i := 0; i < numGoroutines*numOperationsPerGoroutine; i++ {
-				nodeClaim := createTestNodeClaim(testNodePool, testInstanceType.Name, spotOffering.CapacityType(), spotOffering.Zone())
-				nodeClaim.Name = fmt.Sprintf("test-nodeclaim-%d", i)
-				nodeClaims = append(nodeClaims, nodeClaim)
-			}
-
-			ExpectApplied(ctx, env.Client, lo.Map(nodeClaims, func(nc *v1.NodeClaim, _ int) client.Object { return nc })...)
-
-			var wg sync.WaitGroup
-			wg.Add(numGoroutines)
-
-			// Launch multiple goroutines that concurrently price the nodeclaims
-			for i := range numGoroutines {
-				go func(goroutineIndex int) {
-					defer GinkgoRecover()
-					defer wg.Done()
-					for j := range numOperationsPerGoroutine {
-						nodeClaimIndex := goroutineIndex*numOperationsPerGoroutine + j
-						Expect(clusterCost.UpdateNodeClaim(ctx, nodeClaims[nodeClaimIndex])).To(Succeed())
-					}
-				}(i)
-			}
-
-			wg.Wait()
-
-			// Verify final cost is correct (should be numGoroutines * numOperationsPerGoroutine * spotOffering.Price)
-			expectedCost := float64(numGoroutines*numOperationsPerGoroutine) * spotOffering.Price
-			finalCost := clusterCost.GetNodepoolCost(testNodePool)
-			Expect(finalCost).To(BeNumerically("~", expectedCost, 0.001),
-				"Final cost should be sum of all concurrent operations")
-		})
-
 		It("should be thread-safe with concurrent NodeClaim deletions", func() {
 			GinkgoHelper()
 			numGoroutines := 10
@@ -777,18 +694,18 @@ func createTestNodeClaim(np *v1.NodePool, instanceName, capacityType, zone strin
 	})
 }
 
-// trackNodeClaim creates nodeClaim, or updates it, as the third party does, and refreshes its NodePool's prices, as the
-// NodeClaim controller does. The cost tracker counts the NodeClaim as soon as the create returns, and prices its
-// offering once UpdateNodeClaim has read the NodePool's instance types.
+// trackNodeClaim creates nodeClaim, or updates it, as the third party does, and reconciles the pricing controller for
+// its NodePool, which the NodePool's new offering wakes. The cost tracker counts the NodeClaim as soon as the create
+// returns, and prices its offering once the pricing controller has read the NodePool's instance types.
 func trackNodeClaim(nodeClaims ...*v1.NodeClaim) {
 	GinkgoHelper()
 	ExpectApplied(ctx, env.Client, lo.Map(nodeClaims, func(nc *v1.NodeClaim, _ int) client.Object { return nc })...)
 	for _, nodeClaim := range nodeClaims {
-		Expect(clusterCost.UpdateNodeClaim(ctx, nodeClaim)).To(Succeed())
+		ExpectReconcileSucceeded(ctx, pricingController, client.ObjectKey{Name: nodeClaim.Labels[v1.NodePoolLabelKey]})
 	}
 }
 
-func RunUpdateNodeClaimTest(clusterCost *cost.ClusterCost, np *v1.NodePool, instanceName, capacityType, zone string, expectedNodePoolCost float64, expectedClusterCost float64) {
+func RunTrackNodeClaimTest(clusterCost *karpentercluster.ClusterCost, np *v1.NodePool, instanceName, capacityType, zone string, expectedNodePoolCost float64, expectedClusterCost float64) {
 	GinkgoHelper()
 	// Record initial costs before adding nodeclaim
 	initialNodePoolCost := clusterCost.GetNodepoolCost(np)
@@ -815,7 +732,7 @@ func RunUpdateNodeClaimTest(clusterCost *cost.ClusterCost, np *v1.NodePool, inst
 		"Cluster cost should not decrease when adding nodeclaims")
 }
 
-func RunDeleteNodeClaimTest(clusterCost *cost.ClusterCost, nodeClaim *v1.NodeClaim, np *v1.NodePool, expectedNodePoolCost float64, expectedClusterCost float64) {
+func RunDeleteNodeClaimTest(clusterCost *karpentercluster.ClusterCost, nodeClaim *v1.NodeClaim, np *v1.NodePool, expectedNodePoolCost float64, expectedClusterCost float64) {
 	GinkgoHelper()
 	// Record initial costs before removing nodeclaim
 	initialNodePoolCost := clusterCost.GetNodepoolCost(np)

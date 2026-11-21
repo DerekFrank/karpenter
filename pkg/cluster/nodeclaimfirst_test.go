@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package state_test
+package cluster_test
 
 import (
 	. "github.com/onsi/ginkgo/v2"
@@ -53,10 +53,8 @@ var _ = Describe("NodeClaim-first Nodes", func() {
 		for _, obj := range objs {
 			switch obj.(type) {
 			case *v1.NodeClaim:
-				ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(obj))
 			case *corev1.Node:
 			case *corev1.Pod:
-				ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(obj))
 			}
 		}
 	}
@@ -84,7 +82,7 @@ var _ = Describe("NodeClaim-first Nodes", func() {
 		apply(node)
 
 		ExpectStateNodeCount("==", 0)
-		Expect(cluster.NodePoolState.LaunchedNodes(nodePool.Name)).To(BeEmpty())
+		Expect(cs.NodePoolState.LaunchedNodes(nodePool.Name)).To(BeEmpty())
 	})
 	It("should read an unmanaged Node, with no owning NodeClaim and no NodePool label, as its own node", func() {
 		unmanaged := test.Node(test.NodeOptions{
@@ -129,23 +127,22 @@ var _ = Describe("NodeClaim-first Nodes", func() {
 	It("should count an initialized NodeClaim whose Node is missing as NotReady for disruption budgets", func() {
 		ExpectApplied(ctx, env.Client, nodeClaim, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
-		Expect(cluster.NodePoolState.Disruption(nodePool.Name)).To(Equal(karpentercluster.NodePoolDisruption{Nodes: 1}))
+		Expect(cs.NodePoolState.Disruption(nodePool.Name)).To(Equal(karpentercluster.NodePoolDisruption{Nodes: 1}))
 
 		ExpectMakeNodesNotReady(ctx, env.Client, env.Clock, node)
-		Expect(cluster.NodePoolState.Disruption(nodePool.Name)).To(Equal(karpentercluster.NodePoolDisruption{Nodes: 1, NotReady: 1}))
+		Expect(cs.NodePoolState.Disruption(nodePool.Name)).To(Equal(karpentercluster.NodePoolDisruption{Nodes: 1, NotReady: 1}))
 
 		ExpectDeleted(ctx, env.Client, node)
-		Expect(cluster.NodePoolState.Disruption(nodePool.Name)).To(Equal(karpentercluster.NodePoolDisruption{Nodes: 1, NotReady: 1}))
+		Expect(cs.NodePoolState.Disruption(nodePool.Name)).To(Equal(karpentercluster.NodePoolDisruption{Nodes: 1, NotReady: 1}))
 
 		// A disrupting NodeClaim counts as Disrupting, not NotReady.
 		cs.Deletion.Mark(nodeClaim.Name)
-		Expect(cluster.NodePoolState.Disruption(nodePool.Name)).To(Equal(karpentercluster.NodePoolDisruption{Nodes: 1, Disrupting: 1}))
+		Expect(cs.NodePoolState.Disruption(nodePool.Name)).To(Equal(karpentercluster.NodePoolDisruption{Nodes: 1, Disrupting: 1}))
 	})
 	It("should drop the intent kept about a NodeClaim once it's gone", func() {
 		apply(nodeClaim, node)
 		cs.Deletion.Mark(nodeClaim.Name)
 		ExpectDeleted(ctx, env.Client, nodeClaim)
-		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
 
 		apply(test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: nodeClaim.Name}, Status: v1.NodeClaimStatus{ProviderID: test.RandomProviderID()}}))
 		Expect(onlyNode().MarkedForDeletion()).To(BeFalse())

@@ -36,14 +36,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
+	"sigs.k8s.io/karpenter/pkg/cluster/virtualpods"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
-	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 
@@ -57,7 +56,8 @@ type Controller struct {
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
 	provisioner   *provisioning.Provisioner
-	cluster       *state.Cluster
+	nodes         *karpentercluster.NodeState
+	nodePools     *karpentercluster.NodePoolState
 	// counts wakes the controller on each NodePool's nodeCounts, built in Register.
 	counts source.SyncingSource
 }
@@ -74,14 +74,16 @@ func nodeCountsOf(_ string, e karpentercluster.NodePoolEntry) any {
 	return nodeCounts{NodeClaims: e.Derived.NodeClaims, Reserved: e.Derived.Reserved}
 }
 
-func NewController(kubeClient client.Client, cluster *state.Cluster, recorder events.Recorder, cloudProvider cloudprovider.CloudProvider, provisioner *provisioning.Provisioner, clock clock.Clock, deviceAllocationController *deviceallocation.Controller, virtualPodCache *virtualpods.Cache) *Controller {
+func NewController(kubeClient client.Client, nodes *karpentercluster.NodeState, nodePools *karpentercluster.NodePoolState,
+	capacityQuotas *karpentercluster.CapacityQuotaState, recorder events.Recorder, cloudProvider cloudprovider.CloudProvider, provisioner *provisioning.Provisioner, clock clock.Clock, deviceAllocationController *deviceallocation.Controller, virtualPodCache *virtualpods.Cache) *Controller {
 	return &Controller{
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
-		cluster:       cluster,
-		// The controller creates NodeClaims and schedules no pods, so its provisioner writes neither nominations nor buffer
-		// pod counts.
-		provisioner: provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, cluster, clock, deviceAllocationController, virtualPodCache, nil, nil, nil),
+		nodes:         nodes,
+		nodePools:     nodePools,
+		// The controller creates NodeClaims and schedules no pods, so its provisioner writes neither nominations, buffer
+		// pod counts nor pod scheduling decisions.
+		provisioner: provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, nodes, nodePools, capacityQuotas, clock, deviceAllocationController, virtualPodCache, nil, nil, nil, nil),
 	}
 }
 
@@ -96,7 +98,7 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 		return reconcile.Result{}, nil
 	}
 
-	runningNodeClaims, _, reservedNodes := c.cluster.NodePoolState.GetNodeCount(np.Name)
+	runningNodeClaims, _, reservedNodes := c.nodePools.GetNodeCount(np.Name)
 	desiredReplicas := lo.FromPtr(np.Spec.Replicas)
 	// Size down of replicas will be handled in deprovisioning controller to drain nodes and delete NodeClaims.
 	// Reserved nodes are NodeClaims being created that the counts don't include yet: this controller's own from an
@@ -111,11 +113,11 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 	nodeLimit := lo.Ternary(ok, limit.Value(), int64(math.MaxInt64))
 	// The shortfall read above can be stale by the time it reserves, such as once the disruption controller reserves a
 	// replacement, so the reservation admits against replicas as well as the node limit.
-	reservations := c.cluster.NodePoolState.ReserveReplicas(np.Name, desiredReplicas, nodeLimit)
+	reservations := c.nodePools.ReserveReplicas(np.Name, desiredReplicas, nodeLimit)
 	countNodeClaimsToProvision := len(reservations)
 
 	if countNodeClaimsToProvision <= 0 {
-		if running, _, reserved := c.cluster.NodePoolState.GetNodeCount(np.Name); int64(running+reserved) < desiredReplicas {
+		if running, _, reserved := c.nodePools.GetNodeCount(np.Name); int64(running+reserved) < desiredReplicas {
 			log.FromContext(ctx).Info("nodepool node limit reached")
 		}
 		return reconcile.Result{}, nil
@@ -145,7 +147,7 @@ func (c *Controller) Reconcile(ctx context.Context, np *v1.NodePool) (reconcile.
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	// counts narrows the NodePool fields to the ones this controller decides on, so it reconciles a NodePool that may be
 	// short of its replicas, or have room under its node limit again, and not one whose usage, capacity or health changed.
-	c.counts = c.cluster.NodePoolState.SourceOn(nodeCountsOf)
+	c.counts = c.nodePools.SourceOn(nodeCountsOf)
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		// Reconcile on NodePool Create and Update (when replicas or the node limit change, or when NodePool status moves
@@ -171,7 +173,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 		WatchesRawSource(c.counts).
 		// Cluster state's NodePoolState counts the NodePool's NodeClaims only once it has synced; before, it would count
 		// fewer than exist and provision too many.
-		WatchesRawSource(karpenterstate.Requires(c.cluster)).
+		WatchesRawSource(karpenterstate.Requires(c.nodes, c.nodePools)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 10}).
 		Complete(reconcile.AsReconciler(m.GetClient(), c))
 }

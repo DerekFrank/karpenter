@@ -52,8 +52,8 @@ type State struct {
 	CapacityQuotaState *CapacityQuotaState
 	// Nodes holds the stores behind the nodes Karpenter schedules onto and disrupts.
 	Nodes *NodeState
-	// PodScheduling keeps what the provisioner decides about each pod.
-	PodScheduling *PodScheduling
+	// Cost keeps the cost of each NodePool's NodeClaims, priced by the pricing controller.
+	Cost *ClusterCost
 
 	// Deletion is the handle of the deletion marks on NodeClaims, for the disruption queue, their one writer.
 	Deletion *Deletion
@@ -62,6 +62,9 @@ type State struct {
 	Nomination *Nomination
 	// BufferPods is the handle of the buffer pod counts on NodeClaims, for the provisioner, their one writer.
 	BufferPods *BufferPods
+	// PodScheduling is the handle of what the provisioner decides about each pod as it schedules it, for the
+	// provisioner and the provisioning pod controller, which acks the pods it triggers the provisioner for.
+	PodScheduling *PodScheduling
 	// Registrations is the handle of the launch outcomes recorded on NodePools, for the NodeClaim lifecycle controller,
 	// their one writer.
 	Registrations *Registrations
@@ -139,12 +142,22 @@ func New(ctx context.Context, clk clock.Clock, kubeClient client.Client, cloudPr
 		NodePoolState:      nodePools,
 		CapacityQuotaState: NewCapacityQuotaState(ctx, clk, quotas, nodes),
 		Nodes:              nodes,
-		PodScheduling:      NewPodScheduling(),
+		Cost:               newClusterCost(ctx, cloudProvider, nodes.NodeClaimStore),
 		Deletion:           newDeletion(nodes.NodeClaimStore),
 		Nomination:         newNomination(clk, nodes.NodeClaimStore),
 		BufferPods:         newBufferPods(nodes.NodeClaimStore),
+		PodScheduling:      newPodScheduling(clk, nodes.PodStore),
 		Registrations:      newRegistrations(nodePools),
 	}
+}
+
+// Reset clears every store between specs, each of which then holds what its source holds, and the intent on their
+// entries. It's for tests; storelint reports a Reset outside a test.
+func (s State) Reset() {
+	s.Nodes.Clear()
+	s.NodePoolState.Clear()
+	s.CapacityQuotaState.Clear()
+	s.Cost.Clear()
 }
 
 // none is the source of CapacityQuotas when the overlay doesn't overlay them, as without their feature gate: it holds

@@ -59,7 +59,6 @@ import (
 	karpcluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	pkgscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
@@ -651,10 +650,11 @@ func solve(ctx context.Context, t *caseT, cfg Config, s scenario) (scheduling.Re
 		return c.Get(ctx, key, obj, opts...)
 	}}).Build()
 	cp := drawnInstanceTypes{CloudProvider: cfg.CloudProvider, its: s.its}
-	// Cluster state holds no nodes: every pod is pending, read through kubeClient.
-	cs := karpcluster.New(ctx, clock.RealClock{}, nil, cp, karpcluster.WithSources(func(client.Object) karpstate.Newest { return statetest.NewObjects() }))
-	cluster := state.NewCluster(clock.RealClock{}, kubeClient, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
-	prov := provisioning.NewProvisioner(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cp, cluster, clock.RealClock{}, nil, nil, nil, cs.Nomination, cs.BufferPods)
+	// Cluster state holds no nodes: every pod is pending, read from the pod store.
+	srcs := statetest.NewSources()
+	cs := karpcluster.New(ctx, clock.RealClock{}, nil, cp, karpcluster.WithSources(func(obj client.Object) karpstate.Newest { return srcs.For(obj) }))
+	srcs.Put(lo.Map(s.pods, func(pod *corev1.Pod, _ int) client.Object { return pod.DeepCopy() })...)
+	prov := provisioning.NewProvisioner(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cp, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, clock.RealClock{}, nil, nil, nil, cs.Nomination, cs.BufferPods, cs.PodScheduling)
 	opts := *options.FromContext(ctx)
 	opts.MinValuesPolicy = s.minValuesPolicy
 	// Scheduling logs bury the failure report.

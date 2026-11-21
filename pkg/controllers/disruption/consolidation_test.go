@@ -213,9 +213,9 @@ var _ = Describe("Consolidation", func() {
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			c := disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue)
+			c := disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)
 			emptyConsolidation := disruption.NewEmptiness(c, disruption.WithValidator(NewTestEmptinessValidator(nodes, nodeClaims, nodePool, validatorOpt)))
-			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, env.Clock, env.Client, cloudProvider, recorder, emptyConsolidation.Reason())
+			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cs.NodePoolState, env.Clock, env.Client, cloudProvider, recorder, emptyConsolidation.Reason())
 			Expect(err).To(Succeed())
 
 			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, emptyConsolidation.ShouldDisrupt, emptyConsolidation.Class(), queue)
@@ -271,9 +271,9 @@ var _ = Describe("Consolidation", func() {
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, node2)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node, node2}, []*v1.NodeClaim{nodeClaim, nodeClaim2})
 
-			c := disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue)
+			c := disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)
 			multiNodeConsolidation := disruption.NewMultiNodeConsolidation(c, disruption.WithValidator(NewTestMultiConsolidationValidator(nodePool, validatorOpt)))
-			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, env.Clock, env.Client, cloudProvider, recorder, multiNodeConsolidation.Reason())
+			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cs.NodePoolState, env.Clock, env.Client, cloudProvider, recorder, multiNodeConsolidation.Reason())
 			Expect(err).To(Succeed())
 
 			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, multiNodeConsolidation.ShouldDisrupt, multiNodeConsolidation.Class(), queue)
@@ -314,9 +314,9 @@ var _ = Describe("Consolidation", func() {
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
-			c := disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue)
+			c := disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)
 			singleNodeConsolidation := disruption.NewSingleNodeConsolidation(c, disruption.WithValidator(NewTestSingleConsolidationValidator(nodePool, validatorOpt)))
-			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, env.Clock, env.Client, cloudProvider, recorder, singleNodeConsolidation.Reason())
+			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cs.NodePoolState, env.Clock, env.Client, cloudProvider, recorder, singleNodeConsolidation.Reason())
 			Expect(err).To(Succeed())
 
 			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, singleNodeConsolidation.ShouldDisrupt, singleNodeConsolidation.Class(), queue)
@@ -722,9 +722,9 @@ var _ = Describe("Consolidation", func() {
 			// inform cluster state about nodes and nodeclaims
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			c := disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue)
+			c := disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)
 			emptyConsolidation := disruption.NewEmptiness(c)
-			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, env.Clock, env.Client, cloudProvider, recorder, emptyConsolidation.Reason())
+			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cs.NodePoolState, env.Clock, env.Client, cloudProvider, recorder, emptyConsolidation.Reason())
 			Expect(err).To(Succeed())
 
 			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, emptyConsolidation.ShouldDisrupt, emptyConsolidation.Class(), queue)
@@ -785,9 +785,9 @@ var _ = Describe("Consolidation", func() {
 			// inform cluster state about nodes and nodeclaims
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			c := disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue)
+			c := disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)
 			emptyConsolidation := disruption.NewEmptiness(c)
-			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, env.Clock, env.Client, cloudProvider, recorder, emptyConsolidation.Reason())
+			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cs.NodePoolState, env.Clock, env.Client, cloudProvider, recorder, emptyConsolidation.Reason())
 			Expect(err).To(Succeed())
 
 			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, emptyConsolidation.ShouldDisrupt, emptyConsolidation.Class(), queue)
@@ -817,9 +817,9 @@ var _ = Describe("Consolidation", func() {
 			// inform cluster state about nodes and nodeclaims
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			c := disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue)
+			c := disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)
 			multiConsolidation := disruption.NewMultiNodeConsolidation(c)
-			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, env.Clock, env.Client, cloudProvider, recorder, multiConsolidation.Reason())
+			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cs.NodePoolState, env.Clock, env.Client, cloudProvider, recorder, multiConsolidation.Reason())
 			Expect(err).To(Succeed())
 
 			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, multiConsolidation.ShouldDisrupt, multiConsolidation.Class(), queue)
@@ -887,9 +887,9 @@ var _ = Describe("Consolidation", func() {
 			// inform cluster state about nodes and nodeclaims
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			c := disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue)
+			c := disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)
 			multiConsolidation := disruption.NewMultiNodeConsolidation(c)
-			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, env.Clock, env.Client, cloudProvider, recorder, multiConsolidation.Reason())
+			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cs.NodePoolState, env.Clock, env.Client, cloudProvider, recorder, multiConsolidation.Reason())
 			Expect(err).To(Succeed())
 
 			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, multiConsolidation.ShouldDisrupt, multiConsolidation.Class(), queue)
@@ -918,9 +918,9 @@ var _ = Describe("Consolidation", func() {
 			// inform cluster state about nodes and nodeclaims
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			c := disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue)
+			c := disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)
 			singleConsolidation := disruption.NewSingleNodeConsolidation(c)
-			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, env.Clock, env.Client, cloudProvider, recorder, singleConsolidation.Reason())
+			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cs.NodePoolState, env.Clock, env.Client, cloudProvider, recorder, singleConsolidation.Reason())
 			Expect(err).To(Succeed())
 
 			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, singleConsolidation.ShouldDisrupt, singleConsolidation.Class(), queue)
@@ -988,9 +988,9 @@ var _ = Describe("Consolidation", func() {
 			// inform cluster state about nodes and nodeclaims
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			c := disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue)
+			c := disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)
 			singleConsolidation := disruption.NewSingleNodeConsolidation(c)
-			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, env.Clock, env.Client, cloudProvider, recorder, singleConsolidation.Reason())
+			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cs.NodePoolState, env.Clock, env.Client, cloudProvider, recorder, singleConsolidation.Reason())
 			Expect(err).To(Succeed())
 
 			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, singleConsolidation.ShouldDisrupt, singleConsolidation.Class(), queue)
@@ -1076,7 +1076,7 @@ var _ = Describe("Consolidation", func() {
 		It("should not replace a node that the NodeClaimPriceProvider prices below every replacement", func() {
 			cloudprovider.SetNodeClaimPriceProvider(fixedPricer(0.0001))
 			DeferCleanup(test.ResetNodeClaimPriceProvider)
-			disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, queue, clusterCost,
+			disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost,
 				disruption.WithMethods(NewMethodsWithNopValidator()...))
 			pod := replicaSetPod()
 			ExpectApplied(ctx, env.Client, pod, node, nodeClaim, nodePool)
@@ -1088,7 +1088,7 @@ var _ = Describe("Consolidation", func() {
 			ExpectExists(ctx, env.Client, nodeClaim)
 		})
 		It("should replace the same node when it's priced by its offering", func() {
-			disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, queue, clusterCost,
+			disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost,
 				disruption.WithMethods(NewMethodsWithNopValidator()...))
 			pod := replicaSetPod()
 			ExpectApplied(ctx, env.Client, pod, node, nodeClaim, nodePool)
@@ -1134,7 +1134,7 @@ var _ = Describe("Consolidation", func() {
 				corev1.LabelTopologyZone:       mostExpSpotOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
 			})
 
-			ExpectSingletonReconciled(ctx, pricingController)
+			expectPriced()
 			rs := test.ReplicaSet()
 			ExpectApplied(ctx, env.Client, rs)
 			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
@@ -1249,7 +1249,7 @@ var _ = Describe("Consolidation", func() {
 				v1.CapacityTypeLabelKey:        spotOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
 				corev1.LabelTopologyZone:       spotOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
 			})
-			ExpectSingletonReconciled(ctx, pricingController)
+			expectPriced()
 
 			rs := test.ReplicaSet()
 			ExpectApplied(ctx, env.Client, rs)
@@ -1779,7 +1779,7 @@ var _ = Describe("Consolidation", func() {
 				node = lo.Ternary(spotToSpot, spotNode, node)
 				// Add these spot instance with this special condition to cloud provider instancetypes
 				cloudProvider.InstanceTypes = append(cloudProvider.InstanceTypes, lo.Ternary(spotToSpot, spotInstances, onDemandInstances)...)
-				ExpectSingletonReconciled(ctx, pricingController)
+				expectPriced()
 
 				rs := test.ReplicaSet()
 				ExpectApplied(ctx, env.Client, rs)
@@ -2290,7 +2290,7 @@ var _ = Describe("Consolidation", func() {
 				currentInstance,
 				replacementInstance,
 			}
-			ExpectSingletonReconciled(ctx, pricingController)
+			expectPriced()
 
 			// create our RS so we can link a pod to it
 			rs := test.ReplicaSet()
@@ -2375,7 +2375,7 @@ var _ = Describe("Consolidation", func() {
 				currentInstance,
 				replacementInstance,
 			}
-			ExpectSingletonReconciled(ctx, pricingController)
+			expectPriced()
 
 			// create our RS so we can link a pod to it
 			rs := test.ReplicaSet()
@@ -2511,9 +2511,9 @@ var _ = Describe("Consolidation", func() {
 
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-			c := disruption.MakeConsolidation(env.Clock, cluster, env.Overlay, prov, cloudProvider, recorder, queue)
+			c := disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)
 			emptyConsolidation := disruption.NewEmptiness(c, disruption.WithValidator(NewTestEmptinessValidator(nodes, nodeClaims, nodePool, WithEmptinessChurn())))
-			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, env.Clock, env.Client, cloudProvider, recorder, emptyConsolidation.Reason())
+			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cs.NodePoolState, env.Clock, env.Client, cloudProvider, recorder, emptyConsolidation.Reason())
 			Expect(err).To(Succeed())
 
 			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, emptyConsolidation.ShouldDisrupt, emptyConsolidation.Class(), queue)
@@ -3065,7 +3065,6 @@ var _ = Describe("Consolidation", func() {
 			ExpectManualBinding(ctx, env.Client, pods[2], nodes[1])
 
 			// inform cluster state about nodes and nodeclaims, intentionally leaving node as not ready
-			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaims[0]))
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{nodes[1]}, []*v1.NodeClaim{nodeClaims[1]})
 
 			ExpectSingletonReconciled(ctx, disruptionController)
@@ -3139,11 +3138,10 @@ var _ = Describe("Consolidation", func() {
 				nc = ExpectExists(ctx, env.Client, nc)
 				nc.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
 				ExpectApplied(ctx, env.Client, nc)
-				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nc))
 			}
 			// Reset the disruption controller so consolidation methods are not cached as consolidated
 			*queue = lo.FromPtr(disruption.NewQueue(env.Overlay, recorder, cluster, env.Clock, prov, cs.Deletion))
-			disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, queue, clusterCost,
+			disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost,
 				disruption.WithMethods(NewMethodsWithNopValidator()...))
 			ExpectSingletonReconciled(ctx, disruptionController)
 
@@ -3300,7 +3298,7 @@ var _ = Describe("Consolidation", func() {
 				defaultInstanceType,
 				smallInstanceType,
 			}
-			ExpectSingletonReconciled(ctx, pricingController)
+			expectPriced()
 			// create our RS so we can link a pod to it
 			rs := test.ReplicaSet()
 			ExpectApplied(ctx, env.Client, rs)
@@ -3355,8 +3353,6 @@ var _ = Describe("Consolidation", func() {
 
 				if i == elem {
 					ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{n}, []*v1.NodeClaim{m})
-				} else {
-					ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(m))
 				}
 			}
 
@@ -3585,7 +3581,7 @@ var _ = Describe("Consolidation", func() {
 		var nodes []*corev1.Node
 
 		BeforeEach(func() {
-			disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, queue, clusterCost, disruption.WithMethods(NewMethodsWithRealValidator()...))
+			disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost, disruption.WithMethods(NewMethodsWithRealValidator()...))
 			nodeClaims, nodes = test.NodeClaimsAndNodes(2, v1.NodeClaim{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
@@ -4202,7 +4198,7 @@ var _ = Describe("Consolidation", func() {
 		)
 		DescribeTable("should wait for the node TTL for non-empty nodes before consolidating (multi-node)",
 			func(spotToSpot bool) {
-				disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, queue, clusterCost, disruption.WithMethods(NewMethodsWithRealValidator()...))
+				disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost, disruption.WithMethods(NewMethodsWithRealValidator()...))
 				nodeClaims = lo.Ternary(spotToSpot, nodeClaims, spotNodeClaims)
 				nodes = lo.Ternary(spotToSpot, nodes, spotNodes)
 				// create our RS so we can link a pod to it
@@ -4274,7 +4270,7 @@ var _ = Describe("Consolidation", func() {
 		)
 		DescribeTable("should consolidate multiple empty nodes via multi-nodeclaim consolidation",
 			func(spotToSpot bool) {
-				disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, queue, clusterCost, disruption.WithMethods(NewMethodsWithRealValidator()...))
+				disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost, disruption.WithMethods(NewMethodsWithRealValidator()...))
 				nodeClaims = lo.Ternary(spotToSpot, nodeClaims, spotNodeClaims)
 				nodes = lo.Ternary(spotToSpot, nodes, spotNodes)
 				// create our RS so we can link a pod to it
@@ -4337,7 +4333,7 @@ var _ = Describe("Consolidation", func() {
 		)
 		DescribeTable("should continue to single nodeclaim consolidation when multi-nodeclaim consolidation fails validation after the node ttl",
 			func(spotToSpot bool) {
-				disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, queue, clusterCost, disruption.WithMethods(NewMethodsWithRealValidator()...))
+				disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost, disruption.WithMethods(NewMethodsWithRealValidator()...))
 				nodeClaims = lo.Ternary(spotToSpot, nodeClaims, spotNodeClaims)
 				nodes = lo.Ternary(spotToSpot, nodes, spotNodes)
 				// create our RS so we can link a pod to it
@@ -4831,7 +4827,7 @@ var _ = Describe("Consolidation", func() {
 					v1alpha1.LabelReservationID: mostExpensiveReservationID,
 				}),
 			})
-			ExpectSingletonReconciled(ctx, pricingController)
+			expectPriced()
 			reservedNodeClaim, reservedNode = test.NodeClaimAndNode(v1.NodeClaim{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{

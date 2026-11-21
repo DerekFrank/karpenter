@@ -14,12 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package informer_test
+package vpa_test
 
 import (
 	"context"
 	"testing"
-	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -36,12 +35,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
-	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
-	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
-	"sigs.k8s.io/karpenter/pkg/controllers/state/informer"
+	"sigs.k8s.io/karpenter/pkg/cluster/prediction"
+	"sigs.k8s.io/karpenter/pkg/controllers/vpa"
 	"sigs.k8s.io/karpenter/pkg/events"
-	"sigs.k8s.io/karpenter/pkg/state/prediction"
 	"sigs.k8s.io/karpenter/pkg/test"
 	testcrds "sigs.k8s.io/karpenter/pkg/test/crds"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -51,9 +47,8 @@ import (
 var ctx context.Context
 var env *test.Environment
 var store *prediction.Store
-var cluster *state.Cluster
 var recorder *test.EventRecorder
-var controller *informer.VPAController
+var controller *vpa.Controller
 var target prediction.WorkloadReference
 var targetRef autoscalingv1.CrossVersionObjectReference
 var dep *appsv1.Deployment
@@ -66,8 +61,6 @@ func TestVPA(t *testing.T) {
 
 var _ = BeforeSuite(func() {
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(testcrds.CRDs...))
-	cs := karpentercluster.New(ctx, env.Clock, env.Overlay, fake.NewCloudProvider())
-	cluster = state.NewCluster(env.Clock, env.Overlay, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, cs.PodScheduling)
 })
 
 var _ = AfterSuite(func() {
@@ -76,9 +69,8 @@ var _ = AfterSuite(func() {
 
 var _ = BeforeEach(func() {
 	store = prediction.NewStore(env.Overlay)
-	cluster.Reset()
 	recorder = test.NewEventRecorder()
-	controller = informer.NewVPAController(env.Overlay, store, cluster, recorder)
+	controller = vpa.NewController(env.Overlay, store, recorder)
 
 	dep = test.Deployment(test.DeploymentOptions{
 		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "default"},
@@ -320,44 +312,6 @@ var _ = Describe("VPA Controller", func() {
 
 		_, ok = store.Get(target)
 		Expect(ok).To(BeFalse())
-	})
-
-	It("should mark the cluster unconsolidated when a prediction is added, changed, or removed", func() {
-		vpa := test.VerticalPodAutoscaler(test.VerticalPodAutoscalerOptions{TargetRef: targetRef})
-		ExpectApplied(ctx, env.Client, vpa)
-
-		for _, cpu := range []string{"500m", "1"} {
-			consolidationState := cluster.ConsolidationState()
-			env.Clock.Step(time.Second)
-			test.UpdateVPARecommendation(ctx, env.Client, vpa, map[string]corev1.ResourceList{
-				"main": {corev1.ResourceCPU: resource.MustParse(cpu)},
-			})
-			ExpectSingletonReconciled(ctx, controller)
-			Expect(cluster.ConsolidationState()).ToNot(Equal(consolidationState))
-		}
-
-		consolidationState := cluster.ConsolidationState()
-		env.Clock.Step(time.Second)
-		ExpectDeleted(ctx, env.Client, vpa)
-		ExpectSingletonReconciled(ctx, controller)
-		Expect(cluster.ConsolidationState()).ToNot(Equal(consolidationState))
-	})
-
-	It("should not mark the cluster unconsolidated when a VPA update leaves its prediction unchanged", func() {
-		vpa := test.VerticalPodAutoscaler(test.VerticalPodAutoscalerOptions{TargetRef: targetRef})
-		ExpectApplied(ctx, env.Client, vpa)
-		test.UpdateVPARecommendation(ctx, env.Client, vpa, map[string]corev1.ResourceList{
-			"main": {corev1.ResourceCPU: resource.MustParse("500m")},
-		})
-		ExpectSingletonReconciled(ctx, controller)
-
-		consolidationState := cluster.ConsolidationState()
-		env.Clock.Step(time.Second)
-		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(vpa), vpa)).To(Succeed())
-		vpa.Labels = map[string]string{"updated": "true"}
-		ExpectApplied(ctx, env.Client, vpa)
-		ExpectSingletonReconciled(ctx, controller)
-		Expect(cluster.ConsolidationState()).To(Equal(consolidationState))
 	})
 
 	It("should keep a prediction for a target that's deleted and recreated with the same name", func() {

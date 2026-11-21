@@ -27,7 +27,6 @@ import (
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
@@ -42,9 +41,9 @@ type quotaLimit struct {
 
 // newQuotaLimits returns what each enforced quota has left before the solve spends any, and, for each NodeClaim
 // template, the quotas each of its instance types may match.
-func newQuotaLimits(cluster *state.Cluster, templates []*NodeClaimTemplate) ([]*quotaLimit, []map[string][]int) {
-	limits := lo.Map(cluster.CapacityQuotaState.Quotas(), func(q *karpentercluster.Quota, _ int) *quotaLimit {
-		return &quotaLimit{quota: q, remaining: resources.Subtract(q.Limits, cluster.CapacityQuotaState.Reserved(q))}
+func newQuotaLimits(capacityQuotas *karpentercluster.CapacityQuotaState, templates []*NodeClaimTemplate) ([]*quotaLimit, []map[string][]int) {
+	limits := lo.Map(capacityQuotas.Quotas(), func(q *karpentercluster.Quota, _ int) *quotaLimit {
+		return &quotaLimit{quota: q, remaining: resources.Subtract(q.Limits, capacityQuotas.Reserved(q))}
 	})
 	matches := lo.Map(templates, func(t *NodeClaimTemplate, _ int) map[string][]int {
 		byInstanceType := map[string][]int{}

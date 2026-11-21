@@ -28,9 +28,9 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 )
 
@@ -98,7 +98,8 @@ type Validator interface {
 // skip the validation TTL for all but the first command.
 type validation struct {
 	clock         clock.Clock
-	cluster       *state.Cluster
+	cluster       *karpentercluster.NodeState
+	nodePools     *karpentercluster.NodePoolState
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
 	provisioner   *provisioning.Provisioner
@@ -119,6 +120,7 @@ func NewEmptinessValidator(c consolidation) *EmptinessValidator {
 		validation: validation{
 			clock:         c.clock,
 			cluster:       c.cluster,
+			nodePools:     c.nodePools,
 			kubeClient:    c.kubeClient,
 			provisioner:   c.provisioner,
 			cloudProvider: c.cloudProvider,
@@ -159,6 +161,7 @@ func NewSingleConsolidationValidator(c consolidation) *ConsolidationValidator {
 		validation: validation{
 			clock:         c.clock,
 			cluster:       c.cluster,
+			nodePools:     c.nodePools,
 			kubeClient:    c.kubeClient,
 			provisioner:   c.provisioner,
 			cloudProvider: c.cloudProvider,
@@ -177,6 +180,7 @@ func NewMultiConsolidationValidator(c consolidation) *ConsolidationValidator {
 		validation: validation{
 			clock:         c.clock,
 			cluster:       c.cluster,
+			nodePools:     c.nodePools,
 			kubeClient:    c.kubeClient,
 			provisioner:   c.provisioner,
 			cloudProvider: c.cloudProvider,
@@ -230,7 +234,7 @@ func (e *EmptinessValidator) validateCandidates(ctx context.Context, candidates 
 		FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: e.validationType})
 		return nil, NewChurnValidationError(fmt.Errorf("%d candidates are no longer valid", len(candidates)))
 	}
-	disruptionBudgetMapping, err := BuildDisruptionBudgetMapping(ctx, e.cluster, e.clock, e.kubeClient, e.cloudProvider, e.recorder, e.reason)
+	disruptionBudgetMapping, err := BuildDisruptionBudgetMapping(ctx, e.nodePools, e.clock, e.kubeClient, e.cloudProvider, e.recorder, e.reason)
 	if err != nil {
 		return nil, fmt.Errorf("building disruption budgets, %w", err)
 	}
@@ -272,7 +276,7 @@ func (c *ConsolidationValidator) validateCandidates(ctx context.Context, candida
 		FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: c.validationType})
 		return nil, NewChurnValidationError(fmt.Errorf("%d candidates are no longer valid", len(candidates)-len(validatedCandidates)))
 	}
-	disruptionBudgetMapping, err := BuildDisruptionBudgetMapping(ctx, c.cluster, c.clock, c.kubeClient, c.cloudProvider, c.recorder, c.reason)
+	disruptionBudgetMapping, err := BuildDisruptionBudgetMapping(ctx, c.nodePools, c.clock, c.kubeClient, c.cloudProvider, c.recorder, c.reason)
 	if err != nil {
 		return nil, fmt.Errorf("building disruption budgets, %w", err)
 	}

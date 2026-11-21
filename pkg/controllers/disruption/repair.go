@@ -173,7 +173,7 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 		// Static NodePools aren't reactively scheduled, so repair can't simulate a replacement — it mirrors StaticDrift.
 		if candidate.OwnedByStaticNodePool() {
 			np := candidate.NodePool
-			active, _, _ := r.cluster.NodePoolState.GetNodeCount(np.Name)
+			active, _, _ := r.nodePools.GetNodeCount(np.Name)
 
 			// Skip until scale-down completes: a replacement would just be surplus the deprovisioner deletes.
 			if int64(active) > lo.FromPtr(np.Spec.Replicas) {
@@ -206,7 +206,7 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 			// checked first so the delete-only path never takes a slot.
 			var reservations karpentercluster.Reservations
 			if !reservationsFull {
-				reservations = r.cluster.NodePoolState.ReserveNodeCount(np.Name, nodeLimit, 1)
+				reservations = r.nodePools.ReserveNodeCount(np.Name, nodeLimit, 1)
 			}
 			if len(reservations) == 0 {
 				// Static provisioning refuses NotReady or deleting NodePools, so terminating first there would strand
@@ -311,7 +311,7 @@ func (r *Repair) commitReboot(ctx context.Context, candidate *Candidate) (bool, 
 // as soon as one of its current conditions matches the provider policy set, regardless of policy toleration. The
 // threshold rounds up so one unhealthy node does not halt repair in small pools.
 func (r *Repair) breakerTripped(nodePool string) bool {
-	counts := r.cluster.NodePoolState.NodeHealth(nodePool)
+	counts := r.nodePools.NodeHealth(nodePool)
 	thresholdValue := intstr.FromString(repairUnhealthyThreshold)
 	return counts.Unhealthy > lo.Must(intstr.GetScaledValueFromIntOrPercent(&thresholdValue, counts.Nodes, true))
 }
