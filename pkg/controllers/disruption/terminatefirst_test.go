@@ -122,7 +122,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 			})
 			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
 			staticDriftController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, stores, cs.NodePoolState, queue, clusterCost,
-				disruption.WithMethods(disruption.NewStaticDrift(cs.NodePoolState, prov, cloudProvider, recorder)))
+				disruption.WithMethods(disruption.NewStaticDrift(cs.NodePoolState, prov, cloudProvider, recorder, driftBackoff)))
 		})
 
 		It("issues a delete-only command for a static NodePool at its node limit when TerminateFirstDrift is enabled", func() {
@@ -208,6 +208,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 				mostExpensiveInstance.Offerings = append(mostExpensiveInstance.Offerings, &cloudprovider.Offering{
 					Price:               mostExpensiveOffering.Price / 1_000_000.0,
 					Available:           true,
+					Compatible:          true,
 					ReservationCapacity: capacity,
 					Requirements: scheduling.NewLabelRequirements(map[string]string{
 						v1.CapacityTypeLabelKey:          v1.CapacityTypeReserved,
@@ -258,7 +259,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 					[]*corev1.Node{node, healthyNode}, []*v1.NodeClaim{nodeClaim, healthyNodeClaim})
 				erroring := &instanceTypesErrorCloudProvider{CloudProvider: cloudProvider, nodePools: []string{nodePool.Name}}
 				staticDriftController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, stores, cs.NodePoolState, queue, clusterCost,
-					disruption.WithMethods(disruption.NewStaticDrift(cs.NodePoolState, prov, erroring, recorder)))
+					disruption.WithMethods(disruption.NewStaticDrift(cs.NodePoolState, prov, erroring, recorder, driftBackoff)))
 
 				ExpectSingletonReconciled(ctx, staticDriftController)
 
@@ -286,6 +287,48 @@ var _ = Describe("TerminateFirstDrift", func() {
 				Expect(cmds[0].Decision()).To(Equal(disruption.ReplaceDecision))
 			})
 
+			It("issues a delete-only command when the template's on-demand offerings are not Compatible", func() {
+				ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacity: new(true), TerminateFirstDrift: new(true)}}))
+				for _, o := range mostExpensiveInstance.Offerings {
+					o.Available = false
+					o.Compatible = false
+				}
+				withReservation(0)
+				nodePool.Spec.Template.Spec.Requirements[1].Values = []string{v1.CapacityTypeReserved, v1.CapacityTypeOnDemand}
+				ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+				ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+
+				ExpectSingletonReconciled(ctx, staticDriftController)
+
+				cmds := queue.GetCommands()
+				Expect(cmds).To(HaveLen(1))
+				Expect(cmds[0].Decision()).To(Equal(disruption.TerminateFirstDecision))
+				Expect(cmds[0].Replacements).To(HaveLen(0))
+			})
+
+			// e.g. a zone the type isn't offered in, or the NodeClass has no subnet in.
+			It("issues a delete-only command when the template's on-demand offerings are unavailable only outside the instance type's zones", func() {
+				ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{ReservedCapacity: new(true), TerminateFirstDrift: new(true)}}))
+				zone := mostExpensiveOffering.Zone()
+				mostExpensiveInstance.Requirements.Add(scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, zone))
+				mostExpensiveInstance.Offerings = []*cloudprovider.Offering{{
+					Compatible:   true,
+					Price:        mostExpensiveOffering.Price,
+					Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: zone + "-elsewhere"}),
+				}}
+				withReservation(0)
+				nodePool.Spec.Template.Spec.Requirements[1].Values = []string{v1.CapacityTypeReserved, v1.CapacityTypeOnDemand}
+				ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+				ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+
+				ExpectSingletonReconciled(ctx, staticDriftController)
+
+				cmds := queue.GetCommands()
+				Expect(cmds).To(HaveLen(1))
+				Expect(cmds[0].Decision()).To(Equal(disruption.TerminateFirstDecision))
+				Expect(cmds[0].Replacements).To(HaveLen(0))
+			})
+
 			// The fake's offerings carry no instance-type label, as on AWS, so only filtering instance types by the template
 			// keeps a reservation outside the template from counting as capacity for the replacement.
 			It("treats the reservations as full when only an instance type outside the template has capacity", func() {
@@ -294,6 +337,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 				leastExpensiveInstance.Offerings = append(leastExpensiveInstance.Offerings, &cloudprovider.Offering{
 					Price:               leastExpensiveOffering.Price / 1_000_000.0,
 					Available:           true,
+					Compatible:          true,
 					ReservationCapacity: 1,
 					Requirements: scheduling.NewLabelRequirements(map[string]string{
 						v1.CapacityTypeLabelKey:          v1.CapacityTypeReserved,
@@ -456,6 +500,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 			mostExpensiveInstance.Offerings = append(mostExpensiveInstance.Offerings, &cloudprovider.Offering{
 				Price:               mostExpensiveOffering.Price / 1_000_000.0,
 				Available:           available,
+				Compatible:          true,
 				ReservationCapacity: reservationCapacity,
 				Requirements: scheduling.NewLabelRequirements(map[string]string{
 					v1.CapacityTypeLabelKey:          v1.CapacityTypeReserved,
@@ -487,7 +532,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 			})
 			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
 			driftController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, stores, cs.NodePoolState, queue, clusterCost,
-				disruption.WithMethods(disruption.NewDrift(env.Overlay, prov, recorder, env.Clock)))
+				disruption.WithMethods(disruption.NewDrift(env.Overlay, prov, recorder, env.Clock, driftBackoff)))
 		}
 
 		It("issues a delete-only command when the reservation is full and there is no fallback", func() {
@@ -510,6 +555,33 @@ var _ = Describe("TerminateFirstDrift", func() {
 			Expect(cmds[0].Results.NewNodeClaims).To(HaveLen(1))
 			Expect(cmds[0].Results.NewNodeClaims[0].Requirements.Get(v1.CapacityTypeLabelKey).Has(v1.CapacityTypeReserved)).To(BeTrue())
 			Expect(cmds[0].Results.NewNodeClaims[0].Requirements.Get(cloudprovider.ReservationIDLabel).Has(reservationID)).To(BeTrue())
+		})
+
+		// kubectl describe node shows this event, so it should say why the node goes first.
+		It("says why the node goes before its replacement in the termination event", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: new(true), ReservedCapacity: new(true)}}))
+			setupReservedOffering(0, true, v1.CapacityTypeReserved) // full but healthy, reserved-only pool
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			bindReschedulablePod(node)
+
+			ExpectSingletonReconciled(ctx, driftController)
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Decision()).To(Equal(disruption.TerminateFirstDecision))
+			recorder.Reset()
+			ExpectObjectReconciled(ctx, env.Client, queue, cmds[0].Candidates[0].NodeClaim)
+
+			// The RFC allows a distinct reason or message, so check them together.
+			nodeEvents := lo.FilterMap(recorder.Events(), func(e events.Event, _ int) (string, bool) {
+				_, onNode := e.InvolvedObject.(*corev1.Node)
+				return e.Reason + ": " + e.Message, onNode
+			})
+			Expect(nodeEvents).To(HaveLen(1))
+			// A replace-first drift gets this event.
+			Expect(nodeEvents[0]).NotTo(Equal(events.DisruptionTerminating + ": Disrupting Node: Drifted"))
+			// Here the node goes first because its reservation is full.
+			Expect(nodeEvents[0]).To(MatchRegexp(`(?i)reserv`))
 		})
 
 		It("does NOT terminate-first when more reschedulable pods need the reservation than the freed slot can hold", func() {
@@ -572,6 +644,103 @@ var _ = Describe("TerminateFirstDrift", func() {
 			Expect(cmds).To(HaveLen(1))
 			Expect(cmds[0].Decision()).To(Equal(disruption.ReplaceDecision))
 			Expect(cmds[0].Replacements).To(HaveLen(1))
+		})
+
+		DescribeTable("a full reservation with unavailable on-demand offerings",
+			func(mutate func(), nodeSelector map[string]string, terminateFirst bool) {
+				ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: new(true), ReservedCapacity: new(true)}}))
+				for _, o := range mostExpensiveInstance.Offerings {
+					o.Available = false
+				}
+				mutate()
+				setupReservedOffering(0, true, v1.CapacityTypeReserved, v1.CapacityTypeOnDemand)
+				ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+				ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+				rs := test.ReplicaSet()
+				ExpectApplied(ctx, env.Client, rs)
+				Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
+				pod := test.Pod(test.PodOptions{NodeSelector: nodeSelector, ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rs.Name, UID: rs.UID, Controller: new(true), BlockOwnerDeletion: new(true),
+				}}}})
+				ExpectApplied(ctx, env.Client, pod)
+				ExpectManualBinding(ctx, env.Client, pod, node)
+
+				ExpectSingletonReconciled(ctx, driftController)
+
+				cmds := queue.GetCommands()
+				if !terminateFirst {
+					Expect(cmds).To(HaveLen(0))
+					Expect(recorder.Calls(events.DisruptionBlocked)).To(BeNumerically(">", 0))
+					return
+				}
+				Expect(cmds).To(HaveLen(1))
+				Expect(cmds[0].Decision()).To(Equal(disruption.TerminateFirstDecision))
+				Expect(cmds[0].Replacements).To(HaveLen(0))
+				Expect(cmds[0].Results.NewNodeClaims).To(HaveLen(1))
+				Expect(cmds[0].Results.NewNodeClaims[0].Requirements.Get(cloudprovider.ReservationIDLabel).Has(reservationID)).To(BeTrue())
+			},
+			Entry("waits when on-demand is transiently unavailable", func() {}, nil, false),
+			Entry("terminates first when on-demand is not Compatible", func() {
+				for _, o := range mostExpensiveInstance.Offerings {
+					o.Compatible = false
+				}
+			}, nil, true),
+			Entry("terminates first when the instance type has no on-demand offering", func() {
+				mostExpensiveInstance.Offerings = nil
+			}, nil, true),
+			// e.g. a zone the type isn't offered in, or the NodeClass has no subnet in.
+			Entry("terminates first when on-demand is unavailable only outside the instance type's zones", func() {
+				zone := mostExpensiveOffering.Zone()
+				mostExpensiveInstance.Requirements.Add(scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, zone))
+				mostExpensiveInstance.Offerings = []*cloudprovider.Offering{{
+					Compatible:   true,
+					Price:        mostExpensiveOffering.Price,
+					Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: zone + "-elsewhere"}),
+				}}
+			}, nil, true),
+			Entry("terminates first when the pod can't use on-demand", func() {}, map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeReserved}, true),
+		)
+
+		// The transient fallback is another instance type than the candidate's.
+		It("waits when only another instance type in the NodePool has transiently unavailable on-demand", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: new(true), ReservedCapacity: new(true)}}))
+			for _, o := range mostExpensiveInstance.Offerings {
+				o.Available, o.Compatible = false, false // the candidate's own type has no on-demand fallback, ever
+			}
+			for _, o := range leastExpensiveInstance.Offerings {
+				o.Available = false // another type in the NodePool is ICE'd, but may come back
+			}
+			setupReservedOffering(0, true, v1.CapacityTypeReserved, v1.CapacityTypeOnDemand)
+			nodePool.Spec.Template.Spec.Requirements[0].Values = []string{mostExpensiveInstance.Name, leastExpensiveInstance.Name}
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			bindReschedulablePod(node)
+
+			ExpectSingletonReconciled(ctx, driftController)
+
+			Expect(queue.GetCommands()).To(HaveLen(0))
+			Expect(recorder.Calls(events.DisruptionBlocked)).To(BeNumerically(">", 0))
+		})
+
+		It("terminates first when another instance type in the NodePool has on-demand that's not Compatible", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{TerminateFirstDrift: new(true), ReservedCapacity: new(true)}}))
+			for _, o := range mostExpensiveInstance.Offerings {
+				o.Available, o.Compatible = false, false
+			}
+			for _, o := range leastExpensiveInstance.Offerings {
+				o.Available, o.Compatible = false, false
+			}
+			setupReservedOffering(0, true, v1.CapacityTypeReserved, v1.CapacityTypeOnDemand)
+			nodePool.Spec.Template.Spec.Requirements[0].Values = []string{mostExpensiveInstance.Name, leastExpensiveInstance.Name}
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+			ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			bindReschedulablePod(node)
+
+			ExpectSingletonReconciled(ctx, driftController)
+
+			cmds := queue.GetCommands()
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Decision()).To(Equal(disruption.TerminateFirstDecision))
 		})
 
 		It("replaces-first when the reservation still has a spare slot", func() {

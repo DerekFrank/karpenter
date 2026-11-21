@@ -76,8 +76,6 @@ var _ = Describe("NodePool Members", func() {
 })
 
 // expectNodePoolMembers checks the NodePool's members read from its index against a scan of every node and NodeClaim.
-//
-//nolint:gocyclo
 func expectNodePoolMembers(s State, np string) {
 	GinkgoHelper()
 	var want, got []string

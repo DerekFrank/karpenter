@@ -57,8 +57,6 @@ type SimulationOptions struct {
 }
 
 // SimulateScheduling determines whether candidate workloads can be rescheduled after disruption.
-//
-//nolint:gocyclo
 func SimulateScheduling(ctx context.Context, kubeClient client.Client, provisioner *provisioning.Provisioner, clk clock.Clock, recorder events.Recorder,
 	schedulerOpts []scheduling.Options, simulationOpts SimulationOptions, candidates ...*Candidate,
 ) (scheduling.Results, error) {
@@ -177,7 +175,8 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, provision
 //     replaces-first with these Results (as it always has).
 //
 //  2. Only if pass 1 leaves pods pending AND terminateFirstEnabled is set by the caller AND the candidate itself holds a
-//     reservation: re-simulate in strict mode with the candidate's reservation slot credited back (modeling the slot it
+//     reservation: if the NodePool's non-reserved fallback is only transiently unavailable (e.g. ICE), wait for it.
+//     Otherwise, re-simulate in strict mode with the candidate's reservation slot credited back (modeling the slot it
 //     will free on termination). If every pod then places, terminateFirst is true — deleting the candidate is exactly
 //     what unblocks the reschedule. Strict mode makes surplus pods that wouldn't fit the freed slot fail rather than
 //     fall back, and a reservation that is unavailable for another reason stays unschedulable, so we don't terminate
@@ -207,6 +206,9 @@ func SimulateSchedulingWithReservedFallback(
 	if !terminateFirstEnabled || candidate.capacityType != v1.CapacityTypeReserved || reservationID == "" {
 		return results, false, nil
 	}
+	if awaitsTransientCapacity(ctx, provisioner.CloudProvider(), candidate) {
+		return results, false, nil
+	}
 
 	// Pass 2: terminate-first feasibility — credit the candidate's reservation slot back and require every pod to place
 	// under strict mode.
@@ -226,8 +228,8 @@ func SimulateSchedulingWithReservedFallback(
 
 // instanceTypesAreSubset returns true if the lhs slice of instance types are a subset of the rhs.
 func instanceTypesAreSubset(lhs []*cloudprovider.InstanceType, rhs []*cloudprovider.InstanceType) bool {
-	rhsNames := sets.NewString(lo.Map(rhs, func(t *cloudprovider.InstanceType, i int) string { return t.Name })...)
-	lhsNames := sets.NewString(lo.Map(lhs, func(t *cloudprovider.InstanceType, i int) string { return t.Name })...)
+	rhsNames := sets.New[string](lo.Map(rhs, func(t *cloudprovider.InstanceType, i int) string { return t.Name })...)
+	lhsNames := sets.New[string](lo.Map(lhs, func(t *cloudprovider.InstanceType, i int) string { return t.Name })...)
 	return len(rhsNames.Intersection(lhsNames)) == len(lhsNames)
 }
 
@@ -320,8 +322,8 @@ func BuildNodePoolMap(ctx context.Context, kubeClient client.Client, cloudProvid
 // NodePoolStats returns the NodePool's nodes counted toward its disruption budgets, and how many of them already
 // consume the budget for reason. A node consumes a budget when it is:
 //  1. Marked for deletion (a disruption is already in flight),
-//  2. Rebooting (an in-place disruption is already in flight), for every reason, so that other methods don't disrupt
-//     concurrently and exceed the budget, or
+//  2. Rebooting, or re-initializing after a successful reboot (an in-place disruption is still in flight), for every
+//     reason, so that other methods don't disrupt concurrently and exceed the budget, or
 //  3. NotReady, except for the Unhealthy (repair) budget.
 //
 // Repair must not count merely-unhealthy nodes: NotReady is precisely repair's trigger, so counting those nodes against
@@ -383,18 +385,35 @@ func BuildDisruptionBudgetMapping(ctx context.Context, nodePoolState *karpenterc
 
 // mapCandidates maps the list of proposed candidates with the current state
 func mapCandidates(proposed, current []*Candidate) []*Candidate {
-	proposedNames := sets.NewString(lo.Map(proposed, func(c *Candidate, i int) string { return c.Name() })...)
+	proposedNames := sets.New[string](lo.Map(proposed, func(c *Candidate, i int) string { return c.Name() })...)
 	return lo.Filter(current, func(c *Candidate, _ int) bool {
 		return proposedNames.Has(c.Name())
 	})
 }
 
+// templateCompatible reports whether the NodePool template could launch into the offering. An offering outside its
+// instance type's zones can never launch.
+func templateCompatible(nct *scheduling.NodeClaimTemplate, it *cloudprovider.InstanceType, o *cloudprovider.Offering) bool {
+	return templateCompatibleInstanceType(nct, it) && templateCompatibleOffering(nct, it, o)
+}
+
+// templateCompatibleInstanceType is templateCompatible's instance-type half.
+func templateCompatibleInstanceType(nct *scheduling.NodeClaimTemplate, it *cloudprovider.InstanceType) bool {
+	return nct.Requirements.IsCompatible(it.Requirements, pkgscheduling.AllowUndefinedWellKnownLabels)
+}
+
+// templateCompatibleOffering is templateCompatible's offering half.
+func templateCompatibleOffering(nct *scheduling.NodeClaimTemplate, it *cloudprovider.InstanceType, o *cloudprovider.Offering) bool {
+	return it.Requirements.Get(corev1.LabelTopologyZone).Has(o.Zone()) &&
+		nct.Requirements.IsCompatible(o.Requirements, pkgscheduling.AllowUndefinedWellKnownLabels)
+}
+
 // staticReservations reports whether a static NodePool's replacement can only land in full capacity reservations, so
 // pre-spinning it would fail to launch until a reserved node frees its slot, and which compatible reservations are still
-// offered (Available, even if full). A compatible non-reserved offering, even an unavailable one, means the replacement
-// doesn't depend on a reservation slot, so the NodePool waits for that capacity rather than terminating first. A static
+// offered (Available, even if full). A compatible non-reserved offering, even a transiently unavailable one, means the
+// replacement doesn't depend on a reservation slot, so the NodePool waits for that capacity rather than terminating
+// first. A non-reserved offering that isn't Compatible can never launch, so it doesn't count. A static
 // replacement is the bare NodePool template, so this is an offering lookup rather than a scheduling simulation.
-// GetInstanceTypes is NodeClass-scoped, so offerings are filtered by the template's requirements.
 func staticReservations(ctx context.Context, cloudProvider cloudprovider.CloudProvider, np *v1.NodePool, nct *scheduling.NodeClaimTemplate) (bool, sets.Set[string], error) {
 	its, err := cloudProvider.GetInstanceTypes(ctx, np)
 	if err != nil {
@@ -402,11 +421,16 @@ func staticReservations(ctx context.Context, cloudProvider cloudprovider.CloudPr
 	}
 	offered := sets.New[string]()
 	for _, it := range its {
-		if !nct.Requirements.IsCompatible(it.Requirements, pkgscheduling.AllowUndefinedWellKnownLabels) {
+		// Check the instance type once: nearly every offering passes the field check below.
+		if !templateCompatibleInstanceType(nct, it) {
 			continue
 		}
-		for _, o := range it.Offerings.Compatible(nct.Requirements) {
-			if o.CapacityType() != v1.CapacityTypeReserved || o.Launchable() {
+		for _, o := range it.Offerings {
+			reserved := o.CapacityType() == v1.CapacityTypeReserved
+			if (!reserved && !o.Compatible) || !templateCompatibleOffering(nct, it, o) {
+				continue
+			}
+			if !reserved || o.Launchable() {
 				return false, nil, nil
 			}
 			if o.Available {
@@ -415,6 +439,35 @@ func staticReservations(ctx context.Context, cloudProvider cloudprovider.CloudPr
 		}
 	}
 	return true, offered, nil
+}
+
+// awaitsTransientCapacity reports whether the candidate's NodePool has a non-reserved offering that's only transiently
+// unavailable (Compatible but not Available) and that every reschedulable pod could use.
+func awaitsTransientCapacity(ctx context.Context, cloudProvider cloudprovider.CloudProvider, c *Candidate) bool {
+	// The simulation drops instance types with no Available offering, so look them up.
+	its, err := cloudProvider.GetInstanceTypes(ctx, c.NodePool)
+	if err != nil {
+		// We can't rule out a fallback that may come back, so wait.
+		log.FromContext(ctx).Error(serrors.Wrap(fmt.Errorf("getting instance types, %w", err), "NodePool", klog.KObj(c.NodePool)), "waiting instead of terminating first")
+		return true
+	}
+	nct := scheduling.NewNodeClaimTemplate(c.NodePool)
+	podReqs := lo.Map(c.reschedulablePods, func(p *corev1.Pod, _ int) pkgscheduling.Requirements {
+		return pkgscheduling.NewStrictPodRequirements(p)
+	})
+	for _, it := range its {
+		for _, o := range it.Offerings {
+			if o.Available || !o.Compatible || o.CapacityType() == v1.CapacityTypeReserved || !templateCompatible(nct, it, o) {
+				continue
+			}
+			if lo.EveryBy(podReqs, func(r pkgscheduling.Requirements) bool {
+				return r.IsCompatible(it.Requirements, pkgscheduling.AllowUndefinedWellKnownLabels) && r.IsCompatible(o.Requirements, pkgscheduling.AllowUndefinedWellKnownLabels)
+			}) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // holdsOfferedReservation reports whether the candidate holds a slot in a reservation that's still offered, so

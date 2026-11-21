@@ -78,7 +78,8 @@ var _ = BeforeEach(func() {
 	cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{
 		fake.NewInstanceType("default-instance-type",
 			fake.WithOfferings(cloudprovider.Offering{
-				Available: true,
+				Available:  true,
+				Compatible: true,
 				Requirements: scheduling.NewLabelRequirements(map[string]string{
 					v1.CapacityTypeLabelKey:  "spot",
 					corev1.LabelTopologyZone: "test-zone-1",
@@ -290,7 +291,8 @@ var _ = Describe("Validation", func() {
 					fake.NewInstanceType("default-instance-type",
 						fake.WithOfferings(
 							cloudprovider.Offering{
-								Available: true,
+								Available:  true,
+								Compatible: true,
 								Requirements: scheduling.NewLabelRequirements(map[string]string{
 									v1.CapacityTypeLabelKey:  "spot",
 									corev1.LabelTopologyZone: "test-zone-1",
@@ -298,7 +300,8 @@ var _ = Describe("Validation", func() {
 								Price: 1.020,
 							},
 							cloudprovider.Offering{
-								Available: true,
+								Available:  true,
+								Compatible: true,
 								Requirements: scheduling.NewLabelRequirements(map[string]string{
 									v1.CapacityTypeLabelKey:  "on-demand",
 									corev1.LabelTopologyZone: "test-zone-2",
@@ -306,7 +309,8 @@ var _ = Describe("Validation", func() {
 								Price: 2.020,
 							},
 							cloudprovider.Offering{
-								Available: true,
+								Available:  true,
+								Compatible: true,
 								Requirements: scheduling.NewLabelRequirements(map[string]string{
 									v1.CapacityTypeLabelKey:  "spot",
 									corev1.LabelTopologyZone: "test-zone-3",
@@ -314,7 +318,8 @@ var _ = Describe("Validation", func() {
 								Price: 3.020,
 							},
 							cloudprovider.Offering{
-								Available: true,
+								Available:  true,
+								Compatible: true,
 								Requirements: scheduling.NewLabelRequirements(map[string]string{
 									v1.CapacityTypeLabelKey:  "reserved",
 									corev1.LabelTopologyZone: "test-zone-4",
@@ -1284,7 +1289,8 @@ var _ = Describe("Instance Type Controller", func() {
 					fake.NewInstanceType("default-instance-type",
 						fake.WithOfferings(
 							cloudprovider.Offering{
-								Available: true,
+								Available:  true,
+								Compatible: true,
 								Requirements: scheduling.NewLabelRequirements(map[string]string{
 									v1.CapacityTypeLabelKey:  "spot",
 									corev1.LabelTopologyZone: "test-zone-1",
@@ -1292,7 +1298,8 @@ var _ = Describe("Instance Type Controller", func() {
 								Price: 1.020,
 							},
 							cloudprovider.Offering{
-								Available: true,
+								Available:  true,
+								Compatible: true,
 								Requirements: scheduling.NewLabelRequirements(map[string]string{
 									v1.CapacityTypeLabelKey:  "on-demand",
 									corev1.LabelTopologyZone: "test-zone-1",
@@ -1349,7 +1356,8 @@ var _ = Describe("Instance Type Controller", func() {
 					fake.NewInstanceType("default-instance-type",
 						fake.WithOfferings(
 							cloudprovider.Offering{
-								Available: true,
+								Available:  true,
+								Compatible: true,
 								Requirements: scheduling.NewLabelRequirements(map[string]string{
 									v1.CapacityTypeLabelKey:  "spot",
 									corev1.LabelTopologyZone: "test-zone-1",
@@ -1357,7 +1365,8 @@ var _ = Describe("Instance Type Controller", func() {
 								Price: 1.020,
 							},
 							cloudprovider.Offering{
-								Available: true,
+								Available:  true,
+								Compatible: true,
 								Requirements: scheduling.NewLabelRequirements(map[string]string{
 									v1.CapacityTypeLabelKey:  "spot",
 									corev1.LabelTopologyZone: "test-zone-2",
@@ -1414,7 +1423,8 @@ var _ = Describe("Instance Type Controller", func() {
 					fake.NewInstanceType("default-instance-type",
 						fake.WithOfferings(
 							cloudprovider.Offering{
-								Available: true,
+								Available:  true,
+								Compatible: true,
 								Requirements: scheduling.NewLabelRequirements(map[string]string{
 									v1.CapacityTypeLabelKey:  "spot",
 									corev1.LabelTopologyZone: "test-zone-1",
@@ -1422,7 +1432,8 @@ var _ = Describe("Instance Type Controller", func() {
 								Price: 1.020,
 							},
 							cloudprovider.Offering{
-								Available: true,
+								Available:  true,
+								Compatible: true,
 								Requirements: scheduling.NewLabelRequirements(map[string]string{
 									v1.CapacityTypeLabelKey:  "on-demand",
 									corev1.LabelTopologyZone: "test-zone-2",
@@ -1430,7 +1441,8 @@ var _ = Describe("Instance Type Controller", func() {
 								Price: 2.020,
 							},
 							cloudprovider.Offering{
-								Available: true,
+								Available:  true,
+								Compatible: true,
 								Requirements: scheduling.NewLabelRequirements(map[string]string{
 									v1.CapacityTypeLabelKey:  "reserved",
 									corev1.LabelTopologyZone: "test-zone-4",
@@ -1520,7 +1532,8 @@ var _ = Describe("Instance Type Controller", func() {
 					fake.NewInstanceType("default-instance-type",
 						fake.WithOfferings(
 							cloudprovider.Offering{
-								Available: true,
+								Available:  true,
+								Compatible: true,
 								Requirements: scheduling.NewLabelRequirements(map[string]string{
 									v1.CapacityTypeLabelKey:  "spot",
 									corev1.LabelTopologyZone: "test-zone-1",
@@ -1528,7 +1541,8 @@ var _ = Describe("Instance Type Controller", func() {
 								Price: 1.020,
 							},
 							cloudprovider.Offering{
-								Available: true,
+								Available:  true,
+								Compatible: true,
 								Requirements: scheduling.NewLabelRequirements(map[string]string{
 									v1.CapacityTypeLabelKey:  "on-demand",
 									corev1.LabelTopologyZone: "test-zone-2",
@@ -1536,7 +1550,8 @@ var _ = Describe("Instance Type Controller", func() {
 								Price: 2.020,
 							},
 							cloudprovider.Offering{
-								Available: true,
+								Available:  true,
+								Compatible: true,
 								Requirements: scheduling.NewLabelRequirements(map[string]string{
 									v1.CapacityTypeLabelKey:  "reserved",
 									corev1.LabelTopologyZone: "test-zone-4",
@@ -2027,7 +2042,8 @@ var _ = Describe("Instance Type Controller", func() {
 			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{
 				fake.NewInstanceType("default-instance-type-zone-one",
 					fake.WithOfferings(cloudprovider.Offering{
-						Available: true,
+						Available:  true,
+						Compatible: true,
 						Requirements: scheduling.NewLabelRequirements(map[string]string{
 							v1.CapacityTypeLabelKey:  "spot",
 							corev1.LabelTopologyZone: "test-zone-1",
@@ -2037,7 +2053,8 @@ var _ = Describe("Instance Type Controller", func() {
 				),
 				fake.NewInstanceType("default-instance-type-zone-two",
 					fake.WithOfferings(cloudprovider.Offering{
-						Available: true,
+						Available:  true,
+						Compatible: true,
 						Requirements: scheduling.NewLabelRequirements(map[string]string{
 							v1.CapacityTypeLabelKey:  "on-demand",
 							corev1.LabelTopologyZone: "test-zone-2",
@@ -2047,7 +2064,8 @@ var _ = Describe("Instance Type Controller", func() {
 				),
 				fake.NewInstanceType("default-instance-type-zone-four",
 					fake.WithOfferings(cloudprovider.Offering{
-						Available: true,
+						Available:  true,
+						Compatible: true,
 						Requirements: scheduling.NewLabelRequirements(map[string]string{
 							v1.CapacityTypeLabelKey:  "reserved",
 							corev1.LabelTopologyZone: "test-zone-4",
@@ -2122,7 +2140,8 @@ var _ = Describe("Instance Type Controller", func() {
 			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{
 				fake.NewInstanceType("default-instance-type-zone-one",
 					fake.WithOfferings(cloudprovider.Offering{
-						Available: true,
+						Available:  true,
+						Compatible: true,
 						Requirements: scheduling.NewLabelRequirements(map[string]string{
 							v1.CapacityTypeLabelKey:  "spot",
 							corev1.LabelTopologyZone: "test-zone-1",
@@ -2186,7 +2205,8 @@ var _ = Describe("Instance Type Controller", func() {
 			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{
 				fake.NewInstanceType("default-instance-type-zone-one",
 					fake.WithOfferings(cloudprovider.Offering{
-						Available: true,
+						Available:  true,
+						Compatible: true,
 						Requirements: scheduling.NewLabelRequirements(map[string]string{
 							v1.CapacityTypeLabelKey:  "spot",
 							corev1.LabelTopologyZone: "test-zone-1",
@@ -2196,7 +2216,8 @@ var _ = Describe("Instance Type Controller", func() {
 				),
 				fake.NewInstanceType("default-instance-type-zone-two",
 					fake.WithOfferings(cloudprovider.Offering{
-						Available: true,
+						Available:  true,
+						Compatible: true,
 						Requirements: scheduling.NewLabelRequirements(map[string]string{
 							v1.CapacityTypeLabelKey:  "on-demand",
 							corev1.LabelTopologyZone: "test-zone-2",
@@ -2206,7 +2227,8 @@ var _ = Describe("Instance Type Controller", func() {
 				),
 				fake.NewInstanceType("default-instance-type-zone-four",
 					fake.WithOfferings(cloudprovider.Offering{
-						Available: true,
+						Available:  true,
+						Compatible: true,
 						Requirements: scheduling.NewLabelRequirements(map[string]string{
 							v1.CapacityTypeLabelKey:  "reserved",
 							corev1.LabelTopologyZone: "test-zone-4",

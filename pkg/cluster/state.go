@@ -97,6 +97,8 @@ type State struct {
 	// Registrations is the handle of the launch outcomes recorded on NodePools, for the NodeClaim lifecycle controller,
 	// their one writer.
 	Registrations *Registrations
+	// DriftBackoffs is the handle of the drift back-off on NodePools, for disruption, its one writer.
+	DriftBackoffs *DriftBackoffs
 
 	// stores are every store New built, which Close closes.
 	stores []interface{ Close() }
@@ -209,6 +211,7 @@ func New(ctx context.Context, clk clock.Clock, kubeClient client.Client, cloudPr
 		BufferPods:               newBufferPods(nodeClaims),
 		PodScheduling:            newPodScheduling(clk, pods),
 		Registrations:            newRegistrations(nodePools),
+		DriftBackoffs:            newDriftBackoffs(clk, nodePools),
 		stores: []interface{ Close() }{nodeClaims.store, nodes.store, pods.store, csiNodes.store, pvcs.store, clusters.store,
 			nodePools.store, quotaState.quotas, quotaState.pending, cost.offerings, cost.prices},
 	}

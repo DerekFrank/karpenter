@@ -161,9 +161,9 @@ func NewMethods(ctx context.Context, clk clock.Clock, cluster Stores, nodePools 
 		// Delete empty nodes across all consolidation policies (WhenEmpty, WhenEmptyOrUnderutilized, Balanced).
 		NewEmptiness(c),
 		// Terminate and create replacement for drifted NodeClaims in Static NodePool
-		NewStaticDrift(nodePools, provisioner, cp, recorder),
+		NewStaticDrift(nodePools, provisioner, cp, recorder, queue.backoff),
 		// Terminate any NodeClaims that have drifted from provisioning specifications, allowing the pods to reschedule.
-		NewDrift(kubeClient, provisioner, recorder, clk),
+		NewDrift(kubeClient, provisioner, recorder, clk, queue.backoff),
 		// Attempt to identify multiple NodeClaims that we can consolidate simultaneously to reduce pod churn
 		NewMultiNodeConsolidation(c),
 		// And finally fall back our single NodeClaim consolidation to further reduce cluster cost.
@@ -188,6 +188,8 @@ func (c *Controller) Name() string {
 //   - a managed NodePool's spec changing, through its generation.
 //   - the NodeClaim store's UnlaunchedSource: a NodeClaim launching, which can end the wait on NodeClaimsLaunched. It
 //     doesn't count as a change for consolidation, since a launch also changes the NodeClaim's inputs.
+//   - the NodePool store, narrowed to each NodePool's drift back-off window: a window arming, or lapsing, which makes
+//     the NodePool's drifted nodes candidates again. It doesn't count as a change for consolidation.
 //
 // The controller runs every revalidationPeriod, polling the inputs it names.
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
@@ -209,7 +211,6 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 		Complete(singleton.AsReconciler(c))
 }
 
-//nolint:gocyclo
 func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
 
@@ -252,6 +253,8 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return reconciler.Result{}, nil
 	}
 
+	resetUndriftedNodePoolBackoffs(ctx, c.queue.backoff)
+
 	// Attempt different disruption methods. We'll only let one method perform an action
 	for _, m := range c.methods {
 		c.recordRun(fmt.Sprintf("%T", m))
@@ -260,7 +263,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 			if errors.IsConflict(err) {
 				return reconciler.Result{Requeue: true}, nil
 			}
-			return reconciler.Result{}, serrors.Wrap(fmt.Errorf("disrupting, %w", err), strings.ToLower(string(m.Reason())), "reason")
+			return reconciler.Result{}, serrors.Wrap(fmt.Errorf("disrupting, %w", err), "reason", strings.ToLower(string(m.Reason())))
 		}
 		if success {
 			return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil //storelint:deadline the singleton runs again at once after a command

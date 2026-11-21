@@ -42,14 +42,16 @@ type StaticDrift struct {
 	provisioner   *provisioning.Provisioner
 	cloudprovider cloudprovider.CloudProvider
 	recorder      events.Recorder
+	backoff       *DriftBackoff
 }
 
-func NewStaticDrift(nodePools *karpentercluster.NodePoolState, provisioner *provisioning.Provisioner, cloudprovider cloudprovider.CloudProvider, recorder events.Recorder) *StaticDrift {
+func NewStaticDrift(nodePools *karpentercluster.NodePoolState, provisioner *provisioning.Provisioner, cloudprovider cloudprovider.CloudProvider, recorder events.Recorder, backoff *DriftBackoff) *StaticDrift {
 	return &StaticDrift{
 		nodePools:     nodePools,
 		provisioner:   provisioner,
 		cloudprovider: cloudprovider,
 		recorder:      recorder,
+		backoff:       backoff,
 	}
 }
 
@@ -63,12 +65,15 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 	candidatesByNodePool := lo.GroupBy(candidates, func(candidate *Candidate) string {
 		return candidate.NodePool.Name
 	})
-
+	initDriftBackoffMetrics(ctx, d.backoff, lo.Keys(candidatesByNodePool)...)
 	var cmds []Command
 	for npName, npCandidates := range candidatesByNodePool {
 		np := npCandidates[0].NodePool
 
 		if disruptionBudgetMapping[npName] == 0 {
+			continue
+		}
+		if isDriftBackedOff(ctx, d.backoff, d.recorder, np) {
 			continue
 		}
 

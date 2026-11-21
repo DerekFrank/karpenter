@@ -20,6 +20,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -43,6 +44,7 @@ var nodePoolController *nodepool.Controller
 var ctx context.Context
 var env *test.Environment
 var cp *fake.CloudProvider
+var cs karpentercluster.State
 
 func TestAPIs(t *testing.T) {
 	ctx = TestContextWithLogger(t)
@@ -56,9 +58,9 @@ var _ = BeforeSuite(func() {
 })
 
 var _ = BeforeEach(func() {
-	cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cp)
+	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cp)
 	DeferCleanup(cs.Close)
-	nodePoolController = nodepool.NewController(cs.NodePoolState, cp, cs.Cost)
+	nodePoolController = nodepool.NewController(env.Clock, cs.NodePoolState, cp, cs.Cost)
 	Expect(nodePoolController.Register(ctx, nil)).To(Succeed())
 	DeferCleanup(func() { crmetrics.Registry.Unregister(nodePoolController.Collector()) })
 })
@@ -168,5 +170,58 @@ var _ = Describe("Metrics", func() {
 			})
 			Expect(found).To(BeFalse())
 		}
+	})
+	Context("drift backoff metric", func() {
+		const metricName = "karpenter_nodepools_drift_backoff_seconds"
+		// backOff arms the NodePool's drift back-off window for a minute, as disruption does after a failed drift.
+		backOff := func() {
+			GinkgoHelper()
+			now := env.Clock.Now()
+			Expect(cs.DriftBackoffs.BackOff(nodePool.Name, karpentercluster.DriftBackoff{Level: 1, LastFailure: now}, now.Add(time.Minute))).To(BeTrue())
+		}
+		expectRemaining := func(seconds float64) {
+			GinkgoHelper()
+			m, found := FindMetricWithLabelValues(metricName, map[string]string{metrics.NodePoolLabel: nodePool.Name})
+			Expect(found).To(BeTrue())
+			Expect(m.GetGauge().GetValue()).To(BeNumerically("~", seconds))
+		}
+		expectAbsent := func() {
+			GinkgoHelper()
+			_, found := FindMetricWithLabelValues(metricName, map[string]string{metrics.NodePoolLabel: nodePool.Name})
+			Expect(found).To(BeFalse())
+		}
+
+		It("should publish the remaining backoff and update it over time", func() {
+			ExpectApplied(ctx, env.Client, nodePool)
+			backOff()
+			expectRemaining(60)
+
+			env.Clock.Step(15 * time.Second)
+			expectRemaining(45)
+		})
+		It("should delete the metric when backoff is reset", func() {
+			ExpectApplied(ctx, env.Client, nodePool)
+			backOff()
+			expectRemaining(60)
+
+			cs.DriftBackoffs.Reset(nodePool.Name)
+			expectAbsent()
+		})
+		It("should delete the metric when the backoff window expires", func() {
+			ExpectApplied(ctx, env.Client, nodePool)
+			backOff()
+			expectRemaining(60)
+
+			env.Clock.Step(time.Minute + time.Second)
+			expectAbsent()
+		})
+		It("should delete the metric when the NodePool is deleted", func() {
+			ExpectApplied(ctx, env.Client, nodePool)
+			backOff()
+			expectRemaining(60)
+
+			ExpectDeleted(ctx, env.Client, nodePool)
+			expectAbsent()
+		})
 	})
 })

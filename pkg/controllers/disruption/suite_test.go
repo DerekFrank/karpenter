@@ -36,6 +36,7 @@ import (
 
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
 
+	"github.com/awslabs/operatorpkg/status"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -87,6 +88,9 @@ var queue *disruption.Queue
 // validationClock is the real validators' view of env.Clock, fresh each spec, which counts only what validation waits
 // on, not cluster state's lapse and expiry timers.
 var validationClock *test.ClockView
+
+// driftBackoff is the NodePools' drift back-off the queue and the drift methods share, fresh each spec.
+var driftBackoff *disruption.DriftBackoff
 var allKnownDisruptionReasons []v1.DisruptionReason
 
 var onDemandInstances []*cloudprovider.InstanceType
@@ -154,10 +158,12 @@ var _ = BeforeEach(func() {
 	Expect(store.RegisterTargetKinds(ctx, &informertest.FakeInformers{Scheme: metaScheme}, prediction.SupportedTargets.UnsortedList()...)).To(Succeed())
 	prov = provisioning.NewProvisioner(env.Overlay, recorder, cloudProvider, provisioning.StoresOf(cluster), cs.NodePoolState, cs.CapacityQuotaState, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Overlay), store, cs.Nomination, cs.BufferPods, cs.PodScheduling)
 
-	// Ensure that we reset the disruption controller's methods after each test run
-	disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, stores, cs.NodePoolState, queue, clusterCost, disruption.WithMethods(NewMethodsWithNopValidator()...))
+	// Build the queue, and the drift back-off it shares with the Drift methods, before the controller, whose methods
+	// take the queue's back-off.
 	env.Clock.SetTime(time.Now())
-	*queue = lo.FromPtr(disruption.NewQueue(env.Overlay, recorder, cluster.NodeClaims, env.Clock, prov, cs.Deletion))
+	driftBackoff = disruption.NewDriftBackoff(env.Clock, cs.NodePoolState, cs.DriftBackoffs)
+	*queue = lo.FromPtr(disruption.NewQueue(env.Overlay, recorder, cluster.NodeClaims, env.Clock, prov, cs.Deletion, driftBackoff))
+	disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, stores, cs.NodePoolState, queue, clusterCost, disruption.WithMethods(NewMethodsWithNopValidator()...))
 
 	// Reset Feature Flags to test defaults
 	ctx = options.ToContext(ctx, test.Options())
@@ -491,7 +497,7 @@ var _ = Describe("Simulate Scheduling", func() {
 		defer hangCreateClient.Stop()
 
 		p := provisioning.NewProvisioner(hangCreateClient, recorder, cloudProvider, provisioning.StoresOf(cluster), cs.NodePoolState, cs.CapacityQuotaState, env.Clock, deviceallocation.NewController(hangCreateClient), virtualpods.NewVirtualPodCache(hangCreateClient), store, cs.Nomination, cs.BufferPods, cs.PodScheduling)
-		q := disruption.NewQueue(hangCreateClient, recorder, cluster.NodeClaims, env.Clock, p, cs.Deletion)
+		q := disruption.NewQueue(hangCreateClient, recorder, cluster.NodeClaims, env.Clock, p, cs.Deletion, driftBackoff)
 		dc := disruption.NewController(ctx, env.Clock, hangCreateClient, p, cloudProvider, recorder, stores, cs.NodePoolState, q, clusterCost)
 
 		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
@@ -562,6 +568,7 @@ var _ = Describe("Disruption Taints", func() {
 		currentInstance := fake.NewInstanceType("current-on-demand",
 			fake.WithOfferings(cloudprovider.Offering{
 				Available:    false,
+				Compatible:   true,
 				Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"}),
 				Price:        1.5,
 			}),
@@ -570,16 +577,19 @@ var _ = Describe("Disruption Taints", func() {
 			fake.WithOfferings(
 				cloudprovider.Offering{
 					Available:    true,
+					Compatible:   true,
 					Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeSpot, corev1.LabelTopologyZone: "test-zone-1a"}),
 					Price:        1.0,
 				},
 				cloudprovider.Offering{
 					Available:    true,
+					Compatible:   true,
 					Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeSpot, corev1.LabelTopologyZone: "test-zone-1b"}),
 					Price:        0.2,
 				},
 				cloudprovider.Offering{
 					Available:    true,
+					Compatible:   true,
 					Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeSpot, corev1.LabelTopologyZone: "test-zone-1c"}),
 					Price:        0.4,
 				},
@@ -840,7 +850,7 @@ var _ = Describe("BuildDisruptionBudgetMapping", func() {
 		}
 	})
 	It("should not consider not ready nodes for the Unhealthy repair budget", func() {
-		nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "100%"}}
+		nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "100%", Reasons: []v1.DisruptionReason{v1.DisruptionReasonUnhealthy, v1.DisruptionReasonDrifted}}}
 		ExpectApplied(ctx, env.Client, nodePool)
 
 		ExpectMakeNodesNotReady(ctx, env.Client, env.Clock, nodes[0], nodes[1])
@@ -856,7 +866,7 @@ var _ = Describe("BuildDisruptionBudgetMapping", func() {
 		Expect(budgets[nodePool.Name]).To(Equal(8))
 	})
 	It("should still consider marked-for-deletion nodes for the Unhealthy repair budget", func() {
-		nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "100%"}}
+		nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "100%", Reasons: []v1.DisruptionReason{v1.DisruptionReasonUnhealthy}}}
 		ExpectApplied(ctx, env.Client, nodePool)
 
 		// An in-flight repair marks its candidate for deletion; those must still count so repair paces itself.
@@ -889,6 +899,53 @@ var _ = Describe("BuildDisruptionBudgetMapping", func() {
 			Expect(err).To(Succeed())
 			Expect(budgets[nodePool.Name]).To(Equal(8))
 		}
+	})
+	Context("after a successful reboot", func() {
+		// markRebootSucceeded leaves nodeClaims[0] where the reboot controller does on success: Rebooting=False with
+		// RebootSucceeded, and initialization, reset at issuance, waiting to re-run.
+		markRebootSucceeded := func() {
+			nodeClaims[0].StatusConditions(status.WithClock(env.Clock)).SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "node rebooted and rejoined the cluster")
+			nodeClaims[0].StatusConditions(status.WithClock(env.Clock)).SetUnknownWithReason(v1.ConditionTypeInitialized, v1.RebootReasonRebooting, "node is rebooting")
+			ExpectApplied(ctx, env.Client, nodeClaims[0])
+			delete(nodes[0].Labels, v1.NodeInitializedLabelKey)
+			ExpectApplied(ctx, env.Client, nodes[0])
+		}
+		// reinitialize re-runs initialization on nodes[0], as the NodeClaim lifecycle controller does.
+		reinitialize := func() {
+			nodeClaims[0].StatusConditions(status.WithClock(env.Clock)).SetTrue(v1.ConditionTypeInitialized)
+			ExpectApplied(ctx, env.Client, nodeClaims[0])
+			nodes[0].Labels[v1.NodeInitializedLabelKey] = "true"
+			ExpectApplied(ctx, env.Client, nodes[0])
+		}
+		expectStats := func(total, disrupting int) {
+			GinkgoHelper()
+			for _, reason := range allKnownDisruptionReasons {
+				numNodes, numDisrupting := disruption.NodePoolStats(cs.NodePoolState, nodePool.Name, reason)
+				Expect(numNodes).To(Equal(total), "reason %s", reason)
+				Expect(numDisrupting).To(Equal(disrupting), "reason %s", reason)
+			}
+		}
+		It("should count a rebooted node that hasn't re-initialized in the total and as disrupting for all reasons", func() {
+			markRebootSucceeded()
+			expectStats(10, 1)
+		})
+		It("should keep counting a rebooted node as disrupting for as long as it stays uninitialized", func() {
+			markRebootSucceeded()
+			env.Clock.Step(24 * time.Hour)
+			expectStats(10, 1)
+		})
+		It("should count a rebooted node normally once it re-initializes", func() {
+			markRebootSucceeded()
+			reinitialize()
+			expectStats(10, 0)
+		})
+		It("should not count an uninitialized node that never rebooted", func() {
+			nodeClaims[0].StatusConditions(status.WithClock(env.Clock)).SetUnknownWithReason(v1.ConditionTypeInitialized, "NodeNotReady", "Node status is NotReady")
+			ExpectApplied(ctx, env.Client, nodeClaims[0])
+			delete(nodes[0].Labels, v1.NodeInitializedLabelKey)
+			ExpectApplied(ctx, env.Client, nodes[0])
+			expectStats(9, 0)
+		})
 	})
 })
 
@@ -2009,7 +2066,7 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 		Expect(launchedNodeClaims()).To(HaveLen(1))
-		cmd := &disruption.Command{Method: disruption.NewDrift(env.Overlay, prov, recorder, env.Clock), Results: pscheduling.Results{}, Candidates: []*disruption.Candidate{disruption.NewTestCandidate(launchedNodeClaims()[0], nodePool)}, Replacements: nil}
+		cmd := &disruption.Command{Method: disruption.NewDrift(env.Overlay, prov, recorder, env.Clock, driftBackoff), Results: pscheduling.Results{}, Candidates: []*disruption.Candidate{disruption.NewTestCandidate(launchedNodeClaims()[0], nodePool)}, Replacements: nil}
 		Expect(queue.StartCommand(ctx, cmd))
 
 		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, launchedNodeClaims()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
@@ -2404,6 +2461,12 @@ func expectPriced() {
 	for i := range nodePools.Items {
 		ExpectReconcileSucceeded(ctx, pricingController, client.ObjectKeyFromObject(&nodePools.Items[i]))
 	}
+}
+
+// driftBackedOff returns whether the NodePool's drift back-off window holds now.
+func driftBackedOff(nodePool *v1.NodePool) bool {
+	_, _, backedOff := driftBackoff.Get(nodePool)
+	return backedOff
 }
 
 // launchedNodeClaims returns the entries of the launched NodeClaims, the nodes disruption considers, with cluster

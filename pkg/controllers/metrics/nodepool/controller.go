@@ -24,6 +24,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -73,17 +74,29 @@ var (
 		[]opmetrics.Label{metrics.NodePool},
 		opmetrics.Alpha,
 	)
+	DriftBackoffSeconds = metrics.NewCollectedGauge(
+		prometheus.GaugeOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: metrics.NodePoolSubsystem,
+			Name:      "drift_backoff_seconds",
+			Help:      "Seconds remaining in the current drift replacement back-off window for a NodePool. The series is present only while the NodePool is backed off and is removed once it becomes eligible again (absent == not backing off). Labeled by NodePool.",
+		},
+		[]opmetrics.Label{metrics.NodePool},
+		opmetrics.Alpha,
+	)
 )
 
 type Controller struct {
 	nodePools     *karpentercluster.NodePoolState
 	cloudProvider cloudprovider.CloudProvider
 	clusterCost   *karpentercluster.ClusterCost
+	clock         clock.Clock
 }
 
-// NewController returns the NodePool metrics, which read cluster state's NodePools and their cost at scrape time.
-func NewController(nodePools *karpentercluster.NodePoolState, cloudProvider cloudprovider.CloudProvider, clusterCost *karpentercluster.ClusterCost) *Controller {
-	return &Controller{nodePools: nodePools, cloudProvider: cloudProvider, clusterCost: clusterCost}
+// NewController returns the NodePool metrics, which read cluster state's NodePools and their cost at scrape time, as
+// of clk.
+func NewController(clk clock.Clock, nodePools *karpentercluster.NodePoolState, cloudProvider cloudprovider.CloudProvider, clusterCost *karpentercluster.ClusterCost) *Controller {
+	return &Controller{nodePools: nodePools, cloudProvider: cloudProvider, clusterCost: clusterCost, clock: clk}
 }
 
 func (c *Controller) Name() string {
@@ -97,17 +110,22 @@ func (c *Controller) Register(_ context.Context, _ manager.Manager) error {
 
 // collector builds the NodePool gauges at scrape time, once the NodePool store is synced.
 func (c *Controller) collector() *metrics.Collector {
-	return metrics.NewCollector(c.nodePools.Synced, c.collect, Limit, Usage, ClusterCost)
+	return metrics.NewCollector(c.nodePools.Synced, c.collect, Limit, Usage, ClusterCost, DriftBackoffSeconds)
 }
 
-// collect emits each managed NodePool's limits, usage and cost. It reads the store's NodePools, copying none.
+// collect emits each managed NodePool's limits, usage and cost, and the time left in its drift back-off window while
+// the window holds. It reads the store's NodePools, copying none.
 func (c *Controller) collect(emit metrics.Emit) {
+	now := c.clock.Now()
 	for _, e := range c.nodePools.List(client.UnsafeDisableDeepCopy) {
 		nodePool := e.Object
 		if !nodepoolutils.IsManaged(nodePool, c.cloudProvider) {
 			continue
 		}
 		emit.Gauge(ClusterCost, c.clusterCost.GetNodepoolCost(nodePool), nodePool.Name)
+		if _, until, backedOff := karpentercluster.DriftBackoffAt(e, now); backedOff {
+			emit.Gauge(DriftBackoffSeconds, until.Sub(now).Seconds(), nodePool.Name)
+		}
 		for _, g := range []struct {
 			gauge     *metrics.CollectedGauge
 			resources corev1.ResourceList

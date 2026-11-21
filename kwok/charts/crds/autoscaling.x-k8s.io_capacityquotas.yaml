@@ -52,7 +52,7 @@ spec:
             description: spec defines the desired state of CapacityQuota
             properties:
               limits:
-                description: Limits define quota limits.
+                description: limits define quota limits.
                 properties:
                   resources:
                     additionalProperties:
@@ -62,7 +62,7 @@ spec:
                       pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                       x-kubernetes-int-or-string: true
                     description: |-
-                      Resources define resource limits of this quota.
+                      resources define resource limits of this quota.
 
                       Currently supported built-in resources: cpu, memory. Additionally,
                       nodes key can be used to limit the number of existing nodes.
@@ -84,7 +84,7 @@ spec:
                 type: object
               selector:
                 description: |-
-                  Selector is a label selector selecting the nodes to which the quota applies.
+                  selector is a label selector selecting the nodes to which the quota applies.
                   Empty or nil selector matches all nodes.
                 properties:
                   matchExpressions:
@@ -137,7 +137,7 @@ spec:
             description: status defines the observed state of CapacityQuota
             properties:
               conditions:
-                description: Conditions provide a standard mechanism for reporting
+                description: conditions provide a standard mechanism for reporting
                   the quota's state.
                 items:
                   description: Condition contains details for one aspect of the current
@@ -198,12 +198,12 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               observedGeneration:
-                description: ObservedGeneration is the last generation observed by
+                description: observedGeneration is the last generation observed by
                   the controller.
                 format: int64
                 type: integer
               used:
-                description: Used shows the current usage of the quota.
+                description: used shows the current usage of the quota.
                 properties:
                   resources:
                     additionalProperties:
@@ -212,7 +212,7 @@ spec:
                       - type: string
                       pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                       x-kubernetes-int-or-string: true
-                    description: Resources shows the current usage of the resources
+                    description: resources shows the current usage of the resources
                       defined in the quota limits.
                     type: object
                 required:

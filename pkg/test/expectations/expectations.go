@@ -350,7 +350,7 @@ func ExpectFinalizersRemoved(ctx context.Context, c client.Client, objs ...clien
 func ExpectProvisioned(ctx context.Context, c client.Client, cloudProvider cloudprovider.CloudProvider, provisioner *provisioning.Provisioner, pods ...*corev1.Pod) ProvisioningResult {
 	GinkgoHelper()
 	result := ExpectProvisionedNoBinding(ctx, c, cloudProvider, provisioner, pods...)
-	podKeys := sets.NewString(lo.Map(pods, func(p *corev1.Pod, _ int) string { return client.ObjectKeyFromObject(p).String() })...)
+	podKeys := sets.New[string](lo.Map(pods, func(p *corev1.Pod, _ int) string { return client.ObjectKeyFromObject(p).String() })...)
 	for pod, binding := range result.Bindings {
 		// Only bind the pods that are passed through
 		if podKeys.Has(client.ObjectKeyFromObject(pod).String()) {
@@ -392,7 +392,30 @@ func ExpectPVCDriversResolved(ctx context.Context, c client.Client, pvcs *karpen
 	}
 }
 
-//nolint:gocyclo
+// ExpectProvisionedNoNode schedules the pods and creates and launches each new NodeClaim, without registering a Node
+// for it, so the NodeClaims stay in flight.
+func ExpectProvisionedNoNode(ctx context.Context, c client.Client, cloudProvider cloudprovider.CloudProvider, provisioner *provisioning.Provisioner, pods ...*corev1.Pod) []*v1.NodeClaim {
+	GinkgoHelper()
+	for _, pod := range pods {
+		ExpectApplied(ctx, c, pod)
+	}
+	results, err := provisioner.Schedule(ctx)
+	Expect(err).ToNot(HaveOccurred())
+
+	var nodeClaims []*v1.NodeClaim
+	for _, m := range results.NewNodeClaims {
+		// CreateNodeClaims binds or releases the NodeClaim's reservations, as the provisioner does.
+		nodeClaimNames, err := provisioner.CreateNodeClaims(ctx, []*scheduling.NodeClaim{m}, provisioning.WithReason(metrics.ProvisionedReason))
+		Expect(err).ToNot(HaveOccurred())
+		nodeClaim := &v1.NodeClaim{}
+		Expect(c.Get(ctx, types.NamespacedName{Name: nodeClaimNames[0]}, nodeClaim)).To(Succeed())
+		nodeClaim, err = ExpectNodeClaimDeployedNoNode(ctx, c, cloudProvider, nodeClaim)
+		Expect(err).ToNot(HaveOccurred())
+		nodeClaims = append(nodeClaims, nodeClaim)
+	}
+	return nodeClaims
+}
+
 func ExpectProvisionedNoBinding(ctx context.Context, c client.Client, cloudProvider cloudprovider.CloudProvider, provisioner *provisioning.Provisioner, pods ...*corev1.Pod) ProvisioningResult {
 	GinkgoHelper()
 	// Persist objects
@@ -508,14 +531,23 @@ func expectResourceSlicesCreated(ctx context.Context, c client.Client, cp cloudp
 		return it.Name == instanceTypeName
 	})
 	Expect(found).To(BeTrue(), "instance type %q not found in cloud provider", instanceTypeName)
-	if len(it.DynamicResources.ResourceSliceTemplates) == 0 {
+	// Only the sets the node was launched with are published: unscoped sets, and sets whose requirements the node's
+	// labels satisfy.
+	nodeReqs := pscheduling.NewLabelRequirements(node.Labels)
+	var templates []*cloudprovider.ResourceSliceTemplate
+	for _, dr := range it.DynamicResources {
+		if nodeReqs.IsCompatible(dr.Requirements) {
+			templates = append(templates, dr.ResourceSliceTemplates...)
+		}
+	}
+	if len(templates) == 0 {
 		return
 	}
 	Expect(node.UID).ToNot(BeEmpty(), "node %q has no UID, cannot create owner reference", node.Name)
 
 	// Group templates by driver to set ResourceSliceCount correctly
 	templatesByDriver := map[string][]*cloudprovider.ResourceSliceTemplate{}
-	for _, t := range it.DynamicResources.ResourceSliceTemplates {
+	for _, t := range templates {
 		templatesByDriver[t.Driver.Value()] = append(templatesByDriver[t.Driver.Value()], t)
 	}
 
@@ -636,8 +668,8 @@ func ExpectResourceClaimsProcessed(ctx context.Context, c client.Client, pod *co
 // round that relies on the in-cluster allocated-device set.
 func ExpectDeviceAllocationReconciled(ctx context.Context, c client.Client, controller *deviceallocation.Controller) {
 	GinkgoHelper()
-	// Hydrate is guarded by sync.Once internally, so calling it multiple times is safe.
-	controller.Hydrate(ctx)
+	// Hydrate is a no-op once hydrated, so calling it multiple times is safe.
+	Expect(controller.Hydrate(ctx)).To(Succeed())
 	// Reconcile every existing claim to pick up allocation-status changes committed by prior provisioning runs.
 	claimList := &resourcev1.ResourceClaimList{}
 	Expect(c.List(ctx, claimList)).To(Succeed())

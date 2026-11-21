@@ -324,7 +324,6 @@ func exactIndexedField(listOpts *client.ListOptions, indexers map[string]client.
 	return indexKey{}, false
 }
 
-//nolint:gocyclo
 func merge(items []runtime.Object, entries *pinnedEntries, matches func(client.Object) match) []runtime.Object {
 	merged := make([]runtime.Object, 0, len(items))
 	hit := map[types.NamespacedName]struct{}{}

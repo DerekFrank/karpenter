@@ -17,7 +17,10 @@ limitations under the License.
 package cluster
 
 import (
+	"github.com/awslabs/operatorpkg/status"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
@@ -26,12 +29,13 @@ import (
 // NodePoolDisruption counts a NodePool's nodes for its disruption budgets. Each NodeClaim's entry holds the Node its
 // owner reference links, so one source decides all three counts.
 type NodePoolDisruption struct {
-	// Nodes counts the NodePool's launched NodeClaims that are initialized (their Initialized condition is true) or
-	// rebooting, until the instance is terminating. A NodeClaim still initializing has no pods scheduled to it yet and
-	// counts toward no budget, so that a replacement doesn't round a percentage budget up.
+	// Nodes counts the NodePool's launched NodeClaims that are initialized (their Initialized condition is true),
+	// rebooting, or re-initializing after a reboot, until the instance is terminating. A NodeClaim still initializing
+	// has no pods scheduled to it yet and counts toward no budget, so that a replacement doesn't round a percentage
+	// budget up.
 	Nodes int
-	// Disrupting counts the NodeClaims among Nodes that are marked for deletion, deleting or rebooting, which every
-	// disruption budget subtracts.
+	// Disrupting counts the NodeClaims among Nodes that are marked for deletion, deleting, rebooting or
+	// re-initializing after a reboot, which every disruption budget subtracts.
 	Disrupting int
 	// NotReady counts the NodeClaims among Nodes that aren't Disrupting and whose linked Node isn't Ready or is missing,
 	// which every disruption budget but repair's subtracts.
@@ -43,21 +47,37 @@ func (n *NodePoolState) Disruption(nodePoolName string) NodePoolDisruption {
 	return n.Fields(nodePoolName).Disruption
 }
 
-// countsForDisruption returns whether a NodeClaim counts toward its NodePool's disruption budgets. A rebooting
-// NodeClaim counts until its reboot completes, though it's uninitialized meanwhile. A NodeClaim's instance is
-// terminating only once the node is drained and the cloud provider deleted it.
+// countsForDisruption returns whether a NodeClaim counts toward its NodePool's disruption budgets. A rebooted
+// NodeClaim counts until it re-initializes, though it's uninitialized from the reboot's issuance until then. A
+// NodeClaim's instance is terminating only once the node is drained and the cloud provider deleted it.
 func countsForDisruption(e NodeClaimEntry) bool {
 	if !Launched(e) || conditionTrue(e.Object, v1.ConditionTypeInstanceTerminating) {
 		return false
 	}
-	return conditionTrue(e.Object, v1.ConditionTypeInitialized) || rebooting(e.Object)
+	return conditionTrue(e.Object, v1.ConditionTypeInitialized) || rebootDisrupting(e.Object)
+}
+
+// rebootDisrupting returns whether a NodeClaim's reboot is still disrupting it: the reboot is in progress, or it
+// succeeded and the NodeClaim hasn't re-initialized since. The reboot resets initialization at issuance, and
+// initialization re-runs only after the reboot succeeds, so in between the node is neither rebooting nor serving.
+// This is unbounded: a NodeClaim whose initialization never completes after a reboot holds its NodePool's budget
+// until it initializes or is removed.
+func rebootDisrupting(nodeClaim *v1.NodeClaim) bool {
+	if rebooting(nodeClaim) {
+		return true
+	}
+	if conditionTrue(nodeClaim, v1.ConditionTypeInitialized) {
+		return false
+	}
+	cond, ok := lo.Find(nodeClaim.Status.Conditions, func(c status.Condition) bool { return c.Type == v1.ConditionTypeRebooting })
+	return ok && cond.Status == metav1.ConditionFalse && cond.Reason == v1.RebootReasonSucceeded
 }
 
 // nodeClaimDisruption returns a counted NodeClaim's contribution to its NodePool's disruption counts. A NodeClaim
 // without a linked Node reads as not Ready: an initialized NodeClaim's Node has registered, so it has the owner
 // reference that links it, and a missing one is gone.
 func nodeClaimDisruption(e NodeClaimEntry, node *corev1.Node) NodePoolDisruption {
-	if e.Intent.Deletion.Value || deleted(e.Object) || rebooting(e.Object) {
+	if e.Intent.Deletion.Value || deleted(e.Object) || rebootDisrupting(e.Object) {
 		return NodePoolDisruption{Nodes: 1, Disrupting: 1}
 	}
 	if node == nil || nodeutils.GetCondition(node, corev1.NodeReady).Status != corev1.ConditionTrue {
