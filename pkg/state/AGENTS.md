@@ -37,7 +37,7 @@ in `Derived`. See [Claims](#claims).
   file and one type per object or synthetic object: `nodeclaim.go`
   (`NodeClaims`, and the `Deletion`, `Nomination` and `BufferPods` handles),
   `node.go` (`Nodes`, `CSINodes`), `nodeusage.go` (the pod usage on a Node's
-  entry), `pod.go` (`Pods`), `pvc.go` (`PVCs`), `daemonset.go`
+  entry), `pod.go` (`Pods`), `pvc.go` (PVCs and their drivers), `daemonset.go`
   (`DaemonSets`), `cluster.go` (the synthetic `Cluster{}` and its counts),
   `nodepool.go` (`NodePoolState` and the `NodePools` accessor) and
   `capacityquota.go`. `nodestate.go` is the node accessor, which combines a
@@ -85,22 +85,21 @@ There are two kinds of store. They differ only in where the object comes from:
 - **A store's entries never change once stored.** A reader takes no lock and
   can keep what `Get` and `List` return. Every write takes the store's one
   lock, and notifies once the lock is released.
-- **Versions apply to object stores; a `Derive` commits only from its source's
-  current entry.** An object store orders an object's versions by
-  resourceVersion, below. A `Derive` computes a contribution from a source entry
-  without a lock, and commits it only if that entry is still the source store's
-  current one, by pointer, recomputing otherwise: a removed source has no
-  current entry, so a recompute from before the removal is refused and retried.
+- **A `Derive` commits only from its source's current entry.** It computes a
+  contribution from a source entry without a lock, and commits it only if that
+  entry is still the source store's current one, by pointer, recomputing
+  otherwise: a removed source has no current entry, so a recompute from before
+  the removal is refused and retried.
 - **An object store applies the newest version of an object on each
-  notification.** On every key its `Newest` notifies, from an informer event, a
-  write or a delete, it reads that object's newest version and holds it, or
+  notification.** On every key its source notifies, from an informer event, a
+  write or a delete, it reads that object's newest version and commits it, or
   drops the entry once it's gone, then reads again and repeats until what it
   read is what it committed, so a read from before a removal can't commit after
   it. `overlay.Source` returns the newer of the cache's object and the client's
   own write, and hides an object the client deleted until the informer's store
-  drops it. Within one object an older resourceVersion loses, and across UIDs
-  the older resourceVersion loses. A removed UID stays at infinity in the slot
-  while the source still holds it, so a stale read of it loses.
+  drops it. A newer resourceVersion wins, within one UID and across UIDs under
+  one name. A removed UID is kept in the store's `gone` set while the source
+  still holds it, so a stale read of it loses.
 - **Every kind a store follows is overlaid**, so notifications come only from
   the overlay, after it has updated. `cluster.Kinds` lists them, and the
   operator overlays them. An object store holds the informer's own objects, or
@@ -120,8 +119,8 @@ There are two kinds of store. They differ only in where the object comes from:
   new one.
 - **`Reader`** is a store's read-only handle: `Get`, `List`, `Subscribe`,
   `Synced`, `Source` and `SourceOn`. `pkg/cluster` exports Readers.
-- **`Synced`** is true once an object store's `Newest` has synced and it has
-  applied every key the `Newest` held then, and every `Derive` into a store has
+- **`Synced`** is true once an object store's source has synced and it has
+  applied every key the source held then, and every `Derive` into a store has
   applied its source. A fed or key-built store is synced from the start.
 - **`Subscribe(fn)`** calls `fn` with each `Change{Key, Old, New, Existed,
   Exists}` after the lock is released, and returns a func that stops it.
@@ -174,7 +173,7 @@ implements `state.Contribution[D, C]`:
   old key.
 
 **The zero key contributes to nothing**, such as a NodeClaim being deleted,
-which no longer counts against its NodePool. A singleton synthetic object
+which stops counting against its NodePool. A singleton synthetic object
 keys by a non-zero value, as `cluster.TheCluster` does.
 
 `Derive` applies `from`'s entries before it returns, so a `Derive` made after
@@ -453,8 +452,7 @@ op.WithControllers(ctx, controllers.NewControllers(ctx, mgr, ..., s, ...)...).St
   its `karpenter.sh/nodepool` label from kubelet registration, a provider
   contract, so it's neither unmanaged nor a second node: its NodeClaim's entry
   already represents it. Pods bound meanwhile count on the Node's entry and
-  join the NodeClaim's node once the owner reference lands. The providerID is
-  no store's key.
+  join the NodeClaim's node once the owner reference lands.
 - **The cluster-wide counts are the synthetic `Cluster{}` entry**, derived
   from the NodeClaim and Node stores.
 
@@ -510,7 +508,7 @@ Tests are Ginkgo specs, one `RunSpecs` suite per package.
 - Drive an object store through its source, then assert on the target's `Get`,
   as `store_test.go` does.
 - Cover moving between keys ("Derive should move contributions between keys"),
-  an older version arriving after a newer one ("LevelStore should keep the
+  an older version arriving after a newer one ("ObjectStore should keep the
   newer version when an older read commits late"), the dispatch ("Derive
   should dispatch Update and Delete"), `Derived` waiting for its object
   ("ObjectStore should hold Derived for a key until its object arrives"), and
