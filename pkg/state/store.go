@@ -86,14 +86,17 @@ type core[K comparable, O, D, I any] struct {
 	sources map[any]func() bool
 	// cleared drop what each Derive, Claims and expiring Intent of the store recorded, when a test clears the store.
 	cleared map[any]func()
+	// indexes are the store's indexes, kept under mu; indexByName holds them by name for Lookup, which takes no lock.
+	indexes     []*index[K, O, D, I]
+	indexByName sync.Map // string -> *index[K, O, D, I]
 }
 
-// Reader reads a store: Get, List, Subscribe, Synced, Source and SourceOn. pkg/cluster exports Readers, so that a
+// Reader reads a store: Get, List, Lookup, ListMatching, Subscribe, Synced, Source and SourceOn. pkg/cluster exports Readers, so that a
 // store's entries are written only by the writers the model names.
 type Reader[K comparable, O, D, I any] struct{ s *core[K, O, D, I] }
 
-// Store is a store and its writes: a fed store's Feed and FeedAll. A Derive's target, a Claims' and an intent handle's
-// take a Store, and TouchOn re-notifies one.
+// Store is a store and its writes: a fed store's Feed and FeedAll, and Index. A Derive's target, a Claims' and an intent
+// handle's take a Store, and TouchOn and DependsOn re-notify one.
 type Store[K comparable, O, D, I any] struct{ Reader[K, O, D, I] }
 
 func newCore[K comparable, O, D, I any](k kind, build func(K) O) *core[K, O, D, I] {
@@ -176,7 +179,8 @@ func (r Reader[K, O, D, I]) Synced() bool {
 // touch stores key's entry again in a new slot and notifies its subscribers, so that the Derives from the store
 // recompute key's contribution, for a contribution that reads another store's entry that changed, such as a
 // NodeClaim's, which reads its Node's. The new slot refuses the commit of a recompute that read the other store before
-// it changed, as a changed entry would. TouchOn is its one caller.
+// it changed, as a changed entry would. The entry is unchanged, so its index values are too. TouchOn and DependsOn are
+// its callers.
 func (s *Store[K, O, D, I]) touch(key K) {
 	c := s.s
 	c.mu.Lock()
@@ -219,6 +223,7 @@ func (s *Store[K, O, D, I]) Clear() {
 		return true
 	})
 	c.refs = map[K]int{}
+	c.clearIndexesLocked()
 	for _, clear := range c.cleared {
 		clear()
 	}
@@ -339,8 +344,12 @@ func (c *core[K, O, D, I]) intentLocked(key K, update func(I) I) bool {
 }
 
 // storeLocked stores next under key, or deletes the slot once its entry doesn't exist and nothing contributes to it,
-// and records the change of an entry that existed before or after.
+// and records the change of an entry that existed before or after. It indexes next before storing it, so a reader that
+// reads the new slot finds it in the indexes.
 func (c *core[K, O, D, I]) storeLocked(key K, cur, next *slot[O, D, I]) {
+	if cur.exists || next.exists {
+		c.indexLocked(key, next)
+	}
 	if next.exists || c.refs[key] != 0 || len(next.gone) != 0 {
 		c.slots.Store(key, next)
 	} else {

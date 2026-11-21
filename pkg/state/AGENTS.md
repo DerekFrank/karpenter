@@ -27,8 +27,8 @@ in `Derived`. See [Claims](#claims).
 
 - **`pkg/state`** holds the primitives, which know no object kinds: `Entry`,
   `Store` and `Reader` (`NewObjectStore`, `NewFedStore`, `NewSyntheticStore`), `Derive` and `DeriveObject` (`Derivation`,
-  `Contribution`, `Equaler`), `Intent` and `Intended`, `Claims`, `Accessor`,
-  `StoreAccessor`, `View`, and the sources `Reader.Source`, `Reader.SourceOn`,
+  `Contribution`, `Equaler`), `Store.Index` (`Reader.Lookup`, `Reader.ListMatching`), `DependsOn`, `TouchOn`,
+  `Intent` and `Intended`, `Claims`, `Accessor`, `StoreAccessor`, `View`, and the sources `Reader.Source`, `Reader.SourceOn`,
   `Requires`, `Wake`, `WakeCounting` and `After`.
 - **`pkg/state/statetest`** checks a `Contribution`'s laws in tests.
 - **`pkg/state/overlay`** holds `overlay.Client`, the read-after-write client:
@@ -117,8 +117,8 @@ There are two kinds of store. They differ only in where the object comes from:
   `FeedAll` makes `objects` the store's objects among the keys `in` accepts,
   such as one NodeClass's instance types, so a reader sees the old set or the
   new one.
-- **`Reader`** is a store's read-only handle: `Get`, `List`, `Subscribe`,
-  `Synced`, `Source` and `SourceOn`. `pkg/cluster` exports Readers.
+- **`Reader`** is a store's read-only handle: `Get`, `List`, `Lookup`,
+  `ListMatching`, `Subscribe`, `Synced`, `Source` and `SourceOn`. `pkg/cluster` exports Readers.
 - **`Synced`** is true once an object store's source has synced and it has
   applied every key the source held then, and every `Derive` into a store has
   applied its source. A fed or key-built store is synced from the start.
@@ -131,7 +131,29 @@ There are two kinds of store. They differ only in where the object comes from:
   storelint reports a `Clear` outside a test.
 - **`TouchOn(from, to, dependents)`** re-notifies `to`'s keys that `dependents`
   returns for each change of `from`, so the `Derive`s from `to` recompute.
-  It's the only way to touch a key: `touch` is internal to `pkg/state`.
+  `TouchOn` and `DependsOn` are the only ways to touch a key: `touch` is
+  internal to `pkg/state`.
+
+### Index
+
+- **`store.Index(name, values)`** indexes a store's entries by the strings
+  `values(k, entry)` returns, such as the pods by each PVC they mount, as
+  `"namespace/name"`. `values` runs under the store's lock on every change of
+  an entry, so it's pure and cheap, like a contribution; a value it returns
+  twice indexes the key once.
+- **Only entries that exist are indexed.** An entry that stops existing leaves
+  every value, and `Derived` waiting for its object is not indexed. `Index`
+  indexes the entries a store already holds before it returns, and `Clear`
+  empties the store's indexes with it.
+- **`reader.Lookup(name, value)`** returns the keys indexed under `value`, in
+  no particular order, without a lock: each value's keys are replaced, never
+  changed, on a write. `reader.ListMatching(name, value)` returns their
+  entries, as `List` served by the index.
+- **Index by a value that holds few keys**, such as a PVC or a NodeClaim. A
+  write that moves a key into or out of a value copies that value's keys, so
+  indexing many keys under one value, such as pods by namespace, makes every
+  create and delete under it cost the size of the value.
+- **A name indexed twice, or looked up without `Index`, panics.**
 
 ## Writers
 
@@ -207,8 +229,8 @@ binding to the Node, costs a comparison.
   unchanged contribution costs a comparison and nothing else.
 - **Fields are small, and none is a collection that grows with the cluster.**
   A map or slice field carries a `// bounded: <what bounds it>` comment, such
-  as "pods per node". To relate many objects to one key, use the key's
-  `Derive` sources, which are indexed in place, as
+  as "pods per node". To relate many objects to one key, index them by it with
+  `Index`, or use the key's `Derive` sources, which are indexed in place, as
   `NodePoolState.LaunchedNodes` and `StoreAccessor.IndexField` do.
 - **A join is a `Derive` onto an entry.** The Node a NodeClaim's owner
   reference links is the NodeClaim entry's `Derived.Node`, contributed from
@@ -233,6 +255,16 @@ request behind them.
   when a driver resolves (`pvc.go`). A NodeClaim's contribution to its
   NodePool's disruption counts reads its Node's entry, and a Node's change
   touches the NodeClaim its owner reference names.
+- **`DependsOn(target, dep, index)`** is that subscriber over an `Index`: the
+  source store `target` indexes its entries, with `Index`, by the keys of `dep`
+  they read, and on each change of `dep`'s entry under a key, including one that appears
+  or drops, `DependsOn` touches the keys of `target` that `target.Lookup(index,
+  key)` returns, so the `Derive`s from `target` recompute them. A `dep` key is
+  its string, or its `String()`, such as a `types.NamespacedName`'s
+  `"namespace/name"`; any other key type panics. The touch stores the entry in
+  a new slot, so a recompute that read `dep` before it changed is refused at
+  commit, and the one the touch triggers holds. It returns a func that stops
+  it.
 
 ## Intent
 

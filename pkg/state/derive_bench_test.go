@@ -19,6 +19,8 @@ package state
 import (
 	"fmt"
 	"testing"
+
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // BenchmarkDeriveOneKey changes the contribution of one of 1000 sources to one key, Derive's hot path.
@@ -39,5 +41,39 @@ func BenchmarkDeriveOneKey(b *testing.B) {
 	b.StopTimer()
 	if got := fields(s, "x").Count; got != len(versions) {
 		b.Fatalf("x counts %d, want %d", got, len(versions))
+	}
+}
+
+// BenchmarkFeedIndexed feeds one of 1000 pods a new object, with and without an index on its PVCs, the cost Index adds
+// to a write. With moved, each pod alternates between two PVCs, each mounted by 10 pods; without, it alternates between
+// two nodes and keeps its PVC.
+func BenchmarkFeedIndexed(b *testing.B) {
+	for _, c := range []struct{ indexed, moved bool }{{false, true}, {true, true}, {true, false}} {
+		indexed, moved := c.indexed, c.moved
+		b.Run(fmt.Sprintf("indexed=%t/moved=%t", indexed, moved), func(b *testing.B) {
+			pods := NewFedStore[types.NamespacedName, testPod, struct{}, struct{}]()
+			if indexed {
+				pods.Index(byPVC, pvcsOf)
+			}
+			names := make([]types.NamespacedName, 1000)
+			objects := [2][]testPod{make([]testPod, len(names)), make([]testPod, len(names))}
+			for i := range names {
+				names[i] = pod(fmt.Sprintf("p-%d", i))
+				for v := range objects {
+					if moved {
+						objects[v][i] = testPod{PVCs: []string{fmt.Sprintf("pvc-%d", (i+v*50)%100)}}
+					} else {
+						objects[v][i] = testPod{Node: fmt.Sprint(v), PVCs: []string{fmt.Sprintf("pvc-%d", i%100)}}
+					}
+				}
+				pods.Feed(names[i], objects[0][i])
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := range b.N {
+				n := i % len(names)
+				pods.Feed(names[n], objects[(i/len(names)+1)%2][n])
+			}
+		})
 	}
 }
