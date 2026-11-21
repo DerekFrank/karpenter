@@ -173,18 +173,22 @@ func (r Reader[K, O, D, I]) Synced() bool {
 	return true
 }
 
-// touch notifies key's subscribers without changing its entry, so that the Derives from the store recompute key's
-// contribution, for a contribution that reads another store's entry that changed, such as a NodeClaim's, which reads
-// its Node's. TouchOn is its one caller.
+// touch stores key's entry again in a new slot and notifies its subscribers, so that the Derives from the store
+// recompute key's contribution, for a contribution that reads another store's entry that changed, such as a
+// NodeClaim's, which reads its Node's. The new slot refuses the commit of a recompute that read the other store before
+// it changed, as a changed entry would. TouchOn is its one caller.
 func (s *Store[K, O, D, I]) touch(key K) {
-	e, ok := s.Get(key)
-	if !ok {
+	c := s.s
+	c.mu.Lock()
+	cur, ok := c.load(key)
+	if !ok || !cur.exists {
+		c.mu.Unlock()
 		return
 	}
-	s.s.mu.Lock()
-	subscribers := s.s.subscribers
-	s.s.mu.Unlock()
-	notify(subscribers, []Change[K, O, D, I]{{Key: key, Old: e, New: e, Existed: true, Exists: true}})
+	next := *cur
+	c.slots.Store(key, &next)
+	c.pending = append(c.pending, Change[K, O, D, I]{Key: key, Old: cur.entry, New: next.entry, Existed: true, Exists: true})
+	c.unlock()
 }
 
 // TouchOn re-notifies the keys of to that dependents returns for each change of from, so that the Derives from to

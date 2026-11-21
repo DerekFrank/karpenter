@@ -55,6 +55,26 @@ var _ = ginkgo.Describe("Derive commit-if-current", func() {
 		Expect(commit()).To(BeFalse(), "a commit from the removed entry, want it refused")
 		Expect(pooled(s)).To(BeEmpty(), "want the removal to hold")
 	})
+	ginkgo.It("should not commit a recompute that read a dependency from before the dependency changed", func() {
+		nodeClaims, pools := newNodeClaims(), newPools()
+		scale := NewFedStore[string, int64, struct{}, struct{}]()
+		scale.Feed("scale", 1)
+		d := Derive(nodeClaims.Reader, pools, poolOf, func(k types.NamespacedName, e nodeClaimEntry) usage {
+			u := usageOf(k, e)
+			f, _ := scale.Get("scale")
+			u.CPU *= f.Object
+			return u
+		})
+		TouchOn(scale.Reader, nodeClaims, func(Change[string, int64, struct{}, struct{}]) []types.NamespacedName {
+			return []types.NamespacedName{{Name: "a"}}
+		})
+		observe(nodeClaims, nodeClaim("a", "x", 1, "2"))
+		commit := staleRead(d, types.NamespacedName{Name: "a"})
+		scale.Feed("scale", 3)
+		Expect(pooled(pools)).To(Equal(map[string]poolFields{"x": {CPU: 6, Count: 1}}), "the recompute the dependency's change triggers")
+		Expect(commit()).To(BeFalse(), "a commit that read the dependency before it changed, want it refused")
+		Expect(pooled(pools)).To(Equal(map[string]poolFields{"x": {CPU: 6, Count: 1}}), "want the recompute from the new dependency to hold")
+	})
 	ginkgo.It("should apply a key that drops and reappears in a derived store, and refuse a recompute from before it dropped", func() {
 		nodeClaims, pools, _ := newStores()
 		totals := newPools()
