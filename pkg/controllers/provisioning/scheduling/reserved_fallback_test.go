@@ -203,7 +203,7 @@ var _ = Describe("Reserved Instance Types/Full-but-available (capacity-availabil
 		}}}})
 		ExpectApplied(ctx, env.Client, nodePool)
 
-		bindings := ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, smallPod())
+		bindings := ExpectProvisioned(ctx, env.Client, cloudProvider, prov, smallPod())
 		Expect(bindings.Bindings).To(HaveLen(1))
 		node := lo.Values(bindings.Bindings)[0].Node
 		Expect(node.Labels).To(HaveKeyWithValue(v1.CapacityTypeLabelKey, v1.CapacityTypeReserved))
@@ -334,7 +334,7 @@ var _ = Describe("Reserved Instance Types/Full-but-available (capacity-availabil
 			ExpectApplied(ctx, env.Client, nodePoolWith(10, "reserved-type", v1.CapacityTypeReserved, v1.CapacityTypeOnDemand))
 
 			pod := test.UnschedulablePod(podOpts(test.PodOptions{NodePreferences: preferReserved}))
-			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			ExpectProvisioned(ctx, env.Client, cloudProvider, prov, pod)
 			ExpectScheduled(ctx, env.Client, pod)
 		})
 		It("doesn't launch on-demand in a reserved-only NodePool", func() {

@@ -23,7 +23,6 @@ import (
 	"testing"
 	"time"
 
-	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/samber/lo"
@@ -37,18 +36,14 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	fakecp "sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
-	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
 	"sigs.k8s.io/karpenter/pkg/state/statetest"
 	"sigs.k8s.io/karpenter/pkg/test"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
-	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
-// The benchmarks compare one scrape of the node metrics built at scrape time with the work the polling controller did
-// for the same nodes: a Reconcile that rebuilt every series into a metrics.Store, which diffs against the previous set
-// and deletes stale series, plus the scrape of the gauge vectors it wrote. Run with
+// The benchmarks measure one scrape of the node metrics built at scrape time. Run with
 // go test ./pkg/controllers/metrics/node/ -run '^$' -bench . -benchmem
 
 func benchNodeState(b *testing.B, numNodes, podsPerNode int) karpentercluster.State {
@@ -132,145 +127,4 @@ func BenchmarkScrape(b *testing.B) {
 			b.ReportMetric(float64(series), "series")
 		})
 	}
-}
-
-// BenchmarkLegacyReconcile is one rebuild of the polling controller, as on ba93a61e: every series rebuilt into a
-// metrics.Store, which diffs it against the previous set. It ran up to every 5s while nodes changed.
-func BenchmarkLegacyReconcile(b *testing.B) {
-	for _, size := range benchSizes {
-		b.Run(fmt.Sprintf("nodes=%d", size.nodes), func(b *testing.B) {
-			l := newLegacy(benchNodeState(b, size.nodes, size.pods))
-			l.reconcile()
-			b.ResetTimer()
-			for range b.N {
-				l.reconcile()
-			}
-		})
-	}
-}
-
-// BenchmarkLegacyScrape is one scrape of the gauge vectors the polling controller wrote.
-func BenchmarkLegacyScrape(b *testing.B) {
-	for _, size := range benchSizes {
-		b.Run(fmt.Sprintf("nodes=%d", size.nodes), func(b *testing.B) {
-			l := newLegacy(benchNodeState(b, size.nodes, size.pods))
-			l.reconcile()
-			b.ResetTimer()
-			for range b.N {
-				lo.Must(l.registry.Gather())
-			}
-		})
-	}
-}
-
-// legacy is the polling controller's metric building, copied from ba93a61e, writing gauge vectors on its own registry.
-type legacy struct {
-	cs       karpentercluster.State
-	registry *prometheus.Registry
-	store    *metrics.Store
-
-	allocatable, totalPodRequests, totalPodLimits, totalDaemonRequests, totalDaemonLimits, systemOverhead, lifetime, clusterUtilization opmetrics.GaugeMetric
-}
-
-func newLegacy(cs karpentercluster.State) *legacy {
-	initializeMetrics()
-	l := &legacy{cs: cs, registry: prometheus.NewRegistry(), store: metrics.NewStore()}
-	gauge := func(subsystem, name string, labels []opmetrics.Label) opmetrics.GaugeMetric {
-		return opmetrics.NewPrometheusGauge(l.registry, prometheus.GaugeOpts{Namespace: metrics.Namespace, Subsystem: subsystem, Name: name}, labels, opmetrics.Beta)
-	}
-	l.allocatable = gauge(metrics.NodeSubsystem, "allocatable", nodeLabelNamesWithResourceType())
-	l.totalPodRequests = gauge(metrics.NodeSubsystem, "total_pod_requests", nodeLabelNamesWithResourceType())
-	l.totalPodLimits = gauge(metrics.NodeSubsystem, "total_pod_limits", nodeLabelNamesWithResourceType())
-	l.totalDaemonRequests = gauge(metrics.NodeSubsystem, "total_daemon_requests", nodeLabelNamesWithResourceType())
-	l.totalDaemonLimits = gauge(metrics.NodeSubsystem, "total_daemon_limits", nodeLabelNamesWithResourceType())
-	l.systemOverhead = gauge(metrics.NodeSubsystem, "system_overhead", nodeLabelNamesWithResourceType())
-	l.lifetime = gauge(metrics.NodeSubsystem, "current_lifetime_seconds", nodeLabelNames())
-	l.clusterUtilization = gauge("cluster", "utilization_percent", []opmetrics.Label{metrics.ResourceType})
-	return l
-}
-
-func (l *legacy) reconcile() {
-	var nodes []karpentercluster.NodeView
-	for _, e := range l.cs.NodeClaims.List(client.UnsafeDisableDeepCopy) {
-		if v := karpentercluster.ViewOfNodeClaim(e); karpentercluster.Launched(e) && v.Node() != nil {
-			nodes = append(nodes, v)
-		}
-	}
-	for _, e := range l.cs.Nodes.Unmanaged(client.UnsafeDisableDeepCopy) {
-		nodes = append(nodes, karpentercluster.ViewOfNode(e))
-	}
-	metricsMap := lo.SliceToMap(nodes, func(n karpentercluster.NodeView) (string, []*metrics.StoreMetric) {
-		return client.ObjectKeyFromObject(n.Node()).String(), l.buildMetrics(n)
-	})
-	metricsMap["clusterUtilization"] = l.buildClusterUtilizationMetric(nodes)
-	l.store.ReplaceAll(metricsMap)
-}
-
-func (l *legacy) buildClusterUtilizationMetric(nodes []karpentercluster.NodeView) []*metrics.StoreMetric {
-	allocatableAggregate, utilizedAggregate := corev1.ResourceList{}, corev1.ResourceList{}
-	for _, node := range nodes {
-		resources.MergeInto(allocatableAggregate, node.Allocatable())
-		resources.MergeInto(utilizedAggregate, node.PodRequests())
-	}
-	res := make([]*metrics.StoreMetric, 0, len(allocatableAggregate))
-	for resourceName, allocatableResource := range allocatableAggregate {
-		if allocatableResource.Value() == 0 {
-			continue
-		}
-		utilizedResource := utilizedAggregate[resourceName]
-		utilizationPercentage := 100 * lo.Ternary(
-			resourceName == corev1.ResourceCPU,
-			float64(utilizedResource.MilliValue())/float64(allocatableResource.MilliValue()),
-			float64(utilizedResource.Value())/float64(allocatableResource.Value()))
-		res = append(res, &metrics.StoreMetric{
-			GaugeMetric: l.clusterUtilization,
-			Value:       utilizationPercentage,
-			Labels:      map[string]string{metrics.ResourceTypeLabel: resourceNameToString(resourceName)},
-		})
-	}
-	return res
-}
-
-func (l *legacy) buildMetrics(n karpentercluster.NodeView) (res []*metrics.StoreMetric) {
-	for gaugeMetric, resourceList := range map[opmetrics.GaugeMetric]corev1.ResourceList{
-		l.systemOverhead:      resources.Subtract(n.Node().Status.Capacity, n.Node().Status.Allocatable),
-		l.totalPodRequests:    n.PodRequests(),
-		l.totalPodLimits:      n.PodLimits(),
-		l.totalDaemonRequests: n.DaemonSetRequests(),
-		l.totalDaemonLimits:   n.DaemonSetLimits(),
-		l.allocatable:         n.Node().Status.Allocatable,
-	} {
-		for resourceName, quantity := range resourceList {
-			res = append(res, &metrics.StoreMetric{
-				GaugeMetric: gaugeMetric,
-				Value:       lo.Ternary(resourceName == corev1.ResourceCPU, float64(quantity.MilliValue())/float64(1000), float64(quantity.Value())),
-				Labels:      legacyNodeLabelsWithResourceType(n, resourceNameToString(resourceName)),
-			})
-		}
-	}
-	return append(res,
-		&metrics.StoreMetric{
-			GaugeMetric: l.lifetime,
-			Value:       time.Since(n.Node().GetCreationTimestamp().Time).Seconds(),
-			Labels:      legacyNodeLabels(n),
-		})
-}
-
-func legacyNodeLabelsWithResourceType(n karpentercluster.NodeView, resourceTypeName string) prometheus.Labels {
-	metricLabels := legacyNodeLabels(n)
-	metricLabels[metrics.ResourceTypeLabel] = resourceTypeName
-	return metricLabels
-}
-
-// legacyNodeLabels rebuilds the well-known label table for every series, as ba93a61e did.
-func legacyNodeLabels(n karpentercluster.NodeView) prometheus.Labels {
-	node := n.Node()
-	metricLabels := map[string]string{}
-	metricLabels[nodeName] = node.Name
-	metricLabels[nodePhase] = string(node.Status.Phase)
-	metricLabels[managed] = strconv.FormatBool(n.Managed())
-	for _, l := range getWellKnownLabels() {
-		metricLabels[l.name] = node.Labels[l.key]
-	}
-	return metricLabels
 }

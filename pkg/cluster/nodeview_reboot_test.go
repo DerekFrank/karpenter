@@ -30,9 +30,9 @@ import (
 )
 
 var _ = Describe("NodeView Reboot", func() {
-	// stateNode builds the view of an initialized, registered, managed node. rebootStatus, when non-empty, sets
+	// managedView builds the view of an initialized, registered, managed node. rebootStatus, when non-empty, sets
 	// the Rebooting condition to that status; taints are placed on the Node.
-	stateNode := func(rebootStatus metav1.ConditionStatus, taints ...corev1.Taint) karpentercluster.NodeView {
+	managedView := func(rebootStatus metav1.ConditionStatus, taints ...corev1.Taint) karpentercluster.NodeView {
 		nc := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: "default"}}})
 		n := test.Node(test.NodeOptions{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
 			v1.NodePoolLabelKey:        "default",
@@ -51,13 +51,13 @@ var _ = Describe("NodeView Reboot", func() {
 
 	Context("RebootInProgress", func() {
 		It("is true when the Rebooting condition is True", func() {
-			Expect(stateNode(metav1.ConditionTrue).RebootInProgress()).To(BeTrue())
+			Expect(managedView(metav1.ConditionTrue).RebootInProgress()).To(BeTrue())
 		})
 		It("is false when the Rebooting condition is terminal (False)", func() {
-			Expect(stateNode(metav1.ConditionFalse).RebootInProgress()).To(BeFalse())
+			Expect(managedView(metav1.ConditionFalse).RebootInProgress()).To(BeFalse())
 		})
 		It("is false when there is no Rebooting condition", func() {
-			Expect(stateNode("").RebootInProgress()).To(BeFalse())
+			Expect(managedView("").RebootInProgress()).To(BeFalse())
 		})
 		It("is false when the node has no NodeClaim", func() {
 			Expect(karpentercluster.ViewOfNode(karpentercluster.NodeEntry{Object: test.Node()}).RebootInProgress()).To(BeFalse())
@@ -67,12 +67,12 @@ var _ = Describe("NodeView Reboot", func() {
 	Context("Taints", func() {
 		custom := corev1.Taint{Key: "example.com/custom", Effect: corev1.TaintEffectNoSchedule}
 		It("strips the reboot fence taint while rebooting so capacity models as returning", func() {
-			taints := stateNode(metav1.ConditionTrue, v1.RebootingNoScheduleTaint, custom).Taints()
+			taints := managedView(metav1.ConditionTrue, v1.RebootingNoScheduleTaint, custom).Taints()
 			Expect(taints).To(ContainElement(custom))
 			Expect(lo.ContainsBy(taints, func(t corev1.Taint) bool { return t.MatchTaint(&v1.RebootingNoScheduleTaint) })).To(BeFalse())
 		})
 		It("retains the reboot fence taint on an initialized node that is not rebooting", func() {
-			taints := stateNode(metav1.ConditionFalse, v1.RebootingNoScheduleTaint, custom).Taints()
+			taints := managedView(metav1.ConditionFalse, v1.RebootingNoScheduleTaint, custom).Taints()
 			Expect(lo.ContainsBy(taints, func(t corev1.Taint) bool { return t.MatchTaint(&v1.RebootingNoScheduleTaint) })).To(BeTrue())
 		})
 	})

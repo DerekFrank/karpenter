@@ -172,9 +172,9 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 			metrics.ReasonLabel:    strings.ToLower(string(cmd.Reason())),
 			ConsolidationTypeLabel: cmd.ConsolidationType(),
 		})
-		stateNodes := lo.Map(cmd.Candidates, func(c *Candidate, _ int) karpentercluster.NodeClaimEntry { return c.Entry })
-		multiErr := multierr.Combine(err, RequireNoScheduleTaint(ctx, q.kubeClient, false, stateNodes...))
-		multiErr = multierr.Combine(multiErr, ClearNodeClaimsCondition(ctx, q.kubeClient, q.clock, v1.ConditionTypeDisruptionReason, stateNodes...))
+		entries := lo.Map(cmd.Candidates, func(c *Candidate, _ int) karpentercluster.NodeClaimEntry { return c.Entry })
+		multiErr := multierr.Combine(err, RequireNoScheduleTaint(ctx, q.kubeClient, false, entries...))
+		multiErr = multierr.Combine(multiErr, ClearNodeClaimsCondition(ctx, q.kubeClient, q.clock, v1.ConditionTypeDisruptionReason, entries...))
 		// Log the error
 		log.FromContext(ctx).Error(multiErr, "failed terminating nodes while executing a disruption command")
 	} else {

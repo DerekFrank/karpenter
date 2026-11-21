@@ -28,7 +28,7 @@ import (
 // sources are the Objects each test object store follows, by its core, which a test fills as an informer would.
 var sources sync.Map
 
-// objectStore returns an object store that follows Objects the test fills with observe, forget and resync.
+// objectStore returns an object store that follows Objects the test fills with put, remove and relist.
 func objectStore[K comparable, S client.Object, D, I any](opts ...ObjectOption) *Store[K, S, D, I] {
 	return objectStoreOf[K, S, D, I](statetest.NewObjects(), opts...)
 }
@@ -44,26 +44,26 @@ func objectsOf[K comparable, O, D, I any](s *Store[K, O, D, I]) *statetest.Objec
 	return o.(*statetest.Objects)
 }
 
-// observe shows the store a version of obj, as its informer would.
-func observe[K comparable, O, D, I any](s *Store[K, O, D, I], obj client.Object) {
+// put shows the store a version of obj, as its informer would.
+func put[K comparable, O, D, I any](s *Store[K, O, D, I], obj client.Object) {
 	objectsOf(s).Put(obj)
 }
 
-// forget shows the store that the object named name is gone, as its informer would.
-func forget[K comparable, O, D, I any](s *Store[K, O, D, I], name types.NamespacedName) {
+// remove shows the store that the object named name is gone, as its informer would.
+func remove[K comparable, O, D, I any](s *Store[K, O, D, I], name types.NamespacedName) {
 	objectsOf(s).Remove(name)
 }
 
-// resync makes objs the objects among those named in scope, as an informer's relist would.
-func resync[K comparable, O client.Object, D, I any](s *Store[K, O, D, I], objs []O, scope []types.NamespacedName) {
+// relist makes objs the objects among those named in scope, as an informer's relist would.
+func relist[K comparable, O client.Object, D, I any](s *Store[K, O, D, I], objs []O, scope []types.NamespacedName) {
 	listed := map[types.NamespacedName]bool{}
 	for _, obj := range objs {
 		listed[client.ObjectKeyFromObject(obj)] = true
-		observe(s, obj)
+		put(s, obj)
 	}
 	for _, name := range scope {
 		if !listed[name] {
-			forget(s, name)
+			remove(s, name)
 		}
 	}
 }

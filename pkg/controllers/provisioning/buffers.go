@@ -195,8 +195,8 @@ func computeProvisioningCondition(cb *autoscalingv1beta1.CapacityBuffer, s *buff
 
 // bufferPodCountsFromResults builds a NodeClaim name→count mapping of how many
 // virtual buffer pods were placed on each existing node during this scheduling
-// pass. Used to update cluster state (Cluster.UpdateBufferPodCounts) so the emptiness
-// disruption path knows which nodes host buffer capacity.
+// pass. The provisioner records it on the NodeClaims' entries with BufferPods.Replace, so
+// the emptiness disruption path knows which nodes host buffer capacity.
 //
 // Only ExistingNodes are counted — NewNodeClaims don't have a name
 // yet, and those nodes are naturally protected from consolidation by the

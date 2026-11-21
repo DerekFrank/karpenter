@@ -67,7 +67,7 @@ type Stores struct {
 	Cluster    *karpentercluster.Clusters
 	PodsByNode *karpentercluster.PodIndex[string]
 	// RepairPolicyMatcher is the matcher cluster state matches Nodes with, nil when node repair is disabled.
-	RepairPolicyMatcher *repair.RepairPolicyMatcher
+	RepairPolicyMatcher *repair.PolicyMatcher
 }
 
 // StoresOf returns the stores of cluster state disruption reads.
@@ -176,7 +176,7 @@ func (c *Controller) Name() string {
 }
 
 // Register wakes the controller on the changes that can open a disruption decision, and has the consolidation methods
-// skip their work until one comes, in place of a poll:
+// skip their work until one comes:
 //   - the NodeClaim store, narrowed to disruption's inputs (NodeClaims.DisruptionSource): a NodeClaim coming,
 //     launching, linking its Node, starting to delete or going; being marked for deletion; its Drifted or
 //     Consolidatable condition or its do-not-disrupt annotation changing; or its buffer pods coming or going. Its

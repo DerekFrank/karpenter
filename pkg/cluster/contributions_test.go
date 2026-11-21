@@ -31,7 +31,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -56,8 +55,8 @@ var _ = Describe("Contributions", func() {
 		matcher := testMatcher()
 		kernel, other := badNode("a", "Kernel"), badNode("a", "Other")
 		// Repair matches compare by the policies they match.
-		Expect(slices.EqualFunc(matcher.Match(kernel), matcher.Match(kernel), repair.RepairPolicyMatch.Equal)).To(BeTrue())
-		Expect(slices.EqualFunc(matcher.Match(kernel), matcher.Match(other), repair.RepairPolicyMatch.Equal)).To(BeFalse())
+		Expect(slices.EqualFunc(matcher.Match(kernel), matcher.Match(kernel), repair.Match.Equal)).To(BeTrue())
+		Expect(slices.EqualFunc(matcher.Match(kernel), matcher.Match(other), repair.Match.Equal)).To(BeFalse())
 		// Each contribution to a Node's entry sets only its own fields, so the laws hold from fields the others set.
 		usage := NodeDerived{Usage: NodeUsage{Pods: 1, Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}}}
 		for _, base := range []NodeDerived{{}, usage} {
@@ -93,8 +92,7 @@ var _ = Describe("Contributions", func() {
 			p.Spec.Containers[0].Ports = []corev1.ContainerPort{{HostPort: 80, Protocol: corev1.ProtocolTCP}}
 		}
 		terminating := func(p *corev1.Pod) { p.DeletionTimestamp = &metav1.Time{Time: time.Unix(10, 0)} }
-		s := newState(options.ToContext(context.Background(), test.Options()), clock.RealClock{}, fake.NewCloudProvider())
-		of := podContributionOf(options.ToContext(context.Background(), test.Options()), s.PVCs)
+		of := podContributionOf(options.ToContext(context.Background(), test.Options()), newPVCs())
 		contribution := func(p *corev1.Pod) podContribution { return of(client.ObjectKeyFromObject(p), PodEntry{Object: p}) }
 		other := contribution(pod("other", "1", withPVC, withHostPort)).Update(NodeDerived{Usage: NodeUsage{CSIDrivers: []storagev1.CSINodeDriver{{Name: "a"}}}}, podContribution{})
 		for _, base := range []NodeDerived{{}, other} {
@@ -126,7 +124,7 @@ func nodeDerivedEqual(a, b NodeDerived) bool {
 		same(x.Requests, y.Requests) && same(x.Limits, y.Limits) && same(x.DaemonSetRequests, y.DaemonSetRequests) &&
 		same(x.DaemonSetLimits, y.DaemonSetLimits) && reflect.DeepEqual(hostPorts(x.HostPorts), hostPorts(y.HostPorts)) &&
 		maps.Equal(x.Volumes, y.Volumes) && maps.Equal(x.AntiAffinityPods, y.AntiAffinityPods) &&
-		slices.EqualFunc(a.RepairPolicyMatches, b.RepairPolicyMatches, repair.RepairPolicyMatch.Equal) &&
+		slices.EqualFunc(a.RepairPolicyMatches, b.RepairPolicyMatches, repair.Match.Equal) &&
 		equality.Semantic.DeepEqual(x.CSIDrivers, y.CSIDrivers)
 }
 
@@ -138,7 +136,7 @@ func nodeClaimDerivedEqual(a, b NodeClaimDerived) bool {
 }
 
 // testMatcher returns a matcher of one policy: a Node whose BadNode condition is False needs replacing.
-func testMatcher() *repair.RepairPolicyMatcher {
+func testMatcher() *repair.PolicyMatcher {
 	GinkgoHelper()
 	cloudProvider := fake.NewCloudProvider()
 	cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
@@ -146,7 +144,7 @@ func testMatcher() *repair.RepairPolicyMatcher {
 		{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, ReasonRegex: "^Kernel$", Action: cloudprovider.ReplaceNode},
 	}
 	ctx := options.ToContext(context.Background(), test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeRepair: new(true)}}))
-	matcher, err := repair.NewRepairPolicyMatcher(ctx, cloudProvider)
+	matcher, err := repair.NewPolicyMatcher(ctx, cloudProvider)
 	Expect(err).ToNot(HaveOccurred())
 	Expect(matcher).ToNot(BeNil())
 	return matcher

@@ -49,7 +49,7 @@ import (
 
 const benchmarkAcceleratorCondition corev1.NodeConditionType = "AcceleratedHardwareReady"
 
-var benchmarkRepairResult repair.RepairResult
+var benchmarkRepairResult repair.Result
 
 // benchmarkRepairPolicies resembles a production provider policy set: kubelet readiness, reason-specific accelerator
 // policies, a few node-agent conditions and the default fallback.
@@ -129,7 +129,7 @@ func benchmarkNodeClaim(i int, now time.Time) *v1.NodeClaim {
 
 // benchmarkCluster returns cluster state holding n Nodes matched by matcher, each with its NodeClaim, the first
 // unhealthy of which are unhealthy.
-func benchmarkCluster(ctx context.Context, b *testing.B, provider *fake.CloudProvider, matcher *repair.RepairPolicyMatcher, n, unhealthy int, now time.Time) (karpentercluster.State, *statetest.Sources) {
+func benchmarkCluster(ctx context.Context, b *testing.B, provider *fake.CloudProvider, matcher *repair.PolicyMatcher, n, unhealthy int, now time.Time) (karpentercluster.State, *statetest.Sources) {
 	b.Helper()
 	clk := clock.NewFakeClock(now)
 	srcs := statetest.NewSources()
@@ -150,11 +150,11 @@ func benchmarkContext() context.Context {
 	return options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeRepair: new(true)}}))
 }
 
-func benchmarkMatcher(ctx context.Context, b *testing.B) (*fake.CloudProvider, *repair.RepairPolicyMatcher) {
+func benchmarkMatcher(ctx context.Context, b *testing.B) (*fake.CloudProvider, *repair.PolicyMatcher) {
 	b.Helper()
 	provider := fake.NewCloudProvider()
 	provider.RepairPolicy = benchmarkRepairPolicies()
-	matcher, err := repair.NewRepairPolicyMatcher(ctx, provider)
+	matcher, err := repair.NewPolicyMatcher(ctx, provider)
 	if err != nil {
 		b.Fatal(err)
 	}

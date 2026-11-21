@@ -17,21 +17,15 @@ limitations under the License.
 package cluster
 
 import (
-	"context"
 	"slices"
-	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/clock"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
-	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
 )
 
@@ -39,14 +33,12 @@ var _ = Describe("NodePool Members", func() {
 	// The members are checked against a scan of every node and NodeClaim as its NodeClaims launch, move between
 	// NodePools and go away.
 	It("should index each NodePool's Nodes and unlaunched NodeClaims as its members", func() {
-		cs := newState(options.ToContext(context.Background(), test.Options()), clock.RealClock{}, fake.NewCloudProvider())
-		s, nodePools := cs, cs.NodePoolState
-		nodeClaim := func(name, nodePool, providerID, rv string) *v1.NodeClaim {
-			return &v1.NodeClaim{
-				ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(name), ResourceVersion: rv, Labels: map[string]string{v1.NodePoolLabelKey: nodePool}},
-				Spec:       v1.NodeClaimSpec{NodeClassRef: test.NodeClaim().Spec.NodeClassRef},
-				Status:     v1.NodeClaimStatus{ProviderID: providerID},
-			}
+		cs := newSuiteState(testContext())
+		nodePools := cs.NodePoolState
+		nodeClaim := func(name, nodePool, providerID string) *v1.NodeClaim {
+			nc := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{v1.NodePoolLabelKey: nodePool}}})
+			nc.Status.ProviderID = providerID
+			return nc
 		}
 		expect := func() {
 			GinkgoHelper()
@@ -54,37 +46,31 @@ var _ = Describe("NodePool Members", func() {
 				expectNodePoolMembers(cs, np)
 			}
 		}
-		s.NodeClaims.Put(nodeClaim("1", "a", "", "1"))
-		s.NodeClaims.Put(nodeClaim("2", "a", "", "1"))
-		s.NodeClaims.Put(nodeClaim("3", "b", "p3", "1"))
+		apply(nodeClaim("nc-1", "a", ""), nodeClaim("nc-2", "a", ""), nodeClaim("nc-3", "b", "fake://p3"))
 		expect()
-		s.NodeClaims.Put(nodeClaim("1", "a", "p1", "2"))
+		apply(nodeClaim("nc-1", "a", "fake://p1"))
 		expect()
-		s.NodeClaims.Put(nodeClaim("3", "a", "p3", "2"))
+		apply(nodeClaim("nc-3", "a", "fake://p3"))
 		expect()
-		deleting := nodeClaim("2", "a", "", "2")
-		deleting.DeletionTimestamp = &metav1.Time{Time: time.Unix(1, 0)}
-		deleting.Finalizers = []string{"test"}
-		s.NodeClaims.Put(deleting)
+		markDeleting(nodeClaim("nc-2", "a", ""))
 		expect()
 		// A NodeClaim's NodePool is the NodeClaim's label, whatever its Node's says.
 		node := &corev1.Node{
-			ObjectMeta: metav1.ObjectMeta{Name: "n1", UID: "n1", ResourceVersion: "1", Labels: map[string]string{
+			ObjectMeta: metav1.ObjectMeta{Name: "n1", Labels: map[string]string{
 				v1.NodePoolLabelKey: "b", v1.NodeRegisteredLabelKey: "true", corev1.LabelInstanceTypeStable: "x",
-			}, OwnerReferences: []metav1.OwnerReference{{APIVersion: apis.Group + "/v1", Kind: "NodeClaim", Name: "1", UID: "1"}}},
-			Spec: corev1.NodeSpec{ProviderID: "p1"},
+			}, OwnerReferences: []metav1.OwnerReference{{APIVersion: apis.Group + "/v1", Kind: "NodeClaim", Name: "nc-1", UID: "nc-1"}}},
+			Spec: corev1.NodeSpec{ProviderID: "fake://p1"},
 		}
-		s.Nodes.Put(node)
+		apply(node)
 		expect()
 		// LaunchedNodes(a) is the launched NodeClaims, the first linked to n1 by its owner reference.
 		launched := nodePools.LaunchedNodes("a")
 		Expect(launched).To(HaveLen(2))
 		Expect(launched[0].Derived.Node).ToNot(BeNil())
 		Expect(launched[0].Derived.Node.Name).To(Equal("n1"))
-		s.Nodes.Remove(node.Name)
+		remove(node)
 		expect()
-		s.NodeClaims.Remove("1")
-		s.NodeClaims.Remove("3")
+		remove(nodeClaim("nc-1", "a", ""), nodeClaim("nc-3", "a", ""))
 		expect()
 	})
 })

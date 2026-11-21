@@ -40,8 +40,9 @@ func main() {
 
 	overlayUndecoratedCloudProvider := kwok.NewCloudProvider(ctx, op.GetClient(), instanceTypes)
 	cloudProvider := overlay.Decorate(overlayUndecoratedCloudProvider, op.GetClient(), op.InstanceTypeStore)
-	repairPolicyMatcher := lo.Must(repair.NewRepairPolicyMatcher(ctx, cloudProvider))
+	repairPolicyMatcher := lo.Must(repair.NewPolicyMatcher(ctx, cloudProvider))
 	s := cluster.New(ctx, op.Clock, op.GetClient(), cloudProvider, cluster.WithRepairPolicyMatcher(repairPolicyMatcher))
+	defer s.Close()
 	lo.Must0(s.Register(op.Manager))
 	op.
 		WithControllers(ctx, controllers.NewControllers(

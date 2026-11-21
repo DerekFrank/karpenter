@@ -18,5 +18,6 @@ package static
 
 import "sigs.k8s.io/controller-runtime/pkg/source"
 
-// Active is the source Register derives, which wakes the controller for a NodePool, for tests to start on a queue.
+// Active is the source the controller wakes on, the NodePool store narrowed with SourceOn to each NodePool's active NodeClaims,
+// which Register builds, for tests to start on a queue.
 func (c *Controller) Active() source.SyncingSource { return c.active }

@@ -92,7 +92,7 @@ var _ = Describe("Controller", func() {
 		pod0 := rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name})
 		pod1 := rsOwnedPod(test.PodOptions{NodeName: nodes[1].Name})
 		ExpectApplied(ctx, env.Client, pod0, pod1)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster.NodeClaims, cluster.PodsByNode, cs.NodePoolState, queue)
 		result, err := controller.Reconcile(ctx)
@@ -136,7 +136,7 @@ var _ = Describe("Controller", func() {
 			}}},
 		})
 		ExpectApplied(ctx, env.Client, rsPod, jobPod)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster.NodeClaims, cluster.PodsByNode, cs.NodePoolState, queue)
 		_, err := controller.Reconcile(ctx)
@@ -190,7 +190,7 @@ var _ = Describe("Controller", func() {
 		})
 		controlPod := rsOwnedPod(test.PodOptions{NodeName: nodes[1].Name})
 		ExpectApplied(ctx, env.Client, pinnedNodeRSPod, nonControllerRSPod, controlPod)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster.NodeClaims, cluster.PodsByNode, cs.NodePoolState, queue)
 		_, err := controller.Reconcile(ctx)
@@ -219,7 +219,7 @@ var _ = Describe("Controller", func() {
 			}}},
 		})
 		ExpectApplied(ctx, env.Client, jobPod)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster.NodeClaims, cluster.PodsByNode, cs.NodePoolState, queue)
 		_, err := controller.Reconcile(ctx)
@@ -254,7 +254,7 @@ var _ = Describe("Controller", func() {
 		}
 		pod := rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name})
 		ExpectApplied(ctx, env.Client, pod)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 		_, err = controller.Reconcile(ctx)
 		Expect(err).To(Succeed())
@@ -280,7 +280,7 @@ var _ = Describe("Controller", func() {
 		ExpectApplied(ctx, env.Client, nodeClaims[0], nodes[0])
 		pod := rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name})
 		ExpectApplied(ctx, env.Client, pod)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 		failing := &toggleablePDBListFailingClient{Client: env.Overlay, fail: true}
 		controller := deletioncost.NewController(env.Clock, failing, cloudProvider, cluster.NodeClaims, cluster.PodsByNode, cs.NodePoolState, queue)
@@ -311,7 +311,7 @@ var _ = Describe("Controller", func() {
 		}
 		pod := rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name})
 		ExpectApplied(ctx, env.Client, pod)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster.NodeClaims, cluster.PodsByNode, cs.NodePoolState, queue)
 
@@ -343,7 +343,7 @@ var _ = Describe("Controller", func() {
 		})
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaims[0], nodes[0])
 		ExpectApplied(ctx, env.Client, rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name}))
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, nodes, nodeClaims)
 		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster.NodeClaims, cluster.PodsByNode, cs.NodePoolState, queue)
 		reconcile := func() time.Duration {
 			GinkgoHelper()
@@ -417,7 +417,7 @@ var _ = Describe("Controller", func() {
 
 			nodes := []*corev1.Node{nodePool0, nodeOther1, nodeOther2}
 			nodeClaims := []*v1.NodeClaim{ncPool0, ncOther1, ncOther2}
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
+			ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 			failing := &pdbListFailingClient{Client: env.Overlay}
 			controller := deletioncost.NewController(env.Clock, failing, cloudProvider, cluster.NodeClaims, cluster.PodsByNode, cs.NodePoolState, queue)

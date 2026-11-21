@@ -29,8 +29,6 @@ limitations under the License.
 //   - A map or slice field of a store's Derived or Intent fields says what bounds it with a // bounded: comment.
 //   - pkg/cluster exports no raw *state.Store, only Readers and intent handles.
 //   - A Derive's target has a reader besides a source: waking a controller on part of an entry is SourceOn's job.
-//   - A store is cleared, and cluster state reset, only by tests: Clear and cluster.State's Reset are called from a
-//     test, pkg/test, or another Clear or Reset of pkg/state or pkg/cluster, which compose them.
 package storelint
 
 import (
@@ -70,8 +68,8 @@ var derives = map[string]bool{"Derive": true, "DeriveObject": true}
 var writes = map[string]bool{"Create": true, "Update": true, "Patch": true, "Delete": true}
 
 // readOnlyUses are the methods a Derive target can be called with that read nothing: a source, a subscription, the
-// sync gate and a reset.
-var readOnlyUses = map[string]bool{"Source": true, "SourceOn": true, "Subscribe": true, "Synced": true, "Clear": true}
+// sync gate and a close.
+var readOnlyUses = map[string]bool{"Source": true, "SourceOn": true, "Subscribe": true, "Synced": true, "Close": true}
 
 var Analyzer = &analysis.Analyzer{
 	Name:     "storelint",
@@ -129,9 +127,6 @@ func checkCall(pass *analysis.Pass, h *held, call *ast.CallExpr, stack []ast.Nod
 	if store, ok := addedSharedStore(pass, call); ok && !stateRegister(pass, fn) {
 		pass.Reportf(call.Pos(), "%s is a shared store: only cluster.State.Register adds it to the manager", types.ExprString(store))
 	}
-	if name, ok := clears(pass, call); ok && !clearsAllowed(pass, fn) {
-		pass.Reportf(call.Pos(), "%s wipes cluster state: only tests clear stores", name)
-	}
 	if arg, ok := matchingFields(pass, call); ok {
 		pass.Reportf(arg.Pos(), "%s in a store's List, which panics on it: match a field with an Index's List", types.TypeString(pass.TypesInfo.TypeOf(arg), func(p *types.Package) string { return p.Name() }))
 	}
@@ -153,36 +148,6 @@ func builder(pass *analysis.Pass, call *ast.CallExpr) (string, bool) {
 		return "", false
 	}
 	return fn.Name(), true
-}
-
-// clears returns the name of the Clear or Reset method call calls, if it's one that wipes cluster state: a Clear() of a
-// type pkg/state or pkg/cluster declares, or cluster.State's Reset(). An intent handle's Clear(key) ends one value, and
-// isn't one.
-func clears(pass *analysis.Pass, call *ast.CallExpr) (string, bool) {
-	fn, ok := typeutil.Callee(pass.TypesInfo, call).(*types.Func)
-	if !ok || fn.Pkg() == nil {
-		return "", false
-	}
-	sig, ok := fn.Type().(*types.Signature)
-	if !ok || sig.Recv() == nil || sig.Params().Len() != 0 {
-		return "", false
-	}
-	path := fn.Pkg().Path()
-	switch {
-	case fn.Name() == "Clear" && holdsState(path), fn.Name() == "Reset" && named(sig.Recv().Type(), clusterPkg, "State"):
-		return fn.Name(), true
-	}
-	return "", false
-}
-
-// clearsAllowed returns whether code in fn of the package being checked may clear stores: pkg/test and its
-// subpackages, and a Clear or Reset method of the packages that compose them.
-func clearsAllowed(pass *analysis.Pass, fn *ast.FuncDecl) bool {
-	path := pass.Pkg.Path()
-	if path == testPkg || strings.HasPrefix(path, testPkg+"/") {
-		return true
-	}
-	return holdsState(path) && fn != nil && fn.Recv != nil && (fn.Name.Name == "Clear" || fn.Name.Name == "Reset")
 }
 
 // subscribes returns whether call calls a Subscribe method declared in pkg/state or pkg/cluster.
@@ -548,7 +513,7 @@ func checkResults(pass *analysis.Pass, fn *types.Func) {
 }
 
 // checkWakeFilters reports a Derive whose target, a variable or field the package declares, is read only as a source:
-// every use of it is the Derive's target, a Source, SourceOn, Subscribe, Synced or Clear call, or an assignment.
+// every use of it is the Derive's target, a Source, SourceOn, Subscribe, Synced or Close call, or an assignment.
 func checkWakeFilters(pass *analysis.Pass, in *inspector.Inspector) {
 	targets := map[types.Object]*ast.CallExpr{}
 	derivations := map[*ast.CallExpr]bool{}

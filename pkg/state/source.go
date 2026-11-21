@@ -31,8 +31,8 @@ import (
 
 // Source is the store as a controller-runtime source: it enqueues a request for every entry the store holds, then for
 // each key whose entry changes. The request names the object the key is: a key is a name, or a types.NamespacedName.
-// A store keyed by anything else, such as the synthetic Cluster{}, is a source only under Wake or After(Wake), which
-// enqueue one empty request. A controller that acts on part of an entry watches SourceOn.
+// A store keyed by anything else, such as the synthetic Cluster{}, is a source only under Wake, which enqueues one
+// empty request. A controller that acts on part of an entry watches SourceOn.
 func (r Reader[K, O, D, I]) Source() source.SyncingSource { return storeSource[K, O, D, I]{store: r} }
 
 type storeSource[K comparable, O, D, I any] struct {
@@ -98,8 +98,8 @@ func (src storeSource[K, O, D, I]) WaitForSync(ctx context.Context) error {
 }
 
 // Wake makes sources enqueue one empty request for every change, for a controller that reconciles the whole cluster
-// at once, such as disruption. It replaces a singleton's poll: the controller runs when something changed, and the
-// workqueue folds the changes made while it runs into one more run.
+// at once, such as disruption: the controller runs when something changed, and the workqueue folds the changes made
+// while it runs into one more run.
 func Wake(sources ...source.SyncingSource) source.SyncingSource {
 	return WakeCounting(nil, sources...)
 }
@@ -113,14 +113,6 @@ func WakeCounting(count func(), sources ...source.SyncingSource) source.SyncingS
 			count()
 		}
 		q.Add(reconcile.Request{})
-	}}
-}
-
-// After makes sources enqueue each request no sooner than delay after its first change, and folds the changes in
-// between into it, for a watcher that acts on a batch of changes rather than each one, such as metrics.
-func After(delay time.Duration, sources ...source.SyncingSource) source.SyncingSource {
-	return mapped{sources: sources, enqueue: func(q workqueue.TypedRateLimitingInterface[reconcile.Request], r reconcile.Request) {
-		q.AddAfter(r, delay)
 	}}
 }
 

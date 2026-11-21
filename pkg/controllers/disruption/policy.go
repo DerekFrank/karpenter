@@ -121,7 +121,7 @@ func RequireNoScheduleTaint(ctx context.Context, kubeClient client.Client, addTa
 	return multierr.Combine(errs...)
 }
 
-// ClearNodeClaimsCondition will remove the conditionType from the NodeClaim status of the provided statenodes
+// ClearNodeClaimsCondition removes the conditionType from the status of each of the initialized NodeClaims
 func ClearNodeClaimsCondition(ctx context.Context, kubeClient client.Client, clk clock.Clock, conditionType string, nodes ...karpentercluster.NodeClaimEntry) error {
 	errs := make([]error, len(nodes))
 	workqueue.ParallelizeUntil(ctx, len(nodes), len(nodes), func(i int) {
@@ -227,9 +227,6 @@ func IgnoreNodeUninitializedError(err error) error {
 // This checks the node's NodeClaim entry, node labels, and do-not-disrupt annotations on the node.
 func ValidateNodeDisruptable(e karpentercluster.NodeClaimEntry, clk clock.Clock) error {
 	in := karpentercluster.ViewOfNodeClaim(e)
-	if in.NodeClaim() == nil {
-		return fmt.Errorf("node isn't managed by karpenter")
-	}
 	if karpentercluster.InFlight(e) {
 		return fmt.Errorf("nodeclaim does not have an associated node")
 	}

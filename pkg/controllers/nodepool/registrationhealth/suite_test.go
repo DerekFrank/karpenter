@@ -30,14 +30,11 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/workqueue"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
-	karpstate "sigs.k8s.io/karpenter/pkg/state"
-	"sigs.k8s.io/karpenter/pkg/state/statetest"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
@@ -65,7 +62,11 @@ func TestAPIs(t *testing.T) {
 var _ = BeforeSuite(func() {
 	cloudProvider = fake.NewCloudProvider()
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...))
+})
+
+var _ = BeforeEach(func() {
 	cs := cluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
+	DeferCleanup(cs.Close)
 	npState, registrations = cs.NodePoolState, cs.Registrations
 	nodePools = npState
 	controller = registrationhealth.NewController(env.Clock, env.Overlay, cloudProvider, npState)
@@ -260,17 +261,9 @@ var _ = Describe("RegistrationHealth", func() {
 })
 
 var _ = Describe("RegistrationHealth Wakes", func() {
-	var state *cluster.NodePoolState
-	var recorder *cluster.Registrations
-	var srcs *statetest.Sources
 	var queue workqueue.TypedRateLimitingInterface[reconcile.Request]
 	BeforeEach(func() {
-		// Build a fresh state per spec over an in-memory source, so this spec drives the source it reads from without
-		// the main suite's overlay or cache in the loop.
-		srcs = statetest.NewSources()
-		cs := cluster.New(ctx, env.Clock, nil, cloudProvider, cluster.WithSources(func(o client.Object) karpstate.Newest { return srcs.For(o) }))
-		state, recorder = cs.NodePoolState, cs.Registrations
-		c := registrationhealth.NewController(env.Clock, env.Overlay, cloudProvider, state)
+		c := registrationhealth.NewController(env.Clock, env.Overlay, cloudProvider, npState)
 		queue = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
 		DeferCleanup(queue.ShutDown)
 		started, stop := context.WithCancel(ctx)
@@ -288,36 +281,28 @@ var _ = Describe("RegistrationHealth Wakes", func() {
 	}
 	It("should wake for a NodePool when it appears, its spec or registration health changes, or it goes, and not on its status", func() {
 		np := test.NodePool()
-		np.UID = "wakes-np"
-		np.ResourceVersion = "1"
-		np.Generation = 1
-		srcs.Put(np.DeepCopy())
+		ExpectApplied(ctx, env.Client, np)
 		Expect(drain()).To(Equal([]string{np.Name}), "want the NodePool once it's seen")
 
-		recorder.Record(np, 1, cluster.RegistrationOutcome{Registered: true})
+		registrations.Record(np, 1, cluster.RegistrationOutcome{Registered: true})
 		Expect(drain()).To(Equal([]string{np.Name}), "want the NodePool once an outcome makes it healthy")
-		recorder.Record(np, 1, cluster.RegistrationOutcome{Registered: true})
-		recorder.Record(np, 1, cluster.RegistrationOutcome{Reason: "Failed"})
+		registrations.Record(np, 1, cluster.RegistrationOutcome{Registered: true})
+		registrations.Record(np, 1, cluster.RegistrationOutcome{Reason: "Failed"})
 		Expect(drain()).To(BeEmpty(), "want nothing for outcomes that leave its health")
-		recorder.Record(np, 1, cluster.RegistrationOutcome{Reason: "Failed"})
+		registrations.Record(np, 1, cluster.RegistrationOutcome{Reason: "Failed"})
 		Expect(drain()).To(Equal([]string{np.Name}), "want the NodePool once an outcome makes it unhealthy")
-		recorder.Record(np, 2, cluster.RegistrationOutcome{Reason: "Failed"})
+		registrations.Record(np, 2, cluster.RegistrationOutcome{Reason: "Failed"})
 		Expect(drain()).To(Equal([]string{np.Name}), "want the NodePool once outcomes are recorded for a new spec")
 
-		statusOnly := np.DeepCopy()
-		statusOnly.StatusConditions().SetTrue(v1.ConditionTypeNodeRegistrationHealthy)
-		statusOnly.ResourceVersion = "2"
-		srcs.Put(statusOnly)
+		np.StatusConditions().SetTrue(v1.ConditionTypeNodeRegistrationHealthy)
+		ExpectApplied(ctx, env.Client, np)
 		Expect(drain()).To(BeEmpty(), "want nothing for the NodePool's status")
 
-		specChange := statusOnly.DeepCopy()
-		specChange.Spec.Limits = map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("14")}
-		specChange.ResourceVersion = "3"
-		specChange.Generation = 2
-		srcs.Put(specChange)
+		np.Spec.Limits = map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("14")}
+		ExpectApplied(ctx, env.Client, np)
 		Expect(drain()).To(Equal([]string{np.Name}), "want the NodePool once its spec changes")
 
-		srcs.Remove(np)
+		ExpectDeleted(ctx, env.Client, np)
 		Expect(drain()).To(Equal([]string{np.Name}), "want the NodePool once it's gone")
 	})
 })

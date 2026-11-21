@@ -109,7 +109,7 @@ type Candidate struct {
 	TerminationGracePeriod *time.Duration
 	// RepairPolicyResult is the policy decision for this candidate's current node snapshot. ShouldDisrupt populates it,
 	// so a repair pass evaluates each candidate once before sorting and constructing a command.
-	RepairPolicyResult repair.RepairResult
+	RepairPolicyResult repair.Result
 	// RebootEscalated reports that recent reboot history converted a reboot decision to replacement.
 	RebootEscalated bool
 }

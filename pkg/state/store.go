@@ -63,7 +63,7 @@ const (
 type slot[O, D, I any] struct {
 	entry  Entry[O, D, I]
 	exists bool
-	// gone are the UIDs a level store removed under the key while its source still holds them, so that a stale read
+	// gone are the UIDs an object store removed under the key while its source still holds them, so that a stale read
 	// of one is dropped.
 	gone []types.UID // bounded: objects removed under one name that the informer hasn't dropped, normally 0-1
 }
@@ -85,8 +85,11 @@ type core[K comparable, O, D, I any] struct {
 	feed feeder
 	// sources are the Derives into the store, by Derivation; it's synced once they are.
 	sources map[any]func() bool
-	// cleared drop what each Derive, Claims and expiring Intent of the store recorded, when a test clears the store.
-	cleared map[any]func()
+	// stops are what Close stops, by owner: each Derive into the store, each expiring Intent's timer and each DependsOn
+	// that touches the store.
+	stops map[any]func()
+	// closed is whether Close ran.
+	closed bool
 	// indexes are the store's Indexes, kept under mu.
 	indexes []indexer[K, O, D, I]
 }
@@ -100,7 +103,7 @@ type Reader[K comparable, O, D, I any] struct{ s *core[K, O, D, I] }
 type Store[K comparable, O, D, I any] struct{ Reader[K, O, D, I] }
 
 func newCore[K comparable, O, D, I any](k kind, build func(K) O) *core[K, O, D, I] {
-	return &core[K, O, D, I]{kind: k, build: build, refs: map[K]int{}, sources: map[any]func() bool{}, cleared: map[any]func(){}}
+	return &core[K, O, D, I]{kind: k, build: build, refs: map[K]int{}, sources: map[any]func() bool{}, stops: map[any]func(){}}
 }
 
 // NewSyntheticStore returns a store of objects built from their keys, such as the singleton Cluster{}: an entry exists
@@ -236,28 +239,30 @@ func (s *Store[K, O, D, I]) touch(key K) {
 	c.unlock()
 }
 
-// Clear empties the store in place, notifying the removal of each entry, so that subscribers stay subscribed, and each
-// Derive, Claims and expiring Intent into the store forgets what it recorded. An object store then applies what its
-// source holds again. It's for tests, between specs: production code never wipes a store, and storelint reports a
-// Clear outside a test.
-func (s *Store[K, O, D, I]) Clear() {
+// Close stops everything that keeps the store current or holds a timer on it: an object store stops following its
+// source, each Derive into it stops following its own, which stops the expiry timers of the Claims against it, each
+// expiring Intent's timer stops, and each DependsOn that touches it stops. The entries stay as they were. It's
+// idempotent.
+func (s *Store[K, O, D, I]) Close() {
 	c := s.s
 	c.mu.Lock()
-	c.slots.Range(func(k, v any) bool {
-		c.slots.Delete(k)
-		if sl := v.(*slot[O, D, I]); sl.exists {
-			c.pending = append(c.pending, Change[K, O, D, I]{Key: k.(K), Old: sl.entry, Existed: true})
-		}
-		return true
-	})
-	c.refs = map[K]int{}
-	c.clearIndexesLocked()
-	for _, clear := range c.cleared {
-		clear()
+	if c.closed {
+		c.mu.Unlock()
+		return
 	}
-	c.unlock()
+	c.closed = true
+	stops := make([]func(), 0, len(c.stops)+1)
+	for _, stop := range c.stops {
+		stops = append(stops, stop)
+	}
+	c.stops = map[any]func(){}
 	if c.feed != nil {
-		c.feed.resync()
+		stops = append(stops, c.feed.stop)
+	}
+	c.mu.Unlock()
+	// Each stop takes the lock of the store it stops following, or this one's.
+	for _, stop := range stops {
+		stop()
 	}
 }
 

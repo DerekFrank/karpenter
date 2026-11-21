@@ -49,7 +49,7 @@ type NodeClaimDerived struct {
 	Usage NodeUsage
 	// RepairPolicyMatches are the repair policies Node's conditions match, from Node's entry, carried here until repair
 	// derives its own, so that disruption's repair reads one store.
-	RepairPolicyMatches []repair.RepairPolicyMatch // bounded: repair policies
+	RepairPolicyMatches []repair.Match // bounded: repair policies
 }
 
 // NodeClaimIntent is what Karpenter decided about a NodeClaim's node. It drops with the NodeClaim.
@@ -152,7 +152,7 @@ func HasBufferPods(e NodeClaimEntry) bool { return e.Intent.BufferPods.Value > 0
 type linkedNode struct {
 	node    *corev1.Node
 	usage   NodeUsage
-	matches []repair.RepairPolicyMatch
+	matches []repair.Match
 }
 
 func (n linkedNode) Update(f NodeClaimDerived, _ linkedNode) NodeClaimDerived {
@@ -168,7 +168,7 @@ func (n linkedNode) Delete(f NodeClaimDerived) NodeClaimDerived {
 // Equal reports whether both carry the same Node entry's fields. A Node entry's fields never change once stored, so the
 // same Node and the same usage maps are the same fields; equal fields in new maps compare unequal, which costs a write.
 func (n linkedNode) Equal(o linkedNode) bool {
-	return n.node == o.node && sameUsage(n.usage, o.usage) && slices.EqualFunc(n.matches, o.matches, repair.RepairPolicyMatch.Equal)
+	return n.node == o.node && sameUsage(n.usage, o.usage) && slices.EqualFunc(n.matches, o.matches, repair.Match.Equal)
 }
 
 // sameUsage returns whether a and b are the same usage: equal counts, and the same maps and slices.

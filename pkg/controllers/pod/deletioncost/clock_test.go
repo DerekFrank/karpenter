@@ -42,7 +42,7 @@ var _ = Describe("Suite Clock Wiring", func() {
 			Status:     v1.NodeClaimStatus{Allocatable: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")}},
 		})
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 		// nominationWindow is max(2*BatchMaxDuration, 10s), so 20s at the suite's
 		// default BatchMaxDuration of 10s.

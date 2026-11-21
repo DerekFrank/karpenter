@@ -46,22 +46,15 @@ var _ = Describe("NodeClaim-first Nodes", func() {
 			},
 		})
 	})
-	// apply creates the objects through the API server and feeds them to cluster state through its informers.
+	// apply creates the objects through the API server, and returns once cluster state holds them.
 	apply := func(objs ...client.Object) {
 		GinkgoHelper()
 		ExpectApplied(ctx, env.Client, objs...)
-		for _, obj := range objs {
-			switch obj.(type) {
-			case *v1.NodeClaim:
-			case *corev1.Node:
-			case *corev1.Pod:
-			}
-		}
 	}
 	onlyNode := func() karpentercluster.NodeView {
 		GinkgoHelper()
-		ExpectStateNodeCount("==", 1)
-		for n := range stateNodes() {
+		ExpectNodeViewCount("==", 1)
+		for n := range nodeViews() {
 			return n
 		}
 		return karpentercluster.NodeView{}
@@ -81,7 +74,7 @@ var _ = Describe("NodeClaim-first Nodes", func() {
 	It("should not read an orphaned Node, with the NodePool label and no NodeClaim, as a node", func() {
 		apply(node)
 
-		ExpectStateNodeCount("==", 0)
+		ExpectNodeViewCount("==", 0)
 		Expect(cs.NodePoolState.LaunchedNodes(nodePool.Name)).To(BeEmpty())
 	})
 	It("should read an unmanaged Node, with no owning NodeClaim and no NodePool label, as its own node", func() {
@@ -91,24 +84,24 @@ var _ = Describe("NodeClaim-first Nodes", func() {
 		})
 		apply(nodeClaim, node, unmanaged)
 
-		ExpectStateNodeCount("==", 2)
-		n := ExpectStateNodeExists(cluster, unmanaged)
+		ExpectNodeViewCount("==", 2)
+		n := ExpectNodeViewExists(cluster, unmanaged)
 		Expect(n.Managed()).To(BeFalse())
 		Expect(n.NodeClaim()).To(BeNil())
 
 		// Once a NodeClaim's owner reference names it, it's that NodeClaim's node. The providerID links nothing.
 		claiming := test.NodeClaim(v1.NodeClaim{Status: v1.NodeClaimStatus{ProviderID: unmanaged.Spec.ProviderID}})
 		apply(claiming)
-		ExpectStateNodeCount("==", 3)
+		ExpectNodeViewCount("==", 3)
 		apply(nodeclaimutils.UpdateNodeOwnerReferences(ExpectExists(ctx, env.Client, claiming), ExpectExists(ctx, env.Client, unmanaged)))
-		ExpectStateNodeCount("==", 2)
-		Expect(ExpectStateNodeExists(cluster, unmanaged).NodeClaim().Name).To(Equal(claiming.Name))
+		ExpectNodeViewCount("==", 2)
+		Expect(ExpectNodeViewExists(cluster, unmanaged).NodeClaim().Name).To(Equal(claiming.Name))
 	})
 	It("should keep intent kept about a NodeClaim before its launch once it launches", func() {
 		providerID := nodeClaim.Status.ProviderID
 		nodeClaim.Status.ProviderID = ""
 		apply(nodeClaim)
-		ExpectStateNodeCount("==", 0)
+		ExpectNodeViewCount("==", 0)
 
 		cs.Deletion.Mark(nodeClaim.Name)
 		cs.Nomination.Nominate(ctx, nodeClaim.Name)
@@ -127,7 +120,7 @@ var _ = Describe("NodeClaim-first Nodes", func() {
 	})
 	It("should count an initialized NodeClaim whose Node is missing as NotReady for disruption budgets", func() {
 		ExpectApplied(ctx, env.Client, nodeClaim, node)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		Expect(cs.NodePoolState.Disruption(nodePool.Name)).To(Equal(karpentercluster.NodePoolDisruption{Nodes: 1}))
 
 		ExpectMakeNodesNotReady(ctx, env.Client, env.Clock, node)

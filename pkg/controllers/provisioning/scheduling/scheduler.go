@@ -148,7 +148,7 @@ func NewScheduler(
 	deletingNodeNames sets.Set[string],
 	nodePoolState *karpentercluster.NodePoolState,
 	capacityQuotas *karpentercluster.CapacityQuotaState,
-	stateNodes []karpentercluster.NodeView,
+	nodeViews []karpentercluster.NodeView,
 	topology *Topology,
 	instanceTypes map[string][]*cloudprovider.InstanceType,
 	daemonSetPods []*corev1.Pod,
@@ -232,7 +232,7 @@ func NewScheduler(
 		return np.Name, np
 	})
 
-	nodeToNodePool := lo.SliceToMap(stateNodes, func(n karpentercluster.NodeView) (karpentercluster.NodeKey, *v1.NodePool) {
+	nodeToNodePool := lo.SliceToMap(nodeViews, func(n karpentercluster.NodeView) (karpentercluster.NodeKey, *v1.NodePool) {
 		return n.Key(), npByName[n.Labels()[v1.NodePoolLabelKey]]
 	})
 	// The names of the Nodes that are marked for deletion, whose pods are exempt from the consolidateAfter destination
@@ -241,7 +241,7 @@ func NewScheduler(
 	if karpopts.FromContext(ctx).FeatureGates.CapacityQuota {
 		s.quotaLimits, s.quotaMatches = newQuotaLimits(capacityQuotas, s.nodeClaimTemplates)
 	}
-	s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods, nodeToNodePool, resolved.enforceConsolidateAfter)
+	s.calculateExistingNodeClaims(ctx, nodeViews, daemonSetPods, nodeToNodePool, resolved.enforceConsolidateAfter)
 	return s
 }
 
@@ -851,9 +851,9 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod, volu
 	return multierr.Combine(errs...)
 }
 
-func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes []karpentercluster.NodeView, daemonSetPods []*corev1.Pod, nodePoolMap map[karpentercluster.NodeKey]*v1.NodePool, enforceConsolidateAfter bool) {
+func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, nodeViews []karpentercluster.NodeView, daemonSetPods []*corev1.Pod, nodePoolMap map[karpentercluster.NodeKey]*v1.NodePool, enforceConsolidateAfter bool) {
 	// create our existing nodes
-	for _, node := range stateNodes {
+	for _, node := range nodeViews {
 		taints := node.Taints()
 		daemons := s.getCompatibleDaemonPods(ctx, node, taints, daemonSetPods)
 		isUnderConsolidateAfter := enforceConsolidateAfter && disruption.IsUnderConsolidateAfter(nodePoolMap[node.Key()], node.NodeClaim(), s.clock)

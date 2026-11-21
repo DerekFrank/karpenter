@@ -49,8 +49,8 @@ type Equaler[C any] interface {
 // Derivation keeps the Derived fields of a store's entries up to date from the entries of another store. Make one with
 // Derive.
 type Derivation[K1, K2 comparable, D2 any, C Contribution[D2, C]] struct {
-	// read computes a source key's contribution, and returns the version of its entry it computed from.
-	read       func(K1) (version any, next record[K2, C], contributes bool)
+	// read computes a source key's contribution, and returns the slot it computed it from.
+	read       func(K1) (slot any, next record[K2, C], contributes bool)
 	current    func(K1) any
 	fromSynced func() bool
 	to         target[K2, D2]
@@ -82,7 +82,7 @@ type target[K comparable, D any] interface {
 	unlock()
 	derivedLocked(key K, update func(D) D, refs int, compare bool)
 	derivedOfLocked(key K) D
-	addSourceLocked(id any, synced func() bool, cleared func())
+	addSourceLocked(id any, synced func() bool, stop func())
 	removeSourceLocked(id any)
 }
 
@@ -93,18 +93,20 @@ func (c *core[K, O, D, I]) derivedOfLocked(key K) D {
 	return sl.entry.Derived
 }
 
-func (c *core[K, O, D, I]) addSourceLocked(id any, synced func() bool, cleared func()) {
+// addSourceLocked records what feeds the store: synced, which the store's Synced waits on, and stop, which Close calls.
+// Either may be nil.
+func (c *core[K, O, D, I]) addSourceLocked(id any, synced func() bool, stop func()) {
 	if synced != nil {
 		c.sources[id] = synced
 	}
-	if cleared != nil {
-		c.cleared[id] = cleared
+	if stop != nil {
+		c.stops[id] = stop
 	}
 }
 
 func (c *core[K, O, D, I]) removeSourceLocked(id any) {
 	delete(c.sources, id)
-	delete(c.cleared, id)
+	delete(c.stops, id)
 }
 
 // Derive keeps the Derived fields of to's entries up to date from from's entries, such as each NodeClaim's capacity
@@ -169,7 +171,7 @@ func derive[K1, K2 comparable, O1, D1, I1, O2, D2, I2 any, C Contribution[D2, C]
 		d.fromSynced = func() bool { return true }
 	}
 	to.s.lock()
-	to.s.addSourceLocked(d, d.Synced, d.clearLocked)
+	to.s.addSourceLocked(d, d.Synced, d.Stop)
 	to.s.unlock()
 	d.unsubscribe = from.Subscribe(func(c Change[K1, O1, D1, I1]) {
 		if unchanged == nil || !unchanged(c) {
@@ -214,7 +216,8 @@ func (d *Derivation[K1, K2, D2, C]) Remove() {
 	for _, r := range d.records {
 		d.to.derivedLocked(r.key, r.value.Delete, -1, false)
 	}
-	d.clearLocked()
+	d.records = map[K1]record[K2, C]{}
+	d.byKey = map[K2]map[K1]struct{}{}
 	d.to.removeSourceLocked(d)
 	d.to.unlock()
 }
@@ -230,14 +233,9 @@ func (d *Derivation[K1, K2, D2, C]) Sources(key K2) []K1 {
 	return sources
 }
 
-func (d *Derivation[K1, K2, D2, C]) clearLocked() {
-	d.records = map[K1]record[K2, C]{}
-	d.byKey = map[K2]map[K1]struct{}{}
-}
-
 // apply applies k's latest entry. It computes the contribution without a lock, then commits it under to's lock only if
-// from still holds the entry it computed from, and recomputes otherwise, so the last commit for k is from k's latest
-// entry. A store's slots never change once stored, so the slot pointer identifies a version of the entry.
+// from's slot for k is still the one it computed from, and recomputes otherwise, so the last commit for k is from k's
+// latest entry. A store's slots never change once stored, so a slot that's still current holds the entry it read.
 func (d *Derivation[K1, K2, D2, C]) apply(k K1) {
 	for {
 		read, next, contributes := d.read(k)
@@ -247,8 +245,8 @@ func (d *Derivation[K1, K2, D2, C]) apply(k K1) {
 	}
 }
 
-// commit commits a contribution of k computed from the entry read, and returns false, committing nothing, if from no
-// longer holds that entry.
+// commit commits a contribution of k computed from the slot read, and returns false, committing nothing, if read is no
+// longer from's slot for k.
 func (d *Derivation[K1, K2, D2, C]) commit(k K1, read any, next record[K2, C], contributes bool) bool {
 	d.to.lock()
 	defer d.to.unlock()

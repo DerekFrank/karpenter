@@ -106,7 +106,7 @@ var _ = Describe("Repair", func() {
 	// Status.Conditions with Ready=True, so unhealthy conditions must be stamped AFTER this via markUnhealthy.
 	initNode := func(nc *v1.NodeClaim, n *corev1.Node) {
 		ExpectApplied(ctx, env.Client, nc, n)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{n}, []*v1.NodeClaim{nc})
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{n}, []*v1.NodeClaim{nc})
 	}
 
 	// bindReschedulablePod places a ReplicaSet-owned (reschedulable) pod on the node so pre-spin sizing has workload

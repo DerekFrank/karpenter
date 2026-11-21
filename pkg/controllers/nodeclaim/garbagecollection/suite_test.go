@@ -26,17 +26,13 @@ import (
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
-	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	nodeclaimgarbagecollection "sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/garbagecollection"
-	nodeclaimlifcycle "sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
-	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -46,12 +42,9 @@ import (
 
 var (
 	ctx                         context.Context
-	nodeClaimController         *nodeclaimlifcycle.Controller
 	garbageCollectionController *nodeclaimgarbagecollection.Controller
 	env                         *test.Environment
 	cloudProvider               *fake.CloudProvider
-	cluster                     karpentercluster.State
-	cs                          karpentercluster.State
 )
 
 func TestAPIs(t *testing.T) {
@@ -64,10 +57,7 @@ var _ = BeforeSuite(func() {
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...), test.WithFieldIndexers(test.NodeProviderIDFieldIndexer(ctx)))
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
-	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = cs
 	garbageCollectionController = nodeclaimgarbagecollection.NewController(env.Clock, env.Overlay, cloudProvider)
-	nodeClaimController = nodeclaimlifcycle.NewController(env.Clock, env.Overlay, cloudProvider, events.NewRecorder(&record.FakeRecorder{}), cluster.PodsBySimulatedNodeClaim, cs.Registrations, nil)
 })
 
 var _ = AfterSuite(func() {

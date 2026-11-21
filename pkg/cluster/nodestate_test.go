@@ -75,9 +75,8 @@ func unsyncedNodeState(ctx context.Context, cloudProvider cloudprovider.CloudPro
 	return s, srcs
 }
 
-// listSynced is the check cluster state's Synced made against the API server before node state's stores followed it:
-// no NodeClaim cluster state holds is unlaunched, and it holds every managed NodeClaim and every Node the API server
-// does.
+// listSynced checks cluster state against a List of the API server: no NodeClaim cluster state holds is unlaunched, and
+// it holds every managed NodeClaim and every Node the API server does.
 func listSynced(ctx context.Context, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, s State) bool {
 	GinkgoHelper()
 	held := sets.New[string]()
@@ -109,10 +108,11 @@ func listSynced(ctx context.Context, kubeClient client.Client, cloudProvider clo
 }
 
 var _ = Describe("Node stores", func() {
-	// Node state's stores having synced, with no unlaunched NodeClaim, implies what cluster state's Synced checked
-	// against a List of the API server: that it holds every managed NodeClaim and every Node, and none of its NodeClaims
-	// is unlaunched. So gating on the stores' sync with state.Requires, and on HasUnlaunchedNodeClaims, is at least as
-	// strong as the List check it replaces.
+	// Node state's stores having synced, with no unlaunched NodeClaim, implies what a List of the API server would
+	// check: that cluster state holds every managed NodeClaim and every Node, and none of its NodeClaims is unlaunched.
+	// So gating on the stores' sync with state.Requires, and on NodeClaimsLaunched, is at least as strong as that List
+	// check. The stores start from sources that haven't synced, which the suite's informers, synced before any spec,
+	// can't show.
 	It("should be at least as strongly synced as the List check once its stores sync with no unlaunched NodeClaims", func() {
 		r := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // a seeded source makes failures reproducible
 		cloudProvider := cpfake.NewCloudProvider()

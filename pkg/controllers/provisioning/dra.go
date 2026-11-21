@@ -33,22 +33,22 @@ import (
 
 // gatherResourceSlices lists the in-cluster ResourceSlices and filters them down to the set the DRA allocator should
 // treat as the published universe of in-cluster devices. A slice is dropped when it is owned by a Node that is not
-// represented by an initialized, included stateNode:
-//   - Slices owned by nodes that aren't in the provided stateNode set (deleting nodes, disruption candidates) are
+// represented by an initialized, included node view:
+//   - Slices owned by nodes that aren't in the provided node views (deleting nodes, disruption candidates) are
 //     excluded, since those nodes' devices shouldn't be considered persistent capacity.
 //   - Slices owned by uninitialized nodes are excluded. Until a node is initialized its devices are represented by
 //     template devices (see the NodeClaim adapters), so including its published slices would double-count them.
 //
 // Ownership is determined via metadata.ownerReferences (Kind == "Node"), not spec.nodeName, which only indicates
 // accessibility. Slices with no Node owner reference (e.g. cluster-wide slices) are always included.
-func (p *Provisioner) gatherResourceSlices(ctx context.Context, stateNodes []karpentercluster.NodeView) ([]dynamicresources.ResourceSlice, error) {
+func (p *Provisioner) gatherResourceSlices(ctx context.Context, nodeViews []karpentercluster.NodeView) ([]dynamicresources.ResourceSlice, error) {
 	sliceList := &resourcev1.ResourceSliceList{}
 	if err := p.kubeClient.List(ctx, sliceList); err != nil {
 		return nil, fmt.Errorf("listing resourceslices, %w", err)
 	}
 
 	includedNodeNames := sets.New[string]()
-	for _, n := range stateNodes {
+	for _, n := range nodeViews {
 		if n.NodeName() != "" && n.Initialized() {
 			includedNodeNames.Insert(n.NodeName())
 		}

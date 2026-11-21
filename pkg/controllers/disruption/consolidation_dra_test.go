@@ -66,8 +66,8 @@ var _ = Describe("Consolidation/DRA", func() {
 		nodePoolMap, nodePoolToInstanceTypesMap, err := disruption.BuildNodePoolMap(ctx, env.Client, cloudProvider)
 		Expect(err).To(Succeed())
 		candidates := lo.Map(nodes, func(node *corev1.Node, _ int) *disruption.Candidate {
-			stateNode := stateNodeOf(node)
-			candidate, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNode, pdbs, nodePoolMap, nodePoolToInstanceTypesMap, queue, disruption.GracefulDisruptionClass)
+			nodeEntry := entryOfNode(node)
+			candidate, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, nodeEntry, pdbs, nodePoolMap, nodePoolToInstanceTypesMap, queue, disruption.GracefulDisruptionClass)
 			Expect(err).To(Succeed())
 			return candidate
 		})
@@ -97,7 +97,7 @@ var _ = Describe("Consolidation/DRA", func() {
 		})
 		node.Labels[corev1.LabelHostname] = node.Name
 		ExpectApplied(ctx, env.Client, nodeClaim, node)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		return nodeClaim, ExpectExists(ctx, env.Client, node)
 	}
 

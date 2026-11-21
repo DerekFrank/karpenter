@@ -20,11 +20,9 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
-	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/samber/lo"
@@ -38,31 +36,25 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	fakecp "sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
-	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/state"
 	"sigs.k8s.io/karpenter/pkg/state/statetest"
 )
 
-// The benchmarks compare one scrape of the pod metrics built at scrape time with the work the polling controller did
-// for the same pods: a pass that reconciled each pod's series into a metrics.Store, which it did every 30s for every
-// pod, plus the scrape of the gauge vector it wrote. The legacy pass reads each pod's Node from a map rather than the
-// cache, so it understates the controller's cost. Run with
+// The benchmarks measure one scrape of the pod metrics built at scrape time. Run with
 // go test ./pkg/controllers/metrics/pod/ -run '^$' -bench . -benchmem
 
 var benchSizes = []struct{ nodes, pods int }{{1000, 30}, {5000, 30}}
 
 type benchFixture struct {
-	cs    karpentercluster.State
-	nodes map[string]*corev1.Node
-	pods  []*corev1.Pod
+	cs karpentercluster.State
 }
 
 func newBenchFixture(numNodes, podsPerNode int) *benchFixture {
 	ctx := options.ToContext(context.Background(), &options.Options{BatchMaxDuration: 10 * time.Second})
 	srcs := statetest.NewSources()
 	f := &benchFixture{cs: karpentercluster.New(ctx, clock.NewFakeClock(time.Now()), nil, fakecp.NewCloudProvider(),
-		karpentercluster.WithSources(func(obj client.Object) state.Newest { return srcs.For(obj) })), nodes: map[string]*corev1.Node{}}
+		karpentercluster.WithSources(func(obj client.Object) state.Newest { return srcs.For(obj) }))}
 	rv := 0
 	version := func(obj client.Object) {
 		rv++
@@ -80,7 +72,6 @@ func newBenchFixture(numNodes, podsPerNode int) *benchFixture {
 			Spec: corev1.NodeSpec{ProviderID: fmt.Sprintf("fake://%d", i)},
 		}
 		version(node)
-		f.nodes[node.Name] = node
 		srcs.Put(node)
 		for j := range podsPerNode {
 			pod := &corev1.Pod{
@@ -96,7 +87,6 @@ func newBenchFixture(numNodes, podsPerNode int) *benchFixture {
 				}},
 			}
 			version(pod)
-			f.pods = append(f.pods, pod)
 			srcs.Put(pod)
 		}
 	}
@@ -123,79 +113,4 @@ func BenchmarkScrape(b *testing.B) {
 			b.ReportMetric(float64(series), "series")
 		})
 	}
-}
-
-// BenchmarkLegacyReconcilePass is the polling controller reconciling every pod once, as it did every 30s: each pod's
-// labels built and its series updated in the metrics.Store.
-func BenchmarkLegacyReconcilePass(b *testing.B) {
-	for _, size := range benchSizes {
-		b.Run(fmt.Sprintf("pods=%d", size.nodes*size.pods), func(b *testing.B) {
-			f := newBenchFixture(size.nodes, size.pods)
-			l := newLegacy()
-			l.pass(f)
-			b.ResetTimer()
-			for range b.N {
-				l.pass(f)
-			}
-		})
-	}
-}
-
-// BenchmarkLegacyScrape is one scrape of the gauge vector the polling controller wrote.
-func BenchmarkLegacyScrape(b *testing.B) {
-	for _, size := range benchSizes {
-		b.Run(fmt.Sprintf("pods=%d", size.nodes*size.pods), func(b *testing.B) {
-			f := newBenchFixture(size.nodes, size.pods)
-			l := newLegacy()
-			l.pass(f)
-			b.ResetTimer()
-			for range b.N {
-				lo.Must(l.registry.Gather())
-			}
-		})
-	}
-}
-
-type legacy struct {
-	registry *prometheus.Registry
-	store    *metrics.Store
-	podState opmetrics.GaugeMetric
-}
-
-func newLegacy() *legacy {
-	l := &legacy{registry: prometheus.NewRegistry(), store: metrics.NewStore()}
-	l.podState = opmetrics.NewPrometheusGauge(l.registry, prometheus.GaugeOpts{Namespace: metrics.Namespace, Subsystem: metrics.PodSubsystem, Name: "state"}, labelNames(), opmetrics.Beta)
-	return l
-}
-
-// pass reconciles every pod as ba93a61e's controller did for a running, bound, ready pod.
-func (l *legacy) pass(f *benchFixture) {
-	for _, pod := range f.pods {
-		l.store.Update(client.ObjectKeyFromObject(pod).String(), []*metrics.StoreMetric{{GaugeMetric: l.podState, Value: 1, Labels: legacyLabels(pod, f.nodes[pod.Spec.NodeName])}})
-	}
-}
-
-func legacyLabels(pod *corev1.Pod, node *corev1.Node) prometheus.Labels {
-	metricLabels := map[string]string{}
-	metricLabels[podName] = pod.Name
-	metricLabels[podNamespace] = pod.Namespace
-	selflink := ""
-	if len(pod.OwnerReferences) > 0 {
-		selflink = fmt.Sprintf("/apis/%s/namespaces/%s/%ss/%s", pod.OwnerReferences[0].APIVersion, pod.Namespace, strings.ToLower(pod.OwnerReferences[0].Kind), pod.OwnerReferences[0].Name)
-	}
-	metricLabels[ownerSelfLink] = selflink
-	metricLabels[podHostName] = pod.Spec.NodeName
-	metricLabels[podScheduled] = lo.Ternary(pod.Spec.NodeName != "", "true", "false")
-	metricLabels[podPhase] = string(pod.Status.Phase)
-	_, ready := lo.Find(pod.Status.Conditions, func(c corev1.PodCondition) bool {
-		return c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue
-	})
-	metricLabels[podReady] = lo.Ternary(ready, "true", "false")
-	metricLabels[metrics.ZoneLabel] = node.Labels[corev1.LabelTopologyZone]
-	metricLabels[podHostArchitecture] = node.Labels[corev1.LabelArchStable]
-	metricLabels[metrics.CapacityTypeLabel] = node.Labels[v1.CapacityTypeLabelKey]
-	metricLabels[podHostInstanceType] = node.Labels[corev1.LabelInstanceTypeStable]
-	metricLabels[metrics.NodePoolLabel] = node.Labels[v1.NodePoolLabelKey]
-	metricLabels[managed] = strconv.FormatBool(node.Labels[v1.NodePoolLabelKey] != "")
-	return metricLabels
 }

@@ -28,7 +28,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 )
 
-var benchmarkRepairPolicyResult RepairResult
+var benchmarkRepairPolicyResult Result
 
 func BenchmarkRepairPolicyMatcherMatchAndResolve(b *testing.B) {
 	for _, policyCount := range []int{1, 10, 100} {
@@ -54,7 +54,7 @@ func BenchmarkRepairPolicyMatcherMatchAndResolve(b *testing.B) {
 					TolerationDuration: time.Minute,
 					Action:             cloudprovider.ReplaceNode,
 				})
-				matcher, err := newRepairPolicyMatcher(policies, sets.New(cloudprovider.ReplaceNode))
+				matcher, err := newPolicyMatcher(policies, sets.New(cloudprovider.ReplaceNode))
 				if err != nil {
 					b.Fatal(err)
 				}

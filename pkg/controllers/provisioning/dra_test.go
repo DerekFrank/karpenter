@@ -143,7 +143,7 @@ var _ = Describe("Dynamic Resource Allocation", func() {
 	provisionDRA := func(pods ...*corev1.Pod) ProvisioningResult {
 		GinkgoHelper()
 		ExpectDeviceAllocationReconciled(ctx, env.Client, draController)
-		return ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, draProvisioner, pods...)
+		return ExpectProvisioned(ctx, env.Client, cloudProvider, draProvisioner, pods...)
 	}
 
 	// existingNode creates a managed node belonging to nodePool with the given instance type and capacity, applies it,
@@ -465,7 +465,7 @@ var _ = Describe("Dynamic Resource Allocation", func() {
 			pod := draPod("gpu", "late-claim")
 			ExpectApplied(ctx, env.Client, pod)
 			ExpectDeviceAllocationReconciled(ctx, env.Client, draController)
-			ExpectProvisionedNoBinding(ctx, env.Client, cluster, cloudProvider, draProvisioner)
+			ExpectProvisionedNoBinding(ctx, env.Client, cloudProvider, draProvisioner)
 			ExpectNotScheduled(ctx, env.Client, pod)
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(0))
 
@@ -489,7 +489,7 @@ var _ = Describe("Dynamic Resource Allocation", func() {
 
 			pod := draPod("gpu", "gpu-claim")
 			// The provisioner ignores DRA entirely under this flag, so the device controller isn't consulted.
-			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
+			ExpectProvisioned(ctx, env.Client, cloudProvider, prov, pod)
 			ExpectNotScheduled(ctx, env.Client, pod)
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(0))
 		})
@@ -503,7 +503,7 @@ var _ = Describe("Dynamic Resource Allocation", func() {
 			pod := draPod("gpu", "missing-claim")
 			ExpectApplied(ctx, env.Client, pod)
 			ExpectDeviceAllocationReconciled(ctx, env.Client, draController)
-			ExpectProvisionedNoBinding(ctx, env.Client, cluster, cloudProvider, draProvisioner)
+			ExpectProvisionedNoBinding(ctx, env.Client, cloudProvider, draProvisioner)
 			ExpectNotScheduled(ctx, env.Client, pod)
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(0))
 		})
@@ -625,7 +625,7 @@ var _ = Describe("Dynamic Resource Allocation", func() {
 			ExpectApplied(ctx, env.Client, pod)
 			ExpectResourceClaimsProcessed(ctx, env.Client, pod)
 			ExpectDeviceAllocationReconciled(ctx, env.Client, draController)
-			results := ExpectProvisionedResults(ctx, env.Client, cluster, cloudProvider, draProvisioner, pod)
+			results := ExpectProvisionedResults(ctx, env.Client, cloudProvider, draProvisioner, pod)
 			Expect(results.DRAClaimAllocationMetadata).To(HaveKey(types.NamespacedName{Namespace: "default", Name: "gpu-claim"}))
 		})
 	})

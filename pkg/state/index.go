@@ -42,7 +42,6 @@ type Index[K comparable, O, D, I any, V comparable] struct {
 // indexer is an Index of a store, whatever its value type, which the store keeps under its lock.
 type indexer[K comparable, O, D, I any] interface {
 	updateLocked(key K, next *slot[O, D, I])
-	clearLocked()
 }
 
 // NewIndex indexes s's entries by the values values returns of each, such as the pods by each PVC they mount, so that
@@ -156,18 +155,6 @@ func (c *core[K, O, D, I]) indexLocked(key K, next *slot[O, D, I]) {
 	}
 }
 
-// clearIndexesLocked empties each index, for a store Clear empties.
-func (c *core[K, O, D, I]) clearIndexesLocked() {
-	for _, x := range c.indexes {
-		x.clearLocked()
-	}
-}
-
-func (x *Index[K, O, D, I, V]) clearLocked() {
-	x.of = map[K][]V{}
-	x.keys.Clear()
-}
-
 // updateLocked moves key from the values it's indexed under to next's: none if next's entry doesn't exist.
 func (x *Index[K, O, D, I, V]) updateLocked(key K, next *slot[O, D, I]) {
 	var values []V
@@ -235,14 +222,25 @@ func unique[V comparable](values []V) []V {
 // appears or drops, it touches each key of target that idx, an index of target by dep's keys, returns for it, so that
 // the Derives from target recompute it. The touch stores the entry in a new slot, so a recompute that read dep before
 // it changed is refused at commit, and the recompute the touch triggers holds. An idx of another store panics. It
-// returns a func that stops it.
+// returns a func that stops it, which target's Close calls too.
 func DependsOn[K comparable, O, D, I any, K2 comparable, O2, D2, I2 any](target *Store[K, O, D, I], dep Reader[K2, O2, D2, I2], idx *Index[K, O, D, I, K2]) func() {
 	if idx.s != target.s {
 		panic("DependsOn with an index of another store")
 	}
-	return dep.Subscribe(func(c Change[K2, O2, D2, I2]) {
+	unsubscribe := dep.Subscribe(func(c Change[K2, O2, D2, I2]) {
 		for _, key := range idx.lookup(c.Key) {
 			target.touch(key)
 		}
 	})
+	id := new(int)
+	c := target.s
+	c.lock()
+	c.addSourceLocked(id, nil, unsubscribe)
+	c.unlock()
+	return func() {
+		unsubscribe()
+		c.lock()
+		c.removeSourceLocked(id)
+		c.unlock()
+	}
 }

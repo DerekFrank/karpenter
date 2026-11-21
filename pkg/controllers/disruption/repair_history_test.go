@@ -36,7 +36,7 @@ import (
 var _ = Describe("RebootHistory", func() {
 	candidateWithAction := func(uid types.UID, action cloudprovider.RepairAction) *Candidate {
 		c := testCandidate(&v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{UID: uid}}, nil)
-		c.RepairPolicyResult = repair.RepairResult{Action: action, Condition: "AcceleratorReady", Reason: "XID48"}
+		c.RepairPolicyResult = repair.Result{Action: action, Condition: "AcceleratorReady", Reason: "XID48"}
 		return c
 	}
 

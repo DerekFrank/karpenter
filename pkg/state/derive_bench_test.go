@@ -29,14 +29,14 @@ func BenchmarkDeriveOneKey(b *testing.B) {
 	versions := make([]uint64, 1000)
 	for i := range versions {
 		versions[i] = 1
-		observe(nodeClaims, nodeClaim(fmt.Sprintf("nc-%d", i), "x", 1, "1"))
+		put(nodeClaims, nodeClaim(fmt.Sprintf("nc-%d", i), "x", 1, "1"))
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := range b.N {
 		n := i % len(versions)
 		versions[n]++
-		observe(nodeClaims, nodeClaim(fmt.Sprintf("nc-%d", n), "x", versions[n], fmt.Sprint(1+versions[n]%2)))
+		put(nodeClaims, nodeClaim(fmt.Sprintf("nc-%d", n), "x", versions[n], fmt.Sprint(1+versions[n]%2)))
 	}
 	b.StopTimer()
 	if got := fields(s, "x").Count; got != len(versions) {

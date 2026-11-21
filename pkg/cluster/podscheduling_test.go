@@ -201,32 +201,6 @@ var _ = Describe("Pods Mapped To NodeClaim", func() {
 	})
 })
 
-var _ = Describe("Reset", func() {
-	It("should clear the pod scheduling fields, the NodeClaim mappings and the buffer pod counts", func() {
-		pod := test.Pod()
-		ExpectApplied(ctx, env.Client, pod)
-		nn := client.ObjectKeyFromObject(pod)
-		cs.PodScheduling.Ack(pod)
-		cs.PodScheduling.MarkDecisions(nil, map[string][]*corev1.Pod{"np1": {pod}}, map[string][]*corev1.Pod{"nc1": {pod}})
-		nodeClaim := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "provider-a"}})
-		ExpectApplied(ctx, env.Client, nodeClaim)
-		cs.BufferPods.Replace(map[string]int{"provider-a": 2})
-		Expect(bufferPodCount("provider-a")).To(Equal(2))
-
-		cs.Reset()
-		Expect(PodSchedulingOf(cluster.Pods, nn).AckedAt.IsZero()).To(BeTrue())
-		Expect(PodSchedulingOf(cluster.Pods, nn).DecidedAt.IsZero()).To(BeTrue())
-		Expect(PodSchedulingOf(cluster.Pods, nn).SchedulableAt.IsZero()).To(BeTrue())
-		Expect(PodSchedulingOf(cluster.Pods, nn).NodeClaim).To(BeEmpty())
-		Expect(cluster.PodsBySimulatedNodeClaim.Lookup("nc1")).To(BeEmpty())
-		Expect(bufferPodCount("provider-a")).To(Equal(0))
-
-		// The derived store still follows its source after a Reset.
-		cs.PodScheduling.MapToNodeClaims(map[string][]*corev1.Pod{"nc2": {pod}})
-		Expect(cluster.PodsBySimulatedNodeClaim.Lookup("nc2")).To(ConsistOf(nn))
-	})
-})
-
 var _ = Describe("Buffer Pod Counts", func() {
 	BeforeEach(func() {
 		// Buffer pod counts are intent kept with each NodeClaim, by name.

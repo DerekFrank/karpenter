@@ -91,7 +91,11 @@ var _ = BeforeSuite(func() {
 	ctx = options.ToContext(ctx, test.Options())
 
 	cloudProvider = fake.NewCloudProvider()
+})
+
+var _ = BeforeEach(func() {
 	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
+	DeferCleanup(cs.Close)
 	cluster = cs
 	npState = cs.NodePoolState
 	registrations = cs.Registrations
@@ -130,7 +134,6 @@ var _ = AfterEach(func() {
 	env.Clock.SetTime(time.Now())
 	ExpectCleanedUp(ctx, env.Client)
 	cloudProvider.Reset()
-	cs.Reset()
 })
 
 var _ = Describe("Finalizer", func() {

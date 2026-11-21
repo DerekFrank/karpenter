@@ -69,7 +69,7 @@ type ScenarioFixture struct {
 	nodePools     []*v1.NodePool
 	itsByNP       map[string][]*cloudprovider.InstanceType
 	topology      *scheduling.Topology
-	stateNodes    []karpentercluster.NodeView
+	nodeViews     []karpentercluster.NodeView
 	daemonSetPods []*corev1.Pod
 	recorder      events.Recorder
 	clk           clock.Clock
@@ -100,9 +100,9 @@ func benchNodePools(count int) []*v1.NodePool {
 	return nps
 }
 
-// benchStateNodes builds initialized+registered StateNodes directly, distributed
+// benchNodeViews builds initialized+registered node views directly, distributed
 // round-robin across the given NodePools.
-func benchStateNodes(count int, nodePools []*v1.NodePool) []karpentercluster.NodeView {
+func benchNodeViews(count int, nodePools []*v1.NodePool) []karpentercluster.NodeView {
 	rl := corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse("16"),
 		corev1.ResourceMemory: resource.MustParse("32Gi"),
@@ -190,12 +190,12 @@ func buildScenario(tb testing.TB, s Scenario) *ScenarioFixture {
 	if err != nil {
 		tb.Fatalf("creating topology: %s", err)
 	}
-	stateNodes := benchStateNodes(s.Nodes, nodePools)
+	nodeViews := benchNodeViews(s.Nodes, nodePools)
 	daemonSetPods := benchDaemonSetPods(s.DaemonSets)
 
 	f := &ScenarioFixture{
 		ctx: ctx, client: c, cluster: cl, clusterState: cs, nodePools: nodePools, itsByNP: itsByNP,
-		topology: topology, stateNodes: stateNodes, daemonSetPods: daemonSetPods,
+		topology: topology, nodeViews: nodeViews, daemonSetPods: daemonSetPods,
 		recorder: events.NewRecorder(&record.FakeRecorder{}), clk: clk,
 	}
 	scenarioCache[s] = f
@@ -211,7 +211,7 @@ func newSchedulerFromScenario(f *ScenarioFixture) *scheduling.Scheduler {
 		nil, // deletingNodeNames
 		f.clusterState.NodePoolState,
 		f.clusterState.CapacityQuotaState,
-		f.stateNodes,
+		f.nodeViews,
 		f.topology,
 		f.itsByNP,
 		f.daemonSetPods,

@@ -41,14 +41,14 @@ import (
 	"sigs.k8s.io/karpenter/pkg/state/statetest"
 )
 
-type levelNodeClaims = Store[types.NamespacedName, *v1.NodeClaim, struct{}, nodeClaimIntent]
+type objectNodeClaims = Store[types.NamespacedName, *v1.NodeClaim, struct{}, nodeClaimIntent]
 
-func newLevelNodeClaims(from Newest) *levelNodeClaims {
+func newObjectNodeClaims(from Newest) *objectNodeClaims {
 	return NewObjectStore[types.NamespacedName, *v1.NodeClaim, struct{}, nodeClaimIntent](from)
 }
 
 // recount returns the usage of each NodePool counted from the objects the store holds.
-func recount(nodeClaims *levelNodeClaims) map[string]poolFields {
+func recount(nodeClaims *objectNodeClaims) map[string]poolFields {
 	want := map[string]poolFields{}
 	for k, e := range nodeClaims.List() {
 		u := usageOf(k, e)
@@ -58,13 +58,13 @@ func recount(nodeClaims *levelNodeClaims) map[string]poolFields {
 	return want
 }
 
-var _ = ginkgo.Describe("LevelStore", func() {
+var _ = ginkgo.Describe("ObjectStore", func() {
 	var objects *statetest.Objects
-	var nodeClaims *levelNodeClaims
+	var nodeClaims *objectNodeClaims
 	var s *pools
 	ginkgo.BeforeEach(func() {
 		objects = statetest.NewObjects()
-		nodeClaims = newLevelNodeClaims(objects)
+		nodeClaims = newObjectNodeClaims(objects)
 		s = newPools()
 		Derive(nodeClaims.Reader, s, poolOf, usageOf)
 	})
@@ -114,7 +114,7 @@ var _ = ginkgo.Describe("LevelStore", func() {
 	ginkgo.It("should drop a stale read of an object it removed while its source still holds it", func() {
 		key := types.NamespacedName{Name: "a"}
 		hiding := &hides{Objects: statetest.NewObjects()}
-		store := newLevelNodeClaims(hiding)
+		store := newObjectNodeClaims(hiding)
 		feed := store.s.feed.(*newestOf[types.NamespacedName, *v1.NodeClaim, struct{}, nodeClaimIntent])
 		stale := nodeClaim("a", "x", 1, "1")
 		hiding.Put(stale)
@@ -135,7 +135,7 @@ var _ = ginkgo.Describe("LevelStore", func() {
 		key := types.NamespacedName{Name: "a"}
 		stale := nodeClaim("a", "x", 1, "1")
 		late := &lateRead{Objects: statetest.NewObjects(), stale: stale}
-		store := newLevelNodeClaims(late)
+		store := newObjectNodeClaims(late)
 		feed := store.s.feed.(*newestOf[types.NamespacedName, *v1.NodeClaim, struct{}, nodeClaimIntent])
 		feed.apply(key)
 		_, ok := store.Get(key)
@@ -282,17 +282,17 @@ func (s *storedInformers) GetInformer(ctx context.Context, obj client.Object, op
 	return s.FakeInformers.GetInformer(ctx, obj, opts...)
 }
 
-var _ = ginkgo.Describe("LevelStore over the overlay", func() {
+var _ = ginkgo.Describe("ObjectStore over the overlay", func() {
 	var informer *storedInformer
 	var kubeClient *overlay.Client
-	var nodeClaims *levelNodeClaims
+	var nodeClaims *objectNodeClaims
 	var s *pools
 	var nc *v1.NodeClaim
 	ginkgo.BeforeEach(func() {
 		informers := &informertest.FakeInformers{Scheme: scheme.Scheme}
 		informer = &storedInformer{FakeInformer: lo.Must(informers.FakeInformerFor(ctx, &v1.NodeClaim{})), store: toolscache.NewStore(toolscache.MetaNamespaceKeyFunc)}
 		kubeClient = lo.Must(overlay.New(ctx, fake.NewClientBuilder().WithScheme(scheme.Scheme).Build(), &storedInformers{FakeInformers: informers, nodeClaims: informer}, &v1.NodeClaim{}))
-		nodeClaims = newLevelNodeClaims(lo.Must(kubeClient.Source(&v1.NodeClaim{})))
+		nodeClaims = newObjectNodeClaims(lo.Must(kubeClient.Source(&v1.NodeClaim{})))
 		s = newPools()
 		Derive(nodeClaims.Reader, s, poolOf, func(_ types.NamespacedName, e nodeClaimEntry) usage {
 			return usage{CPU: lo.Ternary[int64](e.Object.DeletionTimestamp.IsZero(), 0, 1), Count: 1}

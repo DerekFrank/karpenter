@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -49,11 +50,7 @@ import (
 
 var ctx context.Context
 var env *test.Environment
-var cluster karpentercluster.State
-var metricsStateController *node.Controller
 var cloudProvider *fake.CloudProvider
-
-var cs karpentercluster.State
 
 func TestAPIs(t *testing.T) {
 	ctx = TestContextWithLogger(t)
@@ -67,15 +64,25 @@ var _ = BeforeSuite(func() {
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
 	cloudProvider.InstanceTypes = fake.InstanceTypesAssorted()
-	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = cs
-	metricsStateController = node.NewController(cluster.NodeClaims, cluster.Nodes)
+})
+
+var _ = BeforeEach(func() {
+	cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
+	DeferCleanup(cs.Close)
+	c := node.NewController(cs.NodeClaims, cs.Nodes)
 	// Register derives the node count and registers the collectors, as the operator does.
-	Expect(metricsStateController.Register(ctx, nil)).To(Succeed())
+	Expect(c.Register(ctx, nil)).To(Succeed())
+	DeferCleanup(func() {
+		crmetrics.Registry.Unregister(c.SyncedCollector())
+		crmetrics.Registry.Unregister(c.Collector())
+	})
+})
+
+var _ = AfterEach(func() {
+	ExpectCleanedUp(ctx, env.Client)
 })
 
 var _ = AfterSuite(func() {
-	ExpectCleanedUp(ctx, env.Client)
 	Expect(env.Stop()).To(Succeed(), "Failed to stop environment")
 })
 
@@ -118,7 +125,7 @@ var _ = Describe("Node Metrics", func() {
 		})
 
 		ExpectApplied(ctx, env.Client, managedNode, nodeClaim)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{managedNode}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{managedNode}, []*v1.NodeClaim{nodeClaim})
 
 		for k, v := range resources {
 			metric, found := FindMetricWithLabelValues("karpenter_nodes_allocatable", map[string]string{
@@ -188,10 +195,6 @@ var _ = Describe("Cluster State Synced", func() {
 })
 
 var _ = Describe("Cluster State Node Count", func() {
-	BeforeEach(func() {
-		ExpectCleanedUp(ctx, env.Client)
-		cs.Reset()
-	})
 	apply := func(objs ...client.Object) {
 		GinkgoHelper()
 		ExpectApplied(ctx, env.Client, objs...)

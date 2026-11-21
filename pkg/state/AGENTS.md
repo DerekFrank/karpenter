@@ -29,8 +29,9 @@ in `Derived`. See [Claims](#claims).
   `Store` and `Reader` (`NewObjectStore`, `NewFedStore`, `NewSyntheticStore`), `Derive` and `DeriveObject` (`Derivation`,
   `Contribution`, `Equaler`), `NewIndex` (`Index`), `DependsOn`, `Intent` and
   `Intended`, `Claims`, and the sources `Reader.Source`, `Reader.SourceOn`,
-  `Requires`, `Wake`, `WakeCounting` and `After`.
-- **`pkg/state/statetest`** checks a `Contribution`'s laws in tests.
+  `Requires`, `Wake` and `WakeCounting`.
+- **`pkg/state/statetest`** checks a `Contribution`'s laws in tests, and holds
+  `Objects`, a source a test fills as an informer would.
 - **`pkg/state/overlay`** holds `overlay.Client`, the read-after-write client:
   its reads include its own writes before the informer delivers them.
 - **`pkg/cluster`** holds the cluster's state built from those primitives, one
@@ -52,7 +53,8 @@ in `Derived`. See [Claims](#claims).
   (`kwok/main.go`), and passes it to `controllers.NewControllers`, which gives
   each controller the Readers it reads and the handles it writes: the
   disruption queue gets `Deletion`, and the provisioner gets `Nomination`,
-  `BufferPods` and `PodScheduling`. See [Startup](#startup).
+  `BufferPods` and `PodScheduling`. `State.Close` stops it once the manager
+  stops. See [Startup](#startup).
 - **Imports point one way:** controllers import `pkg/cluster`, which imports
   `pkg/state`. depguard (`.golangci.yaml`) enforces it. `hack/storelint`, run
   by `make verify`, enforces the rules in [Lint](#lint).
@@ -63,7 +65,7 @@ There are two kinds of store. They differ only in where the object comes from:
 
 | Store | Made with | Object | Written by |
 |---|---|---|---|
-| object store | `NewObjectStore[K, S, D, I](from, opts...)`, with `WithKey(func(types.NamespacedName) K)` (such as `state.ByName`) and `WithFilter(func(S) bool)` | the newest version of each object of kind `S` that `from` holds, under its namespaced name or `key(name)` | `from`: the overlay client's `Source` for the kind, or `statetest.Objects` in a unit test |
+| object store | `NewObjectStore[K, S, D, I](from, opts...)`, with `WithKey(func(types.NamespacedName) K)` (such as `state.ByName`) and `WithFilter(func(S) bool)` | the newest version of each object of kind `S` that `from` holds, under its namespaced name or `key(name)` | `from`: the overlay client's `Source` for the kind, or `statetest.Objects` in a `pkg/state` primitive spec, a benchmark or the scheduling properties harness |
 | synthetic store | `NewFedStore[K, O, D, I]()` | a Go type, reported by a feed | `Feed` and `FeedAll` |
 | | `NewSyntheticStore(build)` | `build(key)`, while the entry has a contribution | `Derive`s and `Claims` |
 
@@ -124,10 +126,11 @@ There are two kinds of store. They differ only in where the object comes from:
   applied its source. A fed or key-built store is synced from the start.
 - **`Subscribe(fn)`** calls `fn` with each `Change{Key, Old, New, Existed,
   Exists}` after the lock is released, and returns a func that stops it.
-- **`Clear`** is a test helper: it empties a store in place and notifies each
-  removal, so subscribers stay subscribed, and an object store then applies
-  what its source holds again. `cluster.State.Reset` composes it. Production
-  code never wipes a store; storelint reports a `Clear` outside a test.
+- **`Close`** stops what keeps a store current or holds a timer on it: an
+  object store stops following its source, and each `Derive` into the store,
+  with the `Claims` against it, each `WithExpiry` intent's timer and each
+  `DependsOn` that touches it stop. The entries stay as they were. It's
+  idempotent. `cluster.State.Close` closes every store `cluster.New` built.
 - **`DependsOn` is the only way to touch a key**, so the `Derive`s from its
   store recompute it: `touch` is internal to `pkg/state`. See
   [Keeping values pure](#keeping-values-pure).
@@ -143,8 +146,7 @@ There are two kinds of store. They differ only in where the object comes from:
   key once.
 - **Only entries that exist are indexed.** An entry that stops existing leaves
   every value, and `Derived` waiting for its object is not indexed. `NewIndex`
-  indexes the entries a store already holds before it returns, and `Clear`
-  empties the store's indexes with it.
+  indexes the entries a store already holds before it returns.
 - **`idx.Lookup(v)`** returns the keys indexed under `v`, in no particular
   order, without a lock: each value's keys are replaced, never changed, on a
   write.
@@ -279,7 +281,8 @@ request behind them.
 - **Intent is a field group on the object's entry**, read with the object, and
   each field is a `state.Intended[V]{Value, Until}`.
 - **Each intent has a typed handle**, `state.NewIntent(store, field)`, with
-  `Set`, `Clear`, `Get`, and `Update` for writers that race. `pkg/cluster`
+  `Set`, `Clear`, `Get`, and `Update`, which computes the value from the one it
+  replaces under the store's lock. `pkg/cluster`
   wraps each in a type its one writer holds: `Deletion` (`Mark`, `Unmark`) for
   the disruption queue, `Nomination` (`Nominate`) and `BufferPods`
   (`Replace`) for the provisioner, `PodScheduling` (`Ack`, `MarkDecisions`,
@@ -294,8 +297,8 @@ request behind them.
 - **`WithExpiry(clock, ttl)`** makes a value lapse `ttl` after it's set, or at
   the time `SetUntil` gives. A lapse is an event: the handle clears the value
   from a timer on the clock at the earliest lapse, and the entry notifies. The
-  timer stops once nothing can lapse. A suite steps its fake clock to lapse
-  intent. `Intended.At` reads a value as of a time.
+  timer stops once nothing can lapse, and for good once the store closes. A
+  suite steps its fake clock to lapse intent. `Intended.At` reads a value as of a time.
 
 ## Claims
 
@@ -436,8 +439,6 @@ controllerruntime.NewControllerManagedBy(m).
   **`state.WakeCounting(count, sources...)`** calls `count` for each change as
   it enqueues it, for a controller that skips work while nothing it wakes on
   changed, as disruption's consolidation does.
-- **`state.After(delay, sources...)`** batches each request's changes for
-  `delay`, for a watcher that tolerates the delay.
 - **Metrics are built at scrape time, not reconciled.** A metrics controller
   registers a `metrics.Collector` whose collect reads its stores with
   `client.UnsafeDisableDeepCopy` on each scrape, and never polls; a duration
@@ -457,6 +458,7 @@ controllerruntime.NewControllerManagedBy(m).
 
 ```go
 s := cluster.New(ctx, clk, mgr.GetClient(), cloudProvider) // the overlay client, which overlays cluster.Kinds
+defer s.Close()
 lo.Must0(s.Register(mgr))
 op.WithControllers(ctx, controllers.NewControllers(ctx, mgr, ..., s, ...)...).Start(ctx)
 ```
@@ -472,6 +474,9 @@ op.WithControllers(ctx, controllers.NewControllers(ctx, mgr, ..., s, ...)...).St
    synced, and each controller's workers wait on its sources and `Requires`.
    No constructor outside `pkg/state` and `pkg/cluster` registers a `Derive`
    or a subscriber.
+5. **`State.Close` runs once the manager's `Start` returns.** Every store
+   `cluster.New` built stops following the overlay, and every lapse and expiry
+   timer stops.
 
 - **A controller declares the stores it reads with `state.Requires` in
   `Register`.** A store's sync is one-way and bounded by its first List, so
@@ -504,12 +509,12 @@ type NodeClaimEntry = state.Entry[*v1.NodeClaim, NodeClaimDerived, NodeClaimInte
 type NodeClaimDerived struct {
     Node                *corev1.Node // the Node whose owner reference names this NodeClaim; nil while in flight
     Usage               NodeUsage    // that Node's entry's usage
-    RepairPolicyMatches []repair.RepairPolicyMatch
+    RepairPolicyMatches []repair.Match
 }
 type NodeEntry = state.Entry[*corev1.Node, NodeDerived, struct{}]
 type NodeDerived struct {
     Usage               NodeUsage
-    RepairPolicyMatches []repair.RepairPolicyMatch
+    RepairPolicyMatches []repair.Match
 }
 ```
 
@@ -581,10 +586,8 @@ type NodeDerived struct {
 
 `hack/storelint` reports:
 
-- a write of a `Derive` or `Claims` target (`Store.Feed`, `FeedAll`, `Clear`)
-  outside `pkg/state`;
-- a `Clear()` of a store or of `pkg/cluster` state, or a `Reset()` of
-  `cluster.State`, outside a test or `pkg/test`;
+- a write of a `Derive` or `Claims` target (`Store.Feed`, `FeedAll`) outside
+  `pkg/state`;
 - a `Subscribe`, `Derive`, `DeriveObject`, `NewIndex`, `DependsOn` or store
   constructor in a `New*` function outside `pkg/state` and `pkg/cluster`;
 - a store built anywhere but `pkg/state` itself, `pkg/cluster`, a
@@ -625,18 +628,28 @@ type NodeDerived struct {
 Tests are Ginkgo specs, one `RunSpecs` suite per package.
 
 - **A suite runs against the envtest API server, its cache and the overlay**,
-  as the manager does: `test.NewEnvironment` builds them. The suite builds
-  cluster state with `cluster.New(ctx, env.Clock, env.Overlay, cloudProvider)`.
+  as the manager does: `test.NewEnvironment` builds them.
+- **Each spec builds its own cluster state**, in `BeforeEach`, with
+  `cluster.New(ctx, env.Clock, env.Overlay, cloudProvider)` and
+  `DeferCleanup(s.Close)`, and builds there the controllers under test that
+  take it. A new State reads what the API server holds, so no spec sees
+  another's intent, claims or derived fields.
 - **The controller under test gets `env.Overlay`**, as it gets the manager's
   client in production: its writes reach the stores before they return.
 - **The suite writes through `env.Client`**, as a third party: it writes to the
   API server directly, and each write returns once the cache and every store
   following the overlay hold it, or its removal. `ExpectApplied`,
-  `ExpectDeleted` and every other write through it wait the same way. A suite
-  has no other sync points; a spec that needs one is missing a helper.
-- **A unit test without an API server** builds stores over
-  `statetest.Objects`, which it fills with `Put` and `Remove` as an informer
-  would: `cluster.WithSources` for cluster state.
+  `ExpectDeleted` and every other write through it wait the same way. A spec
+  reconciles only the controller under test, and asserts on what the stores
+  show. A suite has no other sync points; a spec that needs one is missing a
+  helper.
+- **`env.APIServer`** reads back a controller's write to a kind the overlay
+  doesn't record.
+- **`pkg/state`'s primitive specs and benchmarks drive stores through
+  `statetest.Objects`**, filled with `Put` and `Remove`, and so does the
+  scheduling properties harness, which runs thousands of generated cases per
+  run: `cluster.WithSources` for cluster state. `pkg/cluster` and controller
+  specs write through `env.Client`.
 - Drive an object store through its source, then assert on the target's `Get`,
   as `store_test.go` does.
 - Cover moving between keys ("Derive should move contributions between keys"),
@@ -650,14 +663,16 @@ Tests are Ginkgo specs, one `RunSpecs` suite per package.
   keep fields that match a recount of their definitions" do.
 - Check each contribution's laws with `statetest.ExpectContribution(GinkgoT(), ...)`.
 - Check a removed `Derive` leaves nothing behind ("Derive should leave nothing
-  behind in its target once removed").
+  behind in its target once removed"), and a closed store follows nothing and
+  waits on no clock ("Close should stop following the source, the Derives into
+  the store and its timers, and leave its entries"; "Close should leave no
+  subscribers on the overlay and no timers on the clock" in `pkg/cluster`).
 - Test intent as "Intent should set, clear and drop with its entry" and
   "Intent should lapse WithExpiry once its clock steps past the TTL, and
   notify the lapse" do, and a feed as "FedStore should replace a set of
   objects in one write" does.
-- Read through a `Reader` as "Reader should deep-copy the object unless
-  UnsafeDisableDeepCopy" and "Reader should panic on an option it doesn't
-  take" do.
+- Test reads as "Reader should deep-copy the object unless
+  UnsafeDisableDeepCopy" does.
 - Start a source on a workqueue and assert on what it queues, as "Store Source
   should enqueue only keys that appear, disappear, or whose narrowed fields
   change, with SourceOn" does, and as each controller's Wakes spec does for
@@ -670,7 +685,4 @@ Tests are Ginkgo specs, one `RunSpecs` suite per package.
   failures and assert on them after it joins; a Gomega failure inside a
   goroutine holding a lock can hang the spec.
 - Drive a Node's registration window as "Registering window" in
-  `pkg/cluster` does, and the node model as "Node model should show a pod
-  bound to a registered Node in its NodeClaim entry's usage" and "Node model
-  should leave a registering Node out of Unmanaged, and read a Node with
-  neither an owner nor the NodePool label as unmanaged" do.
+  `pkg/cluster` does.

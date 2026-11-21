@@ -65,6 +65,7 @@ var defaultOwnerRefs = []metav1.OwnerReference{{Kind: "ReplicaSet", APIVersion: 
 var cloudProvider *fake.CloudProvider
 var recorder *test.EventRecorder
 var queue *terminator.Queue
+var nodeState *karpentercluster.Nodes
 
 func TestAPIs(t *testing.T) {
 	ctx = TestContextWithLogger(t)
@@ -83,7 +84,13 @@ var _ = BeforeSuite(func() {
 	cloudProvider = fake.NewCloudProvider()
 	recorder = test.NewEventRecorder()
 	queue = terminator.NewQueue(env.Clock, env.Overlay, recorder)
-	terminationController = termination.NewController(env.Clock, env.Overlay, cloudProvider, terminator.NewTerminator(env.Clock, env.Overlay, queue, recorder), recorder, karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider).Nodes)
+})
+
+var _ = BeforeEach(func() {
+	cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
+	DeferCleanup(cs.Close)
+	nodeState = cs.Nodes
+	terminationController = termination.NewController(env.Clock, env.Overlay, cloudProvider, terminator.NewTerminator(env.Clock, env.Overlay, queue, recorder), recorder, nodeState)
 })
 
 var _ = AfterSuite(func() {
@@ -1086,9 +1093,7 @@ var _ = Describe("Termination Wakes", func() {
 	var node *corev1.Node
 	BeforeEach(func() {
 		ctx := options.ToContext(ctx, test.Options())
-		// A fresh cluster state and controller per spec, so each wake queue sees only this spec's events. The State
-		// subscribes to the shared overlay sources, so env.Client's wait waits for its stores too.
-		nodes = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider).Nodes
+		nodes = nodeState
 		c := termination.NewController(env.Clock, env.Overlay, cloudProvider, terminator.NewTerminator(env.Clock, env.Overlay, queue, recorder), recorder, nodes)
 		m, err := controllerruntime.NewManager(env.Config, controllerruntime.Options{
 			Scheme:     scheme.Scheme,

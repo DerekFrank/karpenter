@@ -41,7 +41,7 @@ type NodeDerived struct {
 	Usage NodeUsage
 	// RepairPolicyMatches are the repair policies the Node's conditions match, regardless of toleration, while cluster
 	// state tracks it, contributed by the Node store itself when node repair is enabled.
-	RepairPolicyMatches []repair.RepairPolicyMatch // bounded: repair policies
+	RepairPolicyMatches []repair.Match // bounded: repair policies
 }
 
 // NodeEntry is a Node's entry: the Node, and what its pods, its CSINode and its conditions contribute.
@@ -115,7 +115,7 @@ func Unmanaged(node *corev1.Node) bool {
 }
 
 // repairMatches are a tracked Node's contribution to its own entry: the repair policies its conditions match.
-type repairMatches []repair.RepairPolicyMatch
+type repairMatches []repair.Match
 
 func (m repairMatches) Update(f NodeDerived, _ repairMatches) NodeDerived {
 	f.RepairPolicyMatches = m
@@ -128,12 +128,12 @@ func (m repairMatches) Delete(f NodeDerived) NodeDerived {
 }
 
 func (m repairMatches) Equal(o repairMatches) bool {
-	return slices.EqualFunc(m, o, repair.RepairPolicyMatch.Equal)
+	return slices.EqualFunc(m, o, repair.Match.Equal)
 }
 
 // deriveRepairMatches matches each tracked Node against the repair policies as it changes. Matching only runs for a
 // Node with a condition a policy covers.
-func (n *Nodes) deriveRepairMatches(matcher *repair.RepairPolicyMatcher) {
+func (n *Nodes) deriveRepairMatches(matcher *repair.PolicyMatcher) {
 	state.DeriveObject(n.Reader, n.store,
 		func(name string, node *corev1.Node) string {
 			if !Tracked(node) || !matcher.MatchesAny(node) {

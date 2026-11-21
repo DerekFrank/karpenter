@@ -52,6 +52,8 @@ type Intent[K comparable, O, D, I, V any] struct {
 	timer  clock.Timer
 	stop   chan struct{}
 	armed  time.Time
+	// stopped is whether the store closed, after which no value lapses from a timer, under the store's lock.
+	stopped bool
 }
 
 // NewIntent returns the handle of the intent in the field of the entries' Intent that field points to.
@@ -61,20 +63,23 @@ func NewIntent[K comparable, O, D, I, V any](store *Store[K, O, D, I], field fun
 
 // WithExpiry makes each value Set lapse ttl after it's set, on clk. A lapse is an event: the handle clears the value
 // from a timer on clk at the earliest lapse, and the entry notifies. Get and Intended.At read a value as lapsed as soon
-// as clk passes its time. The timer stops once no value can lapse: each is cleared, or the store is. Call it before
+// as clk passes its time. The timer stops once no value can lapse, and for good once the store closes. Call it before
 // the handle is shared.
 func (h *Intent[K, O, D, I, V]) WithExpiry(clk clock.Clock, ttl time.Duration) *Intent[K, O, D, I, V] {
 	h.clock, h.ttl, h.lapses = clk, ttl, map[K]time.Time{}
 	c := h.store.s
 	c.lock()
-	c.addSourceLocked(h, nil, h.clearLocked)
+	c.addSourceLocked(h, nil, h.stopTimer)
 	c.unlock()
 	return h
 }
 
-// clearLocked forgets every lapse and stops the timer, for a store that's being cleared.
-func (h *Intent[K, O, D, I, V]) clearLocked() {
-	h.lapses = map[K]time.Time{}
+// stopTimer stops the timer for good, for a store that closed.
+func (h *Intent[K, O, D, I, V]) stopTimer() {
+	c := h.store.s
+	c.mu.Lock()
+	defer c.unlock()
+	h.stopped = true
 	h.disarmLocked()
 }
 
@@ -106,8 +111,9 @@ func (h *Intent[K, O, D, I, V]) SetUntil(key K, value V, until time.Time) bool {
 	return ok
 }
 
-// Update sets key's value to what update returns of its current value, under the store's lock, for a holder whose
-// writers race, such as two controllers recording a NodePool's launch outcomes. It returns whether the entry exists.
+// Update sets key's value to what update returns of its current value, under the store's lock, so that the value it
+// writes is computed from the one it replaces, such as a NodePool's launch outcomes with one more recorded. It returns
+// whether the entry exists.
 func (h *Intent[K, O, D, I, V]) Update(key K, update func(V) V) bool {
 	c := h.store.s
 	c.mu.Lock()
@@ -165,7 +171,7 @@ func (h *Intent[K, O, D, I, V]) Get(key K) (V, bool) {
 }
 
 func (h *Intent[K, O, D, I, V]) armLocked(until time.Time) {
-	if h.timer != nil && !h.armed.After(until) {
+	if h.stopped || (h.timer != nil && !h.armed.After(until)) {
 		return
 	}
 	h.disarmLocked()

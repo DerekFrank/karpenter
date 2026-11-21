@@ -54,17 +54,17 @@ type compiledPolicy struct {
 // supportedRepairActions are the repair actions node repair can perform.
 var supportedRepairActions = sets.New(cloudprovider.ReplaceNode, cloudprovider.RebootNode)
 
-// RepairPolicyMatcher validates and evaluates provider repair policies.
-type RepairPolicyMatcher struct {
+// PolicyMatcher validates and evaluates provider repair policies.
+type PolicyMatcher struct {
 	groups         map[policyKey][]compiledPolicy
 	fallbackPolicy compiledPolicy
 	ranks          map[int]int
 }
 
-// RepairResult merges all eligible policies for one Node. Condition, ConditionStatus, Reason, ReasonRegex, Fallback,
+// Result merges all eligible policies for one Node. Condition, ConditionStatus, Reason, ReasonRegex, Fallback,
 // and SelectedEligibleAt identify the deterministic source of the selected Action, while TerminationGracePeriod is
 // the shortest bound and TerminationGracePeriodCondition identifies the condition that supplied it.
-type RepairResult struct {
+type Result struct {
 	Action                           cloudprovider.RepairAction
 	Condition                        corev1.NodeConditionType
 	ConditionStatus                  corev1.ConditionStatus
@@ -86,17 +86,17 @@ type RepairResult struct {
 // ScoreAt returns the result's repair score as of now: the highest rank + age/agingConstant across its eligible
 // policies, where age is the time since the policy became eligible. Scoring every candidate as of the same time keeps
 // equally ranked and aged candidates tied, however far apart they were resolved. It is 0 when no policy is eligible.
-func (r RepairResult) ScoreAt(now time.Time) float64 {
+func (r Result) ScoreAt(now time.Time) float64 {
 	if r.Action == "" {
 		return 0
 	}
 	return float64(r.scoreRank) + now.Sub(r.scoreEligibleAt).Minutes()/agingConstant.Minutes()
 }
 
-// NewRepairPolicyMatcher compiles the cloud provider's repair policies once, for cluster state and node repair to
+// NewPolicyMatcher compiles the cloud provider's repair policies once, for cluster state and node repair to
 // share. It returns nil when node repair is disabled or --legacy-node-repair runs the legacy controller instead, and an
 // error when node repair is enabled but the provider defines no policies or an invalid set.
-func NewRepairPolicyMatcher(ctx context.Context, cloudProvider cloudprovider.CloudProvider) (*RepairPolicyMatcher, error) {
+func NewPolicyMatcher(ctx context.Context, cloudProvider cloudprovider.CloudProvider) (*PolicyMatcher, error) {
 	if !options.FromContext(ctx).FeatureGates.NodeRepair || options.FromContext(ctx).LegacyNodeRepair {
 		return nil, nil
 	}
@@ -104,15 +104,15 @@ func NewRepairPolicyMatcher(ctx context.Context, cloudProvider cloudprovider.Clo
 	if len(policies) == 0 {
 		return nil, fmt.Errorf("node repair requires the cloud provider to define RepairPolicies, but it defines none")
 	}
-	matcher, err := newRepairPolicyMatcher(policies, supportedRepairActions)
+	matcher, err := newPolicyMatcher(policies, supportedRepairActions)
 	if err != nil {
 		return nil, fmt.Errorf("node repair requires valid RepairPolicies, %w", err)
 	}
 	return matcher, nil
 }
 
-// newRepairPolicyMatcher validates and compiles a complete provider repair policy set.
-func newRepairPolicyMatcher(policies []cloudprovider.RepairPolicy, supportedActions sets.Set[cloudprovider.RepairAction]) (*RepairPolicyMatcher, error) {
+// newPolicyMatcher validates and compiles a complete provider repair policy set.
+func newPolicyMatcher(policies []cloudprovider.RepairPolicy, supportedActions sets.Set[cloudprovider.RepairAction]) (*PolicyMatcher, error) {
 	groups := map[policyKey][]compiledPolicy{}
 	var fallbackPolicy compiledPolicy
 	hasFallbackPolicy := false
@@ -153,7 +153,7 @@ func newRepairPolicyMatcher(policies []cloudprovider.RepairPolicy, supportedActi
 	if errs != nil {
 		return nil, errs
 	}
-	return &RepairPolicyMatcher{
+	return &PolicyMatcher{
 		groups:         groups,
 		fallbackPolicy: fallbackPolicy,
 		ranks:          denseRanks(policies),
@@ -230,16 +230,16 @@ func validConditionStatus(status corev1.ConditionStatus) bool {
 	return status == corev1.ConditionTrue || status == corev1.ConditionFalse || status == corev1.ConditionUnknown
 }
 
-// RepairPolicyMatch is a policy that matches one of a Node's conditions. It does not depend on the clock, so it can be
+// Match is a policy that matches one of a Node's conditions. It does not depend on the clock, so it can be
 // computed when the Node changes and resolved against the clock later.
-type RepairPolicyMatch struct {
+type Match struct {
 	policy     compiledPolicy
 	rank       int
 	eligibleAt time.Time
 }
 
 // LogValues returns the decision as structured logging key/value pairs.
-func (r RepairResult) LogValues() []any {
+func (r Result) LogValues() []any {
 	values := []any{
 		"condition", r.Condition,
 		"status", r.ConditionStatus,
@@ -259,7 +259,7 @@ func (r RepairResult) LogValues() []any {
 }
 
 // LogValues returns the match as structured logging key/value pairs.
-func (m RepairPolicyMatch) LogValues() []any {
+func (m Match) LogValues() []any {
 	values := []any{
 		"condition", m.policy.Condition.Type,
 		"status", m.policy.Condition.Status,
@@ -276,12 +276,11 @@ func (m RepairPolicyMatch) LogValues() []any {
 }
 
 // DeepCopyInto copies the match. Compiled policies are immutable, so the copy shares them.
-func (in *RepairPolicyMatch) DeepCopyInto(out *RepairPolicyMatch) {
+func (in *Match) DeepCopyInto(out *Match) {
 	*out = *in
 }
 
-// matchCondition and matchCreated are the only parts of a Node that matching reads. Match and MatchInputsEqual both
-// derive from them, so a cached match is valid exactly while they are equal. Every field is comparable with ==.
+// matchCondition and matchCreated are the only parts of a Node that matching reads. Every field is comparable with ==.
 type matchCondition struct {
 	conditionType  corev1.NodeConditionType
 	status         corev1.ConditionStatus
@@ -297,25 +296,11 @@ func matchCreated(node *corev1.Node) time.Time {
 	return node.CreationTimestamp.UTC()
 }
 
-// MatchInputsEqual returns true when Match returns the same matches for both Nodes. It does not allocate, since it
-// runs on every Node update.
-func MatchInputsEqual(a, b *corev1.Node) bool {
-	if matchCreated(a) != matchCreated(b) || len(a.Status.Conditions) != len(b.Status.Conditions) {
-		return false
-	}
-	for i := range a.Status.Conditions {
-		if newMatchCondition(a.Status.Conditions[i]) != newMatchCondition(b.Status.Conditions[i]) {
-			return false
-		}
-	}
-	return true
-}
-
 // Match returns every policy that matches one of the Node's conditions, regardless of toleration. Provider policies are
 // immutable after construction, so duration pointers in the resolved result must be treated as read-only.
-func (p *RepairPolicyMatcher) Match(node *corev1.Node) []RepairPolicyMatch {
+func (p *PolicyMatcher) Match(node *corev1.Node) []Match {
 	created := matchCreated(node)
-	var matches []RepairPolicyMatch
+	var matches []Match
 	for i := range node.Status.Conditions {
 		c := newMatchCondition(node.Status.Conditions[i])
 		condition := corev1.NodeCondition{Type: c.conditionType, Status: c.status, Reason: c.reason}
@@ -342,15 +327,15 @@ func (p *RepairPolicyMatcher) Match(node *corev1.Node) []RepairPolicyMatch {
 	return matches
 }
 
-func (p *RepairPolicyMatcher) newMatch(policy compiledPolicy, condition corev1.NodeCondition, transitionTime time.Time) RepairPolicyMatch {
+func (p *PolicyMatcher) newMatch(policy compiledPolicy, condition corev1.NodeCondition, transitionTime time.Time) Match {
 	policy.Condition = condition
-	return RepairPolicyMatch{policy: policy, rank: p.ranks[policy.Priority], eligibleAt: transitionTime.Add(policy.TolerationDuration)}
+	return Match{policy: policy, rank: p.ranks[policy.Priority], eligibleAt: transitionTime.Add(policy.TolerationDuration)}
 }
 
 // Resolve merges the matches that are eligible at now into one repair decision, measuring each toleration from no
 // earlier than notBefore.
-func Resolve(matches []RepairPolicyMatch, now, notBefore time.Time) RepairResult {
-	result := RepairResult{}
+func Resolve(matches []Match, now, notBefore time.Time) Result {
+	result := Result{}
 	for _, match := range matches {
 		eligibleAt := match.eligibleAt
 		if earliest := notBefore.Add(match.policy.TolerationDuration); eligibleAt.Before(earliest) {
@@ -362,24 +347,24 @@ func Resolve(matches []RepairPolicyMatch, now, notBefore time.Time) RepairResult
 }
 
 // Matches returns true when the condition is covered by the provider policy set, regardless of toleration.
-func (p *RepairPolicyMatcher) Matches(condition corev1.NodeCondition) bool {
+func (p *PolicyMatcher) Matches(condition corev1.NodeCondition) bool {
 	_, ok := p.groups[policyKey{conditionType: condition.Type, conditionStatus: condition.Status}]
 	return ok
 }
 
 // MatchesAny returns true when Match would return a match for the Node: one of its conditions is covered by the
 // policy set, since a covered condition always matches a reason-specific policy or the fallback. It doesn't allocate.
-func (p *RepairPolicyMatcher) MatchesAny(node *corev1.Node) bool {
+func (p *PolicyMatcher) MatchesAny(node *corev1.Node) bool {
 	return slices.ContainsFunc(node.Status.Conditions, p.Matches)
 }
 
 // Equal returns true when both matches resolve the same way at any time.
-func (m RepairPolicyMatch) Equal(o RepairPolicyMatch) bool {
+func (m Match) Equal(o Match) bool {
 	return m.rank == o.rank && m.eligibleAt.Equal(o.eligibleAt) && m.policy.RepairPolicy == o.policy.RepairPolicy &&
 		m.policy.reasonRegex == o.policy.reasonRegex && m.policy.Condition == o.policy.Condition
 }
 
-func (r *RepairResult) mergePolicy(policy compiledPolicy, rank int, eligibleAt, now time.Time) {
+func (r *Result) mergePolicy(policy compiledPolicy, rank int, eligibleAt, now time.Time) {
 	condition := policy.Condition
 	if eligibleAt.After(now) {
 		return
@@ -418,7 +403,7 @@ func (r *RepairResult) mergePolicy(policy compiledPolicy, rank int, eligibleAt, 
 
 // mergeScore keeps the eligible policy that scores highest as of now. The first eligible policy is always kept, even if
 // it scores 0.
-func (r *RepairResult) mergeScore(rank int, eligibleAt, now time.Time, isFirstEligiblePolicy bool) {
+func (r *Result) mergeScore(rank int, eligibleAt, now time.Time, isFirstEligiblePolicy bool) {
 	score := float64(rank) + now.Sub(eligibleAt).Minutes()/agingConstant.Minutes()
 	if isFirstEligiblePolicy || score > r.ScoreAt(now) {
 		r.scoreRank = rank
@@ -428,7 +413,7 @@ func (r *RepairResult) mergeScore(rank int, eligibleAt, now time.Time, isFirstEl
 
 // shorterTerminationGracePeriod reports whether a policy bound should replace the current one. Equal bounds keep the
 // earliest-eligible condition, then the lowest condition type, so the source is independent of condition order.
-func (r *RepairResult) shorterTerminationGracePeriod(bound time.Duration, condition corev1.NodeConditionType, eligibleAt time.Time) bool {
+func (r *Result) shorterTerminationGracePeriod(bound time.Duration, condition corev1.NodeConditionType, eligibleAt time.Time) bool {
 	switch {
 	case r.TerminationGracePeriod == nil:
 		return true

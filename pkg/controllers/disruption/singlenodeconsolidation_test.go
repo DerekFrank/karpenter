@@ -242,7 +242,7 @@ func createCandidates(disruptionCost float64, nodesPerNodePool ...int) ([]*disru
 			pod := test.Pod()
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node, pod)
 			ExpectManualBinding(ctx, env.Client, pod, node)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
 			ExpectApplied(ctx, env.Client, nodeClaim)
 
@@ -258,13 +258,13 @@ func createCandidates(disruptionCost float64, nodesPerNodePool ...int) ([]*disru
 	}
 
 	return lo.Map(nodeClaims, func(nodeClaim *v1.NodeClaim, _ int) *disruption.Candidate {
-		stateNode := stateNodeOfNodeClaim(nodeClaim)
+		nodeEntry := nodeClaimEntryOf(nodeClaim)
 		candidate, err := disruption.NewCandidate(
 			ctx,
 			cluster.PodsByNode,
 			recorder,
 			env.Clock,
-			stateNode,
+			nodeEntry,
 			limits,
 			nodePoolMap,
 			nodePoolInstanceTypeMap,

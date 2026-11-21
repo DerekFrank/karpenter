@@ -45,8 +45,9 @@ import (
 )
 
 // State holds every store's Reader, the indexes on them and the intent handles. Build it once, with New, where the
-// operator is wired, start its stores with Register, and give each controller the Readers it reads and the intent
-// handles it writes, never State itself, so that each constructor says what it reads and writes.
+// operator is wired, start its stores with Register, give each controller the Readers it reads and the intent handles
+// it writes, never State itself, so that each constructor says what it reads and writes, and Close it once the manager
+// stops.
 type State struct {
 	// NodePoolState keeps the fields of each NodePool, by name, and the reservations against its node limit.
 	NodePoolState *NodePoolState
@@ -69,7 +70,7 @@ type State struct {
 	Cost *ClusterCost
 	// RepairPolicyMatcher is the matcher the Node store matches each Node's conditions with, or nil when node repair is
 	// disabled.
-	RepairPolicyMatcher *repair.RepairPolicyMatcher
+	RepairPolicyMatcher *repair.PolicyMatcher
 
 	// NodeClaimsByProviderID indexes the NodeClaims by providerID, for code that starts from a cloud instance.
 	NodeClaimsByProviderID *NodeClaimIndex[string]
@@ -96,17 +97,20 @@ type State struct {
 	// Registrations is the handle of the launch outcomes recorded on NodePools, for the NodeClaim lifecycle controller,
 	// their one writer.
 	Registrations *Registrations
+
+	// stores are every store New built, which Close closes.
+	stores []interface{ Close() }
 }
 
 // Options configure the state New builds.
 type Options struct {
-	repairPolicyMatcher *repair.RepairPolicyMatcher
+	repairPolicyMatcher *repair.PolicyMatcher
 	sources             Sources
 }
 
 // WithRepairPolicyMatcher makes the Node store match each Node against the repair policies as it changes. Node repair
 // reads the same matcher back through State.RepairPolicyMatcher.
-func WithRepairPolicyMatcher(matcher *repair.RepairPolicyMatcher) option.Function[Options] {
+func WithRepairPolicyMatcher(matcher *repair.PolicyMatcher) option.Function[Options] {
 	return func(o *Options) { o.repairPolicyMatcher = matcher }
 }
 
@@ -182,16 +186,18 @@ func New(ctx context.Context, clk clock.Clock, kubeClient client.Client, cloudPr
 	nodeClaims.deriveNodes(nodes)
 	clusters.derive(nodeClaims)
 	nodePools := NewNodePoolState(clk, sources(&v1.NodePool{}), nodeClaims, nodes, o.repairPolicyMatcher)
+	quotaState := NewCapacityQuotaState(ctx, clk, quotas, nodeClaims, nodes)
+	cost := newClusterCost(ctx, cloudProvider, nodeClaims)
 	return State{
 		NodePoolState:            nodePools,
-		CapacityQuotaState:       NewCapacityQuotaState(ctx, clk, quotas, nodeClaims, nodes),
+		CapacityQuotaState:       quotaState,
 		NodeClaims:               nodeClaims,
 		Nodes:                    nodes,
 		Pods:                     pods,
 		CSINodes:                 csiNodes,
 		PVCs:                     pvcs,
 		Cluster:                  clusters,
-		Cost:                     newClusterCost(ctx, cloudProvider, nodeClaims),
+		Cost:                     cost,
 		RepairPolicyMatcher:      o.repairPolicyMatcher,
 		NodeClaimsByProviderID:   nodeClaims.byProviderID,
 		NodeClaimsByNodePool:     nodeClaims.byNodePool,
@@ -203,18 +209,18 @@ func New(ctx context.Context, clk clock.Clock, kubeClient client.Client, cloudPr
 		BufferPods:               newBufferPods(nodeClaims),
 		PodScheduling:            newPodScheduling(clk, pods),
 		Registrations:            newRegistrations(nodePools),
+		stores: []interface{ Close() }{nodeClaims.store, nodes.store, pods.store, csiNodes.store, pvcs.store, clusters.store,
+			nodePools.store, quotaState.quotas, quotaState.pending, cost.offerings, cost.prices},
 	}
 }
 
-// Reset clears every store between specs, each of which then holds what its source holds, and the intent on their
-// entries. It's for tests; storelint reports a Reset outside a test.
-func (s State) Reset() {
-	for _, store := range []interface{ Clear() }{s.NodeClaims.store, s.Nodes.store, s.Pods.store, s.CSINodes.store, s.PVCs.store, s.Cluster.store} {
-		store.Clear()
+// Close stops every store New built: each stops following the overlay, each Derive into it stops, and every intent
+// lapse and claim expiry timer stops. The stores keep the entries they hold. The operator closes State once the
+// manager stops; a suite closes the State it builds for each spec. It's idempotent.
+func (s *State) Close() {
+	for _, store := range s.stores {
+		store.Close()
 	}
-	s.NodePoolState.Clear()
-	s.CapacityQuotaState.Clear()
-	s.Cost.Clear()
 }
 
 // none is the source of CapacityQuotas when the overlay doesn't overlay them, as without their feature gate: it holds

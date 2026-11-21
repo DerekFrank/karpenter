@@ -74,7 +74,7 @@ type Claim[K1, K comparable, H any] struct {
 // NewClaims returns Claims against the keys derivation feeds. A claim whose source the Derivation hasn't seen
 // contributing within ttl of its Reserve expires at its TTL: the Claims arm one timer, on clk, at the earliest expiry
 // among their live claims, and end the claims due when it fires, notifying the store's subscribers. The timer stops
-// once no live claim expires, the store is cleared, or the Derivation stops or is removed.
+// once no live claim expires, or the Derivation stops or is removed.
 func NewClaims[K1, K comparable, D any, C Contribution[D, C], H Contribution[D, H]](derivation *Derivation[K1, K, D, C], counts func(C) bool,
 	ttl time.Duration, clk clock.Clock) *Claims[K1, K, D, C, H] {
 	c := &Claims[K1, K, D, C, H]{
@@ -88,12 +88,8 @@ func NewClaims[K1, K comparable, D any, C Contribution[D, C], H Contribution[D, 
 	to := derivation.to
 	to.lock()
 	derivation.settles = append(derivation.settles, c.settleLocked)
-	derivation.removes = append(derivation.removes, func() {
-		c.releaseAllLocked()
-		to.removeSourceLocked(c)
-	})
+	derivation.removes = append(derivation.removes, c.releaseAllLocked)
 	derivation.stops = append(derivation.stops, c.stopLocked)
-	to.addSourceLocked(c, nil, c.clearLocked)
 	to.unlock()
 	return c
 }
@@ -232,16 +228,6 @@ func (c *Claims[K1, K, D, C, H]) releaseAllLocked() {
 	for claim := range c.live {
 		c.releaseLocked(claim)
 	}
-}
-
-// clearLocked ends every claim without releasing what it held, for a store that's being cleared.
-func (c *Claims[K1, K, D, C, H]) clearLocked() {
-	for claim := range c.live {
-		claim.done = true
-	}
-	c.live = map[*Claim[K1, K, H]]struct{}{}
-	c.bound = map[K1]*Claim[K1, K, H]{}
-	c.disarmLocked()
 }
 
 // stopLocked stops the timer for good, for a Derivation that stopped following its source: its claims no longer

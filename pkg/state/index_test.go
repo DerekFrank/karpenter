@@ -125,12 +125,12 @@ var _ = ginkgo.Describe("Index", func() {
 		pool := NewIndex(nodeClaims, func(_ types.NamespacedName, e nodeClaimEntry) []string {
 			return []string{e.Object.Labels[v1.NodePoolLabelKey]}
 		})
-		observe(nodeClaims, nodeClaim("a", "x", 1, "1"))
+		put(nodeClaims, nodeClaim("a", "x", 1, "1"))
 		Expect(pool.Lookup("x")).To(ConsistOf(types.NamespacedName{Name: "a"}))
-		observe(nodeClaims, nodeClaim("a", "y", 2, "1"))
+		put(nodeClaims, nodeClaim("a", "y", 2, "1"))
 		Expect(pool.Lookup("x")).To(BeEmpty(), "x once a moved to y")
 		Expect(pool.Lookup("y")).To(ConsistOf(types.NamespacedName{Name: "a"}))
-		forget(nodeClaims, types.NamespacedName{Name: "a"})
+		remove(nodeClaims, types.NamespacedName{Name: "a"})
 		Expect(pool.Lookup("y")).To(BeEmpty(), "y once a is gone")
 	})
 	ginkgo.It("should follow Derived changes, and drop an entry that stops existing", func() {
@@ -138,12 +138,12 @@ var _ = ginkgo.Describe("Index", func() {
 		cpu := NewIndex(pools, func(_ string, e Entry[string, poolFields, struct{}]) []int64 {
 			return []int64{e.Derived.CPU}
 		})
-		observe(nodeClaims, nodeClaim("a", "x", 1, "2"))
+		put(nodeClaims, nodeClaim("a", "x", 1, "2"))
 		Expect(cpu.Lookup(2)).To(ConsistOf("x"))
-		observe(nodeClaims, nodeClaim("a", "x", 2, "3"))
+		put(nodeClaims, nodeClaim("a", "x", 2, "3"))
 		Expect(cpu.Lookup(2)).To(BeEmpty(), "2 once x's cpu changed")
 		Expect(cpu.Lookup(3)).To(ConsistOf("x"))
-		forget(nodeClaims, types.NamespacedName{Name: "a"})
+		remove(nodeClaims, types.NamespacedName{Name: "a"})
 		Expect(cpu.Lookup(0)).To(BeEmpty(), "an entry that stopped existing, want it in no value")
 		Expect(cpu.Lookup(3)).To(BeEmpty())
 	})
@@ -156,9 +156,9 @@ var _ = ginkgo.Describe("Index", func() {
 		Derive(nodeClaims.Reader, nodes, func(types.NamespacedName, nodeClaimEntry) types.NamespacedName {
 			return types.NamespacedName{Name: "n"}
 		}, usageOf)
-		observe(nodeClaims, nodeClaim("a", "x", 1, "2"))
+		put(nodeClaims, nodeClaim("a", "x", 1, "2"))
 		Expect(cpu.Lookup(2)).To(BeEmpty(), "Derived waiting for its object, want it unindexed")
-		observe(nodes, nodeClaim("n", "x", 1, "0"))
+		put(nodes, nodeClaim("n", "x", 1, "0"))
 		Expect(cpu.Lookup(2)).To(ConsistOf(types.NamespacedName{Name: "n"}), "once its object arrives")
 	})
 	ginkgo.It("should index the entries a store holds when it's added", func() {
@@ -177,9 +177,9 @@ var _ = ginkgo.Describe("Index", func() {
 		cpu := NewIndex(nodeClaims, func(_ types.NamespacedName, e nodeClaimEntry) []int64 {
 			return []int64{e.Object.Status.Capacity.Cpu().Value()}
 		})
-		observe(nodeClaims, nodeClaim("a", "x", 1, "1"))
-		observe(nodeClaims, nodeClaim("b", "y", 1, "1"))
-		observe(nodeClaims, nodeClaim("c", "x", 1, "2"))
+		put(nodeClaims, nodeClaim("a", "x", 1, "1"))
+		put(nodeClaims, nodeClaim("b", "y", 1, "1"))
+		put(nodeClaims, nodeClaim("c", "x", 1, "2"))
 		list := func(opts ...client.ListOption) []string {
 			var names []string
 			for k, e := range cpu.List(1, opts...) {
@@ -193,7 +193,7 @@ var _ = ginkgo.Describe("Index", func() {
 		Expect(list(client.MatchingLabels{v1.NodePoolLabelKey: "x"})).To(ConsistOf("a"))
 		Expect(list(client.MatchingLabelsSelector{Selector: labels.SelectorFromSet(labels.Set{v1.NodePoolLabelKey: "y"})},
 			client.UnsafeDisableDeepCopy)).To(ConsistOf("b"))
-		forget(nodeClaims, types.NamespacedName{Name: "a"})
+		remove(nodeClaims, types.NamespacedName{Name: "a"})
 		Expect(list()).To(ConsistOf("b"), "once a is gone")
 	})
 	ginkgo.It("should panic on a List option it doesn't take", func() {
@@ -207,14 +207,6 @@ var _ = ginkgo.Describe("Index", func() {
 		byCPU := NewIndex(pools, func(_ string, e Entry[string, poolFields, struct{}]) []int64 { return []int64{e.Derived.CPU} })
 		Expect(func() { byCPU.List(1, client.MatchingLabels{"a": "b"}) }).
 			To(PanicWith(ContainSubstring("a label selector on a store of string")))
-	})
-	ginkgo.It("should empty on Clear and index what the store holds afterwards", func() {
-		pods, mounts := newTestPods()
-		pods.Feed(pod("a"), testPod{PVCs: []string{"x"}})
-		pods.Clear()
-		Expect(mounts.Lookup(pvc("x"))).To(BeEmpty())
-		pods.Feed(pod("b"), testPod{PVCs: []string{"x"}})
-		Expect(mounts.Lookup(pvc("x"))).To(ConsistOf(pod("b")))
 	})
 	ginkgo.It("should not let a Lookup's caller change the index", func() {
 		pods, mounts := newTestPods()

@@ -216,12 +216,6 @@ func (cc *ClusterCost) UpdateOfferings(ctx context.Context, np *v1.NodePool, ins
 	}
 }
 
-// Clear empties the cost's stores in place. It's for tests, between specs; storelint reports a Clear outside a test.
-func (cc *ClusterCost) Clear() {
-	cc.offerings.Clear()
-	cc.prices.Clear()
-}
-
 // GetClusterCost returns the total cost of all compute resources across
 // all NodePools in the cluster.
 func (cc *ClusterCost) GetClusterCost() float64 {
@@ -231,12 +225,6 @@ func (cc *ClusterCost) GetClusterCost() float64 {
 		total += nodePoolCost(offerings.Derived, prices.Object)
 	}
 	return total
-}
-
-// Sources are the stores a NodePool's cost is computed from, as sources that enqueue a NodePool, by name, whenever its
-// offerings or their prices change, which is whenever GetNodepoolCost may return something new.
-func (cc *ClusterCost) Sources() []source.SyncingSource {
-	return []source.SyncingSource{cc.offerings.Source(), cc.prices.Source()}
 }
 
 // OfferingsSource enqueues a NodePool, by name, whenever the set of offerings it counts changes, such as when a

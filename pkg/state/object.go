@@ -77,7 +77,7 @@ func NewObjectStore[K comparable, S client.Object, D, I any](from Newest, opts .
 	c := newCore[K, S, D, I](objects, nil)
 	n := &newestOf[K, S, D, I]{core: c, from: from, key: key, in: in}
 	c.feed = n
-	from.Subscribe(n.apply)
+	n.unsubscribe = from.Subscribe(n.apply)
 	if from.HasSynced() {
 		n.sweep()
 	}
@@ -88,8 +88,8 @@ func NewObjectStore[K comparable, S client.Object, D, I any](from Newest, opts .
 type feeder interface {
 	start(ctx context.Context) error
 	synced() bool
-	// resync applies every object the source holds, for a store a test cleared.
-	resync()
+	// stop stops following the source.
+	stop()
 }
 
 // Start waits for an object store's source to sync, then applies every object it holds, until ctx is done. It

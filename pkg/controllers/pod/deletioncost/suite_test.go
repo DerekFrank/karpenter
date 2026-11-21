@@ -97,8 +97,6 @@ var _ = BeforeSuite(func() {
 
 	ctx = options.ToContext(ctx, opts)
 	cloudProvider = fake.NewCloudProvider()
-	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = cs
 })
 
 var _ = AfterSuite(func() {
@@ -109,11 +107,13 @@ var _ = BeforeEach(func() {
 	cloudProvider.Reset()
 	cloudProvider.InstanceTypes = fake.InstanceTypesAssorted()
 	queue = deletioncost.NewQueue(env.Overlay)
+	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
+	DeferCleanup(cs.Close)
+	cluster = cs
 })
 
 var _ = AfterEach(func() {
 	ExpectCleanedUp(ctx, env.Client)
-	cs.Reset()
 })
 
 func rsOwnedPod(opts ...test.PodOptions) *corev1.Pod {

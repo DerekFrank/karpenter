@@ -17,13 +17,9 @@ limitations under the License.
 package disruption_test
 
 import (
-	"context"
 	"fmt"
 	"math/rand/v2"
-	"strconv"
-	"time"
 
-	"github.com/awslabs/operatorpkg/status"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -31,17 +27,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
-	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	fakecp "sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
-	"sigs.k8s.io/karpenter/pkg/operator/options"
-	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
-	"sigs.k8s.io/karpenter/pkg/state/statetest"
 	"sigs.k8s.io/karpenter/pkg/test"
+	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 )
 
@@ -87,71 +79,77 @@ func recountNodePoolStats(nodeClaims *karpentercluster.NodeClaims, nodeObjects m
 
 var _ = Describe("NodePoolStats", func() {
 	// Applies random Node and NodeClaim updates, deletes, NodePool moves, reboots, readiness changes and deletion marks
-	// through cluster state, and checks the derived disruption counts against the loop over every node after each
+	// through the API server, and checks the derived disruption counts against the loop over every node after each
 	// change.
 	//
 	//nolint:gocyclo
 	It("should match a recount over every node after each change", func() {
-		statsCtx := options.ToContext(context.Background(), test.Options())
 		r := rand.New(rand.NewPCG(3, 4)) //nolint:gosec // deterministic seed for reproducible test inputs
-		clk := clocktesting.NewFakeClock(time.Now())
-		// This spec drives the stores itself, without an API server: each one follows the Objects of its kind, which the
-		// spec fills as an informer would.
-		srcs := statetest.NewSources()
-		cs := karpentercluster.New(statsCtx, clk, nil, fakecp.NewCloudProvider(),
-			karpentercluster.WithSources(func(obj client.Object) karpenterstate.Newest { return srcs.For(obj) }))
-		c := cs.NodeClaims
 		nodePools := []string{"a", "b", ""}
-		var rv uint64
-		nextRV := func() string { rv++; return strconv.FormatUint(rv, 10) }
-		uids := map[string]types.UID{}
-		nodeObjects := map[string]*corev1.Node{}
-		uid := func(kind, name string) types.UID {
-			if _, ok := uids[kind+name]; !ok {
-				uids[kind+name] = types.UID(fmt.Sprintf("%s-%s-%d", kind, name, rv))
+		// remove deletes the object, finishing a deletion its finalizer holds.
+		remove := func(obj client.Object) {
+			if err := env.Client.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+				Expect(client.IgnoreNotFound(err)).To(Succeed())
+				return
 			}
-			return uids[kind+name]
+			ExpectFinalizersRemoved(ctx, env.Client, obj)
+			ExpectDeleted(ctx, env.Client, obj)
 		}
-		for i := range 20000 {
-			id := r.IntN(30)
+		// deleting returns whether the object exists and is being deleted, which an update can't undo.
+		deleting := func(obj client.Object) bool {
+			current := obj.DeepCopyObject().(client.Object)
+			return env.Client.Get(ctx, client.ObjectKeyFromObject(obj), current) == nil && !current.GetDeletionTimestamp().IsZero()
+		}
+		nodeObjects := func() map[string]*corev1.Node {
+			nodes := map[string]*corev1.Node{}
+			for _, n := range ExpectNodes(ctx, env.Client) {
+				nodes[n.Name] = n
+			}
+			return nodes
+		}
+		for i := range 300 {
+			id := r.IntN(10)
 			name, providerID := fmt.Sprintf("node-%d", id), fmt.Sprintf("fake:///node-%d", id)
 			nodePool := nodePools[r.IntN(len(nodePools))]
 			switch op := r.IntN(12); {
 			case op == 0:
-				srcs.Remove(&v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: name}})
-				delete(uids, "nc"+name)
+				remove(&v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: name}})
 			case op == 1:
-				srcs.Remove(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}})
-				delete(uids, "node"+name)
-				delete(nodeObjects, name)
+				remove(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}})
 			case op == 2:
 				cs.Deletion.Mark(name)
 			case op == 3:
 				cs.Deletion.Unmark(name)
 			case op < 7:
-				nc := &v1.NodeClaim{
-					ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid("nc", name), ResourceVersion: nextRV(), Labels: map[string]string{v1.NodePoolLabelKey: nodePool}},
-					Spec:       v1.NodeClaimSpec{NodeClassRef: test.NodeClaim().Spec.NodeClassRef},
+				nc := test.NodeClaim(v1.NodeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{v1.NodePoolLabelKey: nodePool}},
 					Status:     v1.NodeClaimStatus{ProviderID: providerID},
+				})
+				if deleting(nc) {
+					remove(nc)
+					break
 				}
-				if r.IntN(5) == 0 {
-					nc.DeletionTimestamp = &metav1.Time{Time: time.Unix(1, 0)}
-					nc.Finalizers = []string{v1.TerminationFinalizer}
-				}
+				deleted := r.IntN(5) == 0
 				if r.IntN(4) == 0 {
-					nc.Status.Conditions = append(nc.Status.Conditions, status.Condition{Type: v1.ConditionTypeRebooting, Status: []metav1.ConditionStatus{metav1.ConditionTrue, metav1.ConditionFalse}[r.IntN(2)]})
+					if r.IntN(2) == 0 {
+						nc.StatusConditions().SetTrueWithReason(v1.ConditionTypeRebooting, v1.RebootReasonRequested, "reboot requested")
+					} else {
+						nc.StatusConditions().SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "done")
+					}
 				}
 				if r.IntN(6) == 0 {
-					nc.Status.Conditions = append(nc.Status.Conditions, status.Condition{Type: v1.ConditionTypeInstanceTerminating, Status: metav1.ConditionTrue})
+					nc.StatusConditions().SetTrue(v1.ConditionTypeInstanceTerminating)
 				}
 				if r.IntN(3) != 0 {
-					nc.Status.Conditions = append(nc.Status.Conditions, status.Condition{Type: v1.ConditionTypeInitialized, Status: metav1.ConditionTrue})
+					nc.StatusConditions().SetTrue(v1.ConditionTypeInitialized)
 				}
-				srcs.Put(nc)
+				ExpectApplied(ctx, env.Client, nc)
+				if deleted {
+					ExpectDeletionTimestampSet(ctx, env.Client, nc)
+				}
 			default:
 				labels := map[string]string{corev1.LabelInstanceTypeStable: "default-instance-type"}
-				// Some Nodes are unmanaged: they carry no NodePool label and no NodeClaim joins them, unless a
-				// NodeClaim with the same providerID exists.
+				// Some Nodes are unmanaged: they carry no NodePool label and no owner reference.
 				if r.IntN(5) != 0 {
 					labels[v1.NodePoolLabelKey] = nodePool
 				}
@@ -162,12 +160,20 @@ var _ = Describe("NodePoolStats", func() {
 					labels[v1.NodeInitializedLabelKey] = "true"
 				}
 				node := &corev1.Node{
-					ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid("node", name), ResourceVersion: nextRV(), Labels: labels},
+					ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
 					Spec:       corev1.NodeSpec{ProviderID: providerID},
+				}
+				if deleting(node) {
+					remove(node)
+					break
 				}
 				// Registration links some Nodes to their NodeClaim by owner reference.
 				if r.IntN(2) == 0 {
-					node.OwnerReferences = []metav1.OwnerReference{{APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: name}}
+					uid := types.UID("never-created")
+					if nc := (&v1.NodeClaim{}); env.Client.Get(ctx, types.NamespacedName{Name: name}, nc) == nil {
+						uid = nc.UID
+					}
+					node.OwnerReferences = []metav1.OwnerReference{{APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: name, UID: uid}}
 				}
 				switch r.IntN(3) {
 				case 0:
@@ -175,15 +181,14 @@ var _ = Describe("NodePoolStats", func() {
 				case 1:
 					node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionFalse}}
 				}
+				ExpectApplied(ctx, env.Client, node)
 				if r.IntN(8) == 0 {
-					node.DeletionTimestamp = &metav1.Time{Time: time.Unix(1, 0)}
-					node.Finalizers = []string{v1.TerminationFinalizer}
+					ExpectDeletionTimestampSet(ctx, env.Client, node)
 				}
-				srcs.Put(node)
-				nodeObjects[name] = node
 			}
+			nodes := nodeObjects()
 			for _, reason := range []v1.DisruptionReason{v1.DisruptionReasonUnderutilized, v1.DisruptionReasonDrifted, v1.DisruptionReasonEmpty, v1.DisruptionReasonUnhealthy} {
-				wantNodes, wantDisrupting := recountNodePoolStats(c, nodeObjects, reason)
+				wantNodes, wantDisrupting := recountNodePoolStats(cs.NodeClaims, nodes, reason)
 				// NodePool names are never empty, so nodes without the label count toward none.
 				for _, np := range []string{"a", "b"} {
 					numNodes, disrupting := disruption.NodePoolStats(cs.NodePoolState, np, reason)
@@ -196,7 +201,7 @@ var _ = Describe("NodePoolStats", func() {
 })
 
 var _ = Describe("ValidateNodeDisruptable", func() {
-	stateNode := func(rebootStatus metav1.ConditionStatus) karpentercluster.NodeClaimEntry {
+	nodeEntry := func(rebootStatus metav1.ConditionStatus) karpentercluster.NodeClaimEntry {
 		nc := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: "default"}}})
 		n := test.Node(test.NodeOptions{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
 			v1.NodePoolLabelKey:        "default",
@@ -211,10 +216,10 @@ var _ = Describe("ValidateNodeDisruptable", func() {
 		return karpentercluster.NodeClaimEntry{Object: nc, Derived: karpentercluster.NodeClaimDerived{Node: n}}
 	}
 	It("should reject a rebooting node", func() {
-		err := disruption.ValidateNodeDisruptable(stateNode(metav1.ConditionTrue), clock.RealClock{})
+		err := disruption.ValidateNodeDisruptable(nodeEntry(metav1.ConditionTrue), clock.RealClock{})
 		Expect(err).To(MatchError(ContainSubstring("node is rebooting")), "ValidateNodeDisruptable on a rebooting node should error that the node is rebooting")
 	})
 	It("should accept a node done rebooting", func() {
-		Expect(disruption.ValidateNodeDisruptable(stateNode(metav1.ConditionFalse), clock.RealClock{})).To(Succeed(), "ValidateNodeDisruptable on a node done rebooting")
+		Expect(disruption.ValidateNodeDisruptable(nodeEntry(metav1.ConditionFalse), clock.RealClock{})).To(Succeed(), "ValidateNodeDisruptable on a node done rebooting")
 	})
 })

@@ -83,7 +83,7 @@ var _ = Describe("Wakes", func() {
 		nodePool = test.NodePool()
 		nodeClaim, node = test.NodeClaimAndNode(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name}}})
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		Expect(drain()).To(BeTrue(), "want a wake for the new node")
 	})
 	It("should wake on the pods and node changes consolidation decides on, and not on pod status or nominations", func() {

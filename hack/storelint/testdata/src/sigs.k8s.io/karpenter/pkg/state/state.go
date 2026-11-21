@@ -53,8 +53,6 @@ type Store[K comparable, O, D, I any] struct{ Reader[K, O, D, I] }
 
 func (s *Store[K, O, D, I]) Start(context.Context) error { return nil }
 
-func (s *Store[K, O, D, I]) Clear() {}
-
 func NewSyntheticStore[K comparable, O, D, I any](func(K) O) *Store[K, O, D, I] {
 	return &Store[K, O, D, I]{}
 }

@@ -99,7 +99,7 @@ var _ = Describe("NodePoolState", func() {
 			reservations := cs.NodePoolState.ReserveNodeCount(np.Name, 5, 5)
 			Expect(reservations).To(HaveLen(5))
 			reservations[:2].Release()
-			ExpectStateNodePoolCount(cs.NodePoolState, np.Name, 0, 0, 3)
+			ExpectNodePoolCounts(cs.NodePoolState, np.Name, 0, 0, 3)
 			Expect(cs.NodePoolState.ReserveNodeCount(np.Name, 5, 5)).To(HaveLen(2))
 		})
 
@@ -108,7 +108,7 @@ var _ = Describe("NodePoolState", func() {
 			reservations[0].Release()
 			reservations[0].Release()
 			reservations[0].Bind(nodeClaim.Name)
-			ExpectStateNodePoolCount(cs.NodePoolState, np.Name, 0, 0, 1)
+			ExpectNodePoolCounts(cs.NodePoolState, np.Name, 0, 0, 1)
 		})
 
 		It("should hold a bound reservation until the NodeClaim counts, and never count the NodeClaim zero times", func() {
@@ -117,32 +117,32 @@ var _ = Describe("NodePoolState", func() {
 			reservations[0].Bind(nodeClaim.Name)
 
 			// Bound, but cluster state hasn't seen the NodeClaim yet: the reservation still holds its node.
-			ExpectStateNodePoolCount(cs.NodePoolState, np.Name, 0, 0, 1)
+			ExpectNodePoolCounts(cs.NodePoolState, np.Name, 0, 0, 1)
 			Expect(cs.NodePoolState.ReserveNodeCount(np.Name, 1, 1)).To(BeEmpty())
 
 			ExpectApplied(ctx, env.Client, nodeClaim)
-			ExpectStateNodePoolCount(cs.NodePoolState, np.Name, 1, 0, 0)
+			ExpectNodePoolCounts(cs.NodePoolState, np.Name, 1, 0, 0)
 			Expect(cs.NodePoolState.ReserveNodeCount(np.Name, 1, 1)).To(BeEmpty())
 		})
 
 		It("should release a reservation bound to a NodeClaim the counts already include", func() {
 			reservations := cs.NodePoolState.ReserveNodeCount(np.Name, 2, 1)
 			ExpectApplied(ctx, env.Client, nodeClaim)
-			ExpectStateNodePoolCount(cs.NodePoolState, np.Name, 1, 0, 1)
+			ExpectNodePoolCounts(cs.NodePoolState, np.Name, 1, 0, 1)
 
 			reservations[0].Bind(nodeClaim.Name)
-			ExpectStateNodePoolCount(cs.NodePoolState, np.Name, 1, 0, 0)
+			ExpectNodePoolCounts(cs.NodePoolState, np.Name, 1, 0, 0)
 			Expect(cs.NodePoolState.ReserveNodeCount(np.Name, 2, 2)).To(HaveLen(1))
 		})
 
 		It("should release a bound reservation whose NodeClaim is deleted before it counts", func() {
 			reservations := cs.NodePoolState.ReserveNodeCount(np.Name, 2, 1)
 			reservations[0].Bind(nodeClaim.Name)
-			ExpectStateNodePoolCount(cs.NodePoolState, np.Name, 0, 0, 1)
+			ExpectNodePoolCounts(cs.NodePoolState, np.Name, 0, 0, 1)
 
 			ExpectApplied(ctx, env.Client, nodeClaim)
 			ExpectDeleted(ctx, env.Client, nodeClaim)
-			ExpectStateNodePoolCount(cs.NodePoolState, np.Name, 0, 0, 0)
+			ExpectNodePoolCounts(cs.NodePoolState, np.Name, 0, 0, 0)
 		})
 
 		It("should expire a reservation that is never counted", func() {
@@ -158,7 +158,7 @@ var _ = Describe("NodePoolState", func() {
 
 		It("should keep reservations while a NodePool has no NodeClaims", func() {
 			Expect(cs.NodePoolState.ReserveNodeCount(np.Name, 5, 2)).To(HaveLen(2))
-			ExpectStateNodePoolCount(cs.NodePoolState, np.Name, 0, 0, 2)
+			ExpectNodePoolCounts(cs.NodePoolState, np.Name, 0, 0, 2)
 		})
 	})
 })
@@ -330,31 +330,31 @@ var _ = Describe("NodePoolState Tracking", func() {
 			})
 
 			It("should count a NodeClaim as deleting once it's disrupted, and as active once the disruption clears", func() {
-				ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 1, 0, 0)
+				ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 1, 0, 0)
 
 				nodeClaim.StatusConditions().SetTrueWithReason(v1.ConditionTypeDisruptionReason, string(v1.DisruptionReasonDrifted), string(v1.DisruptionReasonDrifted))
 				ExpectApplied(ctx, env.Client, nodeClaim)
-				ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 0, 1, 0)
+				ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 0, 1, 0)
 
 				nodeClaim.Annotations = map[string]string{"updated": "true"}
 				ExpectApplied(ctx, env.Client, nodeClaim)
-				ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 0, 1, 0)
+				ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 0, 1, 0)
 
 				Expect(nodeClaim.StatusConditions().Clear(v1.ConditionTypeDisruptionReason)).To(Succeed())
 				ExpectApplied(ctx, env.Client, nodeClaim)
-				ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 1, 0, 0)
+				ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 1, 0, 0)
 			})
 
 			It("should count a NodeClaim as deleting once it's being deleted", func() {
 				nodeClaim.Finalizers = []string{v1.TerminationFinalizer}
 				ExpectApplied(ctx, env.Client, nodeClaim)
 				Expect(env.Client.Delete(ctx, nodeClaim)).To(Succeed())
-				ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 0, 1, 0)
+				ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 0, 1, 0)
 			})
 
 			It("should not change the counts when a node is marked for deletion", func() {
 				cs.Deletion.Mark(nodeClaim.Name)
-				ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 1, 0, 0)
+				ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 1, 0, 0)
 			})
 
 			It("should handle NodeClaim cleanup correctly", func() {
@@ -412,20 +412,20 @@ var _ = Describe("NodePoolState Tracking", func() {
 
 			first := cs.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 2)
 			Expect(first).To(HaveLen(2))
-			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 1, 1, 2)
+			ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 1, 1, 2)
 			second := cs.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 10)
 			Expect(second).To(HaveLen(1))
 			Expect(cs.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 1)).To(BeEmpty())
 
 			first.Release()
 			second.Release()
-			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 1, 1, 0)
+			ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 1, 1, 0)
 		})
 
 		It("should keep reservations when a NodePool's last NodeClaim is deleted", func() {
 			Expect(cs.NodePoolState.ReserveNodeCount(nodePool.Name, 5, 2)).To(HaveLen(2))
 			ExpectDeleted(ctx, env.Client, nodeClaim)
-			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 0, 0, 2)
+			ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 0, 0, 2)
 		})
 
 		It("should reserve atomically under concurrent callers", func() {
@@ -436,7 +436,7 @@ var _ = Describe("NodePoolState Tracking", func() {
 			}
 			wg.Wait()
 			Expect(granted.Load()).To(BeEquivalentTo(9))
-			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 1, 0, 9)
+			ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 1, 0, 9)
 		})
 	})
 })

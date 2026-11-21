@@ -62,14 +62,14 @@ type Topology struct {
 	// moving pods to prevent them from being double counted.
 	excludedPods sets.Set[string]
 	nodes        *karpentercluster.Nodes
-	stateNodes   []karpentercluster.NodeView
+	nodeViews    []karpentercluster.NodeView
 }
 
 func NewTopology(
 	ctx context.Context,
 	kubeClient client.Client,
 	nodes *karpentercluster.Nodes,
-	stateNodes []karpentercluster.NodeView,
+	nodeViews []karpentercluster.NodeView,
 	nodePools []*v1.NodePool,
 	instanceTypes map[string][]*cloudprovider.InstanceType,
 	pods []*corev1.Pod,
@@ -79,7 +79,7 @@ func NewTopology(
 		kubeClient:            kubeClient,
 		preferencePolicy:      option.Resolve(opts...).preferencePolicy,
 		nodes:                 nodes,
-		stateNodes:            stateNodes,
+		nodeViews:             nodeViews,
 		domainGroups:          buildDomainGroups(nodePools, instanceTypes),
 		topologyGroups:        map[uint64]*TopologyGroup{},
 		inverseTopologyGroups: map[uint64]*TopologyGroup{},
@@ -375,8 +375,8 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 	// scheduled to them already
 	// Note: long term we should handle this when constructing the domain groups, but that would require domain groups
 	// to handle affinity in addition to taints / tolerations.
-	for _, n := range t.stateNodes {
-		// ignore state nodes which are tracking in-flight NodeClaims
+	for _, n := range t.nodeViews {
+		// ignore the views of in-flight NodeClaims
 		node := n.Node()
 		if node == nil {
 			continue

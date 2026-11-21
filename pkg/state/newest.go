@@ -51,6 +51,8 @@ type newestOf[K comparable, S client.Object, D, I any] struct {
 	key   func(types.NamespacedName) K
 	in    func(S) bool
 	swept atomic.Bool
+	// unsubscribe stops following from.
+	unsubscribe func()
 }
 
 func (n *newestOf[K, S, D, I]) synced() bool { return n.swept.Load() && n.from.HasSynced() }
@@ -65,11 +67,7 @@ func (n *newestOf[K, S, D, I]) start(ctx context.Context) error {
 	return nil
 }
 
-func (n *newestOf[K, S, D, I]) resync() {
-	if n.from.HasSynced() {
-		n.sweep()
-	}
-}
+func (n *newestOf[K, S, D, I]) stop() { n.unsubscribe() }
 
 func (n *newestOf[K, S, D, I]) sweep() {
 	for _, name := range n.from.Keys() {
@@ -112,9 +110,9 @@ func (n *newestOf[K, S, D, I]) read(name types.NamespacedName) (S, bool) {
 
 // commit holds obj under k, or removes k's object when ok is false. Within one object, an older resourceVersion loses,
 // and one as new as the object held replaces it, so the store converges on the informer's own object for a version the
-// overlay held a copy of. A removed object, and one another UID replaced, is at infinity: its UID stays in the slot's
-// gone while from still holds it, so a stale read of it loses, and the next object under the name starts a new
-// incarnation, which drops the entry's intent.
+// overlay held a copy of. A removed object, and one another UID replaced, joins the slot's gone set while from still
+// holds its UID, so a stale read of it loses, and the next object under the name is a new object, which drops the
+// entry's intent.
 func (n *newestOf[K, S, D, I]) commit(name types.NamespacedName, k K, obj S, ok bool) {
 	c := n.core
 	c.mu.Lock()

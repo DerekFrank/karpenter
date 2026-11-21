@@ -40,18 +40,18 @@ var _ = ginkgo.Describe("Derive commit-if-current", func() {
 	ginkgo.It("should not commit a recompute from an entry the source has replaced", func() {
 		nodeClaims, s, d := newStores()
 		key := types.NamespacedName{Name: "a"}
-		observe(nodeClaims, nodeClaim("a", "x", 1, "2"))
+		put(nodeClaims, nodeClaim("a", "x", 1, "2"))
 		commit := staleRead(d, key)
-		observe(nodeClaims, nodeClaim("a", "y", 2, "4"))
+		put(nodeClaims, nodeClaim("a", "y", 2, "4"))
 		Expect(commit()).To(BeFalse(), "a commit from the replaced entry, want it refused")
 		Expect(pooled(s)).To(Equal(map[string]poolFields{"y": {CPU: 4, Count: 1}}))
 	})
 	ginkgo.It("should not commit a recompute from before the source's removal", func() {
 		nodeClaims, s, d := newStores()
 		key := types.NamespacedName{Name: "a"}
-		observe(nodeClaims, nodeClaim("a", "x", 1, "2"))
+		put(nodeClaims, nodeClaim("a", "x", 1, "2"))
 		commit := staleRead(d, key)
-		forget(nodeClaims, key)
+		remove(nodeClaims, key)
 		Expect(commit()).To(BeFalse(), "a commit from the removed entry, want it refused")
 		Expect(pooled(s)).To(BeEmpty(), "want the removal to hold")
 	})
@@ -67,7 +67,7 @@ var _ = ginkgo.Describe("Derive commit-if-current", func() {
 		})
 		readsScale := NewIndex(nodeClaims, func(types.NamespacedName, nodeClaimEntry) []string { return []string{"scale"} })
 		DependsOn(nodeClaims, scale.Reader, readsScale)
-		observe(nodeClaims, nodeClaim("a", "x", 1, "2"))
+		put(nodeClaims, nodeClaim("a", "x", 1, "2"))
 		commit := staleRead(d, types.NamespacedName{Name: "a"})
 		scale.Feed("scale", 3)
 		Expect(pooled(pools)).To(Equal(map[string]poolFields{"x": {CPU: 6, Count: 1}}), "the recompute the dependency's change triggers")
@@ -81,12 +81,12 @@ var _ = ginkgo.Describe("Derive commit-if-current", func() {
 			func(_ string, e Entry[string, poolFields, struct{}]) usage {
 				return usage{CPU: e.Derived.CPU, Count: 1}
 			})
-		observe(nodeClaims, nodeClaim("a", "x", 1, "2"))
+		put(nodeClaims, nodeClaim("a", "x", 1, "2"))
 		commit := staleRead(d, "x")
-		forget(nodeClaims, types.NamespacedName{Name: "a"})
+		remove(nodeClaims, types.NamespacedName{Name: "a"})
 		_, ok := pools.Get("x")
 		Expect(ok).To(BeFalse(), "x once nothing contributes to it")
-		observe(nodeClaims, nodeClaim("b", "x", 2, "5"))
+		put(nodeClaims, nodeClaim("b", "x", 2, "5"))
 		Expect(commit()).To(BeFalse(), "a commit from before x dropped, want it refused")
 		Expect(pooled(totals)).To(Equal(map[string]poolFields{"all": {CPU: 5, Count: 1}}),
 			"the totals once x reappears, want its new entry, not the recompute from before it dropped")

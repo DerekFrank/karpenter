@@ -65,11 +65,6 @@ func (s State) Register(m manager.Manager) error {
 	return m.Add(s.NodePoolUsage.store)
 }
 
-// Reset composes the stores' Clear, for tests.
-func (s State) Reset() {
-	s.NodePoolUsage.store.Clear()
-}
-
 func (s State) Start(m manager.Manager) error {
 	return m.Add(s.NodePoolUsage.store) // want `s.NodePoolUsage.store is a shared store: only cluster.State.Register adds it to the manager`
 }
@@ -98,7 +93,7 @@ func (n *NodeClaim) DeepCopy() *NodeClaim {
 
 func (n *NodeClaim) StatusConditions(observedOnly ...bool) []string { return n.Conditions }
 
-type StateNode struct{ NodeClaim *NodeClaim }
+type ManagedNode struct{ NodeClaim *NodeClaim }
 
 type Node struct{ Name string }
 

@@ -55,12 +55,12 @@ const (
 // terminating workload-bearing nodes, orders candidates by rank + age/τ, and is vetoed by do-not-repair.
 type Repair struct {
 	consolidation
-	policyMatcher *repair.RepairPolicyMatcher
+	policyMatcher *repair.PolicyMatcher
 	rebootHistory *RebootHistory
 }
 
 // NewRepair constructs the repair method around the matcher cluster state matches Nodes with. It panics when cluster
-// state has none, since repair.NewRepairPolicyMatcher only returns nil when node repair is disabled or replaced by --legacy-node-repair.
+// state has none, since repair.NewPolicyMatcher only returns nil when node repair is disabled or replaced by --legacy-node-repair.
 func NewRepair(c consolidation) *Repair {
 	policyMatcher := c.cluster.RepairPolicyMatcher
 	if policyMatcher == nil {
@@ -323,7 +323,7 @@ func (r *Repair) breakerTripped(nodePool string) bool {
 // behavior).
 // TODO: the termination-timestamp deadline is a stopgap — replace once the termination flow has a formal contract
 // (kubernetes-sigs/karpenter#3029, Formalize Node Termination Contract).
-func effectiveDrainBound(c *Candidate, result repair.RepairResult) *time.Duration {
+func effectiveDrainBound(c *Candidate, result repair.Result) *time.Duration {
 	if result.TerminationGracePeriod == nil {
 		return nil // inherit the NodeClaim's own TerminationGracePeriod
 	}
@@ -344,9 +344,9 @@ func (r *Repair) ConsolidationType() string { return "" }
 // keeps current on its NodeClaim's entry. An empty Action means no policy applies or none has waited out its toleration
 // yet. Tolerations are measured from no earlier than the end of the last reboot, since a node rejoins uninitialized
 // after a successful reboot and its conditions may not have caught up yet.
-func repairResult(e karpentercluster.NodeClaimEntry, now time.Time) repair.RepairResult {
+func repairResult(e karpentercluster.NodeClaimEntry, now time.Time) repair.Result {
 	if karpentercluster.InFlight(e) {
-		return repair.RepairResult{}
+		return repair.Result{}
 	}
 	var rebootFinishedAt time.Time
 	for i := range e.Object.Status.Conditions {

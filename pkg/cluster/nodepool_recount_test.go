@@ -37,8 +37,9 @@ import (
 )
 
 var _ = Describe("NodePoolState Recount", func() {
-	// Applies random NodeClaim updates, deletes, NodePool moves and stale versions through cluster state, and checks
-	// the NodePools' counts against a recount of the latest version of each NodeClaim after every change.
+	// Applies random NodeClaim updates, deletes, NodePool moves and stale versions through the NodeClaim store's own
+	// source, and checks the NodePools' counts against a recount of the latest version of each NodeClaim after every
+	// change. A stale version arriving late is what an informer can deliver and the API server can't be made to.
 	//
 	//nolint:gocyclo
 	It("should match a recount of the latest version of each NodeClaim after every change", func() {

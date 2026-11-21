@@ -101,14 +101,6 @@ func helper() {
 
 var _ = state.NewObjectStore[string, string, struct{}, struct{}]() // want `state.NewObjectStore builds a store`
 
-func wipe(s *state.Store[string, int, struct{}, struct{}]) {
-	s.Clear() // want `Clear wipes cluster state: only tests clear stores`
-}
-
-func reset(s cluster.State) {
-	s.Reset() // want `Reset wipes cluster state: only tests clear stores`
-}
-
 // tested is a Contribution with a law test.
 type tested int
 
@@ -122,7 +114,7 @@ func (u untested) Update(f int, prev untested) int { return f + int(u-prev) }
 func (u untested) Delete(f int) int                { return f - int(u) }
 
 // disrupt writes a copy of the NodeClaim a store holds, never the NodeClaim itself.
-func disrupt(ctx context.Context, kubeClient client.Writer, node *cluster.StateNode) {
+func disrupt(ctx context.Context, kubeClient client.Writer, node *cluster.ManagedNode) {
 	_ = kubeClient.Delete(ctx, node.NodeClaim)       // want `node.NodeClaim is the informer cache's object, which a client write overwrites`
 	_ = kubeClient.Patch(ctx, (node.NodeClaim), nil) // want `node.NodeClaim is the informer cache's object, which a client write overwrites`
 	_ = kubeClient.Delete(ctx, node.NodeClaim.DeepCopy())

@@ -59,8 +59,8 @@ var _ = Describe("Unhealthy Nodes", func() {
 			}
 		})
 	}
-	// stateNode is the entry of the NodeClaim whose Node is node, which carries the Node's repair policy matches.
-	stateNode := func(node *corev1.Node) karpentercluster.NodeClaimEntry { return nodeClaimEntryOf(node) }
+	// nodeClaimEntry is the entry of the NodeClaim whose Node is node, which carries the Node's repair policy matches.
+	nodeClaimEntry := func(node *corev1.Node) karpentercluster.NodeClaimEntry { return nodeClaimEntryOf(node) }
 	unhealthyNames := func() []string {
 		var names []string
 		for _, e := range cluster.NodeClaims.List() {
@@ -72,27 +72,23 @@ var _ = Describe("Unhealthy Nodes", func() {
 		return names
 	}
 
-	var suiteCluster karpentercluster.State
-	var matcher *repair.RepairPolicyMatcher
+	var matcher *repair.PolicyMatcher
 	// useMatcher builds cluster state around a matcher, as the operator does once at startup.
-	useMatcher := func(m *repair.RepairPolicyMatcher) {
+	useMatcher := func(m *repair.PolicyMatcher) {
 		cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider, karpentercluster.WithRepairPolicyMatcher(m))
+		DeferCleanup(cs.Close)
 		cluster = cs
 	}
 
 	BeforeEach(func() {
-		suiteCluster = cluster
 		cloudProvider.RepairPolicy = []cloudprovider.RepairPolicy{
 			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, TolerationDuration: 30 * time.Minute, Action: cloudprovider.ReplaceNode},
 			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, ReasonRegex: "^Kernel$", TolerationDuration: time.Minute, Action: cloudprovider.ReplaceNode},
 			{ConditionType: corev1.NodeReady, ConditionStatus: corev1.ConditionUnknown, ReasonRegex: ".*", TolerationDuration: 10 * time.Minute, Action: cloudprovider.ReplaceNode},
 		}
-		matcher = lo.Must(repair.NewRepairPolicyMatcher(
+		matcher = lo.Must(repair.NewPolicyMatcher(
 			options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodeRepair: new(true)}})), cloudProvider))
 		useMatcher(matcher)
-	})
-	AfterEach(func() {
-		cluster = suiteCluster
 	})
 
 	It("should mark a node unhealthy as soon as a condition matches a policy, before its toleration elapses", func() {
@@ -100,7 +96,7 @@ var _ = Describe("Unhealthy Nodes", func() {
 		managedNode()
 
 		Expect(unhealthyNames()).To(ConsistOf(unhealthy.Name))
-		Expect(repairResult(stateNode(unhealthy), env.Clock.Now()).Action).To(BeEmpty())
+		Expect(repairResult(nodeClaimEntry(unhealthy), env.Clock.Now()).Action).To(BeEmpty())
 	})
 	It("should match on condition type and status", func() {
 		_, unknown := managedNode(corev1.NodeCondition{Type: corev1.NodeReady, Status: corev1.ConditionUnknown})
@@ -118,21 +114,21 @@ var _ = Describe("Unhealthy Nodes", func() {
 		_, node := managedNode(badNode())
 
 		env.Clock.Step(31 * time.Minute)
-		result := repairResult(stateNode(node), env.Clock.Now())
+		result := repairResult(nodeClaimEntry(node), env.Clock.Now())
 		Expect(result.Action).To(Equal(cloudprovider.ReplaceNode))
 		Expect(result.Condition).To(Equal(corev1.NodeConditionType("BadNode")))
 	})
 	It("should re-match the policies when a condition's reason changes", func() {
 		_, node := managedNode(badNode())
 		env.Clock.Step(2 * time.Minute)
-		Expect(repairResult(stateNode(node), env.Clock.Now()).Action).To(BeEmpty())
+		Expect(repairResult(nodeClaimEntry(node), env.Clock.Now()).Action).To(BeEmpty())
 
 		updateNode(node, func(n *corev1.Node) {
 			n.Status.Conditions = []corev1.NodeCondition{badNode()}
 			n.Status.Conditions[0].Reason = "Kernel"
 			n.Status.Conditions[0].LastTransitionTime = metav1.NewTime(env.Clock.Now().Add(-2 * time.Minute))
 		})
-		Expect(repairResult(stateNode(node), env.Clock.Now()).ReasonRegex).To(Equal("^Kernel$"))
+		Expect(repairResult(nodeClaimEntry(node), env.Clock.Now()).ReasonRegex).To(Equal("^Kernel$"))
 	})
 	It("should mark a node healthy when its condition recovers", func() {
 		_, node := managedNode(badNode())
@@ -158,7 +154,7 @@ var _ = Describe("Unhealthy Nodes", func() {
 	It("should not report a node whose Node was deleted while its NodeClaim remains", func() {
 		_, node := managedNode(badNode())
 		ExpectDeleted(ctx, env.Client, node)
-		ExpectStateNodeCount("==", 1)
+		ExpectNodeViewCount("==", 1)
 
 		Expect(unhealthyNames()).To(BeEmpty())
 		for _, e := range cluster.NodeClaims.List() {
@@ -168,6 +164,7 @@ var _ = Describe("Unhealthy Nodes", func() {
 	It("should match nodes in a newly constructed cluster", func() {
 		managedNode(badNode())
 		cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider, karpentercluster.WithRepairPolicyMatcher(matcher))
+		DeferCleanup(cs.Close)
 		var matched bool
 		for _, e := range cs.NodeClaims.List() {
 			matched = matched || repairResult(e, env.Clock.Now().Add(24*time.Hour)).Action != ""
@@ -185,9 +182,9 @@ var _ = Describe("Unhealthy Nodes", func() {
 // repairResult is the repair decision for a managed node at now, as disruption's repair resolves it: from the policy
 // matches its NodeClaim's entry carries from its Node, with tolerations measured from no earlier than the end of the
 // last reboot.
-func repairResult(e karpentercluster.NodeClaimEntry, now time.Time) repair.RepairResult {
+func repairResult(e karpentercluster.NodeClaimEntry, now time.Time) repair.Result {
 	if e.Derived.Node == nil {
-		return repair.RepairResult{}
+		return repair.Result{}
 	}
 	var rebootFinishedAt time.Time
 	for _, c := range e.Object.Status.Conditions {

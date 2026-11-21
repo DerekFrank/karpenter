@@ -64,7 +64,7 @@ var _ = ginkgo.Describe("Claims", func() {
 	})
 	ginkgo.It("should admit up to the limit, counting what is held", func() {
 		s, nodeClaims, claims := newCPUClaims(clocktesting.NewFakeClock(time.Now()))
-		observe(nodeClaims, nodeClaim("a", "x", 1, "16"))
+		put(nodeClaims, nodeClaim("a", "x", 1, "16"))
 
 		Expect(claims.Reserve("x", 10, 4, fitsCPU)).To(HaveLen(6), "claims of 4 granted against 24 free")
 		Expect(claims.Reserve("x", 1, 1, fitsCPU)).To(BeEmpty(), "claims granted at the limit")
@@ -76,15 +76,15 @@ var _ = ginkgo.Describe("Claims", func() {
 		claim.Bind(key("a"))
 
 		// Created, not launched: the contribution doesn't count what the claim holds, so the claim keeps holding it.
-		observe(nodeClaims, nodeClaim("a", "x", 1, "0"))
+		put(nodeClaims, nodeClaim("a", "x", 1, "0"))
 		Expect(fields(s, "x")).To(countedAndHeld(0, 4), "before launch")
-		observe(nodeClaims, nodeClaim("a", "x", 2, "2"))
+		put(nodeClaims, nodeClaim("a", "x", 2, "2"))
 		Expect(fields(s, "x")).To(countedAndHeld(2, 0), "after launch")
 	})
 	ginkgo.It("should admit replacements against what the sources they replace contribute, once", func() {
 		s, nodeClaims, claims := newCPUClaims(clocktesting.NewFakeClock(time.Now()))
-		observe(nodeClaims, nodeClaim("a", "x", 1, "30"))
-		observe(nodeClaims, nodeClaim("b", "y", 1, "10"))
+		put(nodeClaims, nodeClaim("a", "x", 1, "30"))
+		put(nodeClaims, nodeClaim("b", "y", 1, "10"))
 		Expect(claims.Reserve("x", 1, 20, fitsCPU)).To(BeEmpty(), "granted 20 against 30 of 40 counted")
 		// b counts toward another key, and a named twice is credited once.
 		Expect(claims.ReserveReplacing("x", 1, 40, []types.NamespacedName{key("a"), key("a"), key("b")}, fitsCPU)).To(HaveLen(1))
@@ -100,14 +100,14 @@ var _ = ginkgo.Describe("Claims", func() {
 		cpuClaims.Reserve("x", 1, 4, fitsCPU)[0].Bind(key("a"))
 		countClaims.Reserve("x", 1, 1, fitsCPU)[0].Bind(key("a"))
 		Expect(fields(s, "x").Reserved).To(Equal(5))
-		observe(nodeClaims, nodeClaim("a", "x", 1, "0"))
+		put(nodeClaims, nodeClaim("a", "x", 1, "0"))
 		Expect(fields(s, "x").Reserved).To(Equal(4), "held once created, before launch")
-		observe(nodeClaims, nodeClaim("a", "x", 2, "2"))
+		put(nodeClaims, nodeClaim("a", "x", 2, "2"))
 		Expect(fields(s, "x")).To(countedAndHeld(2, 0), "after launch")
 	})
 	ginkgo.It("should release and grant nothing once their Derivation is removed", func() {
 		s, nodeClaims, claims := newCPUClaims(clocktesting.NewFakeClock(time.Now()))
-		observe(nodeClaims, nodeClaim("a", "x", 1, "4"))
+		put(nodeClaims, nodeClaim("a", "x", 1, "4"))
 		claims.Reserve("x", 1, 4, fitsCPU)[0].Bind(key("b"))
 		claims.Reserve("x", 1, 4, fitsCPU)
 		claims.derivation.Remove()
@@ -115,13 +115,13 @@ var _ = ginkgo.Describe("Claims", func() {
 		_, exists := s.Get("x")
 		Expect(exists).To(BeFalse(), "x is held once nothing contributes")
 		Expect(claims.Reserve("x", 1, 4, fitsCPU)).To(BeEmpty(), "granted against a removed Derivation")
-		observe(nodeClaims, nodeClaim("b", "x", 1, "4"))
+		put(nodeClaims, nodeClaim("b", "x", 1, "4"))
 		Expect(fields(s, "x")).To(countedAndHeld(0, 0), "a removed Derivation counted a new source")
 	})
 	ginkgo.It("should release at once when bound to an object already counted", func() {
 		s, nodeClaims, claims := newCPUClaims(clocktesting.NewFakeClock(time.Now()))
 		claim := claims.Reserve("x", 1, 4, fitsCPU)[0]
-		observe(nodeClaims, nodeClaim("a", "x", 1, "4"))
+		put(nodeClaims, nodeClaim("a", "x", 1, "4"))
 		Expect(fields(s, "x")).To(countedAndHeld(4, 4), "counted before bound")
 		claim.Bind(key("a"))
 		Expect(fields(s, "x").Reserved).To(Equal(0), "held once bound to a counted object")
@@ -130,16 +130,16 @@ var _ = ginkgo.Describe("Claims", func() {
 	ginkgo.It("should release when their object goes away before it counts", func() {
 		s, nodeClaims, claims := newCPUClaims(clocktesting.NewFakeClock(time.Now()))
 		for name, gone := range map[string]func(){
-			"a": func() { forget(nodeClaims, types.NamespacedName{Name: "a"}) },
+			"a": func() { remove(nodeClaims, types.NamespacedName{Name: "a"}) },
 			"b": func() {
-				observe(nodeClaims, nodeClaim("b", "x", 2, "0"))
-				forget(nodeClaims, types.NamespacedName{Name: "b"})
+				put(nodeClaims, nodeClaim("b", "x", 2, "0"))
+				remove(nodeClaims, types.NamespacedName{Name: "b"})
 			},
-			"c": func() { resync(nodeClaims, []*v1.NodeClaim(nil), claims.derivation.Sources("x")) },
+			"c": func() { relist(nodeClaims, []*v1.NodeClaim(nil), claims.derivation.Sources("x")) },
 		} {
 			claim := claims.Reserve("x", 1, 4, fitsCPU)[0]
 			claim.Bind(key(name))
-			observe(nodeClaims, nodeClaim(name, "x", 1, "0"))
+			put(nodeClaims, nodeClaim(name, "x", 1, "0"))
 			gone()
 			Expect(fields(s, "x").Reserved).To(Equal(0), "held once %s is gone before launch", name)
 		}
@@ -198,18 +198,18 @@ var _ = ginkgo.Describe("Claims", func() {
 		var expired []heldCPU
 		claims.OnExpire(func(_ string, held heldCPU) { mu.Lock(); defer mu.Unlock(); expired = append(expired, held) })
 		// Seen before it's bound, and bound before it's seen.
-		observe(nodeClaims, nodeClaim("a", "x", 1, "0"))
+		put(nodeClaims, nodeClaim("a", "x", 1, "0"))
 		claims.Reserve("x", 1, 4, fitsCPU)[0].Bind(key("a"))
 		claims.Reserve("x", 1, 6, fitsCPU)[0].Bind(key("b"))
-		observe(nodeClaims, nodeClaim("b", "x", 1, "0"))
+		put(nodeClaims, nodeClaim("b", "x", 1, "0"))
 		// An unbound claim expires when the timer fires, which ends every claim due in one pass.
 		claims.Reserve("x", 1, 1, fitsCPU)
 		clk.Step(time.Hour)
 		Eventually(func() []heldCPU { mu.Lock(); defer mu.Unlock(); return slices.Clone(expired) }).Should(Equal([]heldCPU{1}))
 		Expect(fields(s, "x").Reserved).To(Equal(10), "expired claims whose sources haven't launched")
 
-		observe(nodeClaims, nodeClaim("a", "x", 2, "2"))
-		forget(nodeClaims, types.NamespacedName{Name: "b"})
+		put(nodeClaims, nodeClaim("a", "x", 2, "2"))
+		remove(nodeClaims, types.NamespacedName{Name: "b"})
 		Expect(fields(s, "x")).To(countedAndHeld(2, 0), "once a launched and b went")
 		mu.Lock()
 		defer mu.Unlock()
@@ -221,7 +221,7 @@ var _ = ginkgo.Describe("Claims", func() {
 		got[0].Release()
 		got[0].Release()
 		got[0].Bind(key("a"))
-		observe(nodeClaims, nodeClaim("a", "x", 1, "4"))
+		put(nodeClaims, nodeClaim("a", "x", 1, "4"))
 		// A second claim bound to the same object replaces the first.
 		other := claims.Reserve("x", 1, 4, fitsCPU)[0]
 		got[1].Bind(key("b"))
@@ -276,20 +276,20 @@ var _ = ginkgo.Describe("Claims", func() {
 						continue
 					}
 					got[0].Bind(key(name))
-					observe(nodeClaims, nodeClaim(name, "x", 1, "0"))
+					put(nodeClaims, nodeClaim(name, "x", 1, "0"))
 					check("create " + name)
 					mu.Unlock()
 
 					mu.Lock()
 					cpu := int64(1 + r.IntN(4))
-					observe(nodeClaims, nodeClaim(name, "x", 2, fmt.Sprint(cpu)))
+					put(nodeClaims, nodeClaim(name, "x", 2, fmt.Sprint(cpu)))
 					delete(held, name)
 					launched[name] = cpu
 					check("launch " + name)
 					mu.Unlock()
 
 					mu.Lock()
-					forget(nodeClaims, types.NamespacedName{Name: name})
+					remove(nodeClaims, types.NamespacedName{Name: name})
 					delete(launched, name)
 					check("delete " + name)
 					mu.Unlock()
@@ -322,9 +322,9 @@ var _ = ginkgo.Describe("Claims", func() {
 					if len(got) == 0 {
 						continue
 					}
-					observe(nodeClaims, nodeClaim(name, "x", 1, "3"))
+					put(nodeClaims, nodeClaim(name, "x", 1, "3"))
 					got[0].Bind(key(name))
-					forget(nodeClaims, types.NamespacedName{Name: name})
+					remove(nodeClaims, types.NamespacedName{Name: name})
 				}
 			})
 		}

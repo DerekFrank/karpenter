@@ -376,19 +376,6 @@ func (s *CapacityQuotaState) Synced() bool {
 	return true
 }
 
-// Clear stops enforcing every quota, ending every reservation, and empties the store in place, so that its subscribers
-// stay subscribed. It's for tests, between specs; storelint reports a Clear outside a test.
-func (s *CapacityQuotaState) Clear() {
-	s.rebuilding.Lock()
-	defer s.rebuilding.Unlock()
-	for _, q := range s.built {
-		q.nodeClaims.Remove()
-		q.nodes.Remove()
-	}
-	s.built = map[string]*Quota{}
-	s.quotas.Clear()
-}
-
 // QuotaReservation holds the most a NodeClaim could launch with, and one resources.Node, against one CapacityQuota it
 // may match, until the quota's Used counts the NodeClaim's launched capacity. Bind it to the NodeClaim once created, or
 // Release it if it won't be.

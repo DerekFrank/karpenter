@@ -143,7 +143,7 @@ var _ = Describe("Prediction", func() {
 			ExpectManualBinding(ctx, env.Client, pod, node)
 
 			dc := disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, stores, cs.NodePoolState, queue, clusterCost, disruption.WithMethods(NewMethodsWithNopValidator()...))
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			ExpectSingletonReconciled(ctx, dc)
 
 			if !expectConsolidation {
@@ -223,7 +223,7 @@ var _ = Describe("Prediction", func() {
 		ExpectManualBinding(ctx, env.Client, workloadPod, node)
 
 		dc := disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, stores, cs.NodePoolState, queue, clusterCost, disruption.WithMethods(NewMethodsWithNopValidator()...))
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		ExpectSingletonReconciled(ctx, dc)
 
 		cmds := queue.GetCommands()
@@ -266,7 +266,7 @@ var _ = Describe("Prediction", func() {
 		ExpectManualBinding(ctx, env.Client, pod, node)
 
 		dc := disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, stores, cs.NodePoolState, queue, clusterCost, disruption.WithMethods(NewMethodsWithNopValidator()...))
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		ExpectSingletonReconciled(ctx, dc)
 
 		cmds := queue.GetCommands()
@@ -328,7 +328,7 @@ var _ = Describe("Prediction", func() {
 		ExpectManualBinding(ctx, env.Client, podB, node)
 
 		dc := disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, stores, cs.NodePoolState, queue, clusterCost, disruption.WithMethods(NewMethodsWithNopValidator()...))
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		ExpectSingletonReconciled(ctx, dc)
 
 		Expect(queue.GetCommands()).To(BeEmpty())
@@ -370,7 +370,7 @@ var _ = Describe("Prediction", func() {
 		ExpectManualBinding(ctx, env.Client, pod, node)
 
 		dc := disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, stores, cs.NodePoolState, queue, clusterCost, disruption.WithMethods(NewMethodsWithNopValidator()...))
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		ExpectSingletonReconciled(ctx, dc)
 
 		// Drift should produce a replacement command using the expensive instance
@@ -402,7 +402,7 @@ var _ = Describe("Prediction", func() {
 		ExpectManualBinding(ctx, env.Client, pod, node)
 
 		dc := disruption.NewController(ctx, env.Clock, env.Overlay, hydrationProv, cloudProvider, recorder, stores, cs.NodePoolState, queue, clusterCost, disruption.WithMethods(NewMethodsWithNopValidator()...))
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 		wg := sync.WaitGroup{}
 		wg.Add(1)
@@ -427,7 +427,7 @@ var _ = Describe("Prediction", func() {
 		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDisruptionReason)
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 		dc := disruption.NewController(ctx, env.Clock, env.Overlay, hydrationProv, cloudProvider, recorder, stores, cs.NodePoolState, queue, clusterCost, disruption.WithMethods(NewMethodsWithNopValidator()...))
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
 		reconcileCtx, cancel := context.WithCancel(ctx)
 		defer cancel()

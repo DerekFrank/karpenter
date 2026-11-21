@@ -25,7 +25,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -33,8 +32,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
-	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
-	"sigs.k8s.io/karpenter/pkg/state/statetest"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -53,10 +50,8 @@ var _ = Describe("Repair Method Registration", func() {
 	})
 
 	It("panics when repair is enabled on cluster state built without a matcher", func() {
-		// Cluster state the spec builds itself holds nothing, and follows no API server.
-		srcs := statetest.NewSources()
-		cs := karpentercluster.New(ctx, env.Clock, nil, cloudProvider,
-			karpentercluster.WithSources(func(obj client.Object) karpenterstate.Newest { return srcs.For(obj) }))
+		cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
+		DeferCleanup(cs.Close)
 		withoutMatcher := disruption.StoresOf(cs)
 		Expect(func() {
 			disruption.NewMethods(enabledCtx, env.Clock, withoutMatcher, cs.NodePoolState, env.Client, prov, cloudProvider, recorder, queue)
@@ -70,16 +65,16 @@ var _ = Describe("Repair Method Registration", func() {
 
 	It("builds no matcher when the feature gate is disabled", func() {
 		cloudProvider.RepairPolicy = nil
-		Expect(repair.NewRepairPolicyMatcher(disabledCtx, cloudProvider)).To(BeNil())
+		Expect(repair.NewPolicyMatcher(disabledCtx, cloudProvider)).To(BeNil())
 	})
 
 	It("builds a matcher when the feature gate is enabled and policies are valid", func() {
-		Expect(repair.NewRepairPolicyMatcher(enabledCtx, cloudProvider)).NotTo(BeNil())
+		Expect(repair.NewPolicyMatcher(enabledCtx, cloudProvider)).NotTo(BeNil())
 	})
 
 	It("fails when repair is enabled without any policies", func() {
 		cloudProvider.RepairPolicy = nil
-		_, err := repair.NewRepairPolicyMatcher(enabledCtx, cloudProvider)
+		_, err := repair.NewPolicyMatcher(enabledCtx, cloudProvider)
 		Expect(err).To(MatchError("node repair requires the cloud provider to define RepairPolicies, but it defines none"))
 	})
 
@@ -88,7 +83,7 @@ var _ = Describe("Repair Method Registration", func() {
 			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, ReasonRegex: "[", Action: cloudprovider.ReplaceNode},
 			{ConditionType: "BadNode", ConditionStatus: corev1.ConditionFalse, Action: cloudprovider.ReplaceNode},
 		}
-		_, err := repair.NewRepairPolicyMatcher(enabledCtx, cloudProvider)
+		_, err := repair.NewPolicyMatcher(enabledCtx, cloudProvider)
 		Expect(err).To(MatchError(ContainSubstring("node repair requires valid RepairPolicies")))
 	})
 })
@@ -232,12 +227,12 @@ func newTestConsolidationValidator(nodePool *v1.NodePool, c *disruption.Consolid
 
 func (t *TestConsolidationValidator) Validate(ctx context.Context, cmd disruption.Command, _ time.Duration) (disruption.Command, error) {
 	// The objects are copies, which the spec changes and applies.
-	stateNodes := stateNodes()
-	nodes := make([]*corev1.Node, len(stateNodes))
-	nodeClaims := make([]*v1.NodeClaim, len(stateNodes))
-	for i, stateNode := range stateNodes {
-		nodes[i] = karpentercluster.ViewOfNodeClaim(stateNode).Node().DeepCopy()
-		nodeClaims[i] = stateNode.Object.DeepCopy()
+	entries := launchedNodeClaims()
+	nodes := make([]*corev1.Node, len(entries))
+	nodeClaims := make([]*v1.NodeClaim, len(entries))
+	for i, nodeEntry := range entries {
+		nodes[i] = karpentercluster.ViewOfNodeClaim(nodeEntry).Node().DeepCopy()
+		nodeClaims[i] = nodeEntry.Object.DeepCopy()
 	}
 	if t.blocked {
 		blockingBudget(nodes, nodeClaims, t.nodePool)
@@ -253,7 +248,7 @@ func (t *TestConsolidationValidator) Validate(ctx context.Context, cmd disruptio
 
 func churn(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim) {
 	var pods []*corev1.Pod
-	ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
+	ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, nodes, nodeClaims)
 	rs := test.ReplicaSet()
 	ExpectApplied(ctx, env.Client, rs)
 	pods = test.Pods(1, test.PodOptions{
@@ -286,7 +281,7 @@ func churn(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim) {
 }
 
 func blockingBudget(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim, nodePool *v1.NodePool) {
-	ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
+	ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, nodes, nodeClaims)
 	nodePool.Spec.Disruption.Budgets = []v1.Budget{{
 		Nodes: "0%",
 	}}
@@ -294,7 +289,7 @@ func blockingBudget(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim, nodePool *
 }
 
 func nominated(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim) {
-	ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
+	ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, nodes, nodeClaims)
 	for i := range nodes {
 		cs.Nomination.Nominate(ctx, nodeClaims[i].Name)
 		cs.Nomination.Nominate(ctx, nodeClaims[i].Name)

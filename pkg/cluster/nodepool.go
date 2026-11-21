@@ -102,7 +102,7 @@ type NodePoolState struct {
 
 // NewNodePoolState returns the NodePools' entries, derived from the NodeClaim and Node stores. Its NodePool store
 // follows from, the newest version of each NodePool. A matcher counts the Nodes whose conditions match a repair policy.
-func NewNodePoolState(clk clock.Clock, from state.Newest, nodeClaims *NodeClaims, nodes *Nodes, matcher *repair.RepairPolicyMatcher) *NodePoolState {
+func NewNodePoolState(clk clock.Clock, from state.Newest, nodeClaims *NodeClaims, nodes *Nodes, matcher *repair.PolicyMatcher) *NodePoolState {
 	store := state.NewObjectStore[string, *v1.NodePool, NodePoolFields, NodePoolIntent](from, state.WithKey(state.ByName))
 	members := state.Derive(nodeClaims.Reader, store, nodePoolOfNodeClaim, nodeClaimContributionOf)
 	state.DeriveObject(nodes.Reader, store, nodePoolOfNode, func(_ string, node *corev1.Node) nodePoolNode {
@@ -148,9 +148,6 @@ func (n *NodePoolState) Fields(nodePoolName string) NodePoolFields {
 	e, _ := n.Get(nodePoolName, client.UnsafeDisableDeepCopy)
 	return e.Derived
 }
-
-// Clear empties the store in place, ending every reservation, so that its subscribers stay subscribed. It's for tests, between specs; storelint reports a Clear outside a test.
-func (n *NodePoolState) Clear() { n.store.Clear() }
 
 // nodeClaimContribution is a NodeClaim's contribution to its NodePool's fields. Each part is zero where
 // the NodeClaim doesn't count toward the field it feeds.

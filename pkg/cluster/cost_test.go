@@ -345,8 +345,8 @@ var _ = Describe("ClusterCost", func() {
 		})
 		It("should track count correctly when re-adding an offering after the key was deleted", func() {
 			// An offering whose count reached zero leaves the NodePool's offerings, and a NodeClaim of it
-			// counts from zero again. Cost tracking used to undercount an offering that fully scaled down and
-			// back up, by re-adding its key with a count of zero.
+			// counts from zero again, rather than re-adding its key with a count of zero, which would undercount
+			// an offering that fully scaled down and back up.
 			//
 			// To trigger: keep an anchor alive, so the NodePool keeps counting, and cycle a different
 			// offering through add→remove→re-add.
@@ -387,7 +387,7 @@ var _ = Describe("ClusterCost", func() {
 			Expect(cost).To(BeNumerically("~", 4.50, 0.001),
 				fmt.Sprintf("cost should be 4.50 (3.00 anchor + 1.50 spot), got %v", cost))
 
-			// Now reprice the NodePool, which costs every offering it counts. A spot offering counted zero
+			// Reprice the NodePool, which costs every offering it counts. A spot offering counted zero
 			// times would cost 0*1.50 + 1*3.00 = 3.00 instead of 4.50.
 			clusterCost.UpdateOfferings(ctx, testNodePool, cloudProvider.InstanceTypes)
 			costAfterRefresh := clusterCost.GetClusterCost()

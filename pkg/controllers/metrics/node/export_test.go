@@ -27,3 +27,6 @@ type (
 
 // SyncedCollector is the collector of whether cluster state is synced, for a test to register on its own registry.
 func (c *Controller) SyncedCollector() prometheus.Collector { return c.syncedCollector() }
+
+// Collector is the collector of the node gauges Register registers, for a test to unregister.
+func (c *Controller) Collector() prometheus.Collector { return c.collector() }

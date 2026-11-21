@@ -18,5 +18,6 @@ package static
 
 import "sigs.k8s.io/controller-runtime/pkg/source"
 
-// Counts is the source Register derives, which wakes the controller for a NodePool, for tests to start on a queue.
+// Counts is the source the controller wakes on, the NodePool store narrowed with SourceOn to each NodePool's node counts,
+// which Register builds, for tests to start on a queue.
 func (c *Controller) Counts() source.SyncingSource { return c.counts }

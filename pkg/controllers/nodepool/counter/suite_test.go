@@ -57,7 +57,11 @@ func TestAPIs(t *testing.T) {
 var _ = BeforeSuite(func() {
 	cloudProvider = fake.NewCloudProvider()
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...))
+})
+
+var _ = BeforeEach(func() {
 	s := cluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
+	DeferCleanup(s.Close)
 	nodePools = s.NodePoolState
 	nodePoolController = counter.NewController(env.Overlay, cloudProvider, nodePools)
 })

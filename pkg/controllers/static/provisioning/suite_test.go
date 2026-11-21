@@ -117,17 +117,17 @@ var _ = BeforeSuite(func() {
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...))
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
-	virtualPodCache := virtualpods.NewVirtualPodCache(env.Overlay)
-	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = cs
-	prov = provisioning.NewProvisioner(env.Overlay, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, provisioning.StoresOf(cs), cs.NodePoolState, cs.CapacityQuotaState, env.Clock, deviceallocation.NewController(env.Overlay), virtualPodCache, nil, cs.Nomination, cs.BufferPods, cs.PodScheduling)
-	controller = static.NewController(env.Overlay, provisioning.StoresOf(cluster), cluster.NodePoolState, cs.CapacityQuotaState, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, prov, env.Clock, deviceallocation.NewController(env.Overlay), virtualPodCache)
 })
 
 var _ = BeforeEach(func() {
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider.Reset()
-	cs.Reset()
+	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
+	DeferCleanup(cs.Close)
+	cluster = cs
+	virtualPodCache := virtualpods.NewVirtualPodCache(env.Overlay)
+	prov = provisioning.NewProvisioner(env.Overlay, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, provisioning.StoresOf(cs), cs.NodePoolState, cs.CapacityQuotaState, env.Clock, deviceallocation.NewController(env.Overlay), virtualPodCache, nil, cs.Nomination, cs.BufferPods, cs.PodScheduling)
+	controller = static.NewController(env.Overlay, provisioning.StoresOf(cluster), cluster.NodePoolState, cs.CapacityQuotaState, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, prov, env.Clock, deviceallocation.NewController(env.Overlay), virtualPodCache)
 
 	// ensure any waiters on our clock are allowed to proceed before resetting our clock time
 	for env.Clock.HasWaiters() {
@@ -143,7 +143,6 @@ var _ = AfterSuite(func() {
 var _ = AfterEach(func() {
 	ExpectCleanedUp(ctx, env.Client)
 	cloudProvider.Reset()
-	cs.Reset()
 })
 
 var _ = Describe("Static Provisioning Controller", func() {
@@ -166,7 +165,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
 			Expect(nodeClaims.Items).To(HaveLen(0))
 			// The failed create released its reservation, so the next reconcile doesn't count it as reserved.
-			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 0, 0, 0)
+			ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 0, 0, 0)
 		})
 		DescribeTable("should release the reservations of NodeClaims it didn't create",
 			func(newClient func(client.Client) client.Client, canceled bool, wantReserved int) {
@@ -186,7 +185,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 				nodeClaims := &v1.NodeClaimList{}
 				Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
 				Expect(nodeClaims.Items).To(BeEmpty())
-				ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 0, 0, wantReserved)
+				ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 0, 0, wantReserved)
 			},
 			Entry("when the create fails", func(c client.Client) client.Client { return &failingClient{Client: c} }, false, 0),
 			// A create that times out may have created the NodeClaim, so its reservation holds until it expires.
@@ -342,10 +341,9 @@ var _ = Describe("Static Provisioning Controller", func() {
 			})
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, nodeClaim2, node1, node2)
 
-			// Update cluster state to track the nodes
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node1, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2})
-			Expect(StateNodes(cluster)).To(HaveLen(2))
-			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 2, 0, 0)
+			ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node1, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2})
+			Expect(NodeViews(cluster)).To(HaveLen(2))
+			ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 2, 0, 0)
 
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 			Expect(result.RequeueAfter).To(BeZero())
@@ -367,7 +365,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			nodeClaims := &v1.NodeClaimList{}
 			Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
 			Expect(nodeClaims.Items).To(HaveLen(2))
-			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 2, 0, 0)
+			ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 2, 0, 0)
 
 			// Verify NodeClaims have correct nodepool reference
 			for _, nc := range nodeClaims.Items {
@@ -396,14 +394,13 @@ var _ = Describe("Static Provisioning Controller", func() {
 			})
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1)
 
-			// 	// Update cluster state to track the nodes
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
-			Expect(StateNodes(cluster)).To(HaveLen(1))
-			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 1, 0, 0)
+			ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
+			Expect(NodeViews(cluster)).To(HaveLen(1))
+			ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 1, 0, 0)
 
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 			Expect(result.RequeueAfter).To(BeZero())
-			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 3, 0, 0)
+			ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 3, 0, 0)
 
 			// Should create 2 additional NodeClaims (3 desired - 1 existing = 2 new)
 			nodeClaims := &v1.NodeClaimList{}
@@ -447,8 +444,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			ExpectApplied(ctx, env.Client, nodeClaim2, node2)
 			ExpectApplied(ctx, env.Client, nodeClaim3, node3)
 
-			// 	// Update cluster state to track the nodes
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node3, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2, nodeClaim3})
+			ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node3, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2, nodeClaim3})
 
 			// Reconcile multiple times
 			for range 10 {
@@ -459,7 +455,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			existingNodeClaims := &v1.NodeClaimList{}
 			Expect(env.Client.List(ctx, existingNodeClaims)).To(Succeed())
 			Expect(existingNodeClaims.Items).To(HaveLen(3))
-			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 3, 0, 0)
+			ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 3, 0, 0)
 		})
 		It("should not create additional nodeclaims when node limits are reached", func() {
 			nodePool := test.StaticNodePool()
@@ -485,10 +481,9 @@ var _ = Describe("Static Provisioning Controller", func() {
 			})
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1)
 
-			// 	// Update cluster state to track the nodes
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
-			Expect(StateNodes(cluster)).To(HaveLen(1))
-			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 1, 0, 0)
+			ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
+			Expect(NodeViews(cluster)).To(HaveLen(1))
+			ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 1, 0, 0)
 
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 			Expect(result.RequeueAfter).To(BeZero())
@@ -497,7 +492,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			nodeClaims := &v1.NodeClaimList{}
 			Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
 			Expect(nodeClaims.Items).To(HaveLen(1))
-			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 1, 0, 0)
+			ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 1, 0, 0)
 		})
 		It("should reserve nodepool nodecount during provisioning and release after", func() {
 			nodePool := test.StaticNodePool()
@@ -516,7 +511,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			Expect(nodeClaims.Items).To(HaveLen(3))
 
 			// Should be tracking running nodeclaims in nodepool state node
-			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 3, 0, 0)
+			ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 3, 0, 0)
 
 			// Should be able to reserve remaining 7 NodeCounts
 			reservations := cs.NodePoolState.ReserveNodeCount(nodePool.Name, 10, 10)
@@ -530,7 +525,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 
 			// Update the state with Created NodeClaims
 			for _, nodeClaim := range nodeClaims.Items {
-				ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cloudProvider, &nodeClaim)
+				ExpectNodeClaimDeployedOrFailed(ctx, env.Client, cloudProvider, &nodeClaim)
 			}
 
 			result = ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
@@ -544,11 +539,11 @@ var _ = Describe("Static Provisioning Controller", func() {
 			// Should not be able to Reserve more, before or after cluster state counts the NodeClaims it created
 			Expect(cs.NodePoolState.ReserveNodeCount(nodePool.Name, 10, 100)).To(BeEmpty())
 			for _, nodeClaim := range nodeClaims.Items {
-				ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cloudProvider, &nodeClaim)
+				ExpectNodeClaimDeployedOrFailed(ctx, env.Client, cloudProvider, &nodeClaim)
 			}
 			Expect(cs.NodePoolState.ReserveNodeCount(nodePool.Name, 10, 100)).To(BeEmpty())
 
-			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 10, 0, 0)
+			ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 10, 0, 0)
 		})
 		It("should handle zero replicas", func() {
 			nodePool := test.StaticNodePool()
@@ -562,7 +557,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			nodeClaims := &v1.NodeClaimList{}
 			Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
 			Expect(nodeClaims.Items).To(HaveLen(0))
-			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 0, 0, 0)
+			ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 0, 0, 0)
 
 		})
 		It("should respect nodepool template specifications", func() {
@@ -605,7 +600,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			nodePool.Spec.Template.Spec.Requirements = inputRequirements
 			ExpectApplied(ctx, env.Client, nodePool)
 
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{}, []*v1.NodeClaim{})
+			ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{}, []*v1.NodeClaim{})
 
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 			Expect(result.RequeueAfter).To(BeZero())
@@ -614,7 +609,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			nodeClaims := &v1.NodeClaimList{}
 			Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
 			Expect(nodeClaims.Items).To(HaveLen(4))
-			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 4, 0, 0)
+			ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 4, 0, 0)
 
 			nc := nodeClaims.Items[0]
 			Expect(nc.Labels).To(HaveKeyWithValue("custom-label", "custom-value"))
@@ -634,7 +629,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 				Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
 				return len(nodeClaims.Items)
 			}).WithTimeout(40 * time.Second).Should(Equal(numNodeClaims))
-			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, numNodeClaims, 0, 0)
+			ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, numNodeClaims, 0, 0)
 		})
 		It("handles concurrent reconciliation without exceeding NodePool limits", func() {
 			nodePool := test.StaticNodePool()
@@ -660,7 +655,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 
 			// we should never observe > limit NodeClaims.
 			Eventually(func() {
-				ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 10, 0, 0)
+				ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 10, 0, 0)
 			}, 5*time.Second)
 		})
 		It("should not over provision across many reconciles", func() {
@@ -685,8 +680,8 @@ var _ = Describe("Static Provisioning Controller", func() {
 
 			Eventually(func() {
 				ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
-				// at the end we should have right counts in StateNodePool
-				ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 10, 0, 0)
+				// at the end we should have the right counts for the NodePool
+				ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 10, 0, 0)
 			}, 10*time.Second)
 		})
 
@@ -819,7 +814,7 @@ var _ = Describe("Static Provisioning Wakes", func() {
 		Expect(reservations).To(HaveLen(2))
 		result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
 		Expect(result.RequeueAfter).To(BeZero())
-		ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 0, 0, 2)
+		ExpectNodePoolCounts(cs.NodePoolState, nodePool.Name, 0, 0, 2)
 		Expect(drain(queue)).To(Equal([]string{nodePool.Name}))
 
 		// They expire at their TTL with nothing reading them, which changes the counts that wake the controller.

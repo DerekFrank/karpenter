@@ -92,7 +92,12 @@ func (c *Controller) Name() string {
 
 // Register registers the Collector. Nothing reconciles: each scrape reads the stores.
 func (c *Controller) Register(_ context.Context, _ manager.Manager) error {
-	return crmetrics.Registry.Register(metrics.NewCollector(c.nodePools.Synced, c.collect, Limit, Usage, ClusterCost))
+	return crmetrics.Registry.Register(c.collector())
+}
+
+// collector builds the NodePool gauges at scrape time, once the NodePool store is synced.
+func (c *Controller) collector() *metrics.Collector {
+	return metrics.NewCollector(c.nodePools.Synced, c.collect, Limit, Usage, ClusterCost)
 }
 
 // collect emits each managed NodePool's limits, usage and cost. It reads the store's NodePools, copying none.

@@ -84,8 +84,6 @@ var _ = BeforeSuite(func() {
 	cloudProvider = fake.NewCloudProvider()
 	recorder = test.NewEventRecorder()
 	queue = terminator.NewQueue(env.Clock, env.Overlay, recorder)
-	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = cs
 })
 
 var _ = AfterSuite(func() {
@@ -100,6 +98,9 @@ var _ = Describe("Node Health", func() {
 	BeforeEach(func() {
 		env.Clock.SetTime(time.Now())
 		cloudProvider.Reset()
+		cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
+		DeferCleanup(cs.Close)
+		cluster = cs
 		healthController = legacyrepair.NewController(env.Overlay, cloudProvider, cluster.Nodes, env.Clock, recorder)
 		healthController.DeriveHealth()
 
@@ -112,7 +113,6 @@ var _ = Describe("Node Health", func() {
 
 	AfterEach(func() {
 		ExpectCleanedUp(ctx, env.Client)
-		cs.Reset()
 
 		// Reset the metrics collectors
 		metrics.NodeClaimsDisruptedTotal.Reset()

@@ -126,7 +126,7 @@ var _ = Describe("DRA Scheduling Internals", func() {
 	})
 })
 
-// draExistingNodeForTest builds a draExistingNode backed by a StateNode whose initialization state and labels are set
+// draExistingNodeForTest builds a draExistingNode backed by a NodeView whose initialization state and labels are set
 // for exercising the adapter's ResourceSlices() behavior.
 func draExistingNodeForTest(initialized bool, it *cloudprovider.InstanceType) *draExistingNode {
 	labels := map[string]string{

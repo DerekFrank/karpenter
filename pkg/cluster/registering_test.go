@@ -58,13 +58,6 @@ var _ = Describe("Registering window", func() {
 	apply := func(objs ...client.Object) {
 		GinkgoHelper()
 		ExpectApplied(ctx, env.Client, objs...)
-		for _, obj := range objs {
-			switch obj.(type) {
-			case *v1.NodeClaim:
-			case *corev1.Node:
-			case *corev1.Pod:
-			}
-		}
 	}
 	// linkOwner sets the owner reference registration sets, as the registration controller does.
 	linkOwner := func() {
@@ -79,7 +72,7 @@ var _ = Describe("Registering window", func() {
 	}
 	countsNow := func() counts {
 		GinkgoHelper()
-		nodes := slices.Collect(stateNodes())
+		nodes := slices.Collect(nodeViews())
 		c := counts{Scheduler: len(nodes)}
 		for _, n := range nodes {
 			if n.Managed() {
@@ -95,13 +88,13 @@ var _ = Describe("Registering window", func() {
 		apply(nodeClaim, node)
 		window := countsNow()
 		Expect(window).To(Equal(counts{Scheduler: 1, SchedulerNodeClaims: 1, Active: 1, Launches: 1}), "counts in the window")
-		n := karpentercluster.ViewOfNodeClaim(ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim))
+		n := karpentercluster.ViewOfNodeClaim(ExpectNodeClaimEntryExists(cluster, nodeClaim))
 		Expect(n.Node()).To(BeNil(), "the NodeClaim's node links its Node before the owner reference lands")
 		Expect(n.Managed()).To(BeTrue())
 
 		linkOwner()
 		Expect(countsNow()).To(Equal(window), "counts once the owner reference landed")
-		n = karpentercluster.ViewOfNodeClaim(ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim))
+		n = karpentercluster.ViewOfNodeClaim(ExpectNodeClaimEntryExists(cluster, nodeClaim))
 		Expect(n.Node()).ToNot(BeNil())
 		Expect(n.Node().Name).To(Equal(node.Name))
 	})
@@ -111,12 +104,12 @@ var _ = Describe("Registering window", func() {
 		window := countsNow()
 		// The scheduler can count the machine twice for a loop.
 		Expect(window).To(Equal(counts{Scheduler: 2, SchedulerNodeClaims: 1, Active: 1, Launches: 1}), "counts in the window")
-		Expect(ExpectStateNodeExists(cluster, node).Managed()).To(BeFalse(), "the Node reads as unmanaged in the window")
+		Expect(ExpectNodeViewExists(cluster, node).Managed()).To(BeFalse(), "the Node reads as unmanaged in the window")
 		AddReportEntry("registering window without the NodePool label", fmt.Sprintf("%+v", window))
 
 		linkOwner()
 		Expect(countsNow()).To(Equal(counts{Scheduler: 1, SchedulerNodeClaims: 1, Active: 1, Launches: 1}), "counts once the owner reference landed")
-		n := karpentercluster.ViewOfNodeClaim(ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim))
+		n := karpentercluster.ViewOfNodeClaim(ExpectNodeClaimEntryExists(cluster, nodeClaim))
 		Expect(n.Node()).ToNot(BeNil())
 		Expect(n.Node().Name).To(Equal(node.Name))
 	})
@@ -149,7 +142,7 @@ var _ = Describe("Registering window", func() {
 		}
 		see := func() seen {
 			GinkgoHelper()
-			n := karpentercluster.ViewOfNodeClaim(ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim))
+			n := karpentercluster.ViewOfNodeClaim(ExpectNodeClaimEntryExists(cluster, nodeClaim))
 			e, _ := cluster.Nodes.Get(node.Name)
 			requests, daemonSets, available := n.PodRequests(), n.DaemonSetRequests(), n.Available()
 			return seen{

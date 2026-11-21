@@ -65,23 +65,20 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, provision
 	candidateKeys := sets.New(lo.Map(candidates, func(t *Candidate, i int) karpentercluster.NodeKey { return t.Key() })...)
 	// The cluster's capacity, as the provisioner schedules onto it.
 	activeNodes, deletingNodes := provisioner.ExistingNodes()
-	stateNodes := lo.Filter(activeNodes, func(n karpentercluster.NodeView, _ int) bool {
+	remainingNodes := lo.Filter(activeNodes, func(n karpentercluster.NodeView, _ int) bool {
 		return !candidateKeys.Has(n.Key())
 	})
 
 	// We do one final check to ensure that the node that we are attempting to consolidate isn't
-	// already handled for deletion by some other controller. This could happen if the node was markedForDeletion
-	// between returning the candidates and getting the stateNodes above
+	// already handled for deletion by some other controller. This could happen if the node was marked for deletion
+	// between returning the candidates and getting the remainingNodes above
 	if _, ok := lo.Find(deletingNodes, func(n karpentercluster.NodeView) bool {
 		return candidateKeys.Has(n.Key())
 	}); ok {
 		return scheduling.Results{}, errCandidateDeleting
 	}
 
-	pods, err := provisioner.GetPendingPods(ctx)
-	if err != nil {
-		return scheduling.Results{}, fmt.Errorf("determining pending pods, %w", err)
-	}
+	pods := provisioner.GetPendingPods(ctx)
 
 	// candidatePods are the pods on consolidation candidate nodes that we will reschedule. Their UIDs feed
 	// deletingPodUIDs below so the DRA allocator frees the devices they hold and re-allocates their claims onto the
@@ -126,7 +123,7 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, provision
 	scheduler, err := provisioner.NewScheduler(
 		log.IntoContext(ctx, operatorlogging.NopLogger),
 		pods,
-		stateNodes,
+		remainingNodes,
 		deletingPodUIDs,
 		opts...,
 	)
@@ -329,7 +326,7 @@ func BuildNodePoolMap(ctx context.Context, kubeClient client.Client, cloudProvid
 //
 // Repair must not count merely-unhealthy nodes: NotReady is precisely repair's trigger, so counting those nodes against
 // the repair budget would let a wave of unhealthy nodes starve the very budget that repairs them (a node.health cohort
-// could zero the budget and freeze repair). An in-flight repair still counts once its candidate is MarkedForDeletion.
+// could zero the budget and freeze repair). An in-flight repair still counts once its candidate carries the deletion mark.
 // Other reasons keep the reason-agnostic "unhealthy nodes consume budget" semantics introduced for consolidation/drift
 // (kubernetes-sigs/karpenter#981). Cluster state derives the counts as nodes change; karpentercluster.NodePoolFields.Disruption
 // says which nodes count.

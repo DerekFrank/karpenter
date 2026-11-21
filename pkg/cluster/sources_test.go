@@ -22,9 +22,7 @@ import (
 
 	"github.com/awslabs/operatorpkg/option"
 	corev1 "k8s.io/api/core/v1"
-	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -35,8 +33,9 @@ import (
 	"sigs.k8s.io/karpenter/pkg/state/statetest"
 )
 
-// These tests build cluster state without an API server: each object store follows statetest.Objects, which a test
-// fills with Put and Remove as the informers would, through the store's accessor.
+// The specs that race many writers against a recount, or that start from sources that haven't synced, build cluster
+// state without an API server: each object store follows statetest.Objects, which a spec fills with Put and Remove as
+// the informers would, through the store's accessor. Every write applies, with each Derive of it, before Put returns.
 
 // sourcesOf are the Objects each accessor's store follows, by the accessor.
 var sourcesOf sync.Map
@@ -78,34 +77,11 @@ func (n *Nodes) Remove(name string) {
 	sources(n).Remove(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}})
 }
 
-func (c *CSINodes) Put(csiNode *storagev1.CSINode) { sources(c).Put(csiNode) }
-
-func (c *CSINodes) Remove(name string) {
-	sources(c).Remove(&storagev1.CSINode{ObjectMeta: metav1.ObjectMeta{Name: name}})
-}
-
-func (p *Pods) Put(pod *corev1.Pod) { sources(p).Put(pod) }
-
-func (p *Pods) Remove(name types.NamespacedName) {
-	sources(p).Remove(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: name.Namespace, Name: name.Name}})
-}
-
 func (n *NodePoolState) Put(nodePool *v1.NodePool) { sources(n).Put(nodePool) }
-
-func (n *NodePoolState) Remove(name string) {
-	sources(n).Remove(&v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: name}})
-}
 
 // Put shows the CapacityQuota store a version of the CapacityQuota, as the informer would, and enforces it, as the
 // quota controller would on the store's change.
 func (s *CapacityQuotaState) Put(capacityQuota *autoscalingv1beta1.CapacityQuota) {
 	sources(s).Put(capacityQuota)
 	s.rebuild(capacityQuota.Name)
-}
-
-// Remove shows the CapacityQuota store that the CapacityQuota named name is gone, and stops enforcing it, as the quota
-// controller would.
-func (s *CapacityQuotaState) Remove(name string) {
-	sources(s).Remove(&autoscalingv1beta1.CapacityQuota{ObjectMeta: metav1.ObjectMeta{Name: name}})
-	s.rebuild(name)
 }

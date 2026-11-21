@@ -153,19 +153,3 @@ var _ = ginkgo.Describe("Wake", func() {
 		Expect(drain(queue)).To(Equal([]string{""}), "want one empty request for the existing key and both changes")
 	})
 })
-
-var _ = ginkgo.Describe("After", func() {
-	ginkgo.It("should delay and fold changes", func() {
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel()
-		counts := NewFedStore[string, int, struct{}, struct{}]()
-		queue := newQueue()
-		Expect(After(100*time.Millisecond, counts.Source()).Start(ctx, queue)).To(Succeed())
-		for i := 1; i <= 5; i++ {
-			set(counts, "a", i)
-		}
-		Expect(queue.Len()).To(Equal(0), "queued a change before its delay")
-		time.Sleep(300 * time.Millisecond)
-		Expect(drain(queue)).To(Equal([]string{"a"}), "want a once for its five changes")
-	})
-})

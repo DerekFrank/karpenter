@@ -70,7 +70,7 @@ var _ = Describe("Metrics", func() {
 		for i := range nodes {
 			ExpectApplied(ctx, env.Client, rsOwnedPod(test.PodOptions{NodeName: nodes[i].Name}))
 		}
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster.NodeClaims, cluster.PodsByNode, cs.NodePoolState, queue)
 		_, err := controller.Reconcile(ctx)
@@ -90,7 +90,7 @@ var _ = Describe("Metrics", func() {
 		}
 		pod := rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name})
 		ExpectApplied(ctx, env.Client, pod)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 		before := podAnnotationWritesDelta(map[string]string{deletioncost.Result.Name: deletioncost.ResultUpdated.Name})
 		queue.Add(pod, -13, false)
@@ -111,7 +111,7 @@ var _ = Describe("Metrics", func() {
 		}
 		pod := rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name})
 		ExpectApplied(ctx, env.Client, pod)
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
+		ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 		throttler := newThrottlingClient(env.Overlay, 1)
 		q := deletioncost.NewQueue(throttler)

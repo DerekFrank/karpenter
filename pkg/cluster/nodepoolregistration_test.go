@@ -17,7 +17,6 @@ limitations under the License.
 package cluster
 
 import (
-	"context"
 	"slices"
 	"sync"
 
@@ -25,11 +24,8 @@ import (
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
-	"k8s.io/utils/clock"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
-	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
 )
 
@@ -38,12 +34,13 @@ import (
 const registrationNodeClassGeneration = 1
 
 func newRegistrationState() (*NodePoolState, *Registrations) {
-	st := newState(options.ToContext(context.Background(), test.Options()), clock.RealClock{}, fake.NewCloudProvider())
+	st := newSuiteState(testContext())
 	return st.NodePoolState, st.Registrations
 }
 
+// registrationNodePool is a NodePool named name, which apply gives the API server's UID and generation.
 func registrationNodePool(name string) *v1.NodePool {
-	return &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: name, UID: uuid.NewUUID(), ResourceVersion: "1", Generation: 1}}
+	return test.NodePool(v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: name}})
 }
 
 // registration returns what's recorded on the NodePool's entry.
@@ -82,9 +79,9 @@ var _ = Describe("NodePool Registration", func() {
 	var np *v1.NodePool
 	BeforeEach(func() {
 		s, rec = newRegistrationState()
-		np = registrationNodePool("default")
+		np = registrationNodePool("registration")
 		// The registration record is intent on the NodePool's entry, which exists while cluster state holds the NodePool.
-		s.Put(np)
+		apply(np)
 	})
 
 	DescribeTable("should take the registration status from the newest outcomes",
@@ -111,8 +108,7 @@ var _ = Describe("NodePool Registration", func() {
 	})
 	It("should keep each NodePool's own outcomes", func() {
 		a, b := registrationNodePool("a"), registrationNodePool("b")
-		s.Put(a)
-		s.Put(b)
+		apply(a, b)
 		recordOutcome(rec, a, true)
 		recordOutcome(rec, b, false)
 		recordOutcome(rec, b, false)
@@ -172,10 +168,11 @@ var _ = Describe("NodePool Registration", func() {
 		recordOutcome(rec, np, false)
 		recordOutcome(rec, np, false)
 		recreated := registrationNodePool(np.Name)
-		recreated.ResourceVersion = "2"
+		recreated.UID, recreated.Generation = uuid.NewUUID(), 1
 		// Read before cluster state sees it, the recreated NodePool ignores the earlier one's outcomes.
 		expectRegistration(s, recreated, RegistrationUnknown)
-		s.Put(recreated)
+		remove(np)
+		apply(recreated)
 		recordOutcome(rec, recreated, true)
 		expectRegistration(s, recreated, RegistrationHealthy)
 		// The earlier NodePool's outcomes are gone, not hidden.
@@ -191,11 +188,11 @@ var _ = Describe("NodePool Registration", func() {
 		recordOutcome(rec, np, false)
 		// An update of the same NodePool keeps them.
 		updated := np.DeepCopy()
-		updated.ResourceVersion = "2"
-		s.Put(updated)
+		updated.Labels["updated"] = "true"
+		apply(updated)
 		expectRegistration(s, np, RegistrationUnhealthy)
 
-		s.Remove(np.Name)
+		remove(np)
 		got := registration(s, np.Name)
 		Expect(got.UID).To(BeEmpty(), "Registration = %+v once the NodePool is gone, want none", got)
 		Expect(got.Outcomes).To(BeNil(), "Registration = %+v once the NodePool is gone, want none", got)
@@ -205,15 +202,13 @@ var _ = Describe("NodePool Registration", func() {
 		Expect(registration(s, np.Name)).To(BeZero(), "recorded an outcome for a NodePool cluster state doesn't hold")
 
 		// A NodePool that replaces another under its name starts with none, though it keeps what the NodeClaims count.
-		s.Put(np)
+		np = registrationNodePool(np.Name)
+		apply(np)
 		recordOutcome(rec, np, true)
-		s.nodeClaims.Put(&v1.NodeClaim{
-			ObjectMeta: metav1.ObjectMeta{Name: "nc", UID: "nc", ResourceVersion: "1", Labels: map[string]string{v1.NodePoolLabelKey: np.Name}},
-			Spec:       v1.NodeClaimSpec{NodeClassRef: test.NodeClaim().Spec.NodeClassRef},
-		})
+		apply(test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "nc", Labels: map[string]string{v1.NodePoolLabelKey: np.Name}}}))
 		replacement := registrationNodePool(np.Name)
-		replacement.ResourceVersion = "3"
-		s.Put(replacement)
+		remove(np)
+		apply(replacement)
 		Expect(registration(s, np.Name).Outcomes).To(BeNil(), "outcomes once another NodePool took the name, want none")
 		f := s.Fields(np.Name)
 		Expect(f.NodeClaims.Active).To(Equal(1), "fields = %+v once another NodePool took the name, want the counts kept", f)

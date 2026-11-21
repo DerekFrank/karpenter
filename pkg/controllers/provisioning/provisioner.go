@@ -257,7 +257,7 @@ func (p *Provisioner) CreateNodeClaims(ctx context.Context, nodeClaims []*schedu
 	return nodeClaimNames, multierr.Combine(errs...)
 }
 
-func (p *Provisioner) GetPendingPods(ctx context.Context) ([]*corev1.Pod, error) {
+func (p *Provisioner) GetPendingPods(ctx context.Context) []*corev1.Pod {
 	// filter for provisionable pods first, so we don't check for validity/PVCs on pods we won't provision anyway
 	// (e.g. those owned by daemonsets)
 	pods := p.provisionablePods()
@@ -282,7 +282,7 @@ func (p *Provisioner) GetPendingPods(ctx context.Context) ([]*corev1.Pod, error)
 	if options.FromContext(ctx).FeatureGates.CapacityBuffer {
 		pods = append(pods, p.virtualPodCache.GetAll(ctx)...)
 	}
-	return pods, nil
+	return pods
 }
 
 // provisionablePods returns a copy of each provisionable pod the pod store holds, so that every pod the provisioner
@@ -339,7 +339,7 @@ var ErrNodePoolsNotFound = errors.New("no nodepools found")
 func (p *Provisioner) NewScheduler(
 	ctx context.Context,
 	pods []*corev1.Pod,
-	stateNodes []karpentercluster.NodeView,
+	nodeViews []karpentercluster.NodeView,
 	deletingPodUIDs sets.Set[types.UID],
 	opts ...scheduler.Options,
 ) (*scheduler.Scheduler, error) {
@@ -404,7 +404,7 @@ func (p *Provisioner) NewScheduler(
 	scheduler.NewDefaultTopologySpreadInjector(p.kubeClient).Inject(ctx, pods)
 
 	// Calculate cluster topology, if a context error occurs, it is wrapped and returned
-	topology, err := scheduler.NewTopology(ctx, p.kubeClient, p.stores.Nodes, stateNodes, nodePools, instanceTypes, pods, opts...)
+	topology, err := scheduler.NewTopology(ctx, p.kubeClient, p.stores.Nodes, nodeViews, nodePools, instanceTypes, pods, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("tracking topology counts, %w", err)
 	}
@@ -418,7 +418,7 @@ func (p *Provisioner) NewScheduler(
 	// the allocator is left nil and the scheduler short-circuits DRA pods.
 	var allocator *dynamicresources.Allocator
 	if !options.FromContext(ctx).IgnoreDRARequests {
-		inClusterSlices, err := p.gatherResourceSlices(ctx, stateNodes)
+		inClusterSlices, err := p.gatherResourceSlices(ctx, nodeViews)
 		if err != nil {
 			return nil, fmt.Errorf("gathering resourceslices, %w", err)
 		}
@@ -438,7 +438,7 @@ func (p *Provisioner) NewScheduler(
 			deletingNodeNames.Insert(name)
 		}
 	}
-	return scheduler.NewScheduler(ctx, p.kubeClient, nodePools, deletingNodeNames, p.nodePools, p.capacityQuotas, stateNodes, topology, instanceTypes, daemonSetPods, p.recorder, p.clock, volumeReqs, allocator, deletingPodUIDs, predictionStore, opts...), nil
+	return scheduler.NewScheduler(ctx, p.kubeClient, nodePools, deletingNodeNames, p.nodePools, p.capacityQuotas, nodeViews, topology, instanceTypes, daemonSetPods, p.recorder, p.clock, volumeReqs, allocator, deletingPodUIDs, predictionStore, opts...), nil
 }
 
 // ExistingNodes returns the nodes the scheduler schedules onto, active, and the nodes going away, whose pods
@@ -494,16 +494,13 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	// scheduling loop when we launch a new node.  When this order is reversed, our node capacity may be reduced by pods
 	// that have bound which we then provision new un-needed capacity for.
 	// -------
-	// We don't consider the nodes that are MarkedForDeletion since this capacity shouldn't be considered
+	// We don't consider the nodes that are Deleting since this capacity shouldn't be considered
 	// as persistent capacity for the cluster (since it will soon be removed). Additionally, we are scheduling for
-	// the pods that are on these nodes so the MarkedForDeletion node capacity can't be considered.
+	// the pods that are on these nodes so the deleting nodes' capacity can't be considered.
 	active, deleting := p.ExistingNodes()
 
 	// Get pods, exit if nothing to do
-	pendingPods, err := p.GetPendingPods(ctx)
-	if err != nil {
-		return scheduler.Results{}, err
-	}
+	pendingPods := p.GetPendingPods(ctx)
 
 	// Get pods from nodes that are preparing for deletion
 	// We do this after getting the pending pods so that we undershoot if pods are

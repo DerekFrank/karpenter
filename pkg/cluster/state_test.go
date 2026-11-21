@@ -98,11 +98,11 @@ var _ = Describe("Volume Usage/Limits", func() {
 			// The driver controller resolves the PVC's driver.
 			ExpectReconcileSucceeded(ctx, pvcDriverController, client.ObjectKeyFromObject(pvc))
 		}
-		ExpectStateNodeCount("==", 1)
-		stateNode := ExpectStateNodeExists(cluster, node)
+		ExpectNodeViewCount("==", 1)
+		view := ExpectNodeViewExists(cluster, node)
 
 		// Adding more volumes should cause an error since we are at the volume limits
-		Expect(stateNode.VolumeUsage().ExceedsLimits(scheduling.Volumes{
+		Expect(view.VolumeUsage().ExceedsLimits(scheduling.Volumes{
 			csiProvider: sets.New("test"),
 		})).ToNot(BeNil())
 	})
@@ -112,7 +112,7 @@ var _ = Describe("Volume Usage/Limits", func() {
 			ExpectApplied(ctx, env.Client, csiNode)
 			node = ExpectRegistered(ctx, env.Client, nodeClaim, node)
 
-			volumeUsage := ExpectStateNodeExists(cluster, node).VolumeUsage()
+			volumeUsage := ExpectNodeViewExists(cluster, node).VolumeUsage()
 			volumeUsage.AddFallbackLimit(csiProvider, 1)
 			Expect(volumeUsage.ExceedsLimits(scheduling.Volumes{
 				csiProvider: sets.New("volume-a", "volume-b"),
@@ -136,20 +136,14 @@ var _ = Describe("Volume Usage/Limits", func() {
 			// The driver controller resolves the PVC's driver.
 			ExpectReconcileSucceeded(ctx, pvcDriverController, client.ObjectKeyFromObject(pvc))
 		}
-		ExpectStateNodeCount("==", 1)
-		stateNode := ExpectStateNodeExists(cluster, node)
+		ExpectNodeViewCount("==", 1)
+		view := ExpectNodeViewExists(cluster, node)
 
 		// Adding more volumes should cause an error since we are at the volume limits
-		Expect(stateNode.VolumeUsage().ExceedsLimits(scheduling.Volumes{
+		Expect(view.VolumeUsage().ExceedsLimits(scheduling.Volumes{
 			csiProvider: sets.New("test"),
 		})).ToNot(BeNil())
 
-		// Reconcile the nodeclaim one more time to ensure that we maintain our volume usage state
-
-		// Ensure that we still consider adding another volume to the node breaching our volume limits
-		Expect(stateNode.VolumeUsage().ExceedsLimits(scheduling.Volumes{
-			csiProvider: sets.New("test"),
-		})).ToNot(BeNil())
 	})
 	It("should ignore the volume usage limits breach if the pod update is for an already tracked pod", func() {
 		ExpectApplied(ctx, env.Client, sc, csiNode)
@@ -168,11 +162,11 @@ var _ = Describe("Volume Usage/Limits", func() {
 			// The driver controller resolves the PVC's driver.
 			ExpectReconcileSucceeded(ctx, pvcDriverController, client.ObjectKeyFromObject(pvc))
 		}
-		ExpectStateNodeCount("==", 1)
-		stateNode := ExpectStateNodeExists(cluster, node)
+		ExpectNodeViewCount("==", 1)
+		view := ExpectNodeViewExists(cluster, node)
 
 		// Adding more volumes should not cause an error since this PVC volume is already tracked
-		Expect(stateNode.VolumeUsage().ExceedsLimits(scheduling.Volumes{
+		Expect(view.VolumeUsage().ExceedsLimits(scheduling.Volumes{
 			csiProvider: sets.New(client.ObjectKeyFromObject(pvcs[5]).String()),
 		})).To(BeNil())
 	})
@@ -202,11 +196,11 @@ var _ = Describe("HostPort Usage", func() {
 			ExpectApplied(ctx, env.Client, pod)
 			ExpectManualBinding(ctx, env.Client, pod, node)
 		}
-		ExpectStateNodeCount("==", 1)
-		stateNode := ExpectStateNodeExists(cluster, node)
+		ExpectNodeViewCount("==", 1)
+		view := ExpectNodeViewExists(cluster, node)
 
 		// Adding a conflicting host port should cause an error
-		Expect(stateNode.HostPortUsage().Conflicts(test.Pod(), []scheduling.HostPort{
+		Expect(view.HostPortUsage().Conflicts(test.Pod(), []scheduling.HostPort{
 			{
 				IP:       net.IP("0.0.0.0"),
 				Port:     int32(5),
@@ -223,22 +217,11 @@ var _ = Describe("HostPort Usage", func() {
 			ExpectApplied(ctx, env.Client, pod)
 			ExpectManualBinding(ctx, env.Client, pod, node)
 		}
-		ExpectStateNodeCount("==", 1)
-		stateNode := ExpectStateNodeExists(cluster, node)
+		ExpectNodeViewCount("==", 1)
+		view := ExpectNodeViewExists(cluster, node)
 
 		// Adding a conflicting host port should cause an error
-		Expect(stateNode.HostPortUsage().Conflicts(test.Pod(), []scheduling.HostPort{
-			{
-				IP:       net.IP("0.0.0.0"),
-				Port:     int32(5),
-				Protocol: corev1.ProtocolTCP,
-			},
-		})).ToNot(BeNil())
-
-		// Reconcile the nodeclaim one more time to ensure that we maintain our volume usage state
-
-		// Ensure that we still consider the host port usage addition an error
-		Expect(stateNode.HostPortUsage().Conflicts(test.Pod(), []scheduling.HostPort{
+		Expect(view.HostPortUsage().Conflicts(test.Pod(), []scheduling.HostPort{
 			{
 				IP:       net.IP("0.0.0.0"),
 				Port:     int32(5),
@@ -257,11 +240,11 @@ var _ = Describe("HostPort Usage", func() {
 			ExpectApplied(ctx, env.Client, pod)
 			ExpectManualBinding(ctx, env.Client, pod, node)
 		}
-		ExpectStateNodeCount("==", 1)
-		stateNode := ExpectStateNodeExists(cluster, node)
+		ExpectNodeViewCount("==", 1)
+		view := ExpectNodeViewExists(cluster, node)
 
 		// Adding a conflicting host port should not cause an error since this port is already tracked for the pod
-		Expect(stateNode.HostPortUsage().Conflicts(pods[5], []scheduling.HostPort{
+		Expect(view.HostPortUsage().Conflicts(pods[5], []scheduling.HostPort{
 			{
 				IP:       net.IP("0.0.0.0"),
 				Port:     int32(5),
@@ -272,7 +255,7 @@ var _ = Describe("HostPort Usage", func() {
 })
 
 var _ = Describe("Node Deletion", func() {
-	It("should not leak a state node when the NodeClaim and Node names match", func() {
+	It("should not leak a node when the NodeClaim and Node names match", func() {
 		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels: map[string]string{
@@ -285,14 +268,14 @@ var _ = Describe("Node Deletion", func() {
 
 		node = ExpectRegistered(ctx, env.Client, nodeClaim, node)
 
-		ExpectStateNodeCount("==", 1)
+		ExpectNodeViewCount("==", 1)
 
 		// Expect that the node isn't leaked due to names matching. Once its NodeClaim is gone, the Node is orphaned, and
-		// an orphaned Node isn't a state node.
+		// an orphaned Node is no node the scheduler reads.
 		ExpectDeleted(ctx, env.Client, nodeClaim)
-		ExpectStateNodeCount("==", 0)
+		ExpectNodeViewCount("==", 0)
 		ExpectDeleted(ctx, env.Client, node)
-		ExpectStateNodeCount("==", 0)
+		ExpectNodeViewCount("==", 0)
 	})
 })
 
@@ -323,7 +306,7 @@ var _ = Describe("Node Resource Level", func() {
 		ExpectApplied(ctx, env.Client, node)
 
 		// two pods, but neither is bound to the node so the node's CPU requests should be zero
-		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0.0")}, ExpectStateNodeExists(cluster, node).PodRequests())
+		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0.0")}, ExpectNodeViewExists(cluster, node).PodRequests())
 	})
 	It("should count new pods bound to nodes", func() {
 		pod1 := test.UnschedulablePod(test.PodOptions{
@@ -352,10 +335,10 @@ var _ = Describe("Node Resource Level", func() {
 
 		ExpectManualBinding(ctx, env.Client, pod1, node)
 
-		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1.5")}, ExpectStateNodeExists(cluster, node).PodRequests())
+		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1.5")}, ExpectNodeViewExists(cluster, node).PodRequests())
 
 		ExpectManualBinding(ctx, env.Client, pod2, node)
-		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3.5")}, ExpectStateNodeExists(cluster, node).PodRequests())
+		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3.5")}, ExpectNodeViewExists(cluster, node).PodRequests())
 	})
 	It("should count existing pods bound to nodes", func() {
 		pod1 := test.UnschedulablePod(test.PodOptions{
@@ -387,7 +370,7 @@ var _ = Describe("Node Resource Level", func() {
 		ExpectManualBinding(ctx, env.Client, pod2, node)
 
 		// that we just noticed
-		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3.5")}, ExpectStateNodeExists(cluster, node).PodRequests())
+		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3.5")}, ExpectNodeViewExists(cluster, node).PodRequests())
 	})
 	It("should subtract requests if the pod is deleted", func() {
 		pod1 := test.UnschedulablePod(test.PodOptions{
@@ -417,14 +400,14 @@ var _ = Describe("Node Resource Level", func() {
 		ExpectManualBinding(ctx, env.Client, pod1, node)
 		ExpectManualBinding(ctx, env.Client, pod2, node)
 
-		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3.5")}, ExpectStateNodeExists(cluster, node).PodRequests())
+		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3.5")}, ExpectNodeViewExists(cluster, node).PodRequests())
 
 		// delete the pods and the CPU usage should go down
 		ExpectDeleted(ctx, env.Client, pod2)
-		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1.5")}, ExpectStateNodeExists(cluster, node).PodRequests())
+		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1.5")}, ExpectNodeViewExists(cluster, node).PodRequests())
 
 		ExpectDeleted(ctx, env.Client, pod1)
-		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0")}, ExpectStateNodeExists(cluster, node).PodRequests())
+		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0")}, ExpectNodeViewExists(cluster, node).PodRequests())
 	})
 	It("should not add requests if the pod is terminal", func() {
 		pod1 := test.UnschedulablePod(test.PodOptions{
@@ -456,7 +439,7 @@ var _ = Describe("Node Resource Level", func() {
 		ExpectManualBinding(ctx, env.Client, pod1, node)
 		ExpectManualBinding(ctx, env.Client, pod2, node)
 
-		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0")}, ExpectStateNodeExists(cluster, node).PodRequests())
+		ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0")}, ExpectNodeViewExists(cluster, node).PodRequests())
 	})
 	It("should stop tracking nodes that are deleted", func() {
 		pod1 := test.UnschedulablePod(test.PodOptions{
@@ -479,14 +462,14 @@ var _ = Describe("Node Resource Level", func() {
 
 		ExpectManualBinding(ctx, env.Client, pod1, node)
 
-		for n := range stateNodes() {
+		for n := range nodeViews() {
 			ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2.5")}, n.Available())
 			ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1.5")}, n.PodRequests())
 		}
 
-		// delete the node and the internal state should disappear as well
+		// delete the node and its view should disappear as well
 		ExpectDeleted(ctx, env.Client, node)
-		for range stateNodes() {
+		for range nodeViews() {
 			Fail("shouldn't be called as the node was deleted")
 		}
 	})
@@ -512,7 +495,7 @@ var _ = Describe("Node Resource Level", func() {
 
 		ExpectManualBinding(ctx, env.Client, pod1, node1)
 
-		for n := range stateNodes() {
+		for n := range nodeViews() {
 			ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2.5")}, n.Available())
 			ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1.5")}, n.PodRequests())
 		}
@@ -544,7 +527,7 @@ var _ = Describe("Node Resource Level", func() {
 		// deleted the pod and then recreated it, but simulated only receiving an event on the new pod after it has
 		// bound and not getting the new node event entirely
 
-		for n := range stateNodes() {
+		for n := range nodeViews() {
 			if n.Node().Name == node1.Name {
 				// not on node1 any longer, so it should be fully free
 				ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")}, n.Available())
@@ -581,7 +564,7 @@ var _ = Describe("Node Resource Level", func() {
 		ExpectResources(corev1.ResourceList{
 			corev1.ResourceCPU:  resource.MustParse("0"),
 			corev1.ResourcePods: resource.MustParse("0"),
-		}, ExpectStateNodeExists(cluster, node).PodRequests())
+		}, ExpectNodeViewExists(cluster, node).PodRequests())
 
 		sum := 0.0
 		podCount := 0
@@ -590,34 +573,26 @@ var _ = Describe("Node Resource Level", func() {
 			ExpectManualBinding(ctx, env.Client, pod, node)
 			podCount++
 
-			// extra reconciles shouldn't cause it to be multiply counted
-			nReconciles := rand.Intn(3) + 1 // 1 to 3 reconciles
-			for range nReconciles {
-			}
 			sum += pod.Spec.Containers[0].Resources.Requests.Cpu().AsApproximateFloat64()
 			ExpectResources(corev1.ResourceList{
 				corev1.ResourceCPU:  resource.MustParse(fmt.Sprintf("%1.1f", sum)),
 				corev1.ResourcePods: resource.MustParse(fmt.Sprintf("%d", podCount)),
-			}, ExpectStateNodeExists(cluster, node).PodRequests())
+			}, ExpectNodeViewExists(cluster, node).PodRequests())
 		}
 
 		for _, pod := range pods {
 			ExpectDeleted(ctx, env.Client, pod)
-			nReconciles := rand.Intn(3) + 1
-			// or multiply removed
-			for range nReconciles {
-			}
 			sum -= pod.Spec.Containers[0].Resources.Requests.Cpu().AsApproximateFloat64()
 			podCount--
 			ExpectResources(corev1.ResourceList{
 				corev1.ResourceCPU:  resource.MustParse(fmt.Sprintf("%1.1f", sum)),
 				corev1.ResourcePods: resource.MustParse(fmt.Sprintf("%d", podCount)),
-			}, ExpectStateNodeExists(cluster, node).PodRequests())
+			}, ExpectNodeViewExists(cluster, node).PodRequests())
 		}
 		ExpectResources(corev1.ResourceList{
 			corev1.ResourceCPU:  resource.MustParse("0"),
 			corev1.ResourcePods: resource.MustParse("0"),
-		}, ExpectStateNodeExists(cluster, node).PodRequests())
+		}, ExpectNodeViewExists(cluster, node).PodRequests())
 	})
 	It("should track daemonset requested resources separately", func() {
 		ds := test.DaemonSet(
@@ -671,10 +646,10 @@ var _ = Describe("Node Resource Level", func() {
 		ExpectResources(corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("0"),
 			corev1.ResourceMemory: resource.MustParse("0"),
-		}, ExpectStateNodeExists(cluster, node).DaemonSetRequests())
+		}, ExpectNodeViewExists(cluster, node).DaemonSetRequests())
 		ExpectResources(corev1.ResourceList{
 			corev1.ResourceCPU: resource.MustParse("1.5"),
-		}, ExpectStateNodeExists(cluster, node).PodRequests())
+		}, ExpectNodeViewExists(cluster, node).PodRequests())
 
 		ExpectApplied(ctx, env.Client, dsPod)
 		ExpectManualBinding(ctx, env.Client, dsPod, node)
@@ -683,12 +658,12 @@ var _ = Describe("Node Resource Level", func() {
 		ExpectResources(corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("1"),
 			corev1.ResourceMemory: resource.MustParse("2Gi"),
-		}, ExpectStateNodeExists(cluster, node).DaemonSetRequests())
+		}, ExpectNodeViewExists(cluster, node).DaemonSetRequests())
 		// total request
 		ExpectResources(corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("2.5"),
 			corev1.ResourceMemory: resource.MustParse("2Gi"),
-		}, ExpectStateNodeExists(cluster, node).PodRequests())
+		}, ExpectNodeViewExists(cluster, node).PodRequests())
 	})
 	It("should mark node for deletion when node is deleted", func() {
 		node := test.Node(test.NodeOptions{
@@ -705,13 +680,13 @@ var _ = Describe("Node Resource Level", func() {
 		})
 		ExpectApplied(ctx, env.Client, node)
 
-		ExpectStateNodeCount("==", 1)
+		ExpectNodeViewCount("==", 1)
 
 		Expect(env.Client.Delete(ctx, node)).To(Succeed())
 
 		ExpectNodeExists(ctx, env.Client, node.Name)
 		// An unmanaged Node with a deletion timestamp is deleting: its pods reschedule.
-		Expect(ExpectStateNodeExists(cluster, node).Node().DeletionTimestamp.IsZero()).To(BeFalse())
+		Expect(ExpectNodeViewExists(cluster, node).Node().DeletionTimestamp.IsZero()).To(BeFalse())
 	})
 	It("should mark node for deletion when nodeclaim is deleted", func() {
 		nodeClaim := test.NodeClaim(v1.NodeClaim{
@@ -757,12 +732,12 @@ var _ = Describe("Node Resource Level", func() {
 		})
 		node := test.NodeClaimLinkedNode(nodeClaim)
 		node = ExpectRegistered(ctx, env.Client, nodeClaim, node)
-		ExpectStateNodeCount("==", 1)
+		ExpectNodeViewCount("==", 1)
 
 		Expect(env.Client.Delete(ctx, nodeClaim)).To(Succeed())
 		ExpectExists(ctx, env.Client, nodeClaim)
 
-		Expect(karpentercluster.Deleting(ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim))).To(BeTrue())
+		Expect(karpentercluster.Deleting(ExpectNodeClaimEntryExists(cluster, nodeClaim))).To(BeTrue())
 		Expect(karpentercluster.Deleting(nodeClaimEntryOf(node))).To(BeTrue())
 	})
 	It("should nominate the node until the nomination time passes", func() {
@@ -795,15 +770,15 @@ var _ = Describe("Node Resource Level", func() {
 		node := test.Node()
 		ExpectApplied(ctx, env.Client, node)
 
-		ExpectStateNodeCount("==", 1)
-		ExpectStateNodeExists(cluster, node)
+		ExpectNodeViewCount("==", 1)
+		ExpectNodeViewExists(cluster, node)
 
 		// Change the providerID; this mocks CCM adding the providerID onto the node after registration
 		node.Spec.ProviderID = fmt.Sprintf("fake://%s", node.Name)
 		ExpectApplied(ctx, env.Client, node)
 
-		ExpectStateNodeCount("==", 1)
-		ExpectStateNodeExists(cluster, node)
+		ExpectNodeViewCount("==", 1)
+		ExpectNodeViewExists(cluster, node)
 	})
 })
 
@@ -998,7 +973,7 @@ var _ = Describe("Cluster State Sync", func() {
 		wg.Wait()
 
 		Expect(cluster.Cluster.NodeClaimsLaunched()).To(BeTrue())
-		ExpectStateNodeCount("==", 1000)
+		ExpectNodeViewCount("==", 1000)
 	})
 	It("should consider the cluster state synced when nodes don't have provider id", func() {
 		// Deploy 1000 nodes and sync them all with the cluster
@@ -1014,7 +989,7 @@ var _ = Describe("Cluster State Sync", func() {
 		}
 		wg.Wait()
 		Expect(cluster.Cluster.NodeClaimsLaunched()).To(BeTrue())
-		ExpectStateNodeCount("==", 1000)
+		ExpectNodeViewCount("==", 1000)
 
 	})
 	It("should consider the cluster state synced when nodes register provider id", func() {
@@ -1032,7 +1007,7 @@ var _ = Describe("Cluster State Sync", func() {
 			}(i)
 		}
 		wg.Wait()
-		ExpectStateNodeCount("==", 1000)
+		ExpectNodeViewCount("==", 1000)
 		Expect(cluster.Cluster.NodeClaimsLaunched()).To(BeTrue())
 		for i := range 1000 {
 			wg.Add(1)
@@ -1045,7 +1020,7 @@ var _ = Describe("Cluster State Sync", func() {
 		}
 		wg.Wait()
 		Expect(cluster.Cluster.NodeClaimsLaunched()).To(BeTrue())
-		ExpectStateNodeCount("==", 1000)
+		ExpectNodeViewCount("==", 1000)
 	})
 	It("should consider the cluster state synced when all nodeclaims are tracked", func() {
 		// Deploy 1000 nodeClaims and sync them all with the cluster
@@ -1377,7 +1352,7 @@ var _ = Describe("Data Races", func() {
 			}
 		}()
 
-		// Call UpdateNode on 100 nodes (enough to trigger a DATA RACE)
+		// Apply 100 Nodes (enough to trigger a DATA RACE)
 		for range 100 {
 			node := test.Node(test.NodeOptions{
 				ProviderID: test.RandomProviderID(),
@@ -1399,7 +1374,7 @@ var _ = Describe("Data Races", func() {
 			}
 		}()
 
-		// Call UpdateNodeClaim on 100 NodeClaims (enough to trigger a DATA RACE)
+		// Apply 100 NodeClaims (enough to trigger a DATA RACE)
 		for range 100 {
 			nodeClaim := test.NodeClaim(v1.NodeClaim{
 				Status: v1.NodeClaimStatus{
@@ -1435,8 +1410,8 @@ var _ = Describe("Taints", func() {
 			}
 			node = ExpectRegistered(ctx, env.Client, nodeClaim, node)
 
-			stateNode := ExpectStateNodeExists(cluster, node)
-			Expect(stateNode.Taints()).To(HaveLen(0))
+			view := ExpectNodeViewExists(cluster, node)
+			Expect(view.Taints()).To(HaveLen(0))
 		})
 		It("should not consider NodeReadinessController taints on a managed node that isn't initialized", func() {
 			node.Spec.Taints = []corev1.Taint{
@@ -1445,8 +1420,8 @@ var _ = Describe("Taints", func() {
 			}
 			node = ExpectRegistered(ctx, env.Client, nodeClaim, node)
 
-			stateNode := ExpectStateNodeExists(cluster, node)
-			Expect(stateNode.Taints()).To(HaveLen(0))
+			view := ExpectNodeViewExists(cluster, node)
+			Expect(view.Taints()).To(HaveLen(0))
 		})
 		It("should consider ephemeral taints on a managed node after the node is initialized", func() {
 			node = ExpectRegistered(ctx, env.Client, nodeClaim, node)
@@ -1462,9 +1437,9 @@ var _ = Describe("Taints", func() {
 			}
 			ExpectApplied(ctx, env.Client, node)
 
-			stateNode := ExpectStateNodeExists(cluster, node)
-			Expect(stateNode.Taints()).To(HaveLen(4))
-			Expect(stateNode.Taints()).To(ContainElements(
+			view := ExpectNodeViewExists(cluster, node)
+			Expect(view.Taints()).To(HaveLen(4))
+			Expect(view.Taints()).To(ContainElements(
 				corev1.Taint{Key: corev1.TaintNodeNotReady, Effect: corev1.TaintEffectNoSchedule},
 				corev1.Taint{Key: corev1.TaintNodeNotReady, Effect: corev1.TaintEffectNoExecute},
 				corev1.Taint{Key: corev1.TaintNodeUnreachable, Effect: corev1.TaintEffectNoSchedule},
@@ -1482,8 +1457,8 @@ var _ = Describe("Taints", func() {
 			}
 			node = ExpectRegistered(ctx, env.Client, nodeClaim, node)
 
-			stateNode := ExpectStateNodeExists(cluster, node)
-			Expect(stateNode.Taints()).To(HaveLen(0))
+			view := ExpectNodeViewExists(cluster, node)
+			Expect(view.Taints()).To(HaveLen(0))
 		})
 		It("should consider startup taints on a managed node after the node is initialized", func() {
 			nodeClaim.Spec.StartupTaints = []corev1.Taint{
@@ -1498,9 +1473,9 @@ var _ = Describe("Taints", func() {
 			ExpectMakeNodesInitialized(ctx, env.Client, env.Clock, node)
 			ExpectMakeNodeClaimsInitialized(ctx, env.Client, env.Clock, nodeClaim)
 
-			stateNode := ExpectStateNodeExists(cluster, node)
-			Expect(stateNode.Taints()).To(HaveLen(2))
-			Expect(stateNode.Taints()).To(ContainElements(
+			view := ExpectNodeViewExists(cluster, node)
+			Expect(view.Taints()).To(HaveLen(2))
+			Expect(view.Taints()).To(ContainElements(
 				corev1.Taint{Key: "taint-key", Value: "taint-value", Effect: corev1.TaintEffectNoSchedule},
 				corev1.Taint{Key: "taint-key2", Value: "taint-value2", Effect: corev1.TaintEffectNoExecute},
 			))
@@ -1516,9 +1491,9 @@ var _ = Describe("Taints", func() {
 			}
 			ExpectApplied(ctx, env.Client, node)
 
-			stateNode := ExpectStateNodeExists(cluster, node)
-			Expect(stateNode.Taints()).To(HaveLen(4))
-			Expect(stateNode.Taints()).To(ContainElements(
+			view := ExpectNodeViewExists(cluster, node)
+			Expect(view.Taints()).To(HaveLen(4))
+			Expect(view.Taints()).To(ContainElements(
 				corev1.Taint{Key: corev1.TaintNodeNotReady, Effect: corev1.TaintEffectNoSchedule},
 				corev1.Taint{Key: corev1.TaintNodeNotReady, Effect: corev1.TaintEffectNoExecute},
 				corev1.Taint{Key: corev1.TaintNodeUnreachable, Effect: corev1.TaintEffectNoSchedule},
@@ -1539,9 +1514,9 @@ var _ = Describe("Taints", func() {
 
 			ExpectApplied(ctx, env.Client, node)
 
-			stateNode := ExpectStateNodeExists(cluster, node)
-			Expect(stateNode.Taints()).To(HaveLen(4))
-			Expect(stateNode.Taints()).To(ContainElements(
+			view := ExpectNodeViewExists(cluster, node)
+			Expect(view.Taints()).To(HaveLen(4))
+			Expect(view.Taints()).To(ContainElements(
 				corev1.Taint{Key: corev1.TaintNodeNotReady, Effect: corev1.TaintEffectNoSchedule},
 				corev1.Taint{Key: corev1.TaintNodeNotReady, Effect: corev1.TaintEffectNoExecute},
 				corev1.Taint{Key: corev1.TaintNodeUnreachable, Effect: corev1.TaintEffectNoSchedule},
@@ -1551,7 +1526,7 @@ var _ = Describe("Taints", func() {
 	})
 })
 
-var _ = Describe("StateNode Capacity", func() {
+var _ = Describe("NodeView Capacity", func() {
 	It("should include resources.Node in capacity for an initialized node", func() {
 		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
@@ -1569,8 +1544,8 @@ var _ = Describe("StateNode Capacity", func() {
 		ExpectMakeNodesInitialized(ctx, env.Client, env.Clock, node)
 		ExpectMakeNodeClaimsInitialized(ctx, env.Client, env.Clock, nodeClaim)
 
-		stateNode := ExpectStateNodeExists(cluster, node)
-		capacity := stateNode.Capacity()
+		view := ExpectNodeViewExists(cluster, node)
+		capacity := view.Capacity()
 
 		Expect(capacity[resources.Node]).To(Equal(resource.MustParse("1")))
 	})
@@ -1589,8 +1564,8 @@ var _ = Describe("StateNode Capacity", func() {
 		})
 		ExpectApplied(ctx, env.Client, nodeClaim)
 
-		stateNode := karpentercluster.ViewOfNodeClaim(ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim))
-		capacity := stateNode.Capacity()
+		view := karpentercluster.ViewOfNodeClaim(ExpectNodeClaimEntryExists(cluster, nodeClaim))
+		capacity := view.Capacity()
 
 		Expect(capacity[resources.Node]).To(Equal(resource.MustParse("1")))
 	})
@@ -1610,17 +1585,17 @@ var _ = Describe("StateNode Capacity", func() {
 		// Don't initialize - leave as uninitialized
 		node = ExpectRegistered(ctx, env.Client, nodeClaim, node)
 
-		stateNode := ExpectStateNodeExists(cluster, node)
-		capacity := stateNode.Capacity()
+		view := ExpectNodeViewExists(cluster, node)
+		capacity := view.Capacity()
 
 		Expect(capacity[resources.Node]).To(Equal(resource.MustParse("1")))
 	})
 })
 
-func ExpectStateNodeCount(comparator string, count int) int {
+func ExpectNodeViewCount(comparator string, count int) int {
 	GinkgoHelper()
 	c := 0
-	for range stateNodes() {
+	for range nodeViews() {
 		c++
 	}
 	Expect(c).To(BeNumerically(comparator, count))
@@ -1637,8 +1612,8 @@ func expectDaemonSetPod(daemonset *appsv1.DaemonSet, pod *corev1.Pod) {
 	Expect(got.Spec).To(Equal(pod.Spec))
 }
 
-// stateNodes are the nodes as the scheduler reads them: each launched NodeClaim's node, and each unmanaged Node.
-func stateNodes() iter.Seq[karpentercluster.NodeView] {
+// nodeViews are the nodes as the scheduler reads them: each launched NodeClaim's node, and each unmanaged Node.
+func nodeViews() iter.Seq[karpentercluster.NodeView] {
 	return func(yield func(karpentercluster.NodeView) bool) {
 		for _, e := range cluster.NodeClaims.List() {
 			if karpentercluster.Launched(e) && !yield(karpentercluster.ViewOfNodeClaim(e)) {

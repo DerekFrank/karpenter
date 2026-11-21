@@ -69,9 +69,9 @@ var _ = Describe("NodePool", func() {
 		Expect(equality.Semantic.DeepEqual(f, NodePoolFields{})).To(BeTrue(), "fields = %+v once its only NodeClaim left, want zero", f)
 		Expect(f.Usage).To(BeNil(), "fields = %+v once its only NodeClaim left, want zero", f)
 	})
-	// Changes NodeClaims and Nodes at random, concurrently, and checks each NodePool's fields against a recount of the
-	// stores by the definitions of the stores they replace: NodePoolUsage's usage, NodePoolState's counts, the
-	// disruption counts, and the per NodePool node health.
+	// Changes NodeClaims and Nodes at random, concurrently, through the stores' own sources, and checks each NodePool's
+	// fields against a recount of the stores by each field's definition: the usage, the NodeClaim counts, the
+	// disruption counts and the node health.
 	DescribeTable("should keep fields that match a recount of their definitions",
 		func(seed uint64) {
 			s := newState(options.ToContext(context.Background(), test.Options()), clock.RealClock{}, fake.NewCloudProvider(), WithRepairPolicyMatcher(testMatcher()))
@@ -182,8 +182,7 @@ func changeAtRandom(r *rand.Rand, s State, rv string) {
 	}
 }
 
-// recountNodePools recounts each NodePool's fields from the NodeClaim and Node stores, by the definitions the fields
-// replace.
+// recountNodePools recounts each NodePool's fields from the NodeClaim and Node stores, by each field's definition.
 //
 //nolint:gocyclo
 func recountNodePools(s State) map[string]NodePoolFields {
@@ -200,14 +199,14 @@ func recountNodePools(s State) map[string]NodePoolFields {
 		disrupted := lo.ContainsBy(nc.Status.Conditions, func(c status.Condition) bool {
 			return c.Type == v1.ConditionTypeDisruptionReason && c.Status == metav1.ConditionTrue
 		})
-		// NodePoolUsage: every NodeClaim's status.capacity and one node, until it's deleting or disrupted.
+		// Usage: every NodeClaim's status.capacity and one node, until it's deleting or disrupted.
 		if nc.DeletionTimestamp.IsZero() && !disrupted {
 			update(pool, func(n NodePoolFields) NodePoolFields {
 				n.Usage = resources.Merge(n.Usage, nc.Status.Capacity, corev1.ResourceList{resources.Node: resource.MustParse("1")})
 				return n
 			})
 		}
-		// NodePoolState: active or deleting.
+		// NodeClaims: active or deleting.
 		update(pool, func(n NodePoolFields) NodePoolFields {
 			if !nc.DeletionTimestamp.IsZero() || disrupted {
 				n.NodeClaims.Deleting++
@@ -219,7 +218,7 @@ func recountNodePools(s State) map[string]NodePoolFields {
 		if nc.Status.ProviderID == "" {
 			continue
 		}
-		// nodePoolDisruption.
+		// Disruption: the launched, initialized or rebooting NodeClaims, and those disrupting or not ready.
 		if conditionTrue(nc, v1.ConditionTypeInstanceTerminating) || (!conditionTrue(nc, v1.ConditionTypeInitialized) && !rebooting(nc)) {
 			continue
 		}

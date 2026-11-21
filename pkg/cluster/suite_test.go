@@ -60,19 +60,15 @@ func TestAPIs(t *testing.T) {
 	RunSpecs(t, "Cluster")
 }
 
-// The suite runs against the envtest API server: it builds cluster state over env.Overlay, as the operator does, and
-// writes through env.Client.
+// The suite runs against the envtest API server: each spec builds cluster state over env.Overlay, as the operator does,
+// writes through env.Client, and closes the State it built.
 var _ = BeforeSuite(func() {
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...), test.WithConfigOptions(func(config *rest.Config) {
 		config.QPS = -1
 	}))
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
-	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = cs
-	clusterCost = cs.Cost
-	pvcDriverController = driver.NewController(env.Overlay, cluster.PVCs)
-	pricingController = pricing.NewController(env.Clock, cs.NodePoolState, clusterCost)
+	karpentercluster.UseEnvironment(env)
 	nodeOverlayStore = nodeoverlay.NewInstanceTypeStore()
 	nodeOverlayController = nodeoverlay.NewController(env.Clock, env.Overlay, cloudProvider, nodeOverlayStore)
 })
@@ -84,12 +80,17 @@ var _ = AfterSuite(func() {
 var _ = BeforeEach(func() {
 	env.Clock.SetTime(time.Now())
 	cloudProvider.InstanceTypes = fake.InstanceTypesAssorted()
+	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
+	DeferCleanup(cs.Close)
+	cluster = cs
+	clusterCost = cs.Cost
+	pvcDriverController = driver.NewController(env.Overlay, cluster.PVCs)
+	pricingController = pricing.NewController(env.Clock, cs.NodePoolState, clusterCost)
 	nodePool = test.NodePool(v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "default"}})
 	ExpectApplied(ctx, env.Client, nodePool)
 })
 
 var _ = AfterEach(func() {
 	ExpectCleanedUp(ctx, env.Client)
-	cs.Reset()
 	cloudProvider.Reset()
 })
