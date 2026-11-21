@@ -18,6 +18,7 @@ package provisioning
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/awslabs/operatorpkg/serrors"
@@ -34,6 +35,10 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
+
+// ErrCapacityQuotasNotSynced is the refusal of a reservation made before the CapacityQuota store has synced, which a
+// caller retries rather than treating as a limit the NodeClaim doesn't fit.
+var ErrCapacityQuotasNotSynced = errors.New("waiting for capacityquotas to sync")
 
 // ReserveLimits holds each NodeClaim's place against its NodePool's resource limits and, with the CapacityQuota
 // feature gate, against every CapacityQuota it may match, and adds the reservations to the NodeClaim, so that creating
@@ -93,7 +98,7 @@ func (p *Provisioner) reserveLimits(ctx context.Context, nodePool *v1.NodePool, 
 	}
 	if !p.capacityQuotas.Synced() {
 		reservations.Release()
-		return nil, fmt.Errorf("waiting for capacityquotas to sync")
+		return nil, ErrCapacityQuotasNotSynced
 	}
 	quotaReservations, refused := p.capacityQuotas.Reserve(karpentercluster.LaunchRequirements(n.Requirements, n.InstanceTypeOptions), value, replacing)
 	if refused != "" {

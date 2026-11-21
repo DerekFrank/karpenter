@@ -45,6 +45,7 @@ import (
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/state/statetest"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -652,6 +653,35 @@ var _ = Describe("Queue", func() {
 				Entry("leaves back-off untouched for a successful non-drift (consolidation) command",
 					emptinessMethod, nil, true, completeViaSuccess, true),
 			)
+			// startRefused starts a drift command whose replacement the provisioner p refuses against limits.
+			startRefused := func(p *provisioning.Provisioner) {
+				ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
+				ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
+				q := disruption.NewQueue(env.Overlay, recorder, cluster.NodeClaims, env.Clock, p, cs.Deletion, driftBackoff)
+				err := q.StartCommand(ctx, &disruption.Command{
+					Method:            driftMethod(),
+					CreationTimestamp: env.Clock.Now(),
+					ID:                uuid.New(),
+					Results:           scheduling.Results{},
+					Candidates:        []*disruption.Candidate{disruption.NewTestCandidate(nodeClaimEntryOf(nodeClaim1), nodePool)},
+					Replacements:      withReplacement(nodePool),
+				})
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("reserving replacements against limits"))
+			}
+			It("arms back-off when a drift replacement doesn't fit its NodePool's limits", func() {
+				nodePool.Spec.Limits = v1.Limits{corev1.ResourceCPU: resource.MustParse("1m")}
+				startRefused(prov)
+				Expect(driftBackedOff(nodePool)).To(BeTrue())
+			})
+			It("doesn't back off when the CapacityQuotas haven't synced", func() {
+				ctx = options.ToContext(ctx, test.Options(test.OptionsFields{FeatureGates: test.FeatureGates{NodePoolDriftBackoff: new(true), CapacityQuota: new(true)}}))
+				// A CapacityQuota store whose source hasn't synced, as before the informer's first List.
+				unsynced := karpentercluster.NewCapacityQuotaState(ctx, env.Clock, statetest.NewUnsyncedObjects(), cs.NodeClaims, cs.Nodes)
+				p := provisioning.NewProvisioner(env.Overlay, recorder, cloudProvider, provisioning.StoresOf(cluster), cs.NodePoolState, unsynced, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Overlay), store, cs.Nomination, cs.BufferPods, cs.PodScheduling)
+				startRefused(p)
+				Expect(driftBackedOff(nodePool)).To(BeFalse())
+			})
 			It("does not back off the NodePool when NodePoolDriftBackoff is disabled", func() {
 				ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
 				ExpectMakeNodesAndNodeClaimsInitialized(ctx, env.Client, env.Clock, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})

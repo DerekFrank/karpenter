@@ -428,8 +428,8 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	if err := q.provisioner.ReserveLimits(ctx, lo.Map(cmd.Replacements, func(r *Replacement, _ int) *pscheduling.NodeClaim { return r.NodeClaim }),
 		candidateNodeClaims(cmd)); err != nil {
 		// A replacement that doesn't fit its NodePool's limits can't launch, so drift backs off as it does for a failed
-		// launch.
-		if cmd.Reason() == v1.DisruptionReasonDrifted {
+		// launch. CapacityQuotas that haven't synced yet are no limit, and the next pass retries.
+		if cmd.Reason() == v1.DisruptionReasonDrifted && !stderrors.Is(err, provisioning.ErrCapacityQuotasNotSynced) {
 			q.observeDriftOutcome(ctx, cmd, false)
 		}
 		return serrors.Wrap(fmt.Errorf("reserving replacements against limits, %w", err), "command-id", cmd.ID)
