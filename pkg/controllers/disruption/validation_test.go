@@ -48,7 +48,7 @@ var _ = Describe("Repair Method Registration", func() {
 	})
 
 	It("registers repair when the feature gate is enabled", func() {
-		methods := disruption.NewMethods(enabledCtx, env.Clock, cluster, cs.NodePoolState, env.Client, prov, cloudProvider, recorder, queue)
+		methods := disruption.NewMethods(enabledCtx, env.Clock, stores, cs.NodePoolState, env.Client, prov, cloudProvider, recorder, queue)
 		Expect(repairMethodCount(methods)).To(Equal(1))
 	})
 
@@ -57,14 +57,14 @@ var _ = Describe("Repair Method Registration", func() {
 		srcs := statetest.NewSources()
 		cs := karpentercluster.New(ctx, env.Clock, nil, cloudProvider,
 			karpentercluster.WithSources(func(obj client.Object) karpenterstate.Newest { return srcs.For(obj) }))
-		withoutMatcher := cs.Nodes
+		withoutMatcher := disruption.StoresOf(cs)
 		Expect(func() {
 			disruption.NewMethods(enabledCtx, env.Clock, withoutMatcher, cs.NodePoolState, env.Client, prov, cloudProvider, recorder, queue)
 		}).To(PanicWith("node repair requires cluster state built with a repair policy matcher"))
 	})
 
 	It("does not register repair when the feature gate is disabled", func() {
-		methods := disruption.NewMethods(disabledCtx, env.Clock, cluster, cs.NodePoolState, env.Client, prov, cloudProvider, recorder, queue)
+		methods := disruption.NewMethods(disabledCtx, env.Clock, stores, cs.NodePoolState, env.Client, prov, cloudProvider, recorder, queue)
 		Expect(repairMethodCount(methods)).To(BeZero())
 	})
 
@@ -104,7 +104,7 @@ func repairMethodCount(methods []disruption.Method) int {
 }
 
 func NewMethodsWithRealValidator() []disruption.Method {
-	return disruption.NewMethods(ctx, validationClock, cluster, cs.NodePoolState, env.Client, prov, cloudProvider, recorder, queue)
+	return disruption.NewMethods(ctx, validationClock, stores, cs.NodePoolState, env.Client, prov, cloudProvider, recorder, queue)
 }
 
 type NopValidator struct{}
@@ -114,13 +114,13 @@ func (n NopValidator) Validate(_ context.Context, command disruption.Command, _ 
 }
 
 func NewMethodsWithNopValidator() []disruption.Method {
-	c := disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)
+	c := disruption.MakeConsolidation(env.Clock, stores, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)
 	emptiness := disruption.NewEmptiness(c, disruption.WithValidator(NopValidator{}))
 	multiNodeConsolidation := disruption.NewMultiNodeConsolidation(c, disruption.WithValidator(NopValidator{}))
 	singleNodeConsolidation := disruption.NewSingleNodeConsolidation(c, disruption.WithValidator(NopValidator{}))
 	return []disruption.Method{
 		disruption.NewStaticDrift(cs.NodePoolState, prov, cloudProvider, recorder),
-		disruption.NewDrift(env.Overlay, cluster, prov, recorder, env.Clock),
+		disruption.NewDrift(env.Overlay, prov, recorder, env.Clock),
 		emptiness,
 		multiNodeConsolidation,
 		singleNodeConsolidation,
@@ -162,7 +162,7 @@ func NewTestEmptinessValidator(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim,
 		nodes:      nodes,
 		nodeClaims: nodeClaims,
 		nodePool:   nodePool,
-		emptiness:  disruption.NewEmptinessValidator(disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)),
+		emptiness:  disruption.NewEmptinessValidator(disruption.MakeConsolidation(env.Clock, stores, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)),
 	}
 	for _, opt := range opts {
 		opt(v)
@@ -187,7 +187,6 @@ type TestConsolidationValidator struct {
 	blocked       bool
 	churn         bool
 	nominated     bool
-	cluster       *karpentercluster.NodeState
 	nodePool      *v1.NodePool
 	consolidation *disruption.ConsolidationValidator
 }
@@ -213,16 +212,15 @@ func WithUnderutilizedNodeNomination() TestConsolidationValidatorOption {
 }
 
 func NewTestSingleConsolidationValidator(nodePool *v1.NodePool, opts ...TestConsolidationValidatorOption) disruption.Validator {
-	return newTestConsolidationValidator(nodePool, disruption.NewSingleConsolidationValidator(disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)), opts...)
+	return newTestConsolidationValidator(nodePool, disruption.NewSingleConsolidationValidator(disruption.MakeConsolidation(env.Clock, stores, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)), opts...)
 }
 
 func NewTestMultiConsolidationValidator(nodePool *v1.NodePool, opts ...TestConsolidationValidatorOption) disruption.Validator {
-	return newTestConsolidationValidator(nodePool, disruption.NewMultiConsolidationValidator(disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)), opts...)
+	return newTestConsolidationValidator(nodePool, disruption.NewMultiConsolidationValidator(disruption.MakeConsolidation(env.Clock, stores, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)), opts...)
 }
 
 func newTestConsolidationValidator(nodePool *v1.NodePool, c *disruption.ConsolidationValidator, opts ...TestConsolidationValidatorOption) disruption.Validator {
 	v := &TestConsolidationValidator{
-		cluster:       cluster,
 		nodePool:      nodePool,
 		consolidation: c,
 	}
@@ -233,12 +231,13 @@ func newTestConsolidationValidator(nodePool *v1.NodePool, c *disruption.Consolid
 }
 
 func (t *TestConsolidationValidator) Validate(ctx context.Context, cmd disruption.Command, _ time.Duration) (disruption.Command, error) {
-	stateNodes := t.cluster.DeepCopyNodes()
+	// The objects are copies, which the spec changes and applies.
+	stateNodes := stateNodes()
 	nodes := make([]*corev1.Node, len(stateNodes))
 	nodeClaims := make([]*v1.NodeClaim, len(stateNodes))
 	for i, stateNode := range stateNodes {
-		nodes[i] = stateNode.Node
-		nodeClaims[i] = stateNode.NodeClaim
+		nodes[i] = karpentercluster.ViewOfNodeClaim(stateNode).Node().DeepCopy()
+		nodeClaims[i] = stateNode.Object.DeepCopy()
 	}
 	if t.blocked {
 		blockingBudget(nodes, nodeClaims, t.nodePool)

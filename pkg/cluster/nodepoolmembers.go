@@ -20,36 +20,37 @@ import (
 	"cmp"
 	"slices"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
-// LaunchedNodes returns the StateNodes of the NodePool's launched NodeClaims, sorted by providerID, read from the
-// NodeClaim Derive's Sources rather than a scan of every node. They share their Node, NodeClaim and usage with cluster state,
-// so they must not be modified.
-func (n *NodePoolState) LaunchedNodes(nodePoolName string) StateNodes {
-	names := n.members.Sources(nodePoolName)
-	nodes := make(StateNodes, 0, len(names))
-	for _, name := range names {
-		// The Sources can lag the NodeClaims, so a NodeClaim they list may have left, moved or not launched.
-		if e, ok := n.nodes.NodeClaimStore.Get(name); ok && Launched(e) && nodePoolOfNodeClaim(name, e) == nodePoolName {
-			nodes = append(nodes, n.nodes.nodeClaimNode(e, false))
+// LaunchedNodes returns the entries of the NodePool's launched NodeClaims, sorted by providerID, read from
+// NodeClaimsByNodePool rather than a scan of every node. Their objects are the store's, so they must not be modified.
+func (n *NodePoolState) LaunchedNodes(nodePoolName string) []NodeClaimEntry {
+	var nodes []NodeClaimEntry
+	for _, e := range n.nodeClaims.byNodePool.List(nodePoolName, client.UnsafeDisableDeepCopy) {
+		// An entry that changed since the Lookup may have left the NodePool.
+		if Launched(e) && e.Object.Labels[v1.NodePoolLabelKey] == nodePoolName {
+			nodes = append(nodes, e)
 		}
 	}
-	slices.SortFunc(nodes, func(a, b *StateNode) int { return cmp.Compare(a.ProviderID(), b.ProviderID()) })
+	slices.SortFunc(nodes, func(a, b NodeClaimEntry) int {
+		return cmp.Compare(ViewOfNodeClaim(a).ProviderID(), ViewOfNodeClaim(b).ProviderID())
+	})
 	return nodes
 }
 
 // UnlaunchedNodeClaims returns the NodePool's NodeClaims that have neither a providerID nor a deletionTimestamp, sorted
-// by name. They are shared with cluster state, so they must not be modified.
+// by name, read from NodeClaimsByNodePool. They are shared with cluster state, so they must not be modified.
 func (n *NodePoolState) UnlaunchedNodeClaims(nodePoolName string) []*v1.NodeClaim {
-	names := n.members.Sources(nodePoolName)
-	slices.Sort(names)
 	var nodeClaims []*v1.NodeClaim
-	for _, name := range names {
-		if e, ok := n.nodes.NodeClaimStore.Get(name); ok && unlaunched(e) && nodePoolOfNodeClaim(name, e) == nodePoolName {
+	for _, e := range n.nodeClaims.byNodePool.List(nodePoolName, client.UnsafeDisableDeepCopy) {
+		if unlaunched(e) && e.Object.Labels[v1.NodePoolLabelKey] == nodePoolName {
 			nodeClaims = append(nodeClaims, e.Object)
 		}
 	}
+	slices.SortFunc(nodeClaims, func(a, b *v1.NodeClaim) int { return cmp.Compare(a.Name, b.Name) })
 	return nodeClaims
 }
 

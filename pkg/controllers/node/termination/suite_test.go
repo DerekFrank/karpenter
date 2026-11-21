@@ -1081,13 +1081,13 @@ func ExpectRequeued(result reconcile.Result) {
 }
 
 var _ = Describe("Termination Wakes", func() {
-	var nodes *karpentercluster.NodeState
+	var nodes *karpentercluster.Nodes
 	var wakes workqueue.TypedRateLimitingInterface[reconcile.Request]
 	var node *corev1.Node
 	BeforeEach(func() {
 		ctx := options.ToContext(ctx, test.Options())
-		// A fresh NodeState and controller per spec, so each wake queue sees only this spec's events. The State
-		// subscribes to the shared overlay sources, so env.Client's wait waits for this NodeState too.
+		// A fresh cluster state and controller per spec, so each wake queue sees only this spec's events. The State
+		// subscribes to the shared overlay sources, so env.Client's wait waits for its stores too.
 		nodes = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider).Nodes
 		c := termination.NewController(env.Clock, env.Overlay, cloudProvider, terminator.NewTerminator(env.Clock, env.Overlay, queue, recorder), recorder, nodes)
 		m, err := controllerruntime.NewManager(env.Config, controllerruntime.Options{

@@ -58,7 +58,7 @@ var (
 	nodeClaimController *nodeclaimlifecycle.Controller
 	env                 *test.Environment
 	cloudProvider       *fake.CloudProvider
-	cluster             *karpentercluster.NodeState
+	cluster             karpentercluster.State
 	cs                  karpentercluster.State
 	recorder            *test.EventRecorder
 	npState             *karpentercluster.NodePoolState
@@ -92,10 +92,10 @@ var _ = BeforeSuite(func() {
 
 	cloudProvider = fake.NewCloudProvider()
 	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = cs.Nodes
+	cluster = cs
 	npState = cs.NodePoolState
 	registrations = cs.Registrations
-	nodeClaimController = nodeclaimlifecycle.NewController(env.Clock, env.Overlay, cloudProvider, recorder, cluster.PodStore, registrations, nil)
+	nodeClaimController = nodeclaimlifecycle.NewController(env.Clock, env.Overlay, cloudProvider, recorder, cluster.PodsBySimulatedNodeClaim, registrations, nil)
 	registrationHealthController = registrationhealth.NewController(env.Clock, env.Overlay, cloudProvider, npState)
 })
 

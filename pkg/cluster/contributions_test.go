@@ -51,13 +51,6 @@ var _ = Describe("Contributions", func() {
 		for _, b := range []NodeCounts{{}, {Nodes: 3, Unhealthy: 1}} {
 			statetest.ExpectContribution(GinkgoT(), b, nodeCount{nodes: 1}, nodeCount{nodes: 1, unhealthy: 1})
 		}
-		for _, b := range []DaemonSetDerived{{}, {Pods: 3}} {
-			statetest.ExpectContribution(GinkgoT(), b, daemonSetPod(1), daemonSetPod(1))
-		}
-		for _, b := range []int{0, 5} {
-			statetest.ExpectContribution(GinkgoT(), b, mountsPVCs(1), mountsPVCs(1))
-		}
-		statetest.ExpectContribution(GinkgoT(), struct{}{}, member{}, member{})
 	})
 	It("should keep the contribution laws for Node side contributions", func() {
 		matcher := testMatcher()
@@ -73,7 +66,12 @@ var _ = Describe("Contributions", func() {
 				csiDrivers([]storagev1.CSINodeDriver{{Name: "a"}}), csiDrivers([]storagev1.CSINodeDriver{{Name: "a"}, {Name: "b"}}))
 		}
 		// Each NodeClaim has one Node, so the law holds from its fields with no Node.
-		statetest.ExpectContribution(GinkgoT(), NodeClaimDerived{}, linkedNode("a"), linkedNode("b"))
+		a, b := badNode("a", "Kernel"), badNode("b", "Other")
+		statetest.ExpectContributionWith(GinkgoT(), nodeClaimDerivedEqual, NodeClaimDerived{},
+			linkedNode{node: a, usage: usage.Usage, matches: matcher.Match(a)}, linkedNode{node: b})
+		Expect(linkedNode{node: a, usage: usage.Usage}.Equal(linkedNode{node: a, usage: usage.Usage})).To(BeTrue(), "the same Node entry's fields")
+		Expect(linkedNode{node: a, usage: usage.Usage}.Equal(linkedNode{node: a, usage: NodeUsage{Pods: 1}})).To(BeFalse(), "another usage")
+		Expect(linkedNode{node: a}.Equal(linkedNode{node: b})).To(BeFalse(), "another Node")
 	})
 	It("should keep the contribution laws for pod contributions", func() {
 		pod := func(name, cpu string, opts ...func(*corev1.Pod)) *corev1.Pod {
@@ -95,10 +93,10 @@ var _ = Describe("Contributions", func() {
 			p.Spec.Containers[0].Ports = []corev1.ContainerPort{{HostPort: 80, Protocol: corev1.ProtocolTCP}}
 		}
 		terminating := func(p *corev1.Pod) { p.DeletionTimestamp = &metav1.Time{Time: time.Unix(10, 0)} }
-		s, _ := newNodeState(options.ToContext(context.Background(), test.Options()), clock.RealClock{}, fake.NewCloudProvider())
-		of := podContributionOf(options.ToContext(context.Background(), test.Options()), s.PVCStore)
+		s := newState(options.ToContext(context.Background(), test.Options()), clock.RealClock{}, fake.NewCloudProvider())
+		of := podContributionOf(options.ToContext(context.Background(), test.Options()), s.PVCs)
 		contribution := func(p *corev1.Pod) podContribution { return of(client.ObjectKeyFromObject(p), PodEntry{Object: p}) }
-		other := contribution(pod("other", "1", withPVC, withHostPort)).Update(NodeDerived{CSIDrivers: []storagev1.CSINodeDriver{{Name: "a"}}}, podContribution{})
+		other := contribution(pod("other", "1", withPVC, withHostPort)).Update(NodeDerived{Usage: NodeUsage{CSIDrivers: []storagev1.CSINodeDriver{{Name: "a"}}}}, podContribution{})
 		for _, base := range []NodeDerived{{}, other} {
 			statetest.ExpectContributionWith(GinkgoT(), nodeDerivedEqual, base, contribution(pod("a", "1")), contribution(pod("a", "2", withPVC)))
 			statetest.ExpectContributionWith(GinkgoT(), nodeDerivedEqual, base, contribution(pod("a", "2", withPVC, withHostPort)), contribution(pod("a", "1", terminating)))
@@ -129,7 +127,14 @@ func nodeDerivedEqual(a, b NodeDerived) bool {
 		same(x.DaemonSetLimits, y.DaemonSetLimits) && reflect.DeepEqual(hostPorts(x.HostPorts), hostPorts(y.HostPorts)) &&
 		maps.Equal(x.Volumes, y.Volumes) && maps.Equal(x.AntiAffinityPods, y.AntiAffinityPods) &&
 		slices.EqualFunc(a.RepairPolicyMatches, b.RepairPolicyMatches, repair.RepairPolicyMatch.Equal) &&
-		equality.Semantic.DeepEqual(a.CSIDrivers, b.CSIDrivers)
+		equality.Semantic.DeepEqual(x.CSIDrivers, y.CSIDrivers)
+}
+
+// nodeClaimDerivedEqual compares a NodeClaim's derived fields: the same Node, and its usage and matches compared as
+// nodeDerivedEqual compares a Node's.
+func nodeClaimDerivedEqual(a, b NodeClaimDerived) bool {
+	return a.Node == b.Node && nodeDerivedEqual(NodeDerived{Usage: a.Usage, RepairPolicyMatches: a.RepairPolicyMatches},
+		NodeDerived{Usage: b.Usage, RepairPolicyMatches: b.RepairPolicyMatches})
 }
 
 // testMatcher returns a matcher of one policy: a Node whose BadNode condition is False needs replacing.

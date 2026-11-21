@@ -99,7 +99,7 @@ type Queue struct {
 	source             chan event.TypedGenericEvent[*v1.NodeClaim]
 	kubeClient         client.Client
 	recorder           events.Recorder
-	cluster            *karpentercluster.NodeState
+	nodeClaims         *karpentercluster.NodeClaims
 	clock              clock.Clock
 	provisioner        *provisioning.Provisioner
 	// deletion is the handle of the deletion marks, which the queue holds while a command disrupts its candidates.
@@ -108,7 +108,7 @@ type Queue struct {
 
 // NewQueue creates a queue that will asynchronously orchestrate disruption commands, marking their candidates for
 // deletion with deletion.
-func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *karpentercluster.NodeState, clock clock.Clock,
+func NewQueue(kubeClient client.Client, recorder events.Recorder, nodeClaims *karpentercluster.NodeClaims, clock clock.Clock,
 	provisioner *provisioning.Provisioner, deletion *karpentercluster.Deletion,
 ) *Queue {
 	queue := &Queue{
@@ -118,7 +118,7 @@ func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *karpe
 		NodeClaimToCommand: map[string]*Command{},
 		kubeClient:         kubeClient,
 		recorder:           recorder,
-		cluster:            cluster,
+		nodeClaims:         nodeClaims,
 		clock:              clock,
 		provisioner:        provisioner,
 		deletion:           deletion,
@@ -172,7 +172,7 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 			metrics.ReasonLabel:    strings.ToLower(string(cmd.Reason())),
 			ConsolidationTypeLabel: cmd.ConsolidationType(),
 		})
-		stateNodes := lo.Map(cmd.Candidates, func(c *Candidate, _ int) *karpentercluster.StateNode { return c.StateNode })
+		stateNodes := lo.Map(cmd.Candidates, func(c *Candidate, _ int) karpentercluster.NodeClaimEntry { return c.Entry })
 		multiErr := multierr.Combine(err, RequireNoScheduleTaint(ctx, q.kubeClient, false, stateNodes...))
 		multiErr = multierr.Combine(multiErr, ClearNodeClaimsCondition(ctx, q.kubeClient, q.clock, v1.ConditionTypeDisruptionReason, stateNodes...))
 		// Log the error
@@ -210,7 +210,7 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 			// The NodeClaim got deleted after an initial eventual consistency delay
 			// This means that there was an ICE error or the Node initializationTTL expired
 			// In this case, the error is unrecoverable, so don't requeue.
-			if errors.IsNotFound(err) && !q.cluster.NodeClaimExists(cmd.Replacements[i].Name) {
+			if errors.IsNotFound(err) && !q.nodeClaims.Exists(cmd.Replacements[i].Name) {
 				return NewUnrecoverableError(fmt.Errorf("replacement was deleted, %w", err))
 			}
 			waitErrs[i] = fmt.Errorf("getting node claim, %w", err)
@@ -314,7 +314,7 @@ func recordCandidateDisrupted(cmd *Command, candidate *Candidate) {
 func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, error) {
 	errs := make([]error, len(cmd.Candidates))
 	workqueue.ParallelizeUntil(ctx, len(cmd.Candidates), len(cmd.Candidates), func(i int) {
-		if err := RequireNoScheduleTaint(ctx, q.kubeClient, true, cmd.Candidates[i].StateNode); err != nil {
+		if err := RequireNoScheduleTaint(ctx, q.kubeClient, true, cmd.Candidates[i].Entry); err != nil {
 			errs[i] = serrors.Wrap(fmt.Errorf("tainting nodes, %w", err), "taint", pretty.Taint(v1.DisruptedNoScheduleTaint))
 			return
 		}
@@ -490,8 +490,8 @@ func candidateNodeClaims(cmd *Command) []string {
 // HasAny checks to see if the candidate, by its NodeClaim's name, is part of an currently executing command.
 // HasNode returns whether a command in the queue is disrupting the node. Commands are keyed by NodeClaim name, so a node
 // without a NodeClaim is in none.
-func (q *Queue) HasNode(node *karpentercluster.StateNode) bool {
-	return node.NodeClaim != nil && q.HasAny(node.NodeClaim.Name)
+func (q *Queue) HasNode(node karpentercluster.NodeClaimEntry) bool {
+	return q.HasAny(node.Object.Name)
 }
 
 func (q *Queue) HasAny(nodeClaimNames ...string) bool {

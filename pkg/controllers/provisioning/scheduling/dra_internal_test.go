@@ -138,7 +138,7 @@ func draExistingNodeForTest(initialized bool, it *cloudprovider.InstanceType) *d
 	}
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: labels}}
 	nodeClaim := &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: labels}}
-	en := &ExistingNode{StateNode: &karpentercluster.StateNode{Node: node, NodeClaim: nodeClaim}, instanceType: it}
+	en := &ExistingNode{NodeView: karpentercluster.ViewOfNodeClaim(karpentercluster.NodeClaimEntry{Object: nodeClaim, Derived: karpentercluster.NodeClaimDerived{Node: node}}), instanceType: it}
 	en.requirements = scheduling.NewLabelRequirements(labels)
 	return &draExistingNode{en: en, instanceType: it}
 }

@@ -94,7 +94,7 @@ var _ = Describe("Controller", func() {
 		ExpectApplied(ctx, env.Client, pod0, pod1)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, cs.NodePoolState, queue)
+		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster.NodeClaims, cluster.PodsByNode, cs.NodePoolState, queue)
 		result, err := controller.Reconcile(ctx)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
@@ -138,7 +138,7 @@ var _ = Describe("Controller", func() {
 		ExpectApplied(ctx, env.Client, rsPod, jobPod)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, cs.NodePoolState, queue)
+		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster.NodeClaims, cluster.PodsByNode, cs.NodePoolState, queue)
 		_, err := controller.Reconcile(ctx)
 		Expect(err).ToNot(HaveOccurred())
 
@@ -192,7 +192,7 @@ var _ = Describe("Controller", func() {
 		ExpectApplied(ctx, env.Client, pinnedNodeRSPod, nonControllerRSPod, controlPod)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, cs.NodePoolState, queue)
+		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster.NodeClaims, cluster.PodsByNode, cs.NodePoolState, queue)
 		_, err := controller.Reconcile(ctx)
 		Expect(err).ToNot(HaveOccurred())
 
@@ -221,7 +221,7 @@ var _ = Describe("Controller", func() {
 		ExpectApplied(ctx, env.Client, jobPod)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, cs.NodePoolState, queue)
+		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster.NodeClaims, cluster.PodsByNode, cs.NodePoolState, queue)
 		_, err := controller.Reconcile(ctx)
 		Expect(err).ToNot(HaveOccurred())
 
@@ -239,7 +239,7 @@ var _ = Describe("Controller", func() {
 		// Regression: the len(nodes)==0 short-circuit must not advance
 		// the ranked cursor, or the first cycle after nodes appear takes the
 		// "unchanged" short-circuit and never ranks.
-		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, cs.NodePoolState, queue)
+		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster.NodeClaims, cluster.PodsByNode, cs.NodePoolState, queue)
 		result, err := controller.Reconcile(ctx)
 		Expect(err).To(Succeed())
 		Expect(result.RequeueAfter).To(BeZero(), "a node appearing wakes the controller")
@@ -283,7 +283,7 @@ var _ = Describe("Controller", func() {
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 		failing := &toggleablePDBListFailingClient{Client: env.Overlay, fail: true}
-		controller := deletioncost.NewController(env.Clock, failing, cloudProvider, cluster, cs.NodePoolState, queue)
+		controller := deletioncost.NewController(env.Clock, failing, cloudProvider, cluster.NodeClaims, cluster.PodsByNode, cs.NodePoolState, queue)
 
 		_, err := controller.Reconcile(ctx)
 		Expect(err).To(HaveOccurred())
@@ -313,7 +313,7 @@ var _ = Describe("Controller", func() {
 		ExpectApplied(ctx, env.Client, pod)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, cs.NodePoolState, queue)
+		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster.NodeClaims, cluster.PodsByNode, cs.NodePoolState, queue)
 
 		result, err := controller.Reconcile(ctx)
 		Expect(err).To(Succeed())
@@ -344,7 +344,7 @@ var _ = Describe("Controller", func() {
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaims[0], nodes[0])
 		ExpectApplied(ctx, env.Client, rsOwnedPod(test.PodOptions{NodeName: nodes[0].Name}))
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
-		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, cs.NodePoolState, queue)
+		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster.NodeClaims, cluster.PodsByNode, cs.NodePoolState, queue)
 		reconcile := func() time.Duration {
 			GinkgoHelper()
 			result, err := controller.Reconcile(ctx)
@@ -420,7 +420,7 @@ var _ = Describe("Controller", func() {
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
 			failing := &pdbListFailingClient{Client: env.Overlay}
-			controller := deletioncost.NewController(env.Clock, failing, cloudProvider, cluster, cs.NodePoolState, queue)
+			controller := deletioncost.NewController(env.Clock, failing, cloudProvider, cluster.NodeClaims, cluster.PodsByNode, cs.NodePoolState, queue)
 			_, err := controller.Reconcile(ctx)
 			Expect(err).To(HaveOccurred(), "current behavior: PDB list failure aborts the whole reconcile")
 

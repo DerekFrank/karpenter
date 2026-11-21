@@ -42,22 +42,17 @@ import (
 // RankNodes returns three slices whose position implies the pod-deletion-cost
 // annotation: groupA maps to math.MinInt32, groupBC is drifted then normal by
 // SavingsRatio DESC with the rank from RankForBC(i, len(groupBC)), and groupD
-// has its annotations cleared. nodeState holds the nodes it ranks, and nodePools
-// count the same managed nodes per NodePool for the disruption budgets
-// bounding groupBC.
-func RankNodes(ctx context.Context, kubeClient client.Client, clk clock.Clock, nodeState *karpentercluster.NodeState, nodePools *karpentercluster.NodePoolState, nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType) (groupA, groupBC, groupD []*karpentercluster.StateNode, err error) {
+// has its annotations cleared. nodeClaims holds the nodes it ranks, podsByNode
+// their pods, and nodePools count the same managed nodes per NodePool for the
+// disruption budgets bounding groupBC.
+func RankNodes(ctx context.Context, kubeClient client.Client, clk clock.Clock, nodeClaims *karpentercluster.NodeClaims, podsByNode *karpentercluster.PodIndex[string], nodePools *karpentercluster.NodePoolState, nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType) (groupA, groupBC, groupD []karpentercluster.NodeClaimEntry, err error) {
 	// PDC only annotates pods on nodes Karpenter owns, the nodes the budgets
-	// count. An unmanaged node with a deletion timestamp satisfies
-	// StateNode.Deleted(), so without this filter it reaches Group A and gets
-	// MinInt32 written on every pod, uncapped. The StateNodes are pointer
-	// aliases, not deep copies: torn reads are acceptable, since the writes are
-	// best-effort and the next reconcile picks up any drift.
-	var nodes []*karpentercluster.StateNode
-	for n := range nodeState.Nodes() {
-		if n.Managed() {
-			nodes = append(nodes, n)
-		}
-	}
+	// count: the launched NodeClaims. An unmanaged node with a deletion
+	// timestamp would otherwise reach Group A and get MinInt32 written on every
+	// pod, uncapped. The entries are the store's, not deep copies: torn reads
+	// are acceptable, since the writes are best-effort and the next reconcile
+	// picks up any drift.
+	nodes := launchedNodeClaims(nodeClaims)
 	if len(nodes) == 0 {
 		return nil, nil, nil, nil
 	}
@@ -69,10 +64,10 @@ func RankNodes(ctx context.Context, kubeClient client.Client, clk clock.Clock, n
 
 	// Sorted once here: lo.GroupBy preserves per-partition iteration order, so
 	// each group inherits SavingsRatio DESC without its own sort.
-	sortBySavingsRatio(ctx, kubeClient, nodes, nodePoolToInstanceTypesMap)
+	sortBySavingsRatio(ctx, podsByNode, nodes, nodePoolToInstanceTypesMap)
 
-	groups := lo.GroupBy(nodes, func(n *karpentercluster.StateNode) nodePartition {
-		return classifyNode(ctx, kubeClient, clk, n, nodePoolMap, nodePoolToInstanceTypesMap, pdbs)
+	groups := lo.GroupBy(nodes, func(n karpentercluster.NodeClaimEntry) nodePartition {
+		return classifyNode(podsByNode, clk, n, nodePoolMap, nodePoolToInstanceTypesMap, pdbs)
 	})
 	disruptedBlocked := groups[partitionDisrupted]
 	drifted := groups[partitionDrifted]
@@ -81,7 +76,7 @@ func RankNodes(ctx context.Context, kubeClient client.Client, clk clock.Clock, n
 
 	driftBudget := disruption.NodePoolBudgetMap(ctx, clk, nodePools, nodePoolMap, v1.DisruptionReasonDrifted)
 	consolidationBudget := disruption.NodePoolBudgetMap(ctx, clk, nodePools, nodePoolMap, v1.DisruptionReasonUnderutilized)
-	var driftOverflow, normalOverflow []*karpentercluster.StateNode
+	var driftOverflow, normalOverflow []karpentercluster.NodeClaimEntry
 	drifted, driftOverflow = applyPerNodePoolBudget(drifted, driftBudget)
 	normal, normalOverflow = applyPerNodePoolBudget(normal, consolidationBudget)
 	cleanupOnly = append(cleanupOnly, driftOverflow...)
@@ -108,10 +103,10 @@ func RankForBC(i, n int) int {
 // applyPerNodePoolBudget requires nodes pre-sorted by cross-pool SavingsRatio
 // DESC. Do not rewrite with lo.GroupBy: map iteration order would randomize
 // cross-pool priority.
-func applyPerNodePoolBudget(nodes []*karpentercluster.StateNode, budget map[string]int) (bounded, overflow []*karpentercluster.StateNode) {
+func applyPerNodePoolBudget(nodes []karpentercluster.NodeClaimEntry, budget map[string]int) (bounded, overflow []karpentercluster.NodeClaimEntry) {
 	used := map[string]int{}
 	for _, node := range nodes {
-		poolName := node.Labels()[v1.NodePoolLabelKey]
+		poolName := labelsOf(node)[v1.NodePoolLabelKey]
 		if used[poolName] < budget[poolName] {
 			bounded = append(bounded, node)
 			used[poolName]++
@@ -131,18 +126,18 @@ const (
 	partitionCleanupOnly
 )
 
-func classifyNode(ctx context.Context, kubeClient client.Client, clk clock.Clock, node *karpentercluster.StateNode, nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType, pdbs pdb.Limits) nodePartition {
+func classifyNode(podsByNode *karpentercluster.PodIndex[string], clk clock.Clock, node karpentercluster.NodeClaimEntry, nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType, pdbs pdb.Limits) nodePartition {
 	if isGoingAway(node) {
 		return partitionDisrupted
 	}
 	if verr := disruption.ValidateNodeDisruptable(node, clk); verr != nil {
 		return partitionCleanupOnly
 	}
-	return classifyDisruptableNode(ctx, kubeClient, clk, node, nodePoolMap, nodePoolToInstanceTypesMap, pdbs)
+	return classifyDisruptableNode(podsByNode, clk, node, nodePoolMap, nodePoolToInstanceTypesMap, pdbs)
 }
 
-func classifyDisruptableNode(ctx context.Context, kubeClient client.Client, clk clock.Clock, node *karpentercluster.StateNode, nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType, pdbs pdb.Limits) nodePartition {
-	pods, verr := disruption.ValidatePodsDisruptable(ctx, kubeClient, node, pdbs, clk, nil)
+func classifyDisruptableNode(podsByNode *karpentercluster.PodIndex[string], clk clock.Clock, node karpentercluster.NodeClaimEntry, nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType, pdbs pdb.Limits) nodePartition {
+	pods, verr := disruption.ValidatePodsDisruptable(podsByNode, node, pdbs, clk, nil)
 	if verr != nil {
 		return partitionCleanupOnly
 	}
@@ -171,12 +166,12 @@ func classifyDisruptableNode(ctx context.Context, kubeClient client.Client, clk 
 // or a node missing the NodePool or instance-type label. No ranking is being
 // corrupted then, so the filter stands down instead of routing every node to
 // cleanup.
-func isUnpriceable(node *karpentercluster.StateNode, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType) bool {
+func isUnpriceable(node karpentercluster.NodeClaimEntry, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType) bool {
 	if nodePoolToInstanceTypesMap == nil {
 		return false
 	}
-	nodePoolName := node.Labels()[v1.NodePoolLabelKey]
-	itName := node.Labels()[corev1.LabelInstanceTypeStable]
+	nodePoolName := labelsOf(node)[v1.NodePoolLabelKey]
+	itName := labelsOf(node)[corev1.LabelInstanceTypeStable]
 	if nodePoolName == "" || itName == "" {
 		return false
 	}
@@ -190,8 +185,8 @@ func isUnpriceable(node *karpentercluster.StateNode, nodePoolToInstanceTypesMap 
 	return false
 }
 
-func isConsolidationDisabled(node *karpentercluster.StateNode, nodePoolMap map[string]*v1.NodePool) bool {
-	nodePoolName := node.Labels()[v1.NodePoolLabelKey]
+func isConsolidationDisabled(node karpentercluster.NodeClaimEntry, nodePoolMap map[string]*v1.NodePool) bool {
+	nodePoolName := labelsOf(node)[v1.NodePoolLabelKey]
 	if nodePoolName == "" {
 		return false
 	}
@@ -202,15 +197,16 @@ func isConsolidationDisabled(node *karpentercluster.StateNode, nodePoolMap map[s
 	return np.Spec.Disruption.ConsolidateAfter.Duration == nil
 }
 
-func isGoingAway(node *karpentercluster.StateNode) bool {
-	if node.MarkedForDeletion() {
+func isGoingAway(node karpentercluster.NodeClaimEntry) bool {
+	if karpentercluster.Deleting(node) {
 		return true
 	}
-	if node.Node == nil {
+	n := karpentercluster.ViewOfNodeClaim(node).Node()
+	if n == nil {
 		return false
 	}
-	for i := range node.Node.Spec.Taints {
-		if node.Node.Spec.Taints[i].MatchTaint(&v1.DisruptedNoScheduleTaint) {
+	for i := range n.Spec.Taints {
+		if n.Spec.Taints[i].MatchTaint(&v1.DisruptedNoScheduleTaint) {
 			return true
 		}
 	}
@@ -222,14 +218,11 @@ func isGoingAway(node *karpentercluster.StateNode) bool {
 //
 // TODO: the drift-condition read and IsStatic gate are duplicated in
 // disruption/drift.go and disruption/staticdrift.go; dedupe in a follow-up.
-func isDrifted(node *karpentercluster.StateNode, nodePoolMap map[string]*v1.NodePool) bool {
-	if node.NodeClaim == nil {
+func isDrifted(node karpentercluster.NodeClaimEntry, nodePoolMap map[string]*v1.NodePool) bool {
+	if np := nodePoolMap[labelsOf(node)[v1.NodePoolLabelKey]]; np != nil && nodepoolutils.IsStatic(np) {
 		return false
 	}
-	if np := nodePoolMap[node.Labels()[v1.NodePoolLabelKey]]; np != nil && nodepoolutils.IsStatic(np) {
-		return false
-	}
-	return node.NodeClaim.StatusConditions(status.WithObservedOnly()).Get(v1.ConditionTypeDrifted).IsTrue()
+	return node.Object.StatusConditions(status.WithObservedOnly()).Get(v1.ConditionTypeDrifted).IsTrue()
 }
 
 // Controllers that replace a pod they own somewhere else in the cluster, so a
@@ -263,36 +256,45 @@ func hasPinningPods(pods []*corev1.Pod) bool {
 
 // sortBySavingsRatio mirrors disruption.consolidation.sortCandidates so PDC and
 // consolidation prefer the same node.
-func sortBySavingsRatio(ctx context.Context, kubeClient client.Client, nodes []*karpentercluster.StateNode, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType) {
+func sortBySavingsRatio(ctx context.Context, podsByNode *karpentercluster.PodIndex[string], nodes []karpentercluster.NodeClaimEntry, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType) {
 	if len(nodes) <= 1 {
 		return
 	}
+	name := func(n karpentercluster.NodeClaimEntry) string { return karpentercluster.ViewOfNodeClaim(n).Name() }
 	ratio := make(map[string]float64, len(nodes))
 	for _, n := range nodes {
-		labels := n.Labels()
+		labels := labelsOf(n)
 		var it *cloudprovider.InstanceType
 		if m := nodePoolToInstanceTypesMap[labels[v1.NodePoolLabelKey]]; m != nil {
 			it = m[labels[corev1.LabelInstanceTypeStable]]
 		}
-		offeringPrice := disruptionutils.ResolveOfferingPrice(labels, it)
-		if n.NodeClaim != nil {
-			offeringPrice, _ = cloudprovider.PriceNodeClaim(ctx, n.NodeClaim, it)
-		}
-		pods, err := n.Pods(ctx, kubeClient)
-		if err != nil {
-			// Fall back to the base-cost floor; the next reconcile re-reads.
-			log.FromContext(ctx).V(1).WithValues("node", n.Name()).Error(err, "listing pods for savings-ratio sort; using base cost")
-			pods = nil
-		}
+		offeringPrice, _ := cloudprovider.PriceNodeClaim(ctx, n.Object, it)
+		pods := karpentercluster.PodsOn(podsByNode, karpentercluster.ViewOfNodeClaim(n).NodeName())
 		reschedulable := lo.Filter(pods, func(p *corev1.Pod, _ int) bool { return podutils.IsReschedulable(p) })
 		disruptionCost := disruptionutils.ComputeRescheduleDisruptionCost(ctx, reschedulable)
-		ratio[n.Name()] = disruptionutils.SavingsRatio(offeringPrice, disruptionCost)
+		ratio[name(n)] = disruptionutils.SavingsRatio(offeringPrice, disruptionCost)
 	}
 	sort.Slice(nodes, func(i, j int) bool {
-		ri, rj := ratio[nodes[i].Name()], ratio[nodes[j].Name()]
+		ri, rj := ratio[name(nodes[i])], ratio[name(nodes[j])]
 		if ri != rj {
 			return ri > rj
 		}
-		return nodes[i].Name() < nodes[j].Name()
+		return name(nodes[i]) < name(nodes[j])
 	})
+}
+
+// launchedNodeClaims returns the entries of the launched NodeClaims, the managed nodes, with the store's own objects.
+func launchedNodeClaims(nodeClaims *karpentercluster.NodeClaims) []karpentercluster.NodeClaimEntry {
+	var nodes []karpentercluster.NodeClaimEntry
+	for _, e := range nodeClaims.List(client.UnsafeDisableDeepCopy) {
+		if karpentercluster.Launched(e) {
+			nodes = append(nodes, e)
+		}
+	}
+	return nodes
+}
+
+// labelsOf returns the labels of the managed node: its NodeClaim's until its Node registers, then the Node's.
+func labelsOf(n karpentercluster.NodeClaimEntry) map[string]string {
+	return karpentercluster.ViewOfNodeClaim(n).Labels()
 }

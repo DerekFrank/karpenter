@@ -207,7 +207,7 @@ var _ = Describe("NodePoolState Tracking", func() {
 				Expect(deleting).To(Equal(0))
 				Expect(pendingdisruption).To(Equal(0))
 
-				Expect(cluster.NodeClaimExists(nodeClaim.Name)).To(BeTrue())
+				Expect(cluster.NodeClaims.Exists(nodeClaim.Name)).To(BeTrue())
 			})
 
 			It("should track NodeClaim without ProviderID", func() {
@@ -228,7 +228,7 @@ var _ = Describe("NodePoolState Tracking", func() {
 				Expect(deleting).To(Equal(0))
 				Expect(pendingdisruption).To(Equal(0))
 
-				Expect(cluster.NodeClaimExists(nodeClaimWithoutProvider.Name)).To(BeTrue())
+				Expect(cluster.NodeClaims.Exists(nodeClaimWithoutProvider.Name)).To(BeTrue())
 			})
 
 			It("should not track NodeClaim that has no nodepool", func() {
@@ -247,7 +247,7 @@ var _ = Describe("NodePoolState Tracking", func() {
 				Expect(deleting).To(Equal(0))
 				Expect(pendingdisruption).To(Equal(0))
 
-				Expect(cluster.NodeClaimExists(nodeClaimWithoutNodePool.Name)).To(BeTrue())
+				Expect(cluster.NodeClaims.Exists(nodeClaimWithoutNodePool.Name)).To(BeTrue())
 			})
 
 			It("should track multiple NodeClaims in the same NodePool", func() {
@@ -385,7 +385,7 @@ var _ = Describe("NodePoolState Tracking", func() {
 				Expect(running).To(Equal(1))
 				Expect(deleting).To(Equal(0))
 				Expect(pendingdisruption).To(Equal(0))
-				Expect(cluster.NodeClaimExists(nodeClaim.Name)).To(BeTrue())
+				Expect(cluster.NodeClaims.Exists(nodeClaim.Name)).To(BeTrue())
 
 				ExpectDeleted(ctx, env.Client, nodeClaim)
 
@@ -393,7 +393,7 @@ var _ = Describe("NodePoolState Tracking", func() {
 				Expect(running).To(Equal(0))
 				Expect(deleting).To(Equal(0))
 				Expect(pendingdisruption).To(Equal(0))
-				Expect(cluster.NodeClaimExists(nodeClaim.Name)).To(BeFalse())
+				Expect(cluster.NodeClaims.Exists(nodeClaim.Name)).To(BeFalse())
 			})
 
 		})

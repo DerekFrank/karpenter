@@ -193,7 +193,7 @@ var _ = ginkgo.Describe("LevelStore", func() {
 		}
 		wg.Wait()
 		newest, _ := objects.Get(key)
-		e, _ := nodeClaims.Get(key)
+		e, _ := nodeClaims.Get(key, client.UnsafeDisableDeepCopy)
 		Expect(e.Object).To(BeIdenticalTo(newest))
 		Expect(pooled(s)).To(Equal(recount(nodeClaims)))
 	})
@@ -232,7 +232,7 @@ var _ = ginkgo.Describe("LevelStore", func() {
 		wg.Wait()
 		for _, k := range objects.Keys() {
 			o, _ := objects.Get(k)
-			e, ok := nodeClaims.Get(k)
+			e, ok := nodeClaims.Get(k, client.UnsafeDisableDeepCopy)
 			Expect(ok).To(BeTrue(), "%s, want the store to hold it", k)
 			Expect(e.Object).To(BeIdenticalTo(o), "%s, want the newest version", k)
 		}
@@ -303,7 +303,7 @@ var _ = ginkgo.Describe("LevelStore over the overlay", func() {
 		informer.deliver(nc)
 	})
 	held := func() (*v1.NodeClaim, bool) {
-		e, ok := nodeClaims.Get(client.ObjectKeyFromObject(nc))
+		e, ok := nodeClaims.Get(client.ObjectKeyFromObject(nc), client.UnsafeDisableDeepCopy)
 		return e.Object, ok
 	}
 

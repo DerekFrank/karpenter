@@ -51,7 +51,7 @@ import (
 
 var ctx context.Context
 var env *test.Environment
-var cluster *karpentercluster.NodeState
+var cluster karpentercluster.State
 var metricsStateController *node.Controller
 var cloudProvider *fake.CloudProvider
 
@@ -70,8 +70,8 @@ var _ = BeforeSuite(func() {
 	cloudProvider = fake.NewCloudProvider()
 	cloudProvider.InstanceTypes = fake.InstanceTypesAssorted()
 	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = cs.Nodes
-	metricsStateController = node.NewController(cluster)
+	cluster = cs
+	metricsStateController = node.NewController(cluster.NodeClaims, cluster.Nodes)
 	// Register derives the stores the controller wakes on, as the operator does, on a manager that never starts.
 	m, err := controllerruntime.NewManager(env.Config, controllerruntime.Options{
 		Scheme:     scheme.Scheme,
@@ -205,7 +205,7 @@ var _ = Describe("Node Metrics Wakes", func() {
 		pod.Status.Phase = corev1.PodRunning
 		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
 		Expect(env.Client.Status().Update(ctx, pod)).To(Succeed())
-		Expect(lo.Must(cluster.PodStore.Get(client.ObjectKeyFromObject(pod))).Object.Status.Phase).To(Equal(corev1.PodRunning))
+		Expect(lo.Must(cluster.Pods.Get(client.ObjectKeyFromObject(pod))).Object.Status.Phase).To(Equal(corev1.PodRunning))
 		Expect(woken(queue)).To(BeFalse(), "want nothing for the pod's status")
 
 		ExpectDeleted(ctx, env.Client, pod)

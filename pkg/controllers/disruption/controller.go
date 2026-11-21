@@ -48,6 +48,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
+	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
@@ -58,10 +59,51 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
 
+// Stores are the cluster state stores disruption reads: the managed nodes, the cluster-wide counts, the pods by
+// Node, and the repair policy matcher. Disruption reads only the NodeClaim store for nodes; the scheduling
+// simulations read the rest of the cluster's capacity through the provisioner.
+type Stores struct {
+	NodeClaims *karpentercluster.NodeClaims
+	Cluster    *karpentercluster.Clusters
+	PodsByNode *karpentercluster.PodIndex[string]
+	// RepairPolicyMatcher is the matcher cluster state matches Nodes with, nil when node repair is disabled.
+	RepairPolicyMatcher *repair.RepairPolicyMatcher
+}
+
+// StoresOf returns the stores of cluster state disruption reads.
+func StoresOf(s karpentercluster.State) Stores {
+	return Stores{NodeClaims: s.NodeClaims, Cluster: s.Cluster, PodsByNode: s.PodsByNode, RepairPolicyMatcher: s.RepairPolicyMatcher}
+}
+
+// launchedNodeClaims returns the entries of the launched NodeClaims, the nodes disruption considers, with the store's
+// own objects: a caller copies one before changing or writing it.
+func (s Stores) launchedNodeClaims() []karpentercluster.NodeClaimEntry {
+	var nodes []karpentercluster.NodeClaimEntry
+	for _, e := range s.NodeClaims.List(client.UnsafeDisableDeepCopy) {
+		if karpentercluster.Launched(e) {
+			nodes = append(nodes, e)
+		}
+	}
+	return nodes
+}
+
+// nominated returns whether the NodeClaim's node is nominated for a pending pod now, read from the store as it is now.
+func (s Stores) nominated(nodeClaimName string, now time.Time) bool {
+	e, ok := s.NodeClaims.Get(nodeClaimName, client.UnsafeDisableDeepCopy)
+	return ok && karpentercluster.Nominated(e, now)
+}
+
+// hasBufferPods returns whether the provisioner's last pass placed a virtual buffer pod on the NodeClaim's node, read
+// from the store as it is now.
+func (s Stores) hasBufferPods(nodeClaimName string) bool {
+	e, _ := s.NodeClaims.Get(nodeClaimName, client.UnsafeDisableDeepCopy)
+	return karpentercluster.HasBufferPods(e)
+}
+
 type Controller struct {
 	queue         *Queue
 	kubeClient    client.Client
-	cluster       *karpentercluster.NodeState
+	cluster       Stores
 	nodePools     *karpentercluster.NodePoolState
 	provisioner   *provisioning.Provisioner
 	recorder      events.Recorder
@@ -87,7 +129,7 @@ func WithMethods(methods ...Method) option.Function[ControllerOptions] {
 }
 
 func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
-	cp cloudprovider.CloudProvider, recorder events.Recorder, cluster *karpentercluster.NodeState, nodePools *karpentercluster.NodePoolState, queue *Queue, clusterCost *karpentercluster.ClusterCost, opts ...option.Function[ControllerOptions]) *Controller {
+	cp cloudprovider.CloudProvider, recorder events.Recorder, cluster Stores, nodePools *karpentercluster.NodePoolState, queue *Queue, clusterCost *karpentercluster.ClusterCost, opts ...option.Function[ControllerOptions]) *Controller {
 
 	o := option.Resolve(append([]option.Function[ControllerOptions]{WithMethods(NewMethods(ctx, clk, cluster, nodePools, kubeClient, provisioner, cp, recorder, queue)...)}, opts...)...)
 	return &Controller{
@@ -106,7 +148,7 @@ func NewController(ctx context.Context, clk clock.Clock, kubeClient client.Clien
 	}
 }
 
-func NewMethods(ctx context.Context, clk clock.Clock, cluster *karpentercluster.NodeState, nodePools *karpentercluster.NodePoolState, kubeClient client.Client, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue) []Method {
+func NewMethods(ctx context.Context, clk clock.Clock, cluster Stores, nodePools *karpentercluster.NodePoolState, kubeClient client.Client, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue) []Method {
 	c := MakeConsolidation(clk, cluster, nodePools, kubeClient, provisioner, cp, recorder, queue)
 	methods := []Method{}
 	// Repair runs first: fixing a fault outranks any discretionary rebalance. Do not register the method while the
@@ -121,7 +163,7 @@ func NewMethods(ctx context.Context, clk clock.Clock, cluster *karpentercluster.
 		// Terminate and create replacement for drifted NodeClaims in Static NodePool
 		NewStaticDrift(nodePools, provisioner, cp, recorder),
 		// Terminate any NodeClaims that have drifted from provisioning specifications, allowing the pods to reschedule.
-		NewDrift(kubeClient, cluster, provisioner, recorder, clk),
+		NewDrift(kubeClient, provisioner, recorder, clk),
 		// Attempt to identify multiple NodeClaims that we can consolidate simultaneously to reduce pod churn
 		NewMultiNodeConsolidation(c),
 		// And finally fall back our single NodeClaim consolidation to further reduce cluster cost.
@@ -135,14 +177,14 @@ func (c *Controller) Name() string {
 
 // Register wakes the controller on the changes that can open a disruption decision, and has the consolidation methods
 // skip their work until one comes, in place of a poll:
-//   - the NodeClaim store, narrowed to disruption's inputs (NodeState.DisruptionSources): a NodeClaim coming,
+//   - the NodeClaim store, narrowed to disruption's inputs (NodeClaims.DisruptionSource): a NodeClaim coming,
 //     launching, linking its Node, starting to delete or going; being marked for deletion; its Drifted or
 //     Consolidatable condition or its do-not-disrupt annotation changing; or its buffer pods coming or going. Its
-//     nomination, status heartbeats and other conditions don't wake it.
-//   - the Node store, narrowed to disruption's inputs: a Node initializing, its do-not-disrupt annotation or its repair
-//     policy matches changing in number; and its pods' usage, as a pod binds to it or leaves it, starts to terminate,
-//     or gains or loses the do-not-disrupt annotation. A pod's status, its other metadata, pods waiting to schedule,
-//     which have no Node, and the Node's heartbeat don't wake it.
+//     nomination, status heartbeats and other conditions don't wake it. The same source carries its Node's inputs, on
+//     the NodeClaim's entry: the Node initializing, its do-not-disrupt annotation or its repair policy matches
+//     changing in number; and its pods' usage, as a pod binds to it or leaves it, starts to terminate, or gains or
+//     loses the do-not-disrupt annotation. A pod's status, its other metadata, pods waiting to schedule, which have no
+//     Node, and the Node's heartbeat don't wake it.
 //   - a managed NodePool's spec changing, through its generation.
 //   - the NodeClaim store's UnlaunchedSource: a NodeClaim launching, which can end the wait on NodeClaimsLaunched. It
 //     doesn't count as a change for consolidation, since a launch also changes the NodeClaim's inputs.
@@ -157,7 +199,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		WatchesRawSource(singleton.Source()).
-		WatchesRawSource(karpenterstate.Requires(c.cluster, c.nodePools)).
+		WatchesRawSource(karpenterstate.Requires(c.cluster.NodeClaims, c.cluster.Cluster, c.nodePools)).
 		// Every source enqueues the same empty request, so the controller runs once for each burst of changes.
 		WatchesRawSource(c.wakes()).
 		Watches(&v1.NodePool{}, handler.EnqueueRequestsFromMapFunc(func(context.Context, client.Object) []reconcile.Request {
@@ -182,7 +224,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 
 	// A NodeClaim that's launching isn't a node in cluster state yet, so a decision made now would be made off a
 	// smaller subset of nodes than actually exist. The unlaunched NodeClaims wake the controller once they launch.
-	if !c.cluster.NodeClaimsLaunched() {
+	if !c.cluster.Cluster.NodeClaimsLaunched() {
 		return reconciler.Result{}, nil
 	}
 
@@ -190,8 +232,8 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	// If Karpenter restarts or fails with an error during a disruption action, some nodes can be left tainted.
 	// Idempotently remove this taint from candidates that are not in the orchestration queue before continuing.
 	// Reboot bypasses the queue, so preserve its DisruptionReason during drain.
-	outdatedNodes := lo.Reject(c.cluster.DeepCopyNodes(), func(s *karpentercluster.StateNode, _ int) bool {
-		return c.queue.HasNode(s) || s.MarkedForDeletion() || s.RebootInProgress()
+	outdatedNodes := lo.Reject(c.cluster.launchedNodeClaims(), func(e karpentercluster.NodeClaimEntry, _ int) bool {
+		return c.queue.HasNode(e) || karpentercluster.Deleting(e) || karpentercluster.ViewOfNodeClaim(e).RebootInProgress()
 	})
 	if err := RequireNoScheduleTaint(ctx, c.kubeClient, false, outdatedNodes...); err != nil {
 		if errors.IsConflict(err) {

@@ -77,19 +77,15 @@ func makeCandidate(nodeName string, np *v1.NodePool, it *cloudprovider.InstanceT
 			},
 		},
 	}
-	sn := &karpentercluster.StateNode{
-		Node: node,
-	}
+	c := testCandidate(nil, node)
 	// EvictionCost reads the PodDeletionCostManagement gate off the context, so
 	// default Options must be injected. Gate-branching specs live in suite_test.go.
-	return &Candidate{
-		StateNode:                sn,
-		instanceType:             it,
-		NodePool:                 np,
-		reschedulablePods:        pods,
-		Price:                    disruptionutils.ResolveOfferingPrice(sn.Labels(), it),
-		RescheduleDisruptionCost: disruptionutils.ComputeRescheduleDisruptionCost(options.ToContext(context.Background(), &options.Options{}), pods),
-	}
+	c.instanceType = it
+	c.NodePool = np
+	c.reschedulablePods = pods
+	c.Price = disruptionutils.ResolveOfferingPrice(c.Labels(), it)
+	c.RescheduleDisruptionCost = disruptionutils.ComputeRescheduleDisruptionCost(options.ToContext(context.Background(), &options.Options{}), pods)
+	return c
 }
 
 // makeNodePool creates a NodePool with the given name and consolidation policy.
@@ -123,12 +119,12 @@ func makePod(name string, deletionCost string) *corev1.Pod {
 	return p
 }
 
-// candidateNodes extracts the StateNode references from candidates for use as
+// candidateNodes extracts the node views from candidates for use as
 // the allNodes parameter to computeNodePoolTotals in tests.
-func candidateNodes(candidates []*Candidate) []*karpentercluster.StateNode {
-	nodes := make([]*karpentercluster.StateNode, len(candidates))
+func candidateNodes(candidates []*Candidate) []karpentercluster.NodeView {
+	nodes := make([]karpentercluster.NodeView, len(candidates))
 	for i, c := range candidates {
-		nodes[i] = c.StateNode
+		nodes[i] = c.NodeView
 	}
 	return nodes
 }
@@ -170,15 +166,11 @@ func makeShouldDisruptCandidate(np *v1.NodePool, policy v1.ConsolidationPolicy) 
 
 	it := makeInstanceType("m7i.xlarge", 4.84)
 
-	return &Candidate{
-		StateNode: &karpentercluster.StateNode{
-			Node:      node,
-			NodeClaim: nc,
-		},
-		instanceType:             it,
-		NodePool:                 np,
-		RescheduleDisruptionCost: disruptionutils.PerNodeBaseDisruptionCost + 1, // non-empty so consolidation ShouldDisrupt accepts it
-	}
+	c := testCandidate(nc, node)
+	c.instanceType = it
+	c.NodePool = np
+	c.RescheduleDisruptionCost = disruptionutils.PerNodeBaseDisruptionCost + 1 // non-empty so consolidation ShouldDisrupt accepts it
+	return c
 }
 
 var _ = Describe("Balanced Scoring", func() {

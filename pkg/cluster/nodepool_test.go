@@ -88,7 +88,7 @@ var _ = Describe("NodePool", func() {
 			want := recountNodePools(s)
 			got := map[string]NodePoolFields{}
 			for _, name := range []string{"a", "b", "c"} {
-				got[name] = s.NodePoolState.Get(name)
+				got[name] = s.NodePoolState.Fields(name)
 			}
 			for _, name := range lo.Uniq(append(slices.Collect(maps.Keys(got)), slices.Collect(maps.Keys(want))...)) {
 				Expect(equality.Semantic.DeepEqual(nonzeroFields(got[name]), nonzeroFields(want[name]))).To(BeTrue(),
@@ -128,9 +128,9 @@ func changeAtRandom(r *rand.Rand, s State, rv string) {
 	name, pool := fmt.Sprint("nc-", i), pools[i%3]
 	switch r.IntN(10) {
 	case 0:
-		s.Nodes.NodeClaimStore.Remove(name)
+		s.NodeClaims.Remove(name)
 	case 1:
-		s.Nodes.NodeStore.Remove("node-" + name)
+		s.Nodes.Remove("node-" + name)
 	case 2:
 		s.Deletion.Mark(name)
 	case 3:
@@ -156,7 +156,7 @@ func changeAtRandom(r *rand.Rand, s State, rv string) {
 				})
 			}
 		}
-		s.Nodes.NodeClaimStore.Put(nc)
+		s.NodeClaims.Put(nc)
 	default:
 		node := &corev1.Node{
 			ObjectMeta: metav1.ObjectMeta{
@@ -178,7 +178,7 @@ func changeAtRandom(r *rand.Rand, s State, rv string) {
 		if r.IntN(5) != 0 {
 			node.OwnerReferences = []metav1.OwnerReference{{APIVersion: apis.Group + "/v1", Kind: "NodeClaim", Name: name, UID: types.UID(name)}}
 		}
-		s.Nodes.NodeStore.Put(node)
+		s.Nodes.Put(node)
 	}
 }
 
@@ -193,9 +193,9 @@ func recountNodePools(s State) map[string]NodePoolFields {
 			want[name] = fn(want[name])
 		}
 	}
-	for _, f := range s.Nodes.NodeClaimStore.List() {
+	for _, f := range s.NodeClaims.List() {
 		nc := f.Object
-		node := s.Nodes.NodeStore.linked(f)
+		node := f.Derived.Node
 		pool := nc.Labels[v1.NodePoolLabelKey]
 		disrupted := lo.ContainsBy(nc.Status.Conditions, func(c status.Condition) bool {
 			return c.Type == v1.ConditionTypeDisruptionReason && c.Status == metav1.ConditionTrue
@@ -235,14 +235,14 @@ func recountNodePools(s State) map[string]NodePoolFields {
 		})
 	}
 	// The NodePool's node health, from the Node store.
-	for _, e := range s.Nodes.NodeStore.List() {
+	for _, e := range s.Nodes.List() {
 		node := e.Object
 		if !Tracked(node) {
 			continue
 		}
 		update(node.Labels[v1.NodePoolLabelKey], func(n NodePoolFields) NodePoolFields {
 			n.NodeHealth.Nodes++
-			n.NodeHealth.Unhealthy += lo.Ternary(len(s.Nodes.matcher.Match(node)) > 0, 1, 0)
+			n.NodeHealth.Unhealthy += lo.Ternary(len(s.RepairPolicyMatcher.Match(node)) > 0, 1, 0)
 			return n
 		})
 	}

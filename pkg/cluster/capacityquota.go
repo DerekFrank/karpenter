@@ -177,14 +177,14 @@ func newQuota(capacityQuota *autoscalingv1beta1.CapacityQuota) (*Quota, error) {
 
 // nodeClaimKey is the quota a NodeClaim counts against: the quota's name while the NodeClaim counts and the quota
 // selects its node's labels once it has launched capacity, or may select its requirements before.
-func (q *Quota) nodeClaimKey(nodes *Nodes) func(string, NodeClaimEntry) string {
+func (q *Quota) nodeClaimKey() func(string, NodeClaimEntry) string {
 	return func(_ string, e NodeClaimEntry) string {
 		nodeClaim := e.Object
 		if !nodeClaim.DeletionTimestamp.IsZero() || conditionTrue(nodeClaim, v1.ConditionTypeDisruptionReason) {
 			return ""
 		}
 		if len(nodeClaim.Status.Capacity) > 0 {
-			return lo.Ternary(q.Matches((&StateNode{Node: nodes.linked(e), NodeClaim: nodeClaim}).Labels()), q.Name, "")
+			return lo.Ternary(q.Matches(nodeLabels(nodeClaim, e.Derived.Node)), q.Name, "")
 		}
 		requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
 		requirements.Add(scheduling.NewLabelRequirements(nodeClaim.Labels).Values()...)
@@ -225,10 +225,11 @@ type CapacityQuotaState struct {
 	// ctx carries the options, read once State.Register decides whether the CapacityQuota store follows the informer.
 	ctx context.Context
 	// pending counts, under the key true, the quotas whose spec isn't applied yet, derived from quotas.
-	pending *state.Store[bool, bool, pendingQuotas, struct{}]
-	nodes   *NodeState
-	clock   clock.Clock
-	log     logr.Logger
+	pending    *state.Store[bool, bool, pendingQuotas, struct{}]
+	nodeClaims *NodeClaims
+	nodes      *Nodes
+	clock      clock.Clock
+	log        logr.Logger
 
 	// rebuilding serializes the controller's rebuilds. No reader takes it.
 	rebuilding sync.Mutex
@@ -237,20 +238,21 @@ type CapacityQuotaState struct {
 	built map[string]*Quota // bounded: CapacityQuotas
 }
 
-// NewCapacityQuotaState returns the CapacityQuotas' entries, derived from the node state's NodeClaim and Node stores.
+// NewCapacityQuotaState returns the CapacityQuotas' entries, derived from the NodeClaim and Node stores.
 // Its CapacityQuota store follows from, the newest version of each CapacityQuota, and the controller State.Register
 // adds enforces each quota it holds, which it does only with the CapacityQuota feature gate.
-func NewCapacityQuotaState(ctx context.Context, clk clock.Clock, from state.Newest, nodes *NodeState) *CapacityQuotaState {
+func NewCapacityQuotaState(ctx context.Context, clk clock.Clock, from state.Newest, nodeClaims *NodeClaims, nodes *Nodes) *CapacityQuotaState {
 	quotas := state.NewObjectStore[string, *autoscalingv1beta1.CapacityQuota, CapacityQuotaFields, CapacityQuotaIntent](from, state.WithKey(state.ByName))
 	s := &CapacityQuotaState{
-		quotas:   quotas,
-		enforced: state.NewIntent(quotas, func(i *CapacityQuotaIntent) *state.Intended[enforcement] { return &i.Enforced }),
-		ctx:      ctx,
-		pending:  state.NewSyntheticStore[bool, bool, pendingQuotas, struct{}](func(k bool) bool { return k }),
-		nodes:    nodes,
-		clock:    clk,
-		log:      log.FromContext(ctx),
-		built:    map[string]*Quota{},
+		quotas:     quotas,
+		enforced:   state.NewIntent(quotas, func(i *CapacityQuotaIntent) *state.Intended[enforcement] { return &i.Enforced }),
+		ctx:        ctx,
+		pending:    state.NewSyntheticStore[bool, bool, pendingQuotas, struct{}](func(k bool) bool { return k }),
+		nodeClaims: nodeClaims,
+		nodes:      nodes,
+		clock:      clk,
+		log:        log.FromContext(ctx),
+		built:      map[string]*Quota{},
 	}
 	state.Derive(quotas.Reader, s.pending,
 		func(_ string, e CapacityQuotaEntry) bool {
@@ -306,8 +308,8 @@ func (s *CapacityQuotaState) rebuild(name string) {
 			s.log.Error(err, "not enforcing capacityquota", "CapacityQuota", klog.KObj(e.Object))
 		} else {
 			q = parsed
-			q.nodeClaims = state.Derive(s.nodes.NodeClaimStore.Reader, s.quotas, q.nodeClaimKey(s.nodes.NodeStore), nodeClaimQuotaUsage)
-			q.nodes = state.DeriveObject(s.nodes.NodeStore.Reader, s.quotas, q.nodeKey, nodeQuotaUsage)
+			q.nodeClaims = state.Derive(s.nodeClaims.Reader, s.quotas, q.nodeClaimKey(), nodeClaimQuotaUsage)
+			q.nodes = state.DeriveObject(s.nodes.Reader, s.quotas, q.nodeKey, nodeQuotaUsage)
 			// A NodeClaim's Used counts what a reservation held for it once it counts the NodeClaim's launched capacity;
 			// one that stops counting first releases it. Until then the reservation's resources.Node counts twice.
 			q.claims = state.NewClaims[string, string, CapacityQuotaFields, quotaUsage, quotaHeld](q.nodeClaims,

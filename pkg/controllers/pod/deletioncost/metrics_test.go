@@ -72,7 +72,7 @@ var _ = Describe("Metrics", func() {
 		}
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodes, nodeClaims)
 
-		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster, cs.NodePoolState, queue)
+		controller := deletioncost.NewController(env.Clock, env.Overlay, cloudProvider, cluster.NodeClaims, cluster.PodsByNode, cs.NodePoolState, queue)
 		_, err := controller.Reconcile(ctx)
 		Expect(err).ToNot(HaveOccurred())
 

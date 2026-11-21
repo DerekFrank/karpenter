@@ -27,28 +27,30 @@ in `Derived`. See [Claims](#claims).
 
 - **`pkg/state`** holds the primitives, which know no object kinds: `Entry`,
   `Store` and `Reader` (`NewObjectStore`, `NewFedStore`, `NewSyntheticStore`), `Derive` and `DeriveObject` (`Derivation`,
-  `Contribution`, `Equaler`), `NewIndex` (`Index`), `DependsOn`, `TouchOn`,
-  `Intent` and `Intended`, `Claims`, `Accessor`, `StoreAccessor`, `View`, and the sources `Reader.Source`, `Reader.SourceOn`,
+  `Contribution`, `Equaler`), `NewIndex` (`Index`), `DependsOn`, `Intent` and
+  `Intended`, `Claims`, and the sources `Reader.Source`, `Reader.SourceOn`,
   `Requires`, `Wake`, `WakeCounting` and `After`.
 - **`pkg/state/statetest`** checks a `Contribution`'s laws in tests.
 - **`pkg/state/overlay`** holds `overlay.Client`, the read-after-write client:
   its reads include its own writes before the informer delivers them.
 - **`pkg/cluster`** holds the cluster's state built from those primitives, one
   file and one type per object or synthetic object: `nodeclaim.go`
-  (`NodeClaims`, and the `Deletion`, `Nomination` and `BufferPods` handles),
-  `node.go` (`Nodes`, `CSINodes`), `nodeusage.go` (the pod usage on a Node's
-  entry), `pod.go` (`Pods`, and the `PodScheduling` handle), `pvc.go` (PVCs and
-  their drivers), `daemonset.go` (`DaemonSets`), `cluster.go` (the synthetic
-  `Cluster{}` and its counts), `nodepool.go` (`NodePoolState` and the
-  `NodePools` accessor), `capacityquota.go` and `cost.go` (`ClusterCost`).
-  `nodestate.go` is the node accessor, which combines a NodeClaim's entry with
-  its Node's. `state.go` composes them. `pkg/cluster/prediction` and
-  `pkg/cluster/virtualpods` hold the prediction store and the CapacityBuffer
-  virtual pods.
-- **`cluster.State`** holds every accessor, the stores behind them and the
+  (`NodeClaims`, the managed nodes, with `NodeClaimsByProviderID` and
+  `NodeClaimsByNodePool`, the `Deletion`, `Nomination` and `BufferPods`
+  handles, and `Registered`, `InFlight`, `Deleting`, `Nominated` and
+  `HasBufferPods`), `node.go` (`Nodes` with `Unmanaged`, `CSINodes`),
+  `nodeview.go` (`NodeKey` and `NodeView`), `nodeusage.go` (the pod usage on a
+  Node's entry), `pod.go` (`Pods`, `PodsByNode`, `PodsByDaemonSet` and
+  `PodsBySimulatedNodeClaim`, `DaemonSetPod`, `PodsOn`, and the
+  `PodScheduling` handle), `pvc.go` (PVCs and their drivers), `cluster.go`
+  (the synthetic `Cluster{}` and its counts), `nodepool.go` (`NodePoolState`),
+  `capacityquota.go` and `cost.go` (`ClusterCost`). `state.go` composes them.
+  `pkg/cluster/prediction` and `pkg/cluster/virtualpods` hold the prediction
+  store and the CapacityBuffer virtual pods.
+- **`cluster.State`** holds every store's Reader, the indexes on them and the
   intent handles. `cluster.New` builds it once, where the operator is wired
   (`kwok/main.go`), and passes it to `controllers.NewControllers`, which gives
-  each controller the accessors it reads and the handles it writes: the
+  each controller the Readers it reads and the handles it writes: the
   disruption queue gets `Deletion`, and the provisioner gets `Nomination`,
   `BufferPods` and `PodScheduling`. See [Startup](#startup).
 - **Imports point one way:** controllers import `pkg/cluster`, which imports
@@ -115,7 +117,8 @@ There are two kinds of store. They differ only in where the object comes from:
   such as one NodeClass's instance types, so a reader sees the old set or the
   new one.
 - **`Reader`** is a store's read-only handle: `Get`, `List`, `Subscribe`,
-  `Synced`, `Source` and `SourceOn`. `pkg/cluster` exports Readers.
+  `Synced`, `Source` and `SourceOn`. `pkg/cluster` exports Readers. See
+  [Reading](#reading).
 - **`Synced`** is true once an object store's source has synced and it has
   applied every key the source held then, and every `Derive` into a store has
   applied its source. A fed or key-built store is synced from the start.
@@ -123,13 +126,11 @@ There are two kinds of store. They differ only in where the object comes from:
   Exists}` after the lock is released, and returns a func that stops it.
 - **`Clear`** is a test helper: it empties a store in place and notifies each
   removal, so subscribers stay subscribed, and an object store then applies
-  what its source holds again. `cluster.NodeState.Clear` and
-  `cluster.State.Reset` compose it. Production code never wipes a store;
-  storelint reports a `Clear` outside a test.
-- **`TouchOn(from, to, dependents)`** re-notifies `to`'s keys that `dependents`
-  returns for each change of `from`, so the `Derive`s from `to` recompute.
-  `TouchOn` and `DependsOn` are the only ways to touch a key: `touch` is
-  internal to `pkg/state`.
+  what its source holds again. `cluster.State.Reset` composes it. Production
+  code never wipes a store; storelint reports a `Clear` outside a test.
+- **`DependsOn` is the only way to touch a key**, so the `Derive`s from its
+  store recompute it: `touch` is internal to `pkg/state`. See
+  [Keeping values pure](#keeping-values-pure).
 
 ### Index
 
@@ -149,11 +150,18 @@ There are two kinds of store. They differ only in where the object comes from:
   write.
 - **Matching a field is the index's `List`.** `idx.List(v, opts...)` returns
   the entries indexed under `v`, as `Lookup` then `Get`, where the client
-  would take `client.MatchingFields`: `mountsPVC.List(pvc)` is the pods that
-  mount `pvc`. It takes a label selector (`client.MatchingLabels`,
-  `client.MatchingLabelsSelector`) on a store of `metav1.Object`s, and
-  `client.UnsafeDisableDeepCopy`, which changes nothing yet since a store's
-  reads don't copy; any other option panics.
+  would take `client.MatchingFields`: `cluster.PodsByNode.List(name)` is the
+  pods bound to the Node `name`. It takes the options a Reader's `List` takes,
+  and copies each object as it does. An entry that changed since the `Lookup`
+  may no longer return `v`, so a reader re-checks it.
+- **An index replaces a `Derive` used only for its `Sources`.** `pkg/cluster`
+  exports its indexes on `cluster.State` as `<Store>By<Thing>`:
+  `NodeClaimsByProviderID` (the providerID is never a key),
+  `NodeClaimsByNodePool` (`NodePoolState.LaunchedNodes` and
+  `UnlaunchedNodeClaims`), `PodsByNode` (`cluster.PodsOn`), `PodsByDaemonSet`
+  (`cluster.DaemonSetPod` picks a DaemonSet's newest pod from it) and
+  `PodsBySimulatedNodeClaim`. `Nodes.Unmanaged` reads the Node store's index of
+  unmanaged Nodes.
 - **Index by a value that holds few keys**, such as a PVC or a NodeClaim. A
   write that moves a key into or out of a value copies that value's keys, so
   indexing many keys under one value, such as pods by namespace, makes every
@@ -221,9 +229,9 @@ binding to the Node, costs a comparison.
   zero, and `Update(fields, prev)` equals `prev.Delete` followed by
   `Update(fields, zero)`. `statetest.ExpectContribution` checks both, or
   `ExpectContributionWith` for fields that `equality.Semantic` can't compare.
-- **A sample is chosen at read time from the Derivation's Sources**, such as a
-  DaemonSet's newest pod (`DaemonSets.GetDaemonSetPod`), so the contribution
-  is a count that keeps the laws.
+- **A sample is chosen at read time from an index**, such as a DaemonSet's
+  newest pod (`cluster.DaemonSetPod` over `PodsByDaemonSet`), rather than kept
+  in a field, which would have to choose it again whenever it leaves.
 - **`Update` replaces `prev` in one pass**, copying each map once: it merges
   the new value into a copy, then subtracts `prev` from that copy.
 - **A contribution returns new fields and leaves the ones it gets intact.** It
@@ -234,11 +242,10 @@ binding to the Node, costs a comparison.
 - **Fields are small, and none is a collection that grows with the cluster.**
   A map or slice field carries a `// bounded: <what bounds it>` comment, such
   as "pods per node". To relate many objects to one key, index them by it with
-  `NewIndex`, or use the key's `Derive` sources, which are indexed in place, as
-  `NodePoolState.LaunchedNodes` and `StoreAccessor.IndexField` do.
+  `NewIndex`, as `NodeClaimsByNodePool` does for `NodePoolState.LaunchedNodes`.
 - **A join is a `Derive` onto an entry.** The Node a NodeClaim's owner
-  reference links is the NodeClaim entry's `Derived.Node`, contributed from
-  the Node store (`linkedNode`).
+  reference links, with its usage and repair policy matches, is the NodeClaim
+  entry's `Derived`, contributed from the Node store (`linkedNode`).
 - **Every derived field has a reader.** A field with no reader is deleted with
   its `Derive`. A `Derive` computes a field a reader reads; waking a controller
   on part of an entry is `SourceOn`'s job.
@@ -251,15 +258,13 @@ request behind them.
 - **They read the source entry**, and configuration captured at construction,
   such as the options in the context `cluster.New` takes, which decide a pod's
   disruption cost.
-- **A value that depends on another store's entries** is kept current with an
-  index, a `Derive` keyed by the dependency whose `Sources` are the
-  dependents, plus a `TouchOn` that touches the dependents when the
-  dependency changes. A pod's volume usage reads its PVCs' drivers from
-  `PVCs`, which index the pods that mount PVCs by namespace and touch them
-  when a driver resolves (`pvc.go`). A NodeClaim's contribution to its
-  NodePool's disruption counts reads its Node's entry, and a Node's change
-  touches the NodeClaim its owner reference names.
-- **`DependsOn(target, dep, idx)`** is that subscriber over an `Index`: `idx`
+- **A value that depends on another store's entries** reads them, and
+  `DependsOn` keeps it current. A pod's volume usage reads its PVCs' drivers
+  from `PVCs` (`pvc.go`). A value that reads what another store contributes to
+  its own entry needs nothing more: a NodeClaim's contribution to its
+  NodePool's disruption counts reads its own entry's `Derived.Node`, so the
+  Node's change reaches it as a change of the NodeClaim's entry.
+- **`DependsOn(target, dep, idx)`** keeps it current over an `Index`: `idx`
   indexes the source store `target`'s entries by the keys of `dep` they read,
   such as `DependsOn(pods, pvcs, mountsPVC)`, and on each change of `dep`'s
   entry under a key, including one that appears or drops, `DependsOn` touches
@@ -355,35 +360,48 @@ nodeClaim.Reservation = reservations[0]                                         
 ## Reading
 
 ```go
-np, err := nodePools.Get(ctx, client.ObjectKey{Name: name}) // nodePools is a state.Accessor
-np.Object.Spec.Limits                                     // the NodePool, through the client
-np.Derived.Usage                                          // fields derived about it
+np, ok := s.NodePoolState.Get(name)  // an Entry; the NodePool is a deep copy
+np.Object.Spec.Limits
+np.Derived.Usage                     // fields derived about it, shared
 kubeClient.Status().Patch(ctx, np.Object, client.MergeFrom(stored))
+
+for _, nc := range s.NodeClaims.List(client.UnsafeDisableDeepCopy) { // the store's own objects, read-only
+    cluster.ViewOfNodeClaim(nc).Allocatable()
+}
 ```
 
-- **An accessor reads entries and returns a `state.View{Object, Derived,
-  Intent}`.** The object is a deep copy, with `client.UnsafeDisableDeepCopy` as
-  the opt-out. `Derived` and `Intent` are shared and immutable.
-- **`state.StoreAccessor`** reads an object store, and serves `List` selectors
-  and field indexes as the client does, with an `IndexField` for each index.
-  **`state.Accessor`** reads objects through the client, for a kind whose
-  readers need the client's reads, such as NodePools.
-- **A read combines one lookup per store per object.** The node accessor reads
-  a NodeClaim's entry and the entry of the Node it names. A value aggregated
-  across objects is a derived field.
+- **A `Reader` returns entries.** `Get(key, opts...)` returns the `Entry` and
+  whether it exists; `List(opts...)` returns every entry that exists, as an
+  `iter.Seq2` of key and entry.
+- **`Get` and `List` deep-copy the object**, so a caller can change and write
+  it: with the object's `DeepCopy`, as every API object has; a synthetic object
+  without one is a value or never changed by its readers, and is returned as
+  is. `client.UnsafeDisableDeepCopy` returns the store's own object instead,
+  for a hot read that only reads, such as a metrics scrape, a scheduling
+  snapshot or a disruption candidate list. `Derived` and `Intent` are never
+  copied: they're shared and never change.
+- **Options are controller-runtime's.** A `List` takes exactly
+  `client.UnsafeDisableDeepCopy` and a label selector (`client.MatchingLabels`,
+  `client.MatchingLabelsSelector`), a scan, on a store of `metav1.Object`s; a
+  `Get` takes only `client.UnsafeDisableDeepCopy`. Any other option panics,
+  naming it, including `client.MatchingFields`: matching a field is an
+  [Index](#index)'s `List`.
+- **A read takes one lookup per store per object.** A managed node is one
+  NodeClaim entry, which carries its Node. A value aggregated across objects
+  is a derived field.
 - **Readers tolerate lag between stores.** An object and the fields derived
   from other stores may be from different moments, and converge.
-- **An object a store holds is read-only.** A store following an informer holds
-  the informer's own objects, so a `StateNode`'s Node and NodeClaim, an
-  entry's object and a read with `client.UnsafeDisableDeepCopy` are the
-  cache's. Writing one, even through the client, writes the cache: `Create`,
-  `Update`, `Patch`, `Status().Patch` and a `Delete` that leaves the object in
-  storage decode the server's response into the object they're passed. Write
-  a `DeepCopy`, and read conditions with
+- **An object read without a copy is read-only.** It's the informer's own
+  object, as are a NodeClaim entry's `Derived.Node` and a `NodeView`'s
+  `NodeClaim()` and `Node()`. Writing one, even through the client, writes the
+  cache: `Create`, `Update`, `Patch`, `Status().Patch` and a `Delete` that
+  leaves the object in storage decode the server's response into the object
+  they're passed. storelint reports a client write of one. Write a
+  `DeepCopy`, and read conditions with
   `StatusConditions(status.WithObservedOnly())`.
-- **Read an object that has an accessor through it, and write it through the
-  client.** A controller that reads through accessors takes a client of
-  `client.Writer` and `client.StatusClient`.
+- **Read an object that has a store through its `Reader`, and write it
+  through the client.** A controller that reads through Readers takes a
+  client of `client.Writer` and `client.StatusClient`.
 
 ## Reacting
 
@@ -470,31 +488,90 @@ op.WithControllers(ctx, controllers.NewControllers(ctx, mgr, ..., s, ...)...).St
 - **State two or more controllers read lives in `pkg/cluster`.** State one
   controller reads lives with that controller.
 - **Policy lives with its owner:** repair matching in `node/health`,
-  disruptability and budgets in `disruption`. `pkg/cluster` and `StateNode`
-  hold state.
+  disruptability and budgets in `disruption`. `pkg/cluster` holds state, and
+  its node functions do no I/O and carry no policy.
 - **`pkg/state` holds the kind-free primitives,** and `pkg/cluster` holds one
   file per object or synthetic object.
 
 ## The node layout
 
-- **Nodes are an object store keyed by name.** A Node's `Derived` holds the
-  usage of the pods bound to it, from the pod store keyed by `spec.nodeName`,
-  its CSINode's drivers, and its repair policy matches.
-- **NodeClaims are an object store keyed by name.** A NodeClaim's `Derived` is
-  its linked Node's name, contributed from the Node store by owner reference,
-  and its `Intent` is the deletion mark, the nomination and the buffer pods.
-  The node accessor combines the NodeClaim's entry with the Node's entry it
-  names, so a pod event changes only the Node's entry.
-- **A managed Node is read through its NodeClaim's entry.** An unmanaged Node
-  has no owning NodeClaim and no `karpenter.sh/nodepool` label, and is read
-  from the Node store, through the `Cluster{}` entry's unmanaged index.
+```go
+type NodeClaimEntry = state.Entry[*v1.NodeClaim, NodeClaimDerived, NodeClaimIntent]
+type NodeClaimDerived struct {
+    Node                *corev1.Node // the Node whose owner reference names this NodeClaim; nil while in flight
+    Usage               NodeUsage    // that Node's entry's usage
+    RepairPolicyMatches []repair.RepairPolicyMatch
+}
+type NodeEntry = state.Entry[*corev1.Node, NodeDerived, struct{}]
+type NodeDerived struct {
+    Usage               NodeUsage
+    RepairPolicyMatches []repair.RepairPolicyMatch
+}
+```
+
+- **A node's identity is its `NodeKey{NodeClaim, Node}`.** Exactly one field
+  is set: a managed node keys by its NodeClaim's name from the moment the
+  NodeClaim is created, before it has a providerID or a Node, until its entry
+  drops; an unmanaged node keys by its Node's name. The providerID is never a
+  key: `NodeClaimsByProviderID` indexes it.
+- **NodeClaims are the managed nodes, launched or in flight:** an object store
+  keyed by name. A NodeClaim's `Derived` is the Node its owner reference
+  links, that Node's entry's usage and its repair policy matches, until repair
+  derives its own; its `Intent` is the deletion mark, the nomination and the
+  buffer pods. Disruption, static provisioning, limits and nominations read
+  no other node store; a node's pods they read from `PodsByNode`.
+- **Nodes are every Node:** an object store keyed by name. A Node's `Derived`
+  holds the usage of the pods bound to it, from the pod store keyed by
+  `spec.nodeName`, its CSINode's drivers (`NodeUsage.CSIDrivers`) and its
+  repair policy matches. It has no NodeClaim. It's the source of each NodeClaim
+  entry's `Derived`, and only the scheduler, the metrics and the controllers
+  keyed by Node, such as termination and node health, read it.
+- **Two `Derive`s join them:** pods → the Node entry's `Usage`, keyed by
+  `spec.nodeName`; the Node entry → its NodeClaim entry's `Derived`, keyed by
+  the Node's owner reference, once cluster state tracks the Node. A pod event
+  writes the Node entry, then its NodeClaim entry, and the `Derive`s from the
+  NodeClaim store recompute on the NodeClaim's change, comparing an equal
+  contribution away.
+- **From a Node to its NodeClaim, follow the owner reference:**
+  `nodes.Get(pod.Spec.NodeName)`, `cluster.OwnerNodeClaim(node)`, then
+  `nodeClaims.Get`. No field or index holds the link.
+- **`NodeView` is how a reader sees a node's facts:** a concrete struct of
+  three pointers (NodeClaim, Node, usage), passed by value, from
+  `cluster.ViewOfNodeClaim(entry)` or `cluster.ViewOfNode(entry)`, since Go
+  defines no methods on an alias of another package's instantiated generic
+  type. Its methods are `Key`, `NodeName` (the Node's name, `""` while in
+  flight, which pods' `spec.nodeName` compare against; not an identity),
+  `Managed`, `Labels`, `Annotations`, `Taints`, `Capacity`, `Allocatable`,
+  `Available`, `PodRequests`, `PodLimits`, `DaemonSetRequests`,
+  `DaemonSetLimits`, `DisruptionCost`, `HostPortUsage` and `VolumeUsage` (the
+  view's own copies, which a scheduler adds simulated pods to),
+  `Initialized`, `RebootInProgress`, `ProviderID`, `HostName`, `Name` (for
+  logs) and `NodeClaim()`, `Node()` and `Usage()` (the store's, read-only).
+  Labels and taints come from the NodeClaim until the Node registers; capacity
+  and allocatable from the NodeClaim, in place of the Node's zero quantities,
+  until it initializes. Capacity quotas read labels through the same helper.
+- **What only a managed node has are functions of its `NodeClaimEntry`:**
+  `Launched`, `Registered`, `InFlight` (`Derived.Node == nil`), `Deleting`
+  (the deletion mark, a deletion timestamp or a terminating instance),
+  `Nominated(e, now)` and `HasBufferPods`. They do no I/O and carry no policy.
+  Anything that addresses a node, such as a nomination, the deletion mark or a
+  disruption candidate, uses the managed node's entry: Karpenter holds no
+  intent on unmanaged nodes.
+- **An unmanaged Node has no owning NodeClaim and no `karpenter.sh/nodepool`
+  label**, and is read from the Node store through `Nodes.Unmanaged(opts...)`,
+  a typed index of the Node store.
 - **A new Node is registering until its owner reference is set.** It carries
   its `karpenter.sh/nodepool` label from kubelet registration, a provider
-  contract, so it's neither unmanaged nor a second node: its NodeClaim's entry
-  already represents it. Pods bound meanwhile count on the Node's entry and
-  join the NodeClaim's node once the owner reference lands.
+  contract, so it's neither unmanaged nor a second node: its NodeClaim's entry,
+  in flight, already represents it, and the machine counts once. Pods bound
+  meanwhile count on the Node's entry and join the NodeClaim's entry once the
+  owner reference lands.
+- **The scheduler's existing capacity** is each launched NodeClaim's node that
+  isn't `Deleting`, and each unmanaged Node that isn't being deleted, read
+  without a copy (`Provisioner.ExistingNodes`); the deleting ones' pods
+  reschedule.
 - **The cluster-wide counts are the synthetic `Cluster{}` entry**, derived
-  from the NodeClaim and Node stores.
+  from the NodeClaim store.
 
 ## Lint
 
@@ -504,8 +581,8 @@ op.WithControllers(ctx, controllers.NewControllers(ctx, mgr, ..., s, ...)...).St
   outside `pkg/state`;
 - a `Clear()` of a store or of `pkg/cluster` state, or a `Reset()` of
   `cluster.State`, outside a test or `pkg/test`;
-- a `Subscribe`, `Derive`, `DeriveObject` or store constructor in a `New*`
-  function outside `pkg/state` and `pkg/cluster`;
+- a `Subscribe`, `Derive`, `DeriveObject`, `NewIndex`, `DependsOn` or store
+  constructor in a `New*` function outside `pkg/state` and `pkg/cluster`;
 - a store built anywhere but `pkg/state` itself, `pkg/cluster`, a
   `Register(context.Context, manager.Manager) error` method or a test;
 - a shared store added to a manager anywhere but `cluster.State.Register`;
@@ -514,8 +591,19 @@ op.WithControllers(ctx, controllers.NewControllers(ctx, mgr, ..., s, ...)...).St
 - a `Contribution` type without a `statetest.ExpectContribution` test in its
   package;
 - a map or slice field of a store's fields without a `// bounded:` comment;
-- a client write of, or `StatusConditions()` on, an object a `pkg/cluster`
-  value holds.
+- a client write of, or `StatusConditions()` on, an object a store holds: a
+  field of a `pkg/cluster` value, such as a NodeClaim entry's `Derived.Node`;
+  the `Object` of an entry a read returned with `client.UnsafeDisableDeepCopy`,
+  a `pkg/cluster` function returned, or a function was passed; a `NodeView`'s
+  `NodeClaim()` or `Node()`; or a variable holding one;
+- a `client.MatchingFields` passed to a store's or an index's `List`, which
+  panics on it;
+- outside `pkg/cluster`, a node fact `NodeView` owns read straight from a node
+  entry: any field of a NodeClaim entry's `Derived.Node`, and the `Labels`,
+  `Spec.Taints`, `Status.Capacity` or `Status.Allocatable` of a
+  `NodeClaimEntry`'s or `NodeEntry`'s `Object`. A NodeClaim's own spec and
+  status, such as its `NodeClassRef` or conditions, are read from the entry's
+  `Object`.
 
 ## Adding state
 
@@ -526,7 +614,7 @@ op.WithControllers(ctx, controllers.NewControllers(ctx, mgr, ..., s, ...)...).St
    with what it holds, which store feeds it, and when a source stops counting.
 3. Write the contribution type, its `Update`, `Delete` and, for maps, `Equal`.
 4. `Derive` it, and check the laws with `statetest`.
-5. Read it through an accessor, or through the node accessor's combined read.
+5. Read it through its store's `Reader`, or a node's through its `NodeView`.
 
 ## Testing
 
@@ -563,7 +651,9 @@ Tests are Ginkgo specs, one `RunSpecs` suite per package.
   "Intent should lapse WithExpiry once its clock steps past the TTL, and
   notify the lapse" do, and a feed as "FedStore should replace a set of
   objects in one write" does.
-- Read through the accessors as `accessor_test.go` does.
+- Read through a `Reader` as "Reader should deep-copy the object unless
+  UnsafeDisableDeepCopy" and "Reader should panic on an option it doesn't
+  take" do.
 - Start a source on a workqueue and assert on what it queues, as "Store Source
   should enqueue only keys that appear, disappear, or whose narrowed fields
   change, with SourceOn" does, and as each controller's Wakes spec does for
@@ -576,4 +666,7 @@ Tests are Ginkgo specs, one `RunSpecs` suite per package.
   failures and assert on them after it joins; a Gomega failure inside a
   goroutine holding a lock can hang the spec.
 - Drive a Node's registration window as "Registering window" in
-  `pkg/cluster` does.
+  `pkg/cluster` does, and the node model as "Node model should show a pod
+  bound to a registered Node in its NodeClaim entry's usage" and "Node model
+  should leave a registering Node out of Unmanaged, and read a Node with
+  neither an owner nor the NodePool label as unmanaged" do.

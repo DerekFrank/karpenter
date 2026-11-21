@@ -44,12 +44,12 @@ type NodePoolTotals struct {
 //
 // For candidate nodes, we use the accurate RescheduleDisruptionCost already
 // computed from pod objects. For non-candidate nodes, we use the exact
-// disruption cost maintained incrementally on StateNode.
-func computeNodePoolTotals(_ context.Context, allCandidates []*Candidate, allNodes []*karpentercluster.StateNode, clusterCost *karpentercluster.ClusterCost) map[string]NodePoolTotals {
-	// Build candidate lookup by node name for O(1) access.
-	candidateByName := make(map[string]*Candidate, len(allCandidates))
+// disruption cost maintained incrementally on the node's usage.
+func computeNodePoolTotals(_ context.Context, allCandidates []*Candidate, allNodes []karpentercluster.NodeView, clusterCost *karpentercluster.ClusterCost) map[string]NodePoolTotals {
+	// Build candidate lookup by node key for O(1) access.
+	candidateByKey := make(map[karpentercluster.NodeKey]*Candidate, len(allCandidates))
 	for _, c := range allCandidates {
-		candidateByName[c.Name()] = c
+		candidateByKey[c.Key()] = c
 	}
 
 	// First pass over candidates: collect NodePool references and fallback cost.
@@ -79,7 +79,7 @@ func computeNodePoolTotals(_ context.Context, allCandidates []*Candidate, allNod
 		}
 		// Use candidate's precomputed cost when available (accurate, from pod objects).
 		// For non-candidate nodes, use the incrementally-maintained exact disruption cost.
-		if c, found := candidateByName[n.Name()]; found {
+		if c, found := candidateByKey[n.Key()]; found {
 			disruptionByPool[poolName] += c.RescheduleDisruptionCost
 		} else {
 			disruptionByPool[poolName] += n.DisruptionCost()

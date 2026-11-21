@@ -58,13 +58,13 @@ var _ = Describe("NodeClaim-first Nodes", func() {
 			}
 		}
 	}
-	onlyNode := func() *karpentercluster.StateNode {
+	onlyNode := func() karpentercluster.NodeView {
 		GinkgoHelper()
 		ExpectStateNodeCount("==", 1)
-		for n := range cluster.Nodes() {
+		for n := range stateNodes() {
 			return n
 		}
-		return nil
+		return karpentercluster.NodeView{}
 	}
 
 	It("should link a Node to the NodeClaim its owner reference names, whatever its providerID", func() {
@@ -74,9 +74,9 @@ var _ = Describe("NodeClaim-first Nodes", func() {
 		apply(node)
 
 		n := onlyNode()
-		Expect(n.NodeClaim.Name).To(Equal(nodeClaim.Name))
-		Expect(n.Node).ToNot(BeNil())
-		Expect(n.Node.Name).To(Equal(node.Name))
+		Expect(n.NodeClaim().Name).To(Equal(nodeClaim.Name))
+		Expect(n.Node()).ToNot(BeNil())
+		Expect(n.Node().Name).To(Equal(node.Name))
 	})
 	It("should not read an orphaned Node, with the NodePool label and no NodeClaim, as a node", func() {
 		apply(node)
@@ -94,7 +94,7 @@ var _ = Describe("NodeClaim-first Nodes", func() {
 		ExpectStateNodeCount("==", 2)
 		n := ExpectStateNodeExists(cluster, unmanaged)
 		Expect(n.Managed()).To(BeFalse())
-		Expect(n.NodeClaim).To(BeNil())
+		Expect(n.NodeClaim()).To(BeNil())
 
 		// Once a NodeClaim's owner reference names it, it's that NodeClaim's node. The providerID links nothing.
 		claiming := test.NodeClaim(v1.NodeClaim{Status: v1.NodeClaimStatus{ProviderID: unmanaged.Spec.ProviderID}})
@@ -102,7 +102,7 @@ var _ = Describe("NodeClaim-first Nodes", func() {
 		ExpectStateNodeCount("==", 3)
 		apply(nodeclaimutils.UpdateNodeOwnerReferences(ExpectExists(ctx, env.Client, claiming), ExpectExists(ctx, env.Client, unmanaged)))
 		ExpectStateNodeCount("==", 2)
-		Expect(ExpectStateNodeExists(cluster, unmanaged).NodeClaim.Name).To(Equal(claiming.Name))
+		Expect(ExpectStateNodeExists(cluster, unmanaged).NodeClaim().Name).To(Equal(claiming.Name))
 	})
 	It("should keep intent kept about a NodeClaim before its launch once it launches", func() {
 		providerID := nodeClaim.Status.ProviderID
@@ -118,10 +118,11 @@ var _ = Describe("NodeClaim-first Nodes", func() {
 		nodeClaim.Status.ProviderID = providerID
 		apply(nodeClaim, node)
 
-		n := onlyNode()
-		Expect(n.MarkedForDeletion()).To(BeTrue())
-		Expect(n.Nominated(env.Clock)).To(BeTrue())
-		Expect(cluster.IsNodeNominated(nodeClaim.Name)).To(BeTrue())
+		onlyNode()
+		e, _ := cluster.NodeClaims.Get(nodeClaim.Name)
+		Expect(karpentercluster.Deleting(e)).To(BeTrue())
+		Expect(karpentercluster.Nominated(e, env.Clock.Now())).To(BeTrue())
+		Expect(isNodeNominated(nodeClaim.Name)).To(BeTrue())
 		Expect(bufferPodCount(nodeClaim.Name)).To(Equal(2))
 	})
 	It("should count an initialized NodeClaim whose Node is missing as NotReady for disruption budgets", func() {
@@ -145,6 +146,8 @@ var _ = Describe("NodeClaim-first Nodes", func() {
 		ExpectDeleted(ctx, env.Client, nodeClaim)
 
 		apply(test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: nodeClaim.Name}, Status: v1.NodeClaimStatus{ProviderID: test.RandomProviderID()}}))
-		Expect(onlyNode().MarkedForDeletion()).To(BeFalse())
+		onlyNode()
+		e, _ := cluster.NodeClaims.Get(nodeClaim.Name)
+		Expect(karpentercluster.Deleting(e)).To(BeFalse())
 	})
 })

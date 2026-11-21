@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/workqueue"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
@@ -92,20 +93,20 @@ func (n nodeCount) Delete(f NodeCounts) NodeCounts {
 // DeriveNodeHealth returns counts of the tracked Nodes, and of those that unhealthy accepts, per NodePool and across
 // the cluster, kept from now on, for a caller whose idea of unhealthy isn't the matcher's. It builds a store, so a
 // controller calls it from its Register. unhealthy must be pure: it runs on every change of a Node.
-func (s *NodeState) DeriveNodeHealth(unhealthy func(*corev1.Node) bool) *NodeHealth {
+func (n *Nodes) DeriveNodeHealth(unhealthy func(*corev1.Node) bool) *NodeHealth {
 	h := &NodeHealth{
 		store:     state.NewSyntheticStore[nodeHealthKey, nodeHealthKey, NodeCounts, struct{}](func(k nodeHealthKey) nodeHealthKey { return k }),
-		nodes:     s.NodeStore,
+		nodes:     n,
 		unhealthy: unhealthy,
 	}
 	value := func(_ string, node *corev1.Node) nodeCount { return newNodeCount(unhealthy(node)) }
-	state.DeriveObject(s.NodeStore.Reader, h.store, func(_ string, node *corev1.Node) nodeHealthKey {
+	state.DeriveObject(n.Reader, h.store, func(_ string, node *corev1.Node) nodeHealthKey {
 		if np := nodePoolOfNode("", node); np != "" {
 			return nodeHealthKey{NodePool: np}
 		}
 		return nodeHealthKey{}
 	}, value)
-	state.DeriveObject(s.NodeStore.Reader, h.store, func(_ string, node *corev1.Node) nodeHealthKey {
+	state.DeriveObject(n.Reader, h.store, func(_ string, node *corev1.Node) nodeHealthKey {
 		return nodeHealthKey{Cluster: Tracked(node)}
 	}, value)
 	return h
@@ -123,7 +124,7 @@ func (src nodeHealthSource) Start(ctx context.Context, queue workqueue.TypedRate
 		if c.Existed == c.Exists && c.Old.Derived == c.New.Derived {
 			return
 		}
-		for name, e := range h.nodes.List() {
+		for name, e := range h.nodes.List(client.UnsafeDisableDeepCopy) {
 			if !h.unhealthy(e.Object) {
 				continue
 			}
@@ -144,7 +145,7 @@ func (src nodeHealthSource) WaitForSync(ctx context.Context) error {
 // NodeHealth returns the counts of the tracked Nodes labeled with the NodePool, and of those with a condition that
 // matches a repair policy of the matcher cluster state was built with, regardless of toleration.
 func (n *NodePoolState) NodeHealth(nodePoolName string) NodeCounts {
-	return n.Get(nodePoolName).NodeHealth
+	return n.Fields(nodePoolName).NodeHealth
 }
 
 // nodePoolNode is a tracked Node's contribution to its NodePool's NodeHealth.

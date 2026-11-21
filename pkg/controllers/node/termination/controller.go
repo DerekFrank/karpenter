@@ -80,14 +80,14 @@ type Controller struct {
 	cloudProvider cloudprovider.CloudProvider
 	terminator    *terminator.Terminator
 	recorder      events.Recorder
-	nodes         *karpentercluster.NodeState
+	nodes         *karpentercluster.Nodes
 	// draining is the Node store as a source narrowed to the pod count of each deleting managed Node, built in Register.
 	draining source.SyncingSource
 }
 
 // NewController constructs a controller instance. It reconciles a deleting Node when it changes, when a pod binds to it
 // or leaves it, as the node state's pod store sees them, and when a VolumeAttachment of it changes.
-func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, terminator *terminator.Terminator, recorder events.Recorder, nodes *karpentercluster.NodeState) *Controller {
+func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, terminator *terminator.Terminator, recorder events.Recorder, nodes *karpentercluster.Nodes) *Controller {
 	return &Controller{
 		clock:         clk,
 		kubeClient:    kubeClient,
@@ -444,7 +444,7 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 	qps, bucketSize := utilscontroller.GetTypedBucketConfigs(10, minReconciles, maxConcurrentReconciles)
 	// draining narrows each Node's entry to its pod count while it's a deleting managed Node, so a pod binding to or
 	// leaving any other Node, or a pod's status changing, doesn't wake the controller.
-	c.draining = c.nodes.NodeStore.SourceOn(func(_ string, e karpentercluster.NodeEntry) any {
+	c.draining = c.nodes.SourceOn(func(_ string, e karpentercluster.NodeEntry) any {
 		if e.Object.DeletionTimestamp.IsZero() || !nodeutils.IsManaged(e.Object, c.cloudProvider) {
 			return nil
 		}

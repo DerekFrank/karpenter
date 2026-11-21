@@ -43,7 +43,7 @@ import (
 )
 
 var nodePoolController *counter.Controller
-var nodePools *cluster.NodePools
+var nodePools *cluster.NodePoolState
 var ctx context.Context
 var env *test.Environment
 var cloudProvider *fake.CloudProvider
@@ -58,7 +58,7 @@ var _ = BeforeSuite(func() {
 	cloudProvider = fake.NewCloudProvider()
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...))
 	s := cluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	nodePools = s.NodePools
+	nodePools = s.NodePoolState
 	nodePoolController = counter.NewController(env.Overlay, cloudProvider, nodePools)
 })
 
@@ -190,8 +190,8 @@ var _ = Describe("Counter", func() {
 		DeferCleanup(queue.ShutDown)
 		started, stop := context.WithCancel(ctx)
 		DeferCleanup(stop)
-		Expect(nodePools.WaitForSync(started)).To(Succeed())
-		Expect(nodePools.Start(started, queue)).To(Succeed())
+		Expect(nodePools.Source().WaitForSync(started)).To(Succeed())
+		Expect(nodePools.Source().Start(started, queue)).To(Succeed())
 		// Start enqueues each NodePool cluster state holds.
 		Expect(queue.Len()).To(Equal(1))
 		req, _ := queue.Get()

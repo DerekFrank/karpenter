@@ -71,7 +71,10 @@ import (
 var ctx context.Context
 var env *test.Environment
 var clusterCost *karpentercluster.ClusterCost
-var cluster *karpentercluster.NodeState
+var cluster karpentercluster.State
+
+// stores are the stores of cluster that disruption reads.
+var stores disruption.Stores
 var disruptionController *disruption.Controller
 var pricingController *pricing.Controller
 var prov *provisioning.Provisioner
@@ -111,9 +114,10 @@ var _ = BeforeSuite(func() {
 	queue = &disruption.Queue{}
 	cloudProvider.Reset() // installs the fake provider's default repair policies
 	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider, karpentercluster.WithRepairPolicyMatcher(repairPolicyMatcher))
-	cluster = cs.Nodes
+	cluster = cs
+	stores = disruption.StoresOf(cs)
 	clusterCost = cs.Cost
-	pricingController = pricing.NewController(env.Clock, cs.NodePools, cs.NodePoolState, clusterCost)
+	pricingController = pricing.NewController(env.Clock, cs.NodePoolState, clusterCost)
 	useRepairPolicies(cloudProvider.RepairPolicy)
 })
 
@@ -150,13 +154,13 @@ var _ = BeforeEach(func() {
 	metaScheme := runtime.NewScheme()
 	Expect(metav1.AddMetaToScheme(metaScheme)).To(Succeed())
 	Expect(store.RegisterTargetKinds(ctx, &informertest.FakeInformers{Scheme: metaScheme}, prediction.SupportedTargets.UnsortedList()...)).To(Succeed())
-	prov = provisioning.NewProvisioner(env.Overlay, recorder, cloudProvider, cluster, cs.NodePoolState, cs.CapacityQuotaState, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Overlay), store, cs.Nomination, cs.BufferPods, cs.PodScheduling)
+	prov = provisioning.NewProvisioner(env.Overlay, recorder, cloudProvider, provisioning.StoresOf(cluster), cs.NodePoolState, cs.CapacityQuotaState, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Overlay), store, cs.Nomination, cs.BufferPods, cs.PodScheduling)
 
 	// Ensure that we reset the disruption controller's methods after each test run
-	disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost, disruption.WithMethods(NewMethodsWithNopValidator()...))
+	disruptionController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, stores, cs.NodePoolState, queue, clusterCost, disruption.WithMethods(NewMethodsWithNopValidator()...))
 	env.Clock.SetTime(time.Now())
 	cs.Reset()
-	*queue = lo.FromPtr(disruption.NewQueue(env.Overlay, recorder, cluster, env.Clock, prov, cs.Deletion))
+	*queue = lo.FromPtr(disruption.NewQueue(env.Overlay, recorder, cluster.NodeClaims, env.Clock, prov, cs.Deletion))
 
 	// Reset Feature Flags to test defaults
 	ctx = options.ToContext(ctx, test.Options())
@@ -270,11 +274,11 @@ var _ = Describe("Simulate Scheduling", func() {
 		Expect(err).To(Succeed())
 
 		// Generate a candidate
-		stateNode := ExpectStateNodeExists(cluster, nodes[0])
-		candidate, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, stateNode, pdbs, nodePoolMap, nodePoolToInstanceTypesMap, queue, disruption.GracefulDisruptionClass)
+		stateNode := stateNodeOf(nodes[0])
+		candidate, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNode, pdbs, nodePoolMap, nodePoolToInstanceTypesMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(Succeed())
 
-		results, err := disruption.SimulateScheduling(ctx, env.Client, cluster, prov, env.Clock, recorder, nil, disruption.SimulationOptions{}, candidate)
+		results, err := disruption.SimulateScheduling(ctx, env.Client, prov, env.Clock, recorder, nil, disruption.SimulationOptions{}, candidate)
 		Expect(err).To(Succeed())
 		Expect(results.PodErrors[pod]).To(BeNil())
 	})
@@ -492,9 +496,9 @@ var _ = Describe("Simulate Scheduling", func() {
 		hangCreateClient := newHangCreateClient(env.Overlay)
 		defer hangCreateClient.Stop()
 
-		p := provisioning.NewProvisioner(hangCreateClient, recorder, cloudProvider, cluster, cs.NodePoolState, cs.CapacityQuotaState, env.Clock, deviceallocation.NewController(hangCreateClient), virtualpods.NewVirtualPodCache(hangCreateClient), store, cs.Nomination, cs.BufferPods, cs.PodScheduling)
-		q := disruption.NewQueue(hangCreateClient, recorder, cluster, env.Clock, p, cs.Deletion)
-		dc := disruption.NewController(ctx, env.Clock, hangCreateClient, p, cloudProvider, recorder, cluster, cs.NodePoolState, q, clusterCost)
+		p := provisioning.NewProvisioner(hangCreateClient, recorder, cloudProvider, provisioning.StoresOf(cluster), cs.NodePoolState, cs.CapacityQuotaState, env.Clock, deviceallocation.NewController(hangCreateClient), virtualpods.NewVirtualPodCache(hangCreateClient), store, cs.Nomination, cs.BufferPods, cs.PodScheduling)
+		q := disruption.NewQueue(hangCreateClient, recorder, cluster.NodeClaims, env.Clock, p, cs.Deletion)
+		dc := disruption.NewController(ctx, env.Clock, hangCreateClient, p, cloudProvider, recorder, stores, cs.NodePoolState, q, clusterCost)
 
 		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1044,8 +1048,8 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectManualBinding(ctx, env.Client, pod, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating pod disruption, pod has "karpenter.sh/do-not-disrupt" annotation (Pod=%s) (Node=%s)`, client.ObjectKeyFromObject(pod), node.Name)))
 		Expect(disruption.IsPodBlockEvictionError(err)).To(BeTrue())
@@ -1083,8 +1087,8 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectManualBinding(ctx, env.Client, pod, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating pod disruption, pod has "karpenter.sh/do-not-disrupt" annotation (Pod=%s) (Node=%s)`, client.ObjectKeyFromObject(pod), node.Name)))
 		Expect(recorder.DetectedEvent(fmt.Sprintf(`Pod has "karpenter.sh/do-not-disrupt" annotation (Pod=%s)`, client.ObjectKeyFromObject(pod)))).To(BeTrue())
@@ -1122,8 +1126,8 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectManualBinding(ctx, env.Client, pod, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating pod disruption, pod has "karpenter.sh/do-not-disrupt" annotation (Pod=%s) (Node=%s)`, client.ObjectKeyFromObject(pod), node.Name)))
 		Expect(recorder.DetectedEvent(fmt.Sprintf(`Pod has "karpenter.sh/do-not-disrupt" annotation (Pod=%s)`, client.ObjectKeyFromObject(pod)))).To(BeTrue())
@@ -1151,8 +1155,8 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectManualBinding(ctx, env.Client, pod, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		c, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.EventualDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		c, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.EventualDisruptionClass)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(c.NodeClaim).ToNot(BeNil())
 		Expect(c.Node).ToNot(BeNil())
@@ -1183,8 +1187,8 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectManualBinding(ctx, env.Client, pod, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		c, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.EventualDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		c, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.EventualDisruptionClass)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(c.NodeClaim).ToNot(BeNil())
 		Expect(c.Node).ToNot(BeNil())
@@ -1212,8 +1216,8 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectManualBinding(ctx, env.Client, pod, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating pod disruption, pod has "karpenter.sh/do-not-disrupt" annotation (Pod=%s) (Node=%s)`, client.ObjectKeyFromObject(pod), node.Name)))
 		Expect(recorder.DetectedEvent(fmt.Sprintf(`Pod has "karpenter.sh/do-not-disrupt" annotation (Pod=%s)`, client.ObjectKeyFromObject(pod)))).To(BeTrue())
@@ -1248,8 +1252,8 @@ var _ = Describe("Candidate Filtering", func() {
 		pdbLimits, err = pdb.NewLimits(ctx, env.Client)
 		Expect(err).ToNot(HaveOccurred())
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err = disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err = disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating pod disruption, pdb prevents pod evictions (PodDisruptionBudget=[%s]) (Node=%s)`, client.ObjectKeyFromObject(budget), node.Name)))
 		Expect(recorder.DetectedEvent(fmt.Sprintf(`Pdb prevents pod evictions (PodDisruptionBudget=[%s])`, client.ObjectKeyFromObject(budget)))).To(BeTrue())
@@ -1276,8 +1280,8 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectManualBinding(ctx, env.Client, pod, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.EventualDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.EventualDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating pod disruption, pod has "karpenter.sh/do-not-disrupt" annotation (Pod=%s) (Node=%s)`, client.ObjectKeyFromObject(pod), node.Name)))
 		Expect(recorder.DetectedEvent(fmt.Sprintf(`Pod has "karpenter.sh/do-not-disrupt" annotation (Pod=%s)`, client.ObjectKeyFromObject(pod)))).To(BeTrue())
@@ -1311,8 +1315,8 @@ var _ = Describe("Candidate Filtering", func() {
 		pdbLimits, err = pdb.NewLimits(ctx, env.Client)
 		Expect(err).ToNot(HaveOccurred())
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err = disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.EventualDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err = disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.EventualDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating pod disruption, pdb prevents pod evictions (PodDisruptionBudget=[%s]) (Node=%s)`, client.ObjectKeyFromObject(budget), node.Name)))
 		Expect(recorder.DetectedEvent(fmt.Sprintf(`Pdb prevents pod evictions (PodDisruptionBudget=[%s])`, client.ObjectKeyFromObject(budget)))).To(BeTrue())
@@ -1341,8 +1345,8 @@ var _ = Describe("Candidate Filtering", func() {
 
 		ExpectDeletionTimestampSet(ctx, env.Client, pod)
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		c, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		c, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(c.NodeClaim).ToNot(BeNil())
 		Expect(c.Node).ToNot(BeNil())
@@ -1379,8 +1383,8 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectManualBinding(ctx, env.Client, podFailed, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		c, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		c, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(c.NodeClaim).ToNot(BeNil())
 		Expect(c.Node).ToNot(BeNil())
@@ -1402,8 +1406,8 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating node for disruption, disruption is blocked through the "karpenter.sh/do-not-disrupt" annotation (Node=%s)`, node.Name)))
 		Expect(recorder.DetectedEvent(`Disruption is blocked through the "karpenter.sh/do-not-disrupt" annotation`)).To(BeTrue())
@@ -1444,8 +1448,8 @@ var _ = Describe("Candidate Filtering", func() {
 		pdbLimits, err = pdb.NewLimits(ctx, env.Client)
 		Expect(err).ToNot(HaveOccurred())
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err = disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err = disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		// Since we don't want to assume the ordering of the PDBs in the message, we validate the primary error message as well as check that both the budgets are in the message.
 		Expect(err.Error()).To(ContainSubstring("eviction does not support multiple PDBs"))
@@ -1488,8 +1492,8 @@ var _ = Describe("Candidate Filtering", func() {
 		pdbLimits, err = pdb.NewLimits(ctx, env.Client)
 		Expect(err).ToNot(HaveOccurred())
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err = disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err = disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating pod disruption, pdb prevents pod evictions (PodDisruptionBudget=[%s]) (Node=%s)`, client.ObjectKeyFromObject(budget), node.Name)))
 		Expect(recorder.DetectedEvent(fmt.Sprintf(`Pdb prevents pod evictions (PodDisruptionBudget=[%s])`, client.ObjectKeyFromObject(budget)))).To(BeTrue())
@@ -1535,8 +1539,8 @@ var _ = Describe("Candidate Filtering", func() {
 		pdbLimits, err = pdb.NewLimits(ctx, env.Client)
 		Expect(err).ToNot(HaveOccurred())
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err = disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err = disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating pod disruption, pdb prevents pod evictions (PodDisruptionBudget=[%s]) (Node=%s)`, client.ObjectKeyFromObject(budget), node.Name)))
 		Expect(recorder.DetectedEvent(fmt.Sprintf(`Pdb prevents pod evictions (PodDisruptionBudget=[%s])`, client.ObjectKeyFromObject(budget)))).To(BeTrue())
@@ -1581,8 +1585,8 @@ var _ = Describe("Candidate Filtering", func() {
 		pdbLimits, err = pdb.NewLimits(ctx, env.Client)
 		Expect(err).ToNot(HaveOccurred())
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		c, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		c, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(c.NodeClaim).ToNot(BeNil())
 		Expect(c.Node).ToNot(BeNil())
@@ -1612,8 +1616,8 @@ var _ = Describe("Candidate Filtering", func() {
 		pdbLimits, err = pdb.NewLimits(ctx, env.Client)
 		Expect(err).ToNot(HaveOccurred())
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err = disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err = disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating pod disruption, pod has "karpenter.sh/do-not-disrupt" annotation (Pod=%s) (Node=%s)`, client.ObjectKeyFromObject(pod), node.Name)))
 		Expect(recorder.DetectedEvent(fmt.Sprintf(`Pod has "karpenter.sh/do-not-disrupt" annotation (Pod=%s)`, client.ObjectKeyFromObject(pod)))).To(BeTrue())
@@ -1646,8 +1650,8 @@ var _ = Describe("Candidate Filtering", func() {
 		pdbLimits, err = pdb.NewLimits(ctx, env.Client)
 		Expect(err).ToNot(HaveOccurred())
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err = disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err = disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating pod disruption, pdb prevents pod evictions (PodDisruptionBudget=[%s]) (Node=%s)`, client.ObjectKeyFromObject(budget), node.Name)))
 		Expect(recorder.DetectedEvent(fmt.Sprintf(`Pdb prevents pod evictions (PodDisruptionBudget=[%s])`, client.ObjectKeyFromObject(budget)))).To(BeTrue())
@@ -1690,8 +1694,8 @@ var _ = Describe("Candidate Filtering", func() {
 		pdbLimits, err = pdb.NewLimits(ctx, env.Client)
 		Expect(err).ToNot(HaveOccurred())
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		c, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		c, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(c.NodeClaim).ToNot(BeNil())
 		Expect(c.Node).ToNot(BeNil())
@@ -1728,8 +1732,8 @@ var _ = Describe("Candidate Filtering", func() {
 		pdbLimits, err = pdb.NewLimits(ctx, env.Client)
 		Expect(err).ToNot(HaveOccurred())
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		c, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		c, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(c.NodeClaim).ToNot(BeNil())
 		Expect(c.Node).ToNot(BeNil())
@@ -1748,16 +1752,21 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectApplied(ctx, env.Client, nodePool, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, nil)
 		// A Node with the NodePool label and no NodeClaim is orphaned, and isn't a state node at all.
-		Expect(cluster.DeepCopyNodes()).To(BeEmpty())
+		Expect(stateNodes()).To(BeEmpty())
 
-		// Without the label, it's unmanaged: a state node, but never a candidate.
+		// Without the label, it's unmanaged: a Node cluster state holds, but no NodeClaim, so never a candidate.
 		node = ExpectExists(ctx, env.Client, node)
 		delete(node.Labels, v1.NodePoolLabelKey)
 		ExpectApplied(ctx, env.Client, node)
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating node for disruption, node isn't managed by karpenter (Node=%s)`, node.Name)))
+		var unmanaged []string
+		for name := range cluster.Nodes.Unmanaged() {
+			unmanaged = append(unmanaged, name)
+		}
+		Expect(unmanaged).To(ConsistOf(node.Name))
+		Expect(stateNodes()).To(BeEmpty())
+		candidates, err := disruption.GetCandidates(ctx, stores, env.Client, recorder, env.Clock, cloudProvider, func(context.Context, *disruption.Candidate) bool { return true }, disruption.GracefulDisruptionClass, queue)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(candidates).To(BeEmpty())
 	})
 	It("should not consider candidate that has just a NodeClaim representation", func() {
 		nodeClaim, _ := test.NodeClaimAndNode(v1.NodeClaim{
@@ -1773,8 +1782,8 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nil, []*v1.NodeClaim{nodeClaim})
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating node for disruption, nodeclaim does not have an associated node (NodeClaim=%s)`, nodeClaim.Name)))
 	})
@@ -1793,8 +1802,8 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 		cs.Nomination.Nominate(ctx, nodeClaim.Name)
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating node for disruption, node is nominated for a pending pod (Node=%s)`, node.Name)))
 		Expect(recorder.DetectedEvent("Node is nominated for a pending pod")).To(BeTrue())
@@ -1815,8 +1824,8 @@ var _ = Describe("Candidate Filtering", func() {
 
 		ExpectDeletionTimestampSet(ctx, env.Client, nodeClaim)
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating node for disruption, node is deleting or marked for deletion (Node=%s)`, node.Name)))
 	})
@@ -1836,8 +1845,8 @@ var _ = Describe("Candidate Filtering", func() {
 
 		cs.Deletion.Mark(nodeClaim.Name)
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating node for disruption, node is deleting or marked for deletion (Node=%s)`, node.Name)))
 	})
@@ -1855,8 +1864,8 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectApplied(ctx, env.Client, nodePool)
 		node = ExpectRegistered(ctx, env.Client, nodeClaim, node)
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating node for disruption, node isn't initialized nor registered (NodeClaim=%s)`, nodeClaim.Name)))
 	})
@@ -1875,8 +1884,8 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectApplied(ctx, env.Client, nodePool)
 		node = ExpectRegistered(ctx, env.Client, nodeClaim, node)
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating node for disruption, node isn't initialized (Node=%s)`, node.Name)))
 	})
@@ -1893,8 +1902,8 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf(`validating node for disruption, node doesn't have required label (label=karpenter.sh/nodepool) (Node=%s)`, node.Name)))
 		Expect(recorder.DetectedEvent(`Node doesn't have required label (label=karpenter.sh/nodepool)`)).To(BeTrue())
@@ -1917,8 +1926,8 @@ var _ = Describe("Candidate Filtering", func() {
 		delete(nodePoolMap, nodePool.Name)
 		delete(nodePoolInstanceTypeMap, nodePool.Name)
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal(fmt.Sprintf("nodepool not found (NodePool=%s)", nodePool.Name)))
 		Expect(recorder.DetectedEvent(fmt.Sprintf("NodePool not found (NodePool=%s)", nodePool.Name))).To(BeTrue())
@@ -1936,8 +1945,8 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).ToNot(HaveOccurred())
 	})
 	It("should consider candidates that do not have the topology.kubernetes.io/zone label", func() {
@@ -1953,8 +1962,8 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).ToNot(HaveOccurred())
 	})
 	It("should consider candidates that do not have the node.kubernetes.io/instance-type label", func() {
@@ -1970,8 +1979,8 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).ToNot(HaveOccurred())
 	})
 	It("should consider candidates that have an instance type that cannot be resolved", func() {
@@ -1991,8 +2000,8 @@ var _ = Describe("Candidate Filtering", func() {
 		// Mock the InstanceType not existing by removing it from the nodePoolInstanceTypes map
 		delete(nodePoolInstanceTypeMap[nodePool.Name], mostExpensiveInstance.Name)
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		Expect(stateNodes()).To(HaveLen(1))
+		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).ToNot(HaveOccurred())
 	})
 	It("should not consider candidates that are actively being processed in the queue", func() {
@@ -2009,11 +2018,11 @@ var _ = Describe("Candidate Filtering", func() {
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
-		Expect(cluster.DeepCopyNodes()).To(HaveLen(1))
-		cmd := &disruption.Command{Method: disruption.NewDrift(env.Overlay, cluster, prov, recorder, env.Clock), Results: pscheduling.Results{}, Candidates: []*disruption.Candidate{{StateNode: cluster.DeepCopyNodes()[0], NodePool: nodePool}}, Replacements: nil}
+		Expect(stateNodes()).To(HaveLen(1))
+		cmd := &disruption.Command{Method: disruption.NewDrift(env.Overlay, prov, recorder, env.Clock), Results: pscheduling.Results{}, Candidates: []*disruption.Candidate{disruption.NewTestCandidate(stateNodes()[0], nodePool)}, Replacements: nil}
 		Expect(queue.StartCommand(ctx, cmd))
 
-		_, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, cluster.DeepCopyNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
+		_, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNodes()[0], pdbLimits, nodePoolMap, nodePoolInstanceTypeMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(Equal("candidate is already being disrupted"))
 	})
@@ -2313,11 +2322,11 @@ var _ = Describe("Metrics", func() {
 		disruption.MultiNodeConsolidationTimeoutDuration = -time.Second
 		disruption.ConsolidationTimeoutsTotal.Reset()
 
-		c := disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)
+		c := disruption.MakeConsolidation(env.Clock, stores, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)
 		multiNodeConsolidation := disruption.NewMultiNodeConsolidation(c)
 		budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cs.NodePoolState, env.Clock, env.Client, cloudProvider, recorder, multiNodeConsolidation.Reason())
 		Expect(err).ToNot(HaveOccurred())
-		candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, multiNodeConsolidation.ShouldDisrupt, multiNodeConsolidation.Class(), queue)
+		candidates, err := disruption.GetCandidates(ctx, stores, env.Client, recorder, env.Clock, cloudProvider, multiNodeConsolidation.ShouldDisrupt, multiNodeConsolidation.Class(), queue)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(candidates).To(HaveLen(3))
 
@@ -2412,4 +2421,39 @@ func expectPriced() {
 	for i := range nodePools.Items {
 		ExpectReconcileSucceeded(ctx, pricingController, client.ObjectKeyFromObject(&nodePools.Items[i]))
 	}
+}
+
+// stateNodes returns the entries of the launched NodeClaims, the nodes disruption considers, with cluster state's own
+// objects.
+func stateNodes() []karpentercluster.NodeClaimEntry {
+	var nodes []karpentercluster.NodeClaimEntry
+	for _, e := range cluster.NodeClaims.List(client.UnsafeDisableDeepCopy) {
+		if karpentercluster.Launched(e) {
+			nodes = append(nodes, e)
+		}
+	}
+	return nodes
+}
+
+// stateNodeOf returns the entry of the launched NodeClaim whose Node is node, with cluster state's own objects.
+func stateNodeOf(node *corev1.Node) karpentercluster.NodeClaimEntry {
+	GinkgoHelper()
+	for _, e := range stateNodes() {
+		if karpentercluster.ViewOfNodeClaim(e).NodeName() == node.Name {
+			return e
+		}
+	}
+	Fail(fmt.Sprintf("expected a NodeClaim linking Node %s in cluster state", node.Name))
+	return karpentercluster.NodeClaimEntry{}
+}
+
+// stateNodeOfNodeClaim returns the entry of the launched NodeClaim with nodeClaim's providerID, with cluster state's
+// own objects.
+func stateNodeOfNodeClaim(nodeClaim *v1.NodeClaim) karpentercluster.NodeClaimEntry {
+	GinkgoHelper()
+	for _, e := range cluster.NodeClaimsByProviderID.List(nodeClaim.Status.ProviderID, client.UnsafeDisableDeepCopy) {
+		return e
+	}
+	Fail(fmt.Sprintf("expected a NodeClaim with providerID %q in cluster state", nodeClaim.Status.ProviderID))
+	return karpentercluster.NodeClaimEntry{}
 }

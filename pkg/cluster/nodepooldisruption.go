@@ -40,7 +40,7 @@ type NodePoolDisruption struct {
 
 // Disruption returns the NodePool's nodes as its disruption budgets count them.
 func (n *NodePoolState) Disruption(nodePoolName string) NodePoolDisruption {
-	return n.Get(nodePoolName).Disruption
+	return n.Fields(nodePoolName).Disruption
 }
 
 // countsForDisruption returns whether a NodeClaim counts toward its NodePool's disruption budgets. A rebooting

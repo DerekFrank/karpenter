@@ -130,3 +130,67 @@ func disrupt(ctx context.Context, kubeClient client.Writer, node *cluster.StateN
 	_ = node.NodeClaim.StatusConditions(true)
 	_ = node.NodeClaim.DeepCopy().StatusConditions()
 }
+
+// writeEntries writes the objects of entries read without a copy, which are the store's, and of entries read with one,
+// which are the caller's.
+func writeEntries(ctx context.Context, kubeClient client.Writer, nodeClaims *cluster.NodeClaims, idx *state.Index[string, *cluster.NodeClaim, cluster.NodeClaimDerived, struct{}, string]) {
+	copied, _ := nodeClaims.Get("a")
+	_ = kubeClient.Patch(ctx, copied.Object, nil)
+	shared, _ := nodeClaims.Get("a", client.UnsafeDisableDeepCopy)
+	_ = kubeClient.Patch(ctx, shared.Object, nil)   // want `shared.Object is the informer cache's object, which a client write overwrites`
+	_ = kubeClient.Delete(ctx, shared.Derived.Node) // want `shared.Derived.Node is the informer cache's object, which a client write overwrites`
+	_ = kubeClient.Delete(ctx, copied.Derived.Node) // want `copied.Derived.Node is the informer cache's object, which a client write overwrites`
+	nc := shared.Object
+	_ = nc.StatusConditions() // want `nc is the informer cache's object, which StatusConditions\(\) writes`
+	_ = nc.DeepCopy().StatusConditions()
+	for _, e := range nodeClaims.List(client.UnsafeDisableDeepCopy) {
+		_ = kubeClient.Patch(ctx, e.Object, nil)                               // want `e.Object is the informer cache's object, which a client write overwrites`
+		_ = kubeClient.Patch(ctx, cluster.ViewOfNodeClaim(e).NodeClaim(), nil) // want `cluster.ViewOfNodeClaim\(e\).NodeClaim\(\) is the informer cache's object, which a client write overwrites`
+	}
+	for _, e := range nodeClaims.List() {
+		_ = kubeClient.Patch(ctx, e.Object, nil)
+	}
+	for _, e := range idx.List("x", client.UnsafeDisableDeepCopy) {
+		_ = e.Object.StatusConditions() // want `e.Object is the informer cache's object, which StatusConditions\(\) writes`
+	}
+	for _, e := range idx.List("x") {
+		_ = e.Object.StatusConditions()
+	}
+	for _, e := range cluster.LaunchedNodes() {
+		_ = kubeClient.Delete(ctx, e.Object) // want `e.Object is the informer cache's object, which a client write overwrites`
+	}
+	for _, nodeClaim := range cluster.Unlaunched() {
+		_ = kubeClient.Delete(ctx, nodeClaim) // want `nodeClaim is the informer cache's object, which a client write overwrites`
+	}
+}
+
+// fromParameter writes the object of an entry it's passed, which may be a store's own.
+func fromParameter(ctx context.Context, kubeClient client.Writer, e cluster.NodeClaimEntry) {
+	_ = kubeClient.Delete(ctx, e.Object) // want `e.Object is the informer cache's object, which a client write overwrites`
+	_ = kubeClient.Delete(ctx, e.Object.DeepCopy())
+}
+
+// listByField matches a field with a store's List, which panics on it.
+func listByField(nodeClaims *cluster.NodeClaims, idx *state.Index[string, *cluster.NodeClaim, cluster.NodeClaimDerived, struct{}, string]) {
+	for range nodeClaims.List(client.MatchingFields{"status.providerID": "a"}) { // want `client.MatchingFields in a store's List, which panics on it`
+	}
+	for range idx.List("a", client.UnsafeDisableDeepCopy, client.MatchingFields{"x": "y"}) { // want `client.MatchingFields in a store's List`
+	}
+	for range nodeClaims.List(client.MatchingLabels{"a": "b"}, client.UnsafeDisableDeepCopy) {
+	}
+}
+
+// readFacts reads node facts from a node entry, which readers read through the NodeView, and the NodeClaim's own spec
+// and status, which they read from the entry.
+func readFacts(e cluster.NodeClaimEntry) {
+	_ = e.Object.Labels             // want `e.Object.Labels reads a node fact from a node entry's object`
+	_ = e.Object.Spec.Taints        // want `e.Object.Spec.Taints reads a node fact`
+	_ = e.Object.Status.Capacity    // want `e.Object.Status.Capacity reads a node fact`
+	_ = e.Object.Status.Allocatable // want `e.Object.Status.Allocatable reads a node fact`
+	_ = e.Derived.Node.Name         // want `e.Derived.Node.Name reads the Node a NodeClaim entry carries`
+	_ = e.Object.Conditions
+	_ = e.Object.Spec.NodeClassRef
+	_ = e.Object.Status.ProviderID
+	_ = e.Object.DeepCopy()
+	_ = cluster.ViewOfNodeClaim(e).NodeClaim()
+}

@@ -48,32 +48,37 @@ type nodeRankInfo struct {
 // for B/C, math.MinInt32 for A, cleanup=true for D.
 var cs karpentercluster.State
 
-func rankInfoFor(name string, groupA, groupBC, groupD []*karpentercluster.StateNode) nodeRankInfo {
+func rankInfoFor(name string, groupA, groupBC, groupD []karpentercluster.NodeClaimEntry) nodeRankInfo {
 	for _, n := range groupA {
-		if n.Node != nil && n.Node.Name == name {
+		if nodeNameOf(n) == name {
 			return nodeRankInfo{rank: math.MinInt32, cleanup: false, found: true}
 		}
 	}
 	for i, n := range groupBC {
-		if n.Node != nil && n.Node.Name == name {
+		if nodeNameOf(n) == name {
 			return nodeRankInfo{rank: deletioncost.RankForBC(i, len(groupBC)), cleanup: false, found: true}
 		}
 	}
 	for _, n := range groupD {
-		if n.Node != nil && n.Node.Name == name {
+		if nodeNameOf(n) == name {
 			return nodeRankInfo{cleanup: true, found: true}
 		}
 	}
 	return nodeRankInfo{}
 }
 
-func totalRanked(groupA, groupBC, groupD []*karpentercluster.StateNode) int {
+// nodeNameOf is the name of the managed node's Node, "" while it has none.
+func nodeNameOf(n karpentercluster.NodeClaimEntry) string {
+	return karpentercluster.ViewOfNodeClaim(n).NodeName()
+}
+
+func totalRanked(groupA, groupBC, groupD []karpentercluster.NodeClaimEntry) int {
 	return len(groupA) + len(groupBC) + len(groupD)
 }
 
 var ctx context.Context
 var env *test.Environment
-var cluster *karpentercluster.NodeState
+var cluster karpentercluster.State
 var cloudProvider *fake.CloudProvider
 var queue *deletioncost.Queue
 
@@ -93,7 +98,7 @@ var _ = BeforeSuite(func() {
 	ctx = options.ToContext(ctx, opts)
 	cloudProvider = fake.NewCloudProvider()
 	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = cs.Nodes
+	cluster = cs
 })
 
 var _ = AfterSuite(func() {

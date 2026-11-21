@@ -121,7 +121,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 				},
 			})
 			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
-			staticDriftController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost,
+			staticDriftController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, stores, cs.NodePoolState, queue, clusterCost,
 				disruption.WithMethods(disruption.NewStaticDrift(cs.NodePoolState, prov, cloudProvider, recorder)))
 		})
 
@@ -257,7 +257,7 @@ var _ = Describe("TerminateFirstDrift", func() {
 				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock,
 					[]*corev1.Node{node, healthyNode}, []*v1.NodeClaim{nodeClaim, healthyNodeClaim})
 				erroring := &instanceTypesErrorCloudProvider{CloudProvider: cloudProvider, nodePools: []string{nodePool.Name}}
-				staticDriftController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost,
+				staticDriftController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, stores, cs.NodePoolState, queue, clusterCost,
 					disruption.WithMethods(disruption.NewStaticDrift(cs.NodePoolState, prov, erroring, recorder)))
 
 				ExpectSingletonReconciled(ctx, staticDriftController)
@@ -486,8 +486,8 @@ var _ = Describe("TerminateFirstDrift", func() {
 				},
 			})
 			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
-			driftController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost,
-				disruption.WithMethods(disruption.NewDrift(env.Overlay, cluster, prov, recorder, env.Clock)))
+			driftController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, stores, cs.NodePoolState, queue, clusterCost,
+				disruption.WithMethods(disruption.NewDrift(env.Overlay, prov, recorder, env.Clock)))
 		}
 
 		It("issues a delete-only command when the reservation is full and there is no fallback", func() {

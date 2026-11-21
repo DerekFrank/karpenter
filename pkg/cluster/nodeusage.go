@@ -23,6 +23,7 @@ import (
 
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -35,7 +36,8 @@ import (
 	volumeutil "sigs.k8s.io/karpenter/pkg/utils/volume"
 )
 
-// NodeUsage is what the pods bound to a Node use of it, on the Node's entry. A pod counts until it's terminal or gone.
+// NodeUsage is what the pods bound to a Node use of it, and the volumes its CSINode can attach, on the Node's entry and
+// on its NodeClaim's. A pod counts until it's terminal or gone.
 type NodeUsage struct {
 	Pods int
 	// Terminating counts the pods being deleted, which no longer reschedule, and DoNotDisrupt the pods with the
@@ -55,6 +57,9 @@ type NodeUsage struct {
 	Volumes map[volume]int // bounded: PVCs the pods per node mount
 	// AntiAffinityPods are the pods with required anti-affinity.
 	AntiAffinityPods map[types.NamespacedName]*corev1.Pod // bounded: pods per node
+	// CSIDrivers are the drivers of the Node's CSINode, contributed by the CSINode store, which limit the volumes the
+	// Node attaches.
+	CSIDrivers []storagev1.CSINodeDriver // bounded: CSI drivers per node
 }
 
 // volume is a PersistentVolumeClaim a pod mounts, and its CSI driver.
@@ -165,7 +170,7 @@ func (p podContribution) Delete(d NodeDerived) NodeDerived {
 	key := client.ObjectKeyFromObject(p.pod)
 	f.Pods--
 	if f.Pods == 0 {
-		d.Usage = NodeUsage{}
+		d.Usage = NodeUsage{CSIDrivers: f.CSIDrivers}
 		return d
 	}
 	f.Requests = resources.Subtract(f.Requests, p.requests)
@@ -232,8 +237,8 @@ func podNodeKey(_ types.NamespacedName, e PodEntry) string {
 	return lo.Ternary(podutils.IsTerminal(e.Object), "", e.Object.Spec.NodeName)
 }
 
-// volumeUsage returns the node's volume usage: its pods' volumes by driver, against its CSINode's limits.
-func (u NodeUsage) volumeUsage(drivers NodeDerived) *scheduling.VolumeUsage {
+// volumeUsage returns a new volume usage of the node: its pods' volumes by driver, against its CSINode's limits.
+func (u NodeUsage) volumeUsage() *scheduling.VolumeUsage {
 	usage := scheduling.NewVolumeUsage()
 	if len(u.Volumes) > 0 {
 		volumes := scheduling.Volumes{}
@@ -244,7 +249,7 @@ func (u NodeUsage) volumeUsage(drivers NodeDerived) *scheduling.VolumeUsage {
 		}
 		usage.Insert(volumes)
 	}
-	for _, driver := range drivers.CSIDrivers {
+	for _, driver := range u.CSIDrivers {
 		if driver.Allocatable == nil || driver.Allocatable.Count == nil {
 			usage.AddUnbounded(driver.Name)
 			continue

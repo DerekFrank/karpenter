@@ -41,13 +41,11 @@ type PVCDriver struct {
 }
 
 // PVCs are the resolved CSI drivers of the PersistentVolumeClaims, by namespaced name: a fed store. A pod's
-// contribution to its Node's usage reads its PVCs' drivers, so the pods are indexed by the namespace their PVCs are
-// in, and a PVC's change Touches the pods of its namespace that mount it.
+// contribution to its Node's usage reads its PVCs' drivers, so the pods depend on the PVCs they mount
+// (state.DependsOn): a PVC's change recomputes the pods that mount it.
 type PVCs struct {
 	state.Reader[types.NamespacedName, PVCDriver, struct{}, struct{}]
 	store *state.Store[types.NamespacedName, PVCDriver, struct{}, struct{}]
-	// mounts indexes the pods that mount a PVC by namespace: its Sources are the dependents of a namespace's PVCs.
-	mounts *state.Derivation[types.NamespacedName, string, int, mountsPVCs]
 }
 
 func newPVCs() *PVCs {
@@ -82,47 +80,17 @@ func (p *PVCs) driver(pvc types.NamespacedName) string {
 	return e.Object.Driver
 }
 
-// mountsPVCs is a pod that mounts a PVC's contribution to its namespace's count in the index. The pods themselves are
-// the index Derive's sources.
-type mountsPVCs int
-
-func (m mountsPVCs) Update(f int, prev mountsPVCs) int { return f + int(m-prev) }
-func (m mountsPVCs) Delete(f int) int                  { return f - int(m) }
-
-// index keeps the pods that mount a PVC current with the PVCs' drivers: a Derive keyed by the namespace whose
-// Sources are the pods, and a subscriber that Touches the pods that mount a PVC when its driver changes.
-func (p *PVCs) index(pods *Pods) {
-	namespaces := state.NewSyntheticStore[string, string, int, struct{}](func(ns string) string { return ns })
-	p.mounts = state.DeriveObject(pods.Reader, namespaces,
-		func(_ types.NamespacedName, pod *corev1.Pod) string {
-			for _, v := range pod.Spec.Volumes {
-				if volumeutil.PersistentVolumeClaimName(pod, v) != "" {
-					return pod.Namespace
-				}
-			}
-			return ""
-		},
-		func(types.NamespacedName, *corev1.Pod) mountsPVCs { return 1 })
-	state.TouchOn(p.Reader, pods.store, func(c state.Change[types.NamespacedName, PVCDriver, struct{}, struct{}]) []types.NamespacedName {
-		var mounting []types.NamespacedName
-		for _, name := range p.mounts.Sources(c.Key.Namespace) {
-			if e, ok := pods.Get(name); ok && mounts(e.Object, c.Key) {
-				mounting = append(mounting, name)
+// dependOn keeps the pods' contributions current with the drivers of the PVCs they mount: an Index of the pods by
+// each PVC they mount, and DependsOn, which recomputes the pods that mount a PVC when its driver changes.
+func (p *PVCs) dependOn(pods *Pods) {
+	mountsPVC := state.NewIndex(pods.store, func(_ types.NamespacedName, e PodEntry) []types.NamespacedName {
+		var pvcs []types.NamespacedName
+		for _, v := range e.Object.Spec.Volumes {
+			if name := volumeutil.PersistentVolumeClaimName(e.Object, v); name != "" {
+				pvcs = append(pvcs, types.NamespacedName{Namespace: e.Object.Namespace, Name: name})
 			}
 		}
-		return mounting
+		return pvcs
 	})
-}
-
-// mounts returns whether the pod mounts the PVC.
-func mounts(pod *corev1.Pod, pvc types.NamespacedName) bool {
-	if pod.Namespace != pvc.Namespace {
-		return false
-	}
-	for _, v := range pod.Spec.Volumes {
-		if volumeutil.PersistentVolumeClaimName(pod, v) == pvc.Name {
-			return true
-		}
-	}
-	return false
+	state.DependsOn(pods.store, p.Reader, mountsPVC)
 }

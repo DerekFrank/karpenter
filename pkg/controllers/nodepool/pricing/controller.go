@@ -23,10 +23,8 @@ import (
 
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
-	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/utils/clock"
 	controllerruntime "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -64,17 +62,15 @@ var CostTrackingErrorsTotal = opmetrics.NewPrometheusCounter(
 // https://github.com/kubernetes-sigs/karpenter/issues/2605
 type Controller struct {
 	clock         clock.Clock
-	nodePools     *cluster.NodePools
 	nodePoolState *cluster.NodePoolState
 	cost          *cluster.ClusterCost
 	// refreshedAt is when each NodePool's prices were last read. The controller reconciles one NodePool at a time.
 	refreshedAt map[string]time.Time
 }
 
-func NewController(clk clock.Clock, nodePools *cluster.NodePools, nodePoolState *cluster.NodePoolState, cost *cluster.ClusterCost) *Controller {
+func NewController(clk clock.Clock, nodePoolState *cluster.NodePoolState, cost *cluster.ClusterCost) *Controller {
 	return &Controller{
 		clock:         clk,
-		nodePools:     nodePools,
 		nodePoolState: nodePoolState,
 		cost:          cost,
 		refreshedAt:   map[string]time.Time{},
@@ -87,13 +83,11 @@ func (c *Controller) Name() string {
 
 func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
-	nodePool, err := c.nodePools.Get(ctx, req.NamespacedName)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			c.cost.DropPrices(req.Name)
-			delete(c.refreshedAt, req.Name)
-		}
-		return reconcile.Result{}, client.IgnoreNotFound(err)
+	nodePool, ok := c.nodePoolState.Get(req.Name)
+	if !ok {
+		c.cost.DropPrices(req.Name)
+		delete(c.refreshedAt, req.Name)
+		return reconcile.Result{}, nil
 	}
 	if refreshedAt, ok := c.refreshedAt[req.Name]; ok && c.cost.Priced(req.Name) && c.clock.Since(refreshedAt) < refreshPeriod {
 		return reconcile.Result{RequeueAfter: refreshPeriod - c.clock.Since(refreshedAt)}, nil //storelint:poll the cloud provider's prices

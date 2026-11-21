@@ -19,6 +19,7 @@ package cluster_test
 import (
 	"context"
 	"fmt"
+	"iter"
 	"math/rand"
 	"net"
 	"sync"
@@ -37,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -477,14 +479,14 @@ var _ = Describe("Node Resource Level", func() {
 
 		ExpectManualBinding(ctx, env.Client, pod1, node)
 
-		for n := range cluster.Nodes() {
+		for n := range stateNodes() {
 			ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2.5")}, n.Available())
 			ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1.5")}, n.PodRequests())
 		}
 
 		// delete the node and the internal state should disappear as well
 		ExpectDeleted(ctx, env.Client, node)
-		for range cluster.Nodes() {
+		for range stateNodes() {
 			Fail("shouldn't be called as the node was deleted")
 		}
 	})
@@ -510,7 +512,7 @@ var _ = Describe("Node Resource Level", func() {
 
 		ExpectManualBinding(ctx, env.Client, pod1, node1)
 
-		for n := range cluster.Nodes() {
+		for n := range stateNodes() {
 			ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2.5")}, n.Available())
 			ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1.5")}, n.PodRequests())
 		}
@@ -542,8 +544,8 @@ var _ = Describe("Node Resource Level", func() {
 		// deleted the pod and then recreated it, but simulated only receiving an event on the new pod after it has
 		// bound and not getting the new node event entirely
 
-		for n := range cluster.Nodes() {
-			if n.Node.Name == node1.Name {
+		for n := range stateNodes() {
+			if n.Node().Name == node1.Name {
 				// not on node1 any longer, so it should be fully free
 				ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")}, n.Available())
 				ExpectResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0")}, n.PodRequests())
@@ -708,7 +710,8 @@ var _ = Describe("Node Resource Level", func() {
 		Expect(env.Client.Delete(ctx, node)).To(Succeed())
 
 		ExpectNodeExists(ctx, env.Client, node.Name)
-		Expect(ExpectStateNodeExists(cluster, node).MarkedForDeletion()).To(BeTrue())
+		// An unmanaged Node with a deletion timestamp is deleting: its pods reschedule.
+		Expect(ExpectStateNodeExists(cluster, node).Node().DeletionTimestamp.IsZero()).To(BeFalse())
 	})
 	It("should mark node for deletion when nodeclaim is deleted", func() {
 		nodeClaim := test.NodeClaim(v1.NodeClaim{
@@ -759,8 +762,8 @@ var _ = Describe("Node Resource Level", func() {
 		Expect(env.Client.Delete(ctx, nodeClaim)).To(Succeed())
 		ExpectExists(ctx, env.Client, nodeClaim)
 
-		Expect(ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim).MarkedForDeletion()).To(BeTrue())
-		Expect(ExpectStateNodeExists(cluster, node).MarkedForDeletion()).To(BeTrue())
+		Expect(karpentercluster.Deleting(ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim))).To(BeTrue())
+		Expect(karpentercluster.Deleting(nodeClaimEntryOf(node))).To(BeTrue())
 	})
 	It("should nominate the node until the nomination time passes", func() {
 		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
@@ -782,11 +785,11 @@ var _ = Describe("Node Resource Level", func() {
 		cs.Nomination.Nominate(ctx, nodeClaim.Name)
 
 		// Expect that the node is now nominated
-		Expect(ExpectStateNodeExists(cluster, node).Nominated(env.Clock)).To(BeTrue())
+		Expect(karpentercluster.Nominated(nodeClaimEntryOf(node), env.Clock.Now())).To(BeTrue())
 		env.Clock.Step(time.Second * 10) // nomination window is 20s so it should still be nominated
-		Expect(ExpectStateNodeExists(cluster, node).Nominated(env.Clock)).To(BeTrue())
+		Expect(karpentercluster.Nominated(nodeClaimEntryOf(node), env.Clock.Now())).To(BeTrue())
 		env.Clock.Step(time.Second * 11) // past 20s, node should no longer be nominated
-		Expect(ExpectStateNodeExists(cluster, node).Nominated(env.Clock)).To(BeFalse())
+		Expect(karpentercluster.Nominated(nodeClaimEntryOf(node), env.Clock.Now())).To(BeFalse())
 	})
 	It("should handle a node changing from no providerID to registering a providerID", func() {
 		node := test.Node()
@@ -837,7 +840,7 @@ var _ = Describe("Pod Anti-Affinity", func() {
 		ExpectManualBinding(ctx, env.Client, pod, node)
 
 		foundPodCount := 0
-		cluster.ForPodsWithAntiAffinity(func(p *corev1.Pod, n *corev1.Node) bool {
+		cluster.Nodes.ForPodsWithAntiAffinity(func(p *corev1.Pod, n *corev1.Node) bool {
 			foundPodCount++
 			Expect(p.Name).To(Equal(pod.Name))
 			return true
@@ -879,7 +882,7 @@ var _ = Describe("Pod Anti-Affinity", func() {
 		ExpectManualBinding(ctx, env.Client, pod, node)
 
 		foundPodCount := 0
-		cluster.ForPodsWithAntiAffinity(func(p *corev1.Pod, n *corev1.Node) bool {
+		cluster.Nodes.ForPodsWithAntiAffinity(func(p *corev1.Pod, n *corev1.Node) bool {
 			foundPodCount++
 			Fail("shouldn't track pods with preferred anti-affinity")
 			return true
@@ -918,7 +921,7 @@ var _ = Describe("Pod Anti-Affinity", func() {
 		ExpectManualBinding(ctx, env.Client, pod, node)
 
 		foundPodCount := 0
-		cluster.ForPodsWithAntiAffinity(func(p *corev1.Pod, n *corev1.Node) bool {
+		cluster.Nodes.ForPodsWithAntiAffinity(func(p *corev1.Pod, n *corev1.Node) bool {
 			foundPodCount++
 			Expect(p.Name).To(Equal(pod.Name))
 			return true
@@ -927,7 +930,7 @@ var _ = Describe("Pod Anti-Affinity", func() {
 
 		ExpectDeleted(ctx, env.Client, client.Object(pod))
 		foundPodCount = 0
-		cluster.ForPodsWithAntiAffinity(func(p *corev1.Pod, n *corev1.Node) bool {
+		cluster.Nodes.ForPodsWithAntiAffinity(func(p *corev1.Pod, n *corev1.Node) bool {
 			foundPodCount++
 			Fail("should not be called as the pod was deleted")
 			return true
@@ -969,7 +972,7 @@ var _ = Describe("Pod Anti-Affinity", func() {
 		ExpectDeleted(ctx, env.Client, node)
 
 		foundPodCount := 0
-		cluster.ForPodsWithAntiAffinity(func(p *corev1.Pod, n *corev1.Node) bool {
+		cluster.Nodes.ForPodsWithAntiAffinity(func(p *corev1.Pod, n *corev1.Node) bool {
 			foundPodCount++
 			return true
 		})
@@ -994,7 +997,7 @@ var _ = Describe("Cluster State Sync", func() {
 		}
 		wg.Wait()
 
-		Expect(cluster.NodeClaimsLaunched()).To(BeTrue())
+		Expect(cluster.Cluster.NodeClaimsLaunched()).To(BeTrue())
 		ExpectStateNodeCount("==", 1000)
 	})
 	It("should consider the cluster state synced when nodes don't have provider id", func() {
@@ -1010,7 +1013,7 @@ var _ = Describe("Cluster State Sync", func() {
 			}()
 		}
 		wg.Wait()
-		Expect(cluster.NodeClaimsLaunched()).To(BeTrue())
+		Expect(cluster.Cluster.NodeClaimsLaunched()).To(BeTrue())
 		ExpectStateNodeCount("==", 1000)
 
 	})
@@ -1030,7 +1033,7 @@ var _ = Describe("Cluster State Sync", func() {
 		}
 		wg.Wait()
 		ExpectStateNodeCount("==", 1000)
-		Expect(cluster.NodeClaimsLaunched()).To(BeTrue())
+		Expect(cluster.Cluster.NodeClaimsLaunched()).To(BeTrue())
 		for i := range 1000 {
 			wg.Add(1)
 			go func(index int) {
@@ -1041,7 +1044,7 @@ var _ = Describe("Cluster State Sync", func() {
 			}(i)
 		}
 		wg.Wait()
-		Expect(cluster.NodeClaimsLaunched()).To(BeTrue())
+		Expect(cluster.Cluster.NodeClaimsLaunched()).To(BeTrue())
 		ExpectStateNodeCount("==", 1000)
 	})
 	It("should consider the cluster state synced when all nodeclaims are tracked", func() {
@@ -1061,7 +1064,7 @@ var _ = Describe("Cluster State Sync", func() {
 			}()
 		}
 		wg.Wait()
-		Expect(cluster.NodeClaimsLaunched()).To(BeTrue())
+		Expect(cluster.Cluster.NodeClaimsLaunched()).To(BeTrue())
 	})
 	It("should consider the cluster state synced when a combination of nodeclaims and node are tracked", func() {
 		// Deploy 250 nodes to the cluster that also have nodeclaims
@@ -1111,7 +1114,7 @@ var _ = Describe("Cluster State Sync", func() {
 			}()
 		}
 		wg.Wait()
-		Expect(cluster.NodeClaimsLaunched()).To(BeTrue())
+		Expect(cluster.Cluster.NodeClaimsLaunched()).To(BeTrue())
 	})
 	It("should consider the cluster state synced when the representation of nodes is the same", func() {
 		// Deploy 500 nodeClaims to the cluster, apply the linked nodes, but don't sync them
@@ -1133,7 +1136,7 @@ var _ = Describe("Cluster State Sync", func() {
 			}()
 		}
 		wg.Wait()
-		Expect(cluster.NodeClaimsLaunched()).To(BeTrue())
+		Expect(cluster.Cluster.NodeClaimsLaunched()).To(BeTrue())
 	})
 	It("shouldn't consider the cluster state synced if a nodeclaim hasn't resolved its provider id", func() {
 		// Deploy 1000 nodeClaims and sync them all with the cluster
@@ -1156,24 +1159,24 @@ var _ = Describe("Cluster State Sync", func() {
 			}(i)
 		}
 		wg.Wait()
-		Expect(cluster.NodeClaimsLaunched()).To(BeFalse())
+		Expect(cluster.Cluster.NodeClaimsLaunched()).To(BeFalse())
 	})
 	It("shouldn't consider the cluster state synced if a nodeclaim hasn't launched", func() {
 		nodeClaim := test.NodeClaim()
 		nodeClaim.Status.ProviderID = ""
 
 		ExpectApplied(ctx, env.Client, nodeClaim)
-		Expect(cluster.NodeClaimsLaunched()).To(BeFalse())
+		Expect(cluster.Cluster.NodeClaimsLaunched()).To(BeFalse())
 	})
 	It("shouldn't consider the cluster state synced if a nodeclaim without a providerID is deleted", func() {
 		nodeClaim := test.NodeClaim(v1.NodeClaim{})
 		nodeClaim.Status.ProviderID = ""
 
 		ExpectApplied(ctx, env.Client, nodeClaim)
-		Expect(cluster.NodeClaimsLaunched()).To(BeFalse())
+		Expect(cluster.Cluster.NodeClaimsLaunched()).To(BeFalse())
 
 		ExpectDeleted(ctx, env.Client, nodeClaim)
-		Expect(cluster.NodeClaimsLaunched()).To(BeTrue())
+		Expect(cluster.Cluster.NodeClaimsLaunched()).To(BeTrue())
 	})
 })
 
@@ -1185,7 +1188,7 @@ var _ = Describe("DaemonSet Pods", func() {
 			}},
 		)
 		ExpectApplied(ctx, env.Client, daemonset)
-		daemonsetPod := cluster.GetDaemonSetPod(daemonset)
+		daemonsetPod := karpentercluster.DaemonSetPod(cluster.PodsByDaemonSet, daemonset)
 		Expect(daemonsetPod).To(BeNil())
 	})
 	It("should update daemonsetCache when daemonset pod is created", func() {
@@ -1276,15 +1279,15 @@ var _ = Describe("DaemonSet Pods", func() {
 		ExpectApplied(ctx, env.Client, older)
 		time.Sleep(time.Second) // Making sure the two pods have different creationTime
 		ExpectApplied(ctx, env.Client, newer)
-		Expect(cluster.GetDaemonSetPod(daemonset).Name).To(Equal(newer.Name))
+		Expect(karpentercluster.DaemonSetPod(cluster.PodsByDaemonSet, daemonset).Name).To(Equal(newer.Name))
 
 		// The sample is the newest pod left, chosen at read time from the DaemonSet's pods.
 		ExpectDeleted(ctx, env.Client, newer)
-		Expect(cluster.GetDaemonSetPod(daemonset).Name).To(Equal(older.Name))
+		Expect(karpentercluster.DaemonSetPod(cluster.PodsByDaemonSet, daemonset).Name).To(Equal(older.Name))
 
 		// The DaemonSet goes with its last pod, though the DaemonSet itself remains.
 		ExpectDeleted(ctx, env.Client, older)
-		Expect(cluster.GetDaemonSetPod(daemonset)).To(BeNil())
+		Expect(karpentercluster.DaemonSetPod(cluster.PodsByDaemonSet, daemonset)).To(BeNil())
 	})
 	It("should drop the DaemonSet's pod once the pod is orphaned", func() {
 		daemonset := test.DaemonSet()
@@ -1293,13 +1296,13 @@ var _ = Describe("DaemonSet Pods", func() {
 			APIVersion: "apps/v1", Kind: "DaemonSet", Name: daemonset.Name, UID: daemonset.UID, Controller: new(true),
 		}}}})
 		ExpectApplied(ctx, env.Client, pod)
-		Expect(cluster.GetDaemonSetPod(daemonset)).ToNot(BeNil())
+		Expect(karpentercluster.DaemonSetPod(cluster.PodsByDaemonSet, daemonset)).ToNot(BeNil())
 
 		// The garbage collector orphans a deleted DaemonSet's pods by dropping their owner reference.
 		ExpectDeleted(ctx, env.Client, daemonset)
 		pod.OwnerReferences = nil
 		ExpectApplied(ctx, env.Client, pod)
-		Expect(cluster.GetDaemonSetPod(daemonset)).To(BeNil())
+		Expect(karpentercluster.DaemonSetPod(cluster.PodsByDaemonSet, daemonset)).To(BeNil())
 	})
 	It("should delete daemonset in cache when daemonset is deleted", func() {
 		daemonset := test.DaemonSet(
@@ -1330,7 +1333,7 @@ var _ = Describe("DaemonSet Pods", func() {
 
 		ExpectDeleted(ctx, env.Client, daemonset, daemonsetPod)
 
-		Expect(cluster.GetDaemonSetPod(daemonset)).To(BeNil())
+		Expect(karpentercluster.DaemonSetPod(cluster.PodsByDaemonSet, daemonset)).To(BeNil())
 	})
 	It("should only return daemonset pods from the daemonset cache", func() {
 		daemonset := test.DaemonSet(
@@ -1345,7 +1348,7 @@ var _ = Describe("DaemonSet Pods", func() {
 			},
 		})
 		ExpectApplied(ctx, env.Client, lo.Map(otherPods, func(p *corev1.Pod, _ int) client.Object { return p })...)
-		Expect(cluster.GetDaemonSetPod(daemonset)).To(BeNil())
+		Expect(karpentercluster.DaemonSetPod(cluster.PodsByDaemonSet, daemonset)).To(BeNil())
 	})
 })
 
@@ -1367,7 +1370,7 @@ var _ = Describe("Data Races", func() {
 			defer GinkgoRecover()
 			defer wg.Done()
 			for {
-				_ = cluster.NodeClaimsLaunched()
+				_ = cluster.Cluster.NodeClaimsLaunched()
 				if cancelCtx.Err() != nil {
 					return
 				}
@@ -1389,7 +1392,7 @@ var _ = Describe("Data Races", func() {
 			defer GinkgoRecover()
 			defer wg.Done()
 			for {
-				_ = cluster.NodeClaimsLaunched()
+				_ = cluster.Cluster.NodeClaimsLaunched()
 				if cancelCtx.Err() != nil {
 					return
 				}
@@ -1586,7 +1589,7 @@ var _ = Describe("StateNode Capacity", func() {
 		})
 		ExpectApplied(ctx, env.Client, nodeClaim)
 
-		stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim)
+		stateNode := karpentercluster.ViewOfNodeClaim(ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim))
 		capacity := stateNode.Capacity()
 
 		Expect(capacity[resources.Node]).To(Equal(resource.MustParse("1")))
@@ -1617,7 +1620,7 @@ var _ = Describe("StateNode Capacity", func() {
 func ExpectStateNodeCount(comparator string, count int) int {
 	GinkgoHelper()
 	c := 0
-	for range cluster.Nodes() {
+	for range stateNodes() {
 		c++
 	}
 	Expect(c).To(BeNumerically(comparator, count))
@@ -1628,8 +1631,45 @@ func ExpectStateNodeCount(comparator string, count int) int {
 // pod, whose TypeMeta the cache sets, so the pods compare without it.
 func expectDaemonSetPod(daemonset *appsv1.DaemonSet, pod *corev1.Pod) {
 	GinkgoHelper()
-	got := cluster.GetDaemonSetPod(daemonset)
+	got := karpentercluster.DaemonSetPod(cluster.PodsByDaemonSet, daemonset)
 	Expect(got).ToNot(BeNil())
 	Expect(got.ObjectMeta).To(Equal(pod.ObjectMeta))
 	Expect(got.Spec).To(Equal(pod.Spec))
+}
+
+// stateNodes are the nodes as the scheduler reads them: each launched NodeClaim's node, and each unmanaged Node.
+func stateNodes() iter.Seq[karpentercluster.NodeView] {
+	return func(yield func(karpentercluster.NodeView) bool) {
+		for _, e := range cluster.NodeClaims.List() {
+			if karpentercluster.Launched(e) && !yield(karpentercluster.ViewOfNodeClaim(e)) {
+				return
+			}
+		}
+		for _, e := range cluster.Nodes.Unmanaged() {
+			if !yield(karpentercluster.ViewOfNode(e)) {
+				return
+			}
+		}
+	}
+}
+
+// nodeClaimEntryOf returns the entry of the NodeClaim the Node's owner reference names, as cluster state reads it: the
+// Node from the Node store, then the NodeClaim its owner reference names.
+func nodeClaimEntryOf(node *corev1.Node) karpentercluster.NodeClaimEntry {
+	GinkgoHelper()
+	n, ok := cluster.Nodes.Get(node.Name)
+	Expect(ok).To(BeTrue(), "cluster state holds no Node %s", node.Name)
+	e, ok := cluster.NodeClaims.Get(karpentercluster.OwnerNodeClaim(n.Object))
+	Expect(ok).To(BeTrue(), "cluster state holds no NodeClaim for Node %s", node.Name)
+	return e
+}
+
+func isNodeNominated(nodeClaimName string) bool {
+	e, ok := cluster.NodeClaims.Get(nodeClaimName)
+	return ok && karpentercluster.Nominated(e, env.Clock.Now())
+}
+
+func hasBufferPods(nodeClaimName string) bool {
+	e, _ := cluster.NodeClaims.Get(nodeClaimName)
+	return karpentercluster.HasBufferPods(e)
 }

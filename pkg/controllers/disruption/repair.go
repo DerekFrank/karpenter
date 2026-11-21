@@ -27,6 +27,7 @@ import (
 	"github.com/awslabs/operatorpkg/status"
 	"github.com/samber/lo"
 	"k8s.io/apimachinery/pkg/api/equality"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -61,7 +62,7 @@ type Repair struct {
 // NewRepair constructs the repair method around the matcher cluster state matches Nodes with. It panics when cluster
 // state has none, since repair.NewRepairPolicyMatcher only returns nil when node repair is disabled or replaced by --legacy-node-repair.
 func NewRepair(c consolidation) *Repair {
-	policyMatcher := c.cluster.RepairPolicyMatcher()
+	policyMatcher := c.cluster.RepairPolicyMatcher
 	if policyMatcher == nil {
 		panic("node repair requires cluster state built with a repair policy matcher")
 	}
@@ -85,7 +86,7 @@ func (r *Repair) ShouldDisrupt(ctx context.Context, c *Candidate) bool {
 		panic(fmt.Sprintf("repair candidate has no Node: %#v", c))
 	}
 	// Cluster state matches the Node against the repair policies as it changes; only the toleration is resolved here.
-	c.RepairPolicyResult = c.GetRepairResult(r.clock.Now())
+	c.RepairPolicyResult = repairResult(c.Entry, r.clock.Now())
 	// Resolve rejects an empty Action, so this also skips healthy Nodes and those still within toleration.
 	if !r.rebootHistory.Resolve(c) {
 		return false
@@ -233,7 +234,7 @@ func (r *Repair) computeCommands(ctx context.Context, disruptionBudgetMapping ma
 			}}, nil
 		}
 		// Repair pre-spins for all reschedulable workload, including pods whose eviction is currently blocked.
-		results, terminateFirst, err := SimulateSchedulingWithReservedFallback(ctx, r.kubeClient, r.cluster, r.provisioner, r.clock, r.recorder, candidate,
+		results, terminateFirst, err := SimulateSchedulingWithReservedFallback(ctx, r.kubeClient, r.provisioner, r.clock, r.recorder, candidate,
 			terminateFirstEnabled, SimulationOptions{IncludeBlockedCandidatePods: true})
 		if err != nil {
 			if errors.Is(err, errCandidateDeleting) {
@@ -338,3 +339,20 @@ func (r *Repair) Reason() v1.DisruptionReason { return v1.DisruptionReasonUnheal
 func (r *Repair) Class() string { return RepairDisruptionClass }
 
 func (r *Repair) ConsolidationType() string { return "" }
+
+// repairResult returns the repair decision for the managed node's Node at now, from the policy matches cluster state
+// keeps current on its NodeClaim's entry. An empty Action means no policy applies or none has waited out its toleration
+// yet. Tolerations are measured from no earlier than the end of the last reboot, since a node rejoins uninitialized
+// after a successful reboot and its conditions may not have caught up yet.
+func repairResult(e karpentercluster.NodeClaimEntry, now time.Time) repair.RepairResult {
+	if karpentercluster.InFlight(e) {
+		return repair.RepairResult{}
+	}
+	var rebootFinishedAt time.Time
+	for i := range e.Object.Status.Conditions {
+		if c := e.Object.Status.Conditions[i]; c.Type == v1.ConditionTypeRebooting && c.Status == metav1.ConditionFalse {
+			rebootFinishedAt = c.LastTransitionTime.Time
+		}
+	}
+	return repair.Resolve(e.Derived.RepairPolicyMatches, now, rebootFinishedAt)
+}

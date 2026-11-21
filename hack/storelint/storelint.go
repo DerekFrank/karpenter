@@ -60,7 +60,7 @@ const (
 // builders are the pkg/state functions that build a store, a Derive, Claims or an intent handle.
 var builders = map[string]bool{
 	"NewObjectStore": true, "NewFedStore": true, "NewSyntheticStore": true,
-	"Derive": true, "DeriveObject": true, "NewClaims": true, "NewIntent": true, "TouchOn": true,
+	"Derive": true, "DeriveObject": true, "NewClaims": true, "NewIntent": true, "NewIndex": true, "DependsOn": true,
 }
 
 // derives are the builders whose second argument is the target they write.
@@ -82,6 +82,7 @@ var Analyzer = &analysis.Analyzer{
 
 func run(pass *analysis.Pass) (any, error) {
 	in := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
+	h := newHeld(pass)
 	readsStores := importsAny(pass.Pkg, statePkg, clusterPkg) && pass.Pkg.Path() != statePkg
 	in.WithStack([]ast.Node{(*ast.CallExpr)(nil), (*ast.KeyValueExpr)(nil), (*ast.AssignStmt)(nil)}, func(n ast.Node, push bool, stack []ast.Node) bool {
 		if !push || isTest(pass, n.Pos()) {
@@ -89,7 +90,7 @@ func run(pass *analysis.Pass) (any, error) {
 		}
 		switch n := n.(type) {
 		case *ast.CallExpr:
-			checkCall(pass, n, stack)
+			checkCall(pass, h, n, stack)
 		case *ast.KeyValueExpr:
 			if key, ok := n.Key.(*ast.Ident); ok && key.Name == "RequeueAfter" && readsStores {
 				checkDeadline(pass, n.Pos())
@@ -107,10 +108,11 @@ func run(pass *analysis.Pass) (any, error) {
 	checkBounded(pass)
 	checkExports(pass)
 	checkWakeFilters(pass, in)
+	checkNodeEntryFields(pass, in)
 	return nil, nil
 }
 
-func checkCall(pass *analysis.Pass, call *ast.CallExpr, stack []ast.Node) {
+func checkCall(pass *analysis.Pass, h *held, call *ast.CallExpr, stack []ast.Node) {
 	fn := enclosingFunc(stack)
 	constructor := isConstructor(fn) && !holdsState(pass.Pkg.Path())
 	if name, ok := builder(pass, call); ok {
@@ -130,10 +132,13 @@ func checkCall(pass *analysis.Pass, call *ast.CallExpr, stack []ast.Node) {
 	if name, ok := clears(pass, call); ok && !clearsAllowed(pass, fn) {
 		pass.Reportf(call.Pos(), "%s wipes cluster state: only tests clear stores", name)
 	}
-	if obj, ok := writtenHeldObject(pass, call); ok {
+	if arg, ok := matchingFields(pass, call); ok {
+		pass.Reportf(arg.Pos(), "%s in a store's List, which panics on it: match a field with an Index's List", types.TypeString(pass.TypesInfo.TypeOf(arg), func(p *types.Package) string { return p.Name() }))
+	}
+	if obj, ok := writtenHeldObject(pass, h, call); ok {
 		pass.Reportf(call.Pos(), "%s is the informer cache's object, which a client write overwrites: write a DeepCopy", types.ExprString(obj))
 	}
-	if obj, ok := conditionsOfHeldObject(pass, call); ok {
+	if obj, ok := conditionsOfHeldObject(pass, h, call); ok {
 		pass.Reportf(call.Pos(), "%s is the informer cache's object, which StatusConditions() writes: pass status.WithObservedOnly()", types.ExprString(obj))
 	}
 }
@@ -259,37 +264,22 @@ func addedSharedStore(pass *analysis.Pass, call *ast.CallExpr) (ast.Expr, bool) 
 }
 
 // writtenHeldObject returns the object a client write is passed, if it's an object a store holds.
-func writtenHeldObject(pass *analysis.Pass, call *ast.CallExpr) (ast.Expr, bool) {
+func writtenHeldObject(pass *analysis.Pass, h *held, call *ast.CallExpr) (ast.Expr, bool) {
 	fn, ok := typeutil.Callee(pass.TypesInfo, call).(*types.Func)
 	if !ok || !writes[fn.Name()] || fn.Pkg() == nil || fn.Pkg().Path() != clientPkg || len(call.Args) < 2 {
 		return nil, false
 	}
-	return heldObject(pass, call.Args[1])
+	return ast.Unparen(call.Args[1]), h.object(call.Args[1])
 }
 
 // conditionsOfHeldObject returns the object StatusConditions() is called on without options, if it's an object a store
 // holds.
-func conditionsOfHeldObject(pass *analysis.Pass, call *ast.CallExpr) (ast.Expr, bool) {
+func conditionsOfHeldObject(pass *analysis.Pass, h *held, call *ast.CallExpr) (ast.Expr, bool) {
 	sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr)
 	if !ok || sel.Sel.Name != "StatusConditions" || len(call.Args) != 0 {
 		return nil, false
 	}
-	return heldObject(pass, sel.X)
-}
-
-// heldObject returns e if it's a field of a value of a type pkg/cluster declares, such as a StateNode's NodeClaim, which
-// holds an object a store holds.
-func heldObject(pass *analysis.Pass, e ast.Expr) (ast.Expr, bool) {
-	e = ast.Unparen(e)
-	sel, ok := e.(*ast.SelectorExpr)
-	if !ok {
-		return nil, false
-	}
-	s, ok := pass.TypesInfo.Selections[sel]
-	if !ok || s.Kind() != types.FieldVal || s.Obj().Pkg() == nil || s.Obj().Pkg().Path() != clusterPkg {
-		return nil, false
-	}
-	return e, true
+	return ast.Unparen(sel.X), h.object(sel.X)
 }
 
 // checkDeadline reports a RequeueAfter at pos unless its line carries //storelint:deadline with a reason, or

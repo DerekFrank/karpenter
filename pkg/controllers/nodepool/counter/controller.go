@@ -46,7 +46,7 @@ type Controller struct {
 	// kubeClient only writes: NodePools are read through nodePools.
 	kubeClient    writer
 	cloudProvider cloudprovider.CloudProvider
-	nodePools     *cluster.NodePools
+	nodePools     *cluster.NodePoolState
 }
 
 var BaseResources = corev1.ResourceList{
@@ -64,7 +64,7 @@ type writer interface {
 
 // NewController is a constructor. The controller reconciles a NodePool when it's created and whenever its fields
 // change.
-func NewController(kubeClient writer, cloudProvider cloudprovider.CloudProvider, nodePools *cluster.NodePools) *Controller {
+func NewController(kubeClient writer, cloudProvider cloudprovider.CloudProvider, nodePools *cluster.NodePoolState) *Controller {
 	return &Controller{
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
@@ -79,9 +79,10 @@ func (c *Controller) Name() string {
 
 func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
-	nodePool, err := c.nodePools.Get(ctx, req.NamespacedName)
-	if err != nil {
-		return reconcile.Result{}, client.IgnoreNotFound(err)
+	// The NodePool is a copy, which the controller writes.
+	nodePool, ok := c.nodePools.Get(req.Name)
+	if !ok {
+		return reconcile.Result{}, nil
 	}
 	if !nodepoolutils.IsManaged(nodePool.Object, c.cloudProvider) {
 		return reconcile.Result{}, nil
@@ -108,7 +109,7 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 		})).
 		// nodePools reconciles a NodePool whenever its fields change, which include its usage, and holds off reconciling
 		// until they count every NodeClaim, so that the status is never patched with a partial count.
-		WatchesRawSource(c.nodePools).
+		WatchesRawSource(c.nodePools.Source()).
 		WithOptions(controller.Options{MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), 10, 1000)}).
 		Complete(c)
 }

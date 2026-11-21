@@ -110,10 +110,10 @@ func (c *core[K, O, D, I]) removeSourceLocked(id any) {
 // Derive keeps the Derived fields of to's entries up to date from from's entries, such as each NodeClaim's capacity
 // summed onto its NodePool's entry. Each entry of from contributes value(key, entry) to the key that key(key, entry)
 // returns in to, dispatched to the contribution's Update and Delete as Contribution describes. A zero key means an
-// entry contributes to nothing. A join is a Derive onto an entry, such as a Node's name onto its NodeClaim's.
+// entry contributes to nothing. A join is a Derive onto an entry, such as a Node onto its NodeClaim's entry.
 //
 // key and value are pure: they read only the source entry, never block and do no I/O. A value that depends on another
-// store's entry reads it, and a subscriber to that store Touches the source when it changes.
+// store's entry reads it, and DependsOn recomputes the source when that entry changes.
 //
 // Derive applies from's entries before it returns, and each change of from after from's lock is released, so to can
 // briefly lag from. to is synced once from is.
@@ -176,7 +176,7 @@ func derive[K1, K2 comparable, O1, D1, I1, O2, D2, I2 any, C Contribution[D2, C]
 			d.apply(c.Key)
 		}
 	})
-	for k := range from.List() {
+	for k := range from.list() {
 		d.apply(k)
 	}
 	d.swept.Store(true)

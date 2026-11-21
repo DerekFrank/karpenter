@@ -129,18 +129,17 @@ func benchmarkNodeClaim(i int, now time.Time) *v1.NodeClaim {
 
 // benchmarkCluster returns cluster state holding n Nodes matched by matcher, each with its NodeClaim, the first
 // unhealthy of which are unhealthy.
-func benchmarkCluster(ctx context.Context, b *testing.B, provider *fake.CloudProvider, matcher *repair.RepairPolicyMatcher, n, unhealthy int, now time.Time) (*karpentercluster.NodeState, *statetest.Sources) {
+func benchmarkCluster(ctx context.Context, b *testing.B, provider *fake.CloudProvider, matcher *repair.RepairPolicyMatcher, n, unhealthy int, now time.Time) (karpentercluster.State, *statetest.Sources) {
 	b.Helper()
 	clk := clock.NewFakeClock(now)
 	srcs := statetest.NewSources()
 	cs := karpentercluster.New(ctx, clk, nil, provider, karpentercluster.WithRepairPolicyMatcher(matcher),
 		karpentercluster.WithSources(func(obj client.Object) karpenterstate.Newest { return srcs.For(obj) }))
-	clusterState := cs.Nodes
 	for i := range n {
 		srcs.Put(benchmarkNodeClaim(i, now))
 		srcs.Put(benchmarkNode(i, i < unhealthy, benchmarkAcceleratorReason(i < unhealthy, 0), now, now))
 	}
-	return clusterState, srcs
+	return cs, srcs
 }
 
 // benchmarkContext enables node repair and carries an Info-level logger, as the controller runs with, so debug logging
@@ -206,12 +205,12 @@ func BenchmarkRepairDecision(b *testing.B) {
 				now := time.Now()
 				unhealthy := n * unhealthyPercent / 100
 				clusterState, _ := benchmarkCluster(ctx, b, provider, matcher, n, unhealthy, now)
-				var nodes []*karpentercluster.StateNode
-				for node := range clusterState.Nodes() {
+				var nodes []karpentercluster.NodeClaimEntry
+				for _, node := range clusterState.NodeClaims.List(client.UnsafeDisableDeepCopy) {
 					nodes = append(nodes, node)
 				}
-				if repairable := lo.CountBy(nodes, func(node *karpentercluster.StateNode) bool {
-					return node.GetRepairResult(now).Action != ""
+				if repairable := lo.CountBy(nodes, func(node karpentercluster.NodeClaimEntry) bool {
+					return repairResult(node, now).Action != ""
 				}); repairable != unhealthy {
 					b.Fatalf("expected %d repairable nodes, got %d", unhealthy, repairable)
 				}
@@ -219,7 +218,7 @@ func BenchmarkRepairDecision(b *testing.B) {
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					for _, node := range nodes {
-						benchmarkRepairResult = node.GetRepairResult(now)
+						benchmarkRepairResult = repairResult(node, now)
 					}
 				}
 			})

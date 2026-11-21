@@ -57,11 +57,11 @@ func NewUninitializedNodeError(node *scheduling.ExistingNode) *UninitializedNode
 
 func (u *UninitializedNodeError) Error() string {
 	var info []string
-	if u.NodeClaim != nil {
-		info = append(info, fmt.Sprintf("nodeclaim/%s", u.NodeClaim.Name))
+	if nodeClaim := u.NodeClaim(); nodeClaim != nil {
+		info = append(info, fmt.Sprintf("nodeclaim/%s", nodeClaim.Name))
 	}
-	if u.Node != nil {
-		info = append(info, fmt.Sprintf("node/%s", u.Node.Name))
+	if node := u.Node(); node != nil {
+		info = append(info, fmt.Sprintf("node/%s", node.Name))
 	}
 	return fmt.Sprintf("would schedule against uninitialized %s", strings.Join(info, ", "))
 }
@@ -69,17 +69,17 @@ func (u *UninitializedNodeError) Error() string {
 // RequireNoScheduleTaint will add/remove the karpenter.sh/disruption:NoSchedule taint from the candidates.
 // This is used to enforce no taints at the beginning of disruption, and
 // to add/remove taints while executing a disruption action.
-func RequireNoScheduleTaint(ctx context.Context, kubeClient client.Client, addTaint bool, nodes ...*karpentercluster.StateNode) error {
+func RequireNoScheduleTaint(ctx context.Context, kubeClient client.Client, addTaint bool, nodes ...karpentercluster.NodeClaimEntry) error {
 	errs := make([]error, len(nodes))
 	workqueue.ParallelizeUntil(ctx, len(nodes), len(nodes), func(i int) {
-		// If the StateNode is Karpenter owned and only has a nodeclaim, or is not owned by
-		// Karpenter, thus having no nodeclaim, don't touch the node.
-		if nodes[i].Node == nil || nodes[i].NodeClaim == nil {
+		// A managed node whose Node isn't linked yet has no Node to touch.
+		nodeName := karpentercluster.ViewOfNodeClaim(nodes[i]).NodeName()
+		if nodeName == "" {
 			return
 		}
 		node := &corev1.Node{}
 		if err := retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
-			if e := kubeClient.Get(ctx, client.ObjectKey{Name: nodes[i].Node.Name}, node); e != nil {
+			if e := kubeClient.Get(ctx, client.ObjectKey{Name: nodeName}, node); e != nil {
 				return e
 			}
 			// If the node already has the taint, continue to the next
@@ -122,15 +122,15 @@ func RequireNoScheduleTaint(ctx context.Context, kubeClient client.Client, addTa
 }
 
 // ClearNodeClaimsCondition will remove the conditionType from the NodeClaim status of the provided statenodes
-func ClearNodeClaimsCondition(ctx context.Context, kubeClient client.Client, clk clock.Clock, conditionType string, nodes ...*karpentercluster.StateNode) error {
+func ClearNodeClaimsCondition(ctx context.Context, kubeClient client.Client, clk clock.Clock, conditionType string, nodes ...karpentercluster.NodeClaimEntry) error {
 	errs := make([]error, len(nodes))
 	workqueue.ParallelizeUntil(ctx, len(nodes), len(nodes), func(i int) {
-		if !nodes[i].Initialized() || nodes[i].NodeClaim == nil {
+		if !karpentercluster.ViewOfNodeClaim(nodes[i]).Initialized() {
 			return
 		}
 		nodeClaim := &v1.NodeClaim{}
 		if err := retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
-			if e := kubeClient.Get(ctx, client.ObjectKeyFromObject(nodes[i].NodeClaim), nodeClaim); e != nil {
+			if e := kubeClient.Get(ctx, client.ObjectKeyFromObject(nodes[i].Object), nodeClaim); e != nil {
 				return e
 			}
 			stored := nodeClaim.DeepCopy()
@@ -223,14 +223,14 @@ func IgnoreNodeUninitializedError(err error) error {
 	return err
 }
 
-// ValidateNodeDisruptable returns an error if the StateNode cannot be disrupted
-// This checks all associated StateNode internals, node labels, and do-not-disrupt annotations on the node.
-// ValidateNodeDisruptable takes in a recorder to emit events on the nodeclaims when the state node is not a candidate
-func ValidateNodeDisruptable(in *karpentercluster.StateNode, clk clock.Clock) error {
-	if in.NodeClaim == nil {
+// ValidateNodeDisruptable returns an error if the managed node cannot be disrupted
+// This checks the node's NodeClaim entry, node labels, and do-not-disrupt annotations on the node.
+func ValidateNodeDisruptable(e karpentercluster.NodeClaimEntry, clk clock.Clock) error {
+	in := karpentercluster.ViewOfNodeClaim(e)
+	if in.NodeClaim() == nil {
 		return fmt.Errorf("node isn't managed by karpenter")
 	}
-	if in.Node == nil {
+	if karpentercluster.InFlight(e) {
 		return fmt.Errorf("nodeclaim does not have an associated node")
 	}
 	// A rebooting node must not be picked up by other disruption methods. This covers the drain window
@@ -238,19 +238,19 @@ func ValidateNodeDisruptable(in *karpentercluster.StateNode, clk clock.Clock) er
 	if in.RebootInProgress() {
 		return fmt.Errorf("node is rebooting")
 	}
-	if in.MarkedForDeletion() {
+	if karpentercluster.Deleting(e) {
 		return fmt.Errorf("node is deleting or marked for deletion")
 	}
 	// Checked ahead of nomination, which provisioning keeps renewing on an uninitialized node while pods wait for it.
 	if !in.Initialized() {
 		// Liveness's registration timeout owns a node until it registers, so only a registered node is ignorable.
-		if !in.Registered() {
+		if !karpentercluster.Registered(e) {
 			return fmt.Errorf("node isn't initialized nor registered")
 		}
 		return NewNodeUninitializedError(fmt.Errorf("node isn't initialized"))
 	}
 	// skip the node if it is nominated by a recent provisioning pass to be the target of a pending pod.
-	if in.Nominated(clk) {
+	if karpentercluster.Nominated(e, clk.Now()) {
 		return fmt.Errorf("node is nominated for a pending pod")
 	}
 	if in.Annotations()[v1.DoNotDisruptAnnotationKey] == "true" {
@@ -263,14 +263,12 @@ func ValidateNodeDisruptable(in *karpentercluster.StateNode, clk clock.Clock) er
 	return nil
 }
 
-// ValidatePodsDisruptable returns the pods on the StateNode, and an error if one of them cannot be disrupted. contains a pod that cannot be disrupted
+// ValidatePodsDisruptable returns copies of the pods bound to the managed node's Node, read from podsByNode, and an
+// error if one of them cannot be disrupted.
 // This checks associated PDBs and do-not-disrupt annotations for each pod on the node.
-// ValidatePodsDisruptable takes in a recorder to emit events on the nodeclaims when the state node is not a candidate
-func ValidatePodsDisruptable(ctx context.Context, kubeClient client.Client, in *karpentercluster.StateNode, pdbs pdb.Limits, clk clock.Clock, recorder events.Recorder) ([]*corev1.Pod, error) {
-	pods, err := in.Pods(ctx, kubeClient)
-	if err != nil {
-		return nil, err
-	}
+// ValidatePodsDisruptable takes in a recorder to emit events on the nodeclaims when the node is not a candidate
+func ValidatePodsDisruptable(podsByNode *karpentercluster.PodIndex[string], e karpentercluster.NodeClaimEntry, pdbs pdb.Limits, clk clock.Clock, recorder events.Recorder) ([]*corev1.Pod, error) {
+	pods := karpentercluster.PodsOn(podsByNode, karpentercluster.ViewOfNodeClaim(e).NodeName())
 	for _, po := range pods {
 		// We only consider pods that are actively running for "karpenter.sh/do-not-disrupt"
 		// This means that we will allow Mirror Pods and DaemonSets to block disruption using this annotation

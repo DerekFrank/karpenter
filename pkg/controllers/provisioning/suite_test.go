@@ -61,7 +61,7 @@ import (
 var (
 	cs            karpentercluster.State
 	ctx           context.Context
-	cluster       *karpentercluster.NodeState
+	cluster       karpentercluster.State
 	cloudProvider *fake.CloudProvider
 	prov          *provisioning.Provisioner
 	// provClock is the provisioner's view of env.Clock, which counts only what the provisioner waits on, not cluster
@@ -83,10 +83,10 @@ var _ = BeforeSuite(func() {
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
 	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = cs.Nodes
+	cluster = cs
 	predictionStore = prediction.NewStore(env.Overlay)
 	provClock = test.NewClockView(env.Clock)
-	prov = provisioning.NewProvisioner(env.Overlay, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, cs.NodePoolState, cs.CapacityQuotaState, provClock, deviceallocation.NewController(env.Overlay), virtualpods.NewVirtualPodCache(env.Overlay), predictionStore, cs.Nomination, cs.BufferPods, cs.PodScheduling)
+	prov = provisioning.NewProvisioner(env.Overlay, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, provisioning.StoresOf(cs), cs.NodePoolState, cs.CapacityQuotaState, provClock, deviceallocation.NewController(env.Overlay), virtualpods.NewVirtualPodCache(env.Overlay), predictionStore, cs.Nomination, cs.BufferPods, cs.PodScheduling)
 	instanceTypes, _ := cloudProvider.GetInstanceTypes(ctx, nil)
 	instanceTypeMap = map[string]*cloudprovider.InstanceType{}
 	for _, it := range instanceTypes {
@@ -339,8 +339,8 @@ var _ = Describe("Provisioning", func() {
 		// Provisioning should fail here since there are no valid nodePools to schedule the pod
 		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
 		ExpectNotScheduled(ctx, env.Client, pod)
-		Expect(PodSchedulingOf(cluster.PodStore, nn).SchedulableAt.IsZero()).To(BeTrue())
-		Expect(PodSchedulingOf(cluster.PodStore, nn).DecidedAt.IsZero()).To(BeFalse())
+		Expect(PodSchedulingOf(cluster.Pods, nn).SchedulableAt.IsZero()).To(BeTrue())
+		Expect(PodSchedulingOf(cluster.Pods, nn).DecidedAt.IsZero()).To(BeFalse())
 		ExpectMetricHistogramSampleCountValue("karpenter_pods_scheduling_decision_duration_seconds", 1, nil)
 	})
 	It("should provision nodes for pods with supported node selectors", func() {
@@ -495,7 +495,7 @@ var _ = Describe("Provisioning", func() {
 
 		nodeClaim := &v1.NodeClaim{}
 		Expect(env.Client.Get(ctx, types.NamespacedName{Name: nodeClaims[0]}, nodeClaim)).To(Succeed())
-		Expect(PodSchedulingOf(cluster.PodStore, client.ObjectKeyFromObject(pod)).NodeClaim).To(BeEquivalentTo(nodeClaim.Name))
+		Expect(PodSchedulingOf(cluster.Pods, client.ObjectKeyFromObject(pod)).NodeClaim).To(BeEquivalentTo(nodeClaim.Name))
 
 		Expect(nodeClaim.Annotations).To(HaveKeyWithValue(v1.NodePoolHashAnnotationKey, hash))
 	})
@@ -935,8 +935,8 @@ var _ = Describe("Provisioning", func() {
 				Expect(err).To(HaveOccurred())
 				Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
 				// The refused NodeClaim's reservation is released, and the created one's still holds.
-				Expect(cs.NodePoolState.Get(nodePool.Name).ReservedResources).To(HaveKey(corev1.ResourceCPU))
-				Expect(cs.NodePoolState.Get(nodePool.Name).ReservedResources[resources.Node]).To(BeComparableTo(resource.MustParse("1")))
+				Expect(cs.NodePoolState.Fields(nodePool.Name).ReservedResources).To(HaveKey(corev1.ResourceCPU))
+				Expect(cs.NodePoolState.Fields(nodePool.Name).ReservedResources[resources.Node]).To(BeComparableTo(resource.MustParse("1")))
 			})
 			It("should count a NodeClaim's launched capacity in place of its reservation once it launches", func() {
 				results := ExpectProvisionedResults(ctx, env.Client, cluster, cloudProvider, prov, pod())
@@ -947,7 +947,7 @@ var _ = Describe("Provisioning", func() {
 				nodeClaim.Status.Capacity = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}
 				ExpectApplied(ctx, env.Client, nodeClaim)
 
-				fields := cs.NodePoolState.Get(nodePool.Name)
+				fields := cs.NodePoolState.Fields(nodePool.Name)
 				Expect(fields.Usage[corev1.ResourceCPU]).To(BeComparableTo(resource.MustParse("2")))
 				Expect(fields.ReservedResources).To(BeEmpty())
 			})

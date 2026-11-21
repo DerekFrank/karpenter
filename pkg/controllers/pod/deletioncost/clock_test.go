@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/test"
@@ -32,7 +33,7 @@ import (
 
 // Guards the suite's choice to hand env.Clock to cluster.New. A second
 // FakeClock still compiles but freezes state-layer time against env.Clock.Step.
-// Cluster.IsNodeNominated reads the cluster's own clock, so it tells them apart.
+// A nomination lapses on the cluster's own clock, which clears it from the NodeClaim's entry, so it tells them apart.
 var _ = Describe("Suite Clock Wiring", func() {
 	It("should let env.Clock drive the cluster's own time reads", func() {
 		nodePool := test.NodePool()
@@ -46,15 +47,21 @@ var _ = Describe("Suite Clock Wiring", func() {
 		// nominationWindow is max(2*BatchMaxDuration, 10s), so 20s at the suite's
 		// default BatchMaxDuration of 10s.
 		cs.Nomination.Nominate(ctx, nodeClaim.Name)
+		// nominated reads the nomination as the entry holds it, without a clock of the spec's own: it holds until the
+		// cluster's clock lapses it.
+		nominated := func() bool {
+			e, _ := cluster.NodeClaims.Get(nodeClaim.Name, client.UnsafeDisableDeepCopy)
+			return e.Intent.Nomination.Value
+		}
 
-		Expect(cluster.IsNodeNominated(nodeClaim.Name)).To(BeTrue())
+		Expect(nominated()).To(BeTrue())
 
 		env.Clock.Step(10 * time.Second)
-		Expect(cluster.IsNodeNominated(nodeClaim.Name)).To(BeTrue(),
+		Expect(nominated()).To(BeTrue(),
 			"10s is inside the 20s nomination window")
 
 		env.Clock.Step(11 * time.Second)
-		Expect(cluster.IsNodeNominated(nodeClaim.Name)).To(BeFalse(),
+		Eventually(nominated).Should(BeFalse(),
 			"21s is past the 20s nomination window; a cluster holding a second clock would still report nominated")
 	})
 })

@@ -64,12 +64,12 @@ type Scenario struct {
 type ScenarioFixture struct {
 	ctx           context.Context
 	client        client.Client
-	cluster       *karpentercluster.NodeState
+	cluster       *karpentercluster.Nodes
 	clusterState  karpentercluster.State
 	nodePools     []*v1.NodePool
 	itsByNP       map[string][]*cloudprovider.InstanceType
 	topology      *scheduling.Topology
-	stateNodes    []*karpentercluster.StateNode
+	stateNodes    []karpentercluster.NodeView
 	daemonSetPods []*corev1.Pod
 	recorder      events.Recorder
 	clk           clock.Clock
@@ -102,13 +102,13 @@ func benchNodePools(count int) []*v1.NodePool {
 
 // benchStateNodes builds initialized+registered StateNodes directly, distributed
 // round-robin across the given NodePools.
-func benchStateNodes(count int, nodePools []*v1.NodePool) []*karpentercluster.StateNode {
+func benchStateNodes(count int, nodePools []*v1.NodePool) []karpentercluster.NodeView {
 	rl := corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse("16"),
 		corev1.ResourceMemory: resource.MustParse("32Gi"),
 		corev1.ResourcePods:   resource.MustParse("110"),
 	}
-	sn := make([]*karpentercluster.StateNode, 0, count)
+	sn := make([]karpentercluster.NodeView, 0, count)
 	for i := range count {
 		nc := test.NodeClaim(v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{
@@ -126,7 +126,7 @@ func benchStateNodes(count int, nodePools []*v1.NodePool) []*karpentercluster.St
 		node.Labels[corev1.LabelInstanceTypeStable] = "fake-it-0"
 		node.Labels[v1.NodeRegisteredLabelKey] = "true"
 		node.Labels[v1.NodeInitializedLabelKey] = "true"
-		sn = append(sn, &karpentercluster.StateNode{Node: node, NodeClaim: nc})
+		sn = append(sn, karpentercluster.ViewOfNodeClaim(karpentercluster.NodeClaimEntry{Object: nc, Derived: karpentercluster.NodeClaimDerived{Node: node}}))
 	}
 	return sn
 }
@@ -208,7 +208,7 @@ func newSchedulerFromScenario(f *ScenarioFixture) *scheduling.Scheduler {
 		f.ctx,
 		f.client,
 		f.nodePools,
-		f.cluster,
+		nil, // deletingNodeNames
 		f.clusterState.NodePoolState,
 		f.clusterState.CapacityQuotaState,
 		f.stateNodes,

@@ -50,13 +50,13 @@ import (
 func startNodeState(t interface {
 	Helper()
 	Fatal(args ...any)
-}, ctx context.Context, s *NodeState, srcs *statetest.Sources) {
+}, ctx context.Context, s State, srcs *statetest.Sources) {
 	t.Helper()
-	for _, store := range []interface{ Start(context.Context) error }{s.NodeClaimStore.store, s.NodeStore.store, s.PodStore.store, s.CSINodeStore.store} {
+	for _, store := range []interface{ Start(context.Context) error }{s.NodeClaims.store, s.Nodes.store, s.Pods.store, s.CSINodes.store, s.NodePoolState.store} {
 		go func() { _ = store.Start(ctx) }()
 	}
 	srcs.SetSynced()
-	for deadline := time.Now().Add(10 * time.Second); !s.Synced(); time.Sleep(10 * time.Millisecond) {
+	for deadline := time.Now().Add(10 * time.Second); !s.NodeClaims.Synced() || !s.Nodes.Synced() || !s.Cluster.Synced(); time.Sleep(10 * time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatal("node state didn't sync")
 		}
@@ -65,25 +65,23 @@ func startNodeState(t interface {
 
 // unsyncedNodeState builds node state over sources that haven't synced, holding objs, as informers before their first
 // List would once they deliver it.
-func unsyncedNodeState(ctx context.Context, cloudProvider cloudprovider.CloudProvider, objs ...client.Object) (*NodeState, *statetest.Sources) {
+func unsyncedNodeState(ctx context.Context, cloudProvider cloudprovider.CloudProvider, objs ...client.Object) (State, *statetest.Sources) {
 	srcs := statetest.NewUnsyncedSources()
 	for _, obj := range objs {
 		srcs.For(obj).Hold(obj)
 	}
-	s := NewNodeState(ctx, clock.RealClock{}, func(obj client.Object) state.Newest { return srcs.For(obj) }, cloudProvider, nil)
-	for _, accessor := range []any{s, s.NodeClaimStore, s.NodeStore, s.PodStore, s.CSINodeStore} {
-		sourcesOf.Store(accessor, srcs)
-	}
+	s := New(ctx, clock.RealClock{}, nil, cloudProvider, WithSources(func(obj client.Object) state.Newest { return srcs.For(obj) }))
+	registerSources(s, srcs)
 	return s, srcs
 }
 
 // listSynced is the check cluster state's Synced made against the API server before node state's stores followed it:
 // no NodeClaim cluster state holds is unlaunched, and it holds every managed NodeClaim and every Node the API server
 // does.
-func listSynced(ctx context.Context, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, s *NodeState) bool {
+func listSynced(ctx context.Context, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, s State) bool {
 	GinkgoHelper()
 	held := sets.New[string]()
-	for name, e := range s.NodeClaimStore.List() {
+	for name, e := range s.NodeClaims.List(client.UnsafeDisableDeepCopy) {
 		if e.Object.Status.ProviderID == "" {
 			return false
 		}
@@ -94,7 +92,7 @@ func listSynced(ctx context.Context, kubeClient client.Client, cloudProvider clo
 	nodes := &corev1.NodeList{}
 	Expect(kubeClient.List(ctx, nodes)).To(Succeed())
 	tracked := sets.New[string]()
-	for name := range s.NodeStore.List() {
+	for name := range s.Nodes.List(client.UnsafeDisableDeepCopy) {
 		tracked.Insert(name)
 	}
 	for _, nodeClaim := range nodeClaims {
@@ -110,7 +108,7 @@ func listSynced(ctx context.Context, kubeClient client.Client, cloudProvider clo
 	return true
 }
 
-var _ = Describe("NodeState", func() {
+var _ = Describe("Node stores", func() {
 	// Node state's stores having synced, with no unlaunched NodeClaim, implies what cluster state's Synced checked
 	// against a List of the API server: that it holds every managed NodeClaim and every Node, and none of its NodeClaims
 	// is unlaunched. So gating on the stores' sync with state.Requires, and on HasUnlaunchedNodeClaims, is at least as
@@ -142,9 +140,9 @@ var _ = Describe("NodeState", func() {
 				}
 				kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(objs...).Build()
 				s, srcs := unsyncedNodeState(ctx, cloudProvider, objs...)
-				Expect(s.Synced()).To(BeFalse(), "round %d: node state is synced before its sources", round)
+				Expect(s.NodeClaims.Synced() && s.Nodes.Synced()).To(BeFalse(), "round %d: node state is synced before its sources", round)
 				startNodeState(GinkgoT(), ctx, s, srcs)
-				launched := !s.HasUnlaunchedNodeClaims()
+				launched := s.Cluster.NodeClaimsLaunched()
 				Expect(listSynced(ctx, kubeClient, cloudProvider, s)).To(Equal(launched),
 					"round %d: synced stores with every NodeClaim launched = %t, but the List check = %t", round, launched, !launched)
 			}()

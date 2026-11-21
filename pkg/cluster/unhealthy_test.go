@@ -59,32 +59,25 @@ var _ = Describe("Unhealthy Nodes", func() {
 			}
 		})
 	}
-	stateNode := func(node *corev1.Node) *karpentercluster.StateNode {
-		for n := range cluster.Nodes() {
-			if n.Node != nil && n.Node.Name == node.Name {
-				return n.DeepCopy()
-			}
-		}
-		Fail("node not in cluster state")
-		return nil
-	}
+	// stateNode is the entry of the NodeClaim whose Node is node, which carries the Node's repair policy matches.
+	stateNode := func(node *corev1.Node) karpentercluster.NodeClaimEntry { return nodeClaimEntryOf(node) }
 	unhealthyNames := func() []string {
 		var names []string
-		for n := range cluster.Nodes() {
+		for _, e := range cluster.NodeClaims.List() {
 			// Past every policy's toleration, so this lists Nodes that match any policy.
-			if n.GetRepairResult(env.Clock.Now().Add(24*time.Hour)).Action != "" {
-				names = append(names, n.Node.Name)
+			if repairResult(e, env.Clock.Now().Add(24*time.Hour)).Action != "" {
+				names = append(names, e.Derived.Node.Name)
 			}
 		}
 		return names
 	}
 
-	var suiteCluster *karpentercluster.NodeState
+	var suiteCluster karpentercluster.State
 	var matcher *repair.RepairPolicyMatcher
 	// useMatcher builds cluster state around a matcher, as the operator does once at startup.
 	useMatcher := func(m *repair.RepairPolicyMatcher) {
 		cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider, karpentercluster.WithRepairPolicyMatcher(m))
-		cluster = cs.Nodes
+		cluster = cs
 	}
 
 	BeforeEach(func() {
@@ -107,7 +100,7 @@ var _ = Describe("Unhealthy Nodes", func() {
 		managedNode()
 
 		Expect(unhealthyNames()).To(ConsistOf(unhealthy.Name))
-		Expect(stateNode(unhealthy).GetRepairResult(env.Clock.Now()).Action).To(BeEmpty())
+		Expect(repairResult(stateNode(unhealthy), env.Clock.Now()).Action).To(BeEmpty())
 	})
 	It("should match on condition type and status", func() {
 		_, unknown := managedNode(corev1.NodeCondition{Type: corev1.NodeReady, Status: corev1.ConditionUnknown})
@@ -125,21 +118,21 @@ var _ = Describe("Unhealthy Nodes", func() {
 		_, node := managedNode(badNode())
 
 		env.Clock.Step(31 * time.Minute)
-		result := stateNode(node).GetRepairResult(env.Clock.Now())
+		result := repairResult(stateNode(node), env.Clock.Now())
 		Expect(result.Action).To(Equal(cloudprovider.ReplaceNode))
 		Expect(result.Condition).To(Equal(corev1.NodeConditionType("BadNode")))
 	})
 	It("should re-match the policies when a condition's reason changes", func() {
 		_, node := managedNode(badNode())
 		env.Clock.Step(2 * time.Minute)
-		Expect(stateNode(node).GetRepairResult(env.Clock.Now()).Action).To(BeEmpty())
+		Expect(repairResult(stateNode(node), env.Clock.Now()).Action).To(BeEmpty())
 
 		updateNode(node, func(n *corev1.Node) {
 			n.Status.Conditions = []corev1.NodeCondition{badNode()}
 			n.Status.Conditions[0].Reason = "Kernel"
 			n.Status.Conditions[0].LastTransitionTime = metav1.NewTime(env.Clock.Now().Add(-2 * time.Minute))
 		})
-		Expect(stateNode(node).GetRepairResult(env.Clock.Now()).ReasonRegex).To(Equal("^Kernel$"))
+		Expect(repairResult(stateNode(node), env.Clock.Now()).ReasonRegex).To(Equal("^Kernel$"))
 	})
 	It("should mark a node healthy when its condition recovers", func() {
 		_, node := managedNode(badNode())
@@ -168,18 +161,18 @@ var _ = Describe("Unhealthy Nodes", func() {
 		ExpectStateNodeCount("==", 1)
 
 		Expect(unhealthyNames()).To(BeEmpty())
-		for n := range cluster.Nodes() {
-			Expect(n.GetRepairResult(env.Clock.Now().Add(time.Hour)).Action).To(BeEmpty())
+		for _, e := range cluster.NodeClaims.List() {
+			Expect(repairResult(e, env.Clock.Now().Add(time.Hour)).Action).To(BeEmpty())
 		}
 	})
 	It("should match nodes in a newly constructed cluster", func() {
 		managedNode(badNode())
 		cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider, karpentercluster.WithRepairPolicyMatcher(matcher))
-		fresh := cs.Nodes
-
-		Expect(lo.SomeBy(fresh.DeepCopyNodes(), func(n *karpentercluster.StateNode) bool {
-			return n.GetRepairResult(env.Clock.Now().Add(24*time.Hour)).Action != ""
-		})).To(BeTrue())
+		var matched bool
+		for _, e := range cs.NodeClaims.List() {
+			matched = matched || repairResult(e, env.Clock.Now().Add(24*time.Hour)).Action != ""
+		}
+		Expect(matched).To(BeTrue())
 	})
 	It("should not match nodes without a matcher, as when node repair is disabled", func() {
 		useMatcher(nil)
@@ -188,3 +181,19 @@ var _ = Describe("Unhealthy Nodes", func() {
 		Expect(unhealthyNames()).To(BeEmpty())
 	})
 })
+
+// repairResult is the repair decision for a managed node at now, as disruption's repair resolves it: from the policy
+// matches its NodeClaim's entry carries from its Node, with tolerations measured from no earlier than the end of the
+// last reboot.
+func repairResult(e karpentercluster.NodeClaimEntry, now time.Time) repair.RepairResult {
+	if e.Derived.Node == nil {
+		return repair.RepairResult{}
+	}
+	var rebootFinishedAt time.Time
+	for _, c := range e.Object.Status.Conditions {
+		if c.Type == v1.ConditionTypeRebooting && c.Status == metav1.ConditionFalse {
+			rebootFinishedAt = c.LastTransitionTime.Time
+		}
+	}
+	return repair.Resolve(e.Derived.RepairPolicyMatches, now, rebootFinishedAt)
+}

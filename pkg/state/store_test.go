@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	realclock "k8s.io/utils/clock"
 	clock "k8s.io/utils/clock/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/state/statetest"
@@ -591,7 +592,77 @@ var _ = ginkgo.Describe("Contributions", func() {
 	ginkgo.It("should keep their laws", func() {
 		statetest.ExpectContribution(ginkgo.GinkgoT(), poolFields{CPU: 3, Count: 1}, usage{CPU: 2, Count: 1}, usage{CPU: 8, Count: 1})
 		statetest.ExpectContribution(ginkgo.GinkgoT(), clusterFields{CPU: 5}, poolCPU(2), poolCPU(7))
-		statetest.ExpectContribution(ginkgo.GinkgoT(), 3, indexed(1), indexed(1))
 		statetest.ExpectContribution(ginkgo.GinkgoT(), linked{}, linkedNode("a"), linkedNode("b"))
+	})
+})
+
+var _ = ginkgo.Describe("Reader", func() {
+	ginkgo.It("should deep-copy the object unless UnsafeDisableDeepCopy", func() {
+		nodeClaims := newNodeClaims()
+		observe(nodeClaims, nodeClaim("a", "x", 1, "2"))
+		observe(nodeClaims, nodeClaim("b", "y", 2, "2"))
+		deletion := NewIntent(nodeClaims, func(i *nodeClaimIntent) *Intended[bool] { return &i.Deletion })
+		key := types.NamespacedName{Name: "a"}
+		deletion.Set(key, true)
+		held, _ := nodeClaims.Get(key, client.UnsafeDisableDeepCopy)
+		got, ok := nodeClaims.Get(key)
+		Expect(ok).To(BeTrue())
+		Expect(got.Object).ToNot(BeIdenticalTo(held.Object), "Get, want a copy of a")
+		Expect(got.Object).To(Equal(held.Object), "Get, want a copy equal to a")
+		Expect(got.Intent.Deletion.Value).To(BeTrue(), "Get, want a with its intent")
+		got.Object.Labels[v1.NodePoolLabelKey] = "changed"
+		again, _ := nodeClaims.Get(key, client.UnsafeDisableDeepCopy)
+		Expect(again.Object).To(BeIdenticalTo(held.Object), "Get with UnsafeDisableDeepCopy, want the store's own object")
+		Expect(again.Object.Labels[v1.NodePoolLabelKey]).To(Equal("x"), "changing a copy changed the store's object")
+
+		for k, e := range nodeClaims.List() {
+			shared, _ := nodeClaims.Get(k, client.UnsafeDisableDeepCopy)
+			Expect(e.Object).ToNot(BeIdenticalTo(shared.Object), "List, want a copy of %s", k)
+		}
+		for k, e := range nodeClaims.List(client.UnsafeDisableDeepCopy) {
+			shared, _ := nodeClaims.Get(k, client.UnsafeDisableDeepCopy)
+			Expect(e.Object).To(BeIdenticalTo(shared.Object), "List with UnsafeDisableDeepCopy copied %s", k)
+		}
+		var names []string
+		for k := range nodeClaims.List(client.MatchingLabels{v1.NodePoolLabelKey: "y"}) {
+			names = append(names, k.Name)
+		}
+		Expect(names).To(Equal([]string{"b"}), "List with a label selector, want only b")
+
+		pool := NewIndex(nodeClaims, func(_ types.NamespacedName, e nodeClaimEntry) []string {
+			return []string{e.Object.Labels[v1.NodePoolLabelKey]}
+		})
+		for _, e := range pool.List("x") {
+			Expect(e.Object).ToNot(BeIdenticalTo(held.Object), "an Index's List, want a copy")
+		}
+		for _, e := range pool.List("x", client.UnsafeDisableDeepCopy) {
+			Expect(e.Object).To(BeIdenticalTo(held.Object), "an Index's List with UnsafeDisableDeepCopy copied")
+		}
+	})
+	ginkgo.It("should return a synthetic object without DeepCopy as it is", func() {
+		names := NewFedStore[string, string, struct{}, struct{}]()
+		names.Feed("x", "x")
+		e, ok := names.Get("x")
+		Expect(ok).To(BeTrue())
+		Expect(e.Object).To(Equal("x"))
+	})
+	ginkgo.It("should panic on an option it doesn't take", func() {
+		nodeClaims := newNodeClaims()
+		observe(nodeClaims, nodeClaim("a", "x", 1, "2"))
+		list := func(opts ...client.ListOption) func() {
+			return func() {
+				for range nodeClaims.List(opts...) {
+				}
+			}
+		}
+		Expect(list(client.MatchingFields{"status.providerID": "a"})).To(PanicWith(ContainSubstring("MatchingFields")))
+		Expect(list(client.InNamespace("default"))).To(PanicWith(ContainSubstring("InNamespace")))
+		Expect(list(client.Limit(1))).To(PanicWith(ContainSubstring("Limit")))
+		Expect(func() { nodeClaims.Get(types.NamespacedName{Name: "a"}, &client.GetOptions{}) }).To(PanicWith(ContainSubstring("GetOptions")))
+		pools := newPools()
+		Expect(func() {
+			for range pools.List(client.MatchingLabels{"a": "b"}) {
+			}
+		}).To(PanicWith(ContainSubstring("isn't a metav1.Object")), "a label selector on a store of strings")
 	})
 })

@@ -1196,7 +1196,7 @@ var _ = Describe("Topology", func() {
 					MaxSkew:           1,
 				}},
 			})
-			topology, err := scheduling.NewTopology(ctx, env.Client, cluster, nil, []*v1.NodePool{nodePool},
+			topology, err := scheduling.NewTopology(ctx, env.Client, cluster.Nodes, nil, []*v1.NodePool{nodePool},
 				map[string][]*cloudprovider.InstanceType{nodePool.Name: cloudProvider.InstanceTypes}, []*corev1.Pod{pod})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(pod.Spec.TopologySpreadConstraints[0].LabelSelector.MatchExpressions).To(BeEmpty())
@@ -1225,7 +1225,7 @@ var _ = Describe("Topology", func() {
 					MaxSkew:           1,
 				}},
 			}, 3)
-			_, err := scheduling.NewTopology(ctx, env.Client, cluster, nil, []*v1.NodePool{nodePool},
+			_, err := scheduling.NewTopology(ctx, env.Client, cluster.Nodes, nil, []*v1.NodePool{nodePool},
 				map[string][]*cloudprovider.InstanceType{nodePool.Name: cloudProvider.InstanceTypes}, pods)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(selector.MatchExpressions).To(BeEmpty())

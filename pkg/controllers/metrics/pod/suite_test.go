@@ -44,7 +44,7 @@ import (
 var podController *pod.Controller
 var ctx context.Context
 var env *test.Environment
-var cluster *karpentercluster.NodeState
+var cluster karpentercluster.State
 var cs karpentercluster.State
 var cloudProvider *fake.CloudProvider
 
@@ -60,8 +60,8 @@ var _ = BeforeSuite(func() {
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
 	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = cs.Nodes
-	podController = pod.NewController(env.Overlay, cluster.PodStore)
+	cluster = cs
+	podController = pod.NewController(env.Overlay, cluster.Pods)
 })
 
 var _ = AfterEach(func() {

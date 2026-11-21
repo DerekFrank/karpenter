@@ -47,7 +47,7 @@ type changeTracker interface{ trackChanges(*changes) }
 // doesn't count, since a launch also changes the NodeClaim's inputs.
 func (c *Controller) wakes() source.SyncingSource {
 	return karpenterstate.Wake(
-		c.cluster.NodeClaimStore.UnlaunchedSource(),
-		karpenterstate.WakeCounting(c.changes.add, c.cluster.DisruptionSources()...),
+		c.cluster.NodeClaims.UnlaunchedSource(),
+		karpenterstate.WakeCounting(c.changes.add, c.cluster.NodeClaims.DisruptionSource()),
 	)
 }

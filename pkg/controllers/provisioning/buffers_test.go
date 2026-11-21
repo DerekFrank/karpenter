@@ -373,10 +373,10 @@ var _ = Describe("filterVirtualPodMapping", func() {
 
 // makeExistingNode returns an existing node whose NodeClaim is named nodeClaimName, which keys its buffer pod counts.
 func makeExistingNode(nodeClaimName string) *scheduler.ExistingNode {
-	sn := karpentercluster.NewNode()
-	sn.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: nodeClaimName}}
-	sn.Node = &corev1.Node{
-		Spec: corev1.NodeSpec{ProviderID: "fake://" + nodeClaimName},
-	}
-	return &scheduler.ExistingNode{StateNode: sn}
+	return &scheduler.ExistingNode{NodeView: karpentercluster.ViewOfNodeClaim(karpentercluster.NodeClaimEntry{
+		Object: &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: nodeClaimName}},
+		Derived: karpentercluster.NodeClaimDerived{Node: &corev1.Node{
+			Spec: corev1.NodeSpec{ProviderID: "fake://" + nodeClaimName},
+		}},
+	})}
 }

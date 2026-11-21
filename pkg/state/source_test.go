@@ -169,32 +169,3 @@ var _ = ginkgo.Describe("After", func() {
 		Expect(drain(queue)).To(Equal([]string{"a"}), "want a once for its five changes")
 	})
 })
-
-var _ = ginkgo.Describe("Accessor Source", func() {
-	ginkgo.It("should enqueue objects whose derived fields change", func() {
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel()
-		accessor, counts, _ := nodePoolAccessor("a", "b", "c")
-		set(counts, "a", 1)
-		queue := newQueue()
-		Expect(accessor.Start(ctx, queue)).To(Succeed())
-		Expect(drain(queue)).To(Equal([]string{"a"}), "Start queued, want a, the one NodePool with derived fields")
-		set(counts, "b", 2)
-		set(counts, "b", 3)
-		unset(counts, "a")
-		unset(counts, "c")
-		Expect(drain(queue)).To(Equal([]string{"b", "a"}), "want b once for its two changes, then a for its fields going away, and not c, which didn't change")
-	})
-	ginkgo.It("should stop enqueueing once its context is done", func() {
-		ctx, cancel := context.WithCancel(ctx)
-		accessor, counts, _ := nodePoolAccessor("a")
-		queue := newQueue()
-		Expect(accessor.Start(ctx, queue)).To(Succeed())
-		cancel()
-		Eventually(func() []string {
-			e, _ := counts.Get("a")
-			counts.Feed("a", e.Object+1)
-			return drain(queue)
-		}).WithTimeout(10*time.Second).WithPolling(10*time.Millisecond).Should(BeNil(), "the accessor still queues changes after its context is done")
-	})
-})

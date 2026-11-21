@@ -21,6 +21,25 @@ import "context"
 
 type Object interface{}
 
+type GetOption interface{ ApplyToGet() }
+
+type ListOption interface{ ApplyToList() }
+
+type UnsafeDisableDeepCopyOption bool
+
+func (UnsafeDisableDeepCopyOption) ApplyToGet()  {}
+func (UnsafeDisableDeepCopyOption) ApplyToList() {}
+
+const UnsafeDisableDeepCopy = UnsafeDisableDeepCopyOption(true)
+
+type MatchingFields map[string]string
+
+func (MatchingFields) ApplyToList() {}
+
+type MatchingLabels map[string]string
+
+func (MatchingLabels) ApplyToList() {}
+
 type Writer interface {
 	Delete(ctx context.Context, obj Object) error
 	Patch(ctx context.Context, obj Object, patch any) error

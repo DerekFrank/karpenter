@@ -59,21 +59,21 @@ type SimulationOptions struct {
 // SimulateScheduling determines whether candidate workloads can be rescheduled after disruption.
 //
 //nolint:gocyclo
-func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *karpentercluster.NodeState, provisioner *provisioning.Provisioner, clk clock.Clock, recorder events.Recorder,
+func SimulateScheduling(ctx context.Context, kubeClient client.Client, provisioner *provisioning.Provisioner, clk clock.Clock, recorder events.Recorder,
 	schedulerOpts []scheduling.Options, simulationOpts SimulationOptions, candidates ...*Candidate,
 ) (scheduling.Results, error) {
-	candidateNames := sets.NewString(lo.Map(candidates, func(t *Candidate, i int) string { return t.Name() })...)
-	nodes := cluster.DeepCopyNodes()
-	deletingNodes := nodes.Deleting()
-	stateNodes := lo.Filter(nodes.Active(), func(n *karpentercluster.StateNode, _ int) bool {
-		return !candidateNames.Has(n.Name())
+	candidateKeys := sets.New(lo.Map(candidates, func(t *Candidate, i int) karpentercluster.NodeKey { return t.Key() })...)
+	// The cluster's capacity, as the provisioner schedules onto it.
+	activeNodes, deletingNodes := provisioner.ExistingNodes()
+	stateNodes := lo.Filter(activeNodes, func(n karpentercluster.NodeView, _ int) bool {
+		return !candidateKeys.Has(n.Key())
 	})
 
 	// We do one final check to ensure that the node that we are attempting to consolidate isn't
 	// already handled for deletion by some other controller. This could happen if the node was markedForDeletion
 	// between returning the candidates and getting the stateNodes above
-	if _, ok := lo.Find(deletingNodes, func(n *karpentercluster.StateNode) bool {
-		return candidateNames.Has(n.Name())
+	if _, ok := lo.Find(deletingNodes, func(n karpentercluster.NodeView) bool {
+		return candidateKeys.Has(n.Key())
 	}); ok {
 		return scheduling.Results{}, errCandidateDeleting
 	}
@@ -108,7 +108,7 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	}
 	pods = append(pods, candidatePods...)
 
-	deletingNodePods, err := deletingNodes.CurrentlyReschedulablePods(ctx, kubeClient, clk, recorder)
+	deletingNodePods, err := provisioner.CurrentlyReschedulablePods(ctx, deletingNodes...)
 	if err != nil {
 		return scheduling.Results{}, fmt.Errorf("failed to get pods from deleting nodes, %w", err)
 	}
@@ -190,7 +190,6 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 func SimulateSchedulingWithReservedFallback(
 	ctx context.Context,
 	kubeClient client.Client,
-	cluster *karpentercluster.NodeState,
 	provisioner *provisioning.Provisioner,
 	clk clock.Clock,
 	recorder events.Recorder,
@@ -199,7 +198,7 @@ func SimulateSchedulingWithReservedFallback(
 	simulationOpts SimulationOptions,
 ) (results scheduling.Results, terminateFirst bool, err error) {
 	// Pass 1: replace-first feasibility.
-	results, err = SimulateScheduling(ctx, kubeClient, cluster, provisioner, clk, recorder, nil, simulationOpts, candidate)
+	results, err = SimulateScheduling(ctx, kubeClient, provisioner, clk, recorder, nil, simulationOpts, candidate)
 	if err != nil || results.AllNonPendingPodsScheduled() {
 		return results, false, err
 	}
@@ -214,7 +213,7 @@ func SimulateSchedulingWithReservedFallback(
 
 	// Pass 2: terminate-first feasibility — credit the candidate's reservation slot back and require every pod to place
 	// under strict mode.
-	tfResults, err := SimulateScheduling(ctx, kubeClient, cluster, provisioner, clk, recorder,
+	tfResults, err := SimulateScheduling(ctx, kubeClient, provisioner, clk, recorder,
 		[]scheduling.Options{scheduling.DisableReservedCapacityFallback, scheduling.CreditReservationCapacity(reservationID, 1)}, simulationOpts, candidate)
 	if err != nil {
 		return results, false, err
@@ -236,7 +235,7 @@ func instanceTypesAreSubset(lhs []*cloudprovider.InstanceType, rhs []*cloudprovi
 }
 
 // GetCandidates returns nodes that appear to be currently deprovisionable based off of their nodePool.
-func GetCandidates(ctx context.Context, cluster *karpentercluster.NodeState, kubeClient client.Client, recorder events.Recorder, clk clock.Clock,
+func GetCandidates(ctx context.Context, cluster Stores, kubeClient client.Client, recorder events.Recorder, clk clock.Clock,
 	cloudProvider cloudprovider.CloudProvider, shouldDisrupt CandidateFilter, disruptionClass string, queue *Queue,
 ) ([]*Candidate, error) {
 	candidates, _, err := GetCandidatesWithTotals(ctx, cluster, kubeClient, recorder, clk, cloudProvider, shouldDisrupt, disruptionClass, queue, nil)
@@ -247,7 +246,7 @@ func GetCandidates(ctx context.Context, cluster *karpentercluster.NodeState, kub
 // candidates before filtering, so balanced scoring normalizes against the full pool.
 // When clusterCost is non-nil, TotalCost is read from precomputed cluster state
 // rather than re-summed from candidates.
-func GetCandidatesWithTotals(ctx context.Context, cluster *karpentercluster.NodeState, kubeClient client.Client, recorder events.Recorder, clk clock.Clock,
+func GetCandidatesWithTotals(ctx context.Context, cluster Stores, kubeClient client.Client, recorder events.Recorder, clk clock.Clock,
 	cloudProvider cloudprovider.CloudProvider, shouldDisrupt CandidateFilter, disruptionClass string, queue *Queue, clusterCost *karpentercluster.ClusterCost,
 ) ([]*Candidate, map[string]NodePoolTotals, error) {
 	nodePoolMap, nodePoolToInstanceTypesMap, err := BuildNodePoolMap(ctx, kubeClient, cloudProvider)
@@ -263,14 +262,17 @@ func GetCandidatesWithTotals(ctx context.Context, cluster *karpentercluster.Node
 	// Using a fixed value is important for repair which tie-breaks candidates based on their DisruptionCost.
 	// We don't want the order in which candidates are evaluated to affect their DisruptionCost.
 	var fixedNowClk clock.Clock = fixedNowClock{Clock: clk, now: clk.Now()}
-	allNodes := cluster.DeepCopyNodes()
-	allCandidates := lo.FilterMap(allNodes, func(n *karpentercluster.StateNode, _ int) (*Candidate, bool) {
-		cn, e := NewCandidate(ctx, kubeClient, recorder, fixedNowClk, n, pdbs, nodePoolMap, nodePoolToInstanceTypesMap, queue, disruptionClass)
+	// The candidates only read their entries; one that's written is copied first.
+	allNodes := cluster.launchedNodeClaims()
+	allCandidates := lo.FilterMap(allNodes, func(n karpentercluster.NodeClaimEntry, _ int) (*Candidate, bool) {
+		cn, e := NewCandidate(ctx, cluster.PodsByNode, recorder, fixedNowClk, n, pdbs, nodePoolMap, nodePoolToInstanceTypesMap, queue, disruptionClass)
 		return cn, e == nil
 	})
 	// Compute totals using ALL nodes for disruption cost denominator (RFC requirement:
 	// "Non-candidate nodes still contribute to the denominators").
-	nodePoolTotals := computeNodePoolTotals(ctx, allCandidates, []*karpentercluster.StateNode(allNodes), clusterCost)
+	nodePoolTotals := computeNodePoolTotals(ctx, allCandidates, lo.Map(allNodes, func(n karpentercluster.NodeClaimEntry, _ int) karpentercluster.NodeView {
+		return karpentercluster.ViewOfNodeClaim(n)
+	}), clusterCost)
 	filtered := lo.Filter(allCandidates, func(c *Candidate, _ int) bool { return shouldDisrupt(ctx, c) })
 	return filtered, nodePoolTotals, nil
 }

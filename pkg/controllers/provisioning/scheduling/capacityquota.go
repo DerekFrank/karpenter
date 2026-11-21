@@ -121,7 +121,7 @@ func (s *Scheduler) spendQuotas(nodeClaim *NodeClaim) {
 }
 
 // spendQuotasForNode spends an existing node's capacity, and one resources.Node, from each quota that selects it.
-func (s *Scheduler) spendQuotasForNode(node *karpentercluster.StateNode) {
+func (s *Scheduler) spendQuotasForNode(node karpentercluster.NodeView) {
 	for _, l := range s.quotaLimits {
 		if l.quota.Matches(node.Labels()) {
 			l.remaining = resources.Subtract(l.remaining, lo.Assign(node.Capacity(), corev1.ResourceList{resources.Node: *resources.Quantity("1")}))

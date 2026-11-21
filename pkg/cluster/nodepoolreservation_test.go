@@ -57,7 +57,7 @@ var _ = Describe("NodePool Reservations", func() {
 	Context("Replicas", func() {
 		It("should reserve up to replicas less what's active and reserved, within the node limit", func() {
 			s := newState(options.ToContext(context.Background(), test.Options()), clocktesting.NewFakeClock(time.Now()), fake.NewCloudProvider())
-			s.Nodes.NodeClaimStore.Put(limitNodeClaim("a", "1", "2", true))
+			s.NodeClaims.Put(limitNodeClaim("a", "1", "2", true))
 			replacement := s.NodePoolState.ReserveNodeCount("np", math.MaxInt64, 1)
 			Expect(s.NodePoolState.ReserveReplicas("np", 4, math.MaxInt64)).To(HaveLen(2), "reserved past 1 active and 1 reserved of 4 replicas")
 			Expect(s.NodePoolState.ReserveReplicas("np", 4, math.MaxInt64)).To(BeEmpty())
@@ -75,11 +75,11 @@ var _ = Describe("NodePool Reservations", func() {
 			clk = clocktesting.NewFakeClock(time.Now())
 			s = newState(options.ToContext(context.Background(), test.Options()), clk, fake.NewCloudProvider())
 		})
-		reserved := func() corev1.ResourceList { return s.NodePoolState.Get("np").ReservedResources }
-		usage := func() corev1.ResourceList { return s.NodePoolState.Get("np").Usage }
+		reserved := func() corev1.ResourceList { return s.NodePoolState.Fields("np").ReservedResources }
+		usage := func() corev1.ResourceList { return s.NodePoolState.Fields("np").Usage }
 
 		It("should admit up to the limit, counting usage and what is held", func() {
-			s.Nodes.NodeClaimStore.Put(limitNodeClaim("a", "1", "2", true))
+			s.NodeClaims.Put(limitNodeClaim("a", "1", "2", true))
 			Expect(s.NodePoolState.ReserveResources("np", limits, nodeResources("4"), nil)).ToNot(BeNil())
 			Expect(s.NodePoolState.ReserveResources("np", limits, nodeResources("4"), nil)).ToNot(BeNil())
 			Expect(s.NodePoolState.ReserveResources("np", limits, nodeResources("4"), nil)).To(BeNil(), "admitted 2 counted and 12 held against 10")
@@ -93,11 +93,11 @@ var _ = Describe("NodePool Reservations", func() {
 			reservation.Bind("a")
 
 			// Created, not launched: Usage counts the NodeClaim as a node, not its capacity, so the reservation holds.
-			s.Nodes.NodeClaimStore.Put(limitNodeClaim("a", "1", "", false))
+			s.NodeClaims.Put(limitNodeClaim("a", "1", "", false))
 			Expect(cpuOf(usage()).IsZero()).To(BeTrue())
 			Expect(cpuOf(reserved()).String()).To(Equal("8"))
 
-			s.Nodes.NodeClaimStore.Put(limitNodeClaim("a", "2", "2", true))
+			s.NodeClaims.Put(limitNodeClaim("a", "2", "2", true))
 			Expect(cpuOf(usage()).String()).To(Equal("2"))
 			Expect(reserved()).To(BeEmpty())
 		})
@@ -106,7 +106,7 @@ var _ = Describe("NodePool Reservations", func() {
 			reservation.Bind("a")
 			nc := limitNodeClaim("a", "1", "", false)
 			nc.DeletionTimestamp, nc.Finalizers = &metav1.Time{Time: time.Unix(1, 0)}, []string{"test"}
-			s.Nodes.NodeClaimStore.Put(nc)
+			s.NodeClaims.Put(nc)
 			Expect(reserved()).To(BeEmpty())
 		})
 		It("should release a reservation for a NodeClaim that's never created", func() {
@@ -115,8 +115,8 @@ var _ = Describe("NodePool Reservations", func() {
 			Expect(s.NodePoolState.ReserveResources("np", limits, nodeResources("10"), nil)).ToNot(BeNil())
 		})
 		It("should credit what the NodeClaims it replaces count, once", func() {
-			s.Nodes.NodeClaimStore.Put(limitNodeClaim("a", "1", "8", true))
-			s.Nodes.NodeClaimStore.Put(limitNodeClaim("other-pool", "1", "8", true))
+			s.NodeClaims.Put(limitNodeClaim("a", "1", "8", true))
+			s.NodeClaims.Put(limitNodeClaim("other-pool", "1", "8", true))
 			Expect(s.NodePoolState.ReserveResources("np", limits, nodeResources("8"), nil)).To(BeNil())
 			// A NodeClaim of another NodePool, or named twice, isn't credited again.
 			Expect(s.NodePoolState.ReserveResources("np", limits, nodeResources("11"), []string{"a", "a", "other-pool"})).To(BeNil())
@@ -126,10 +126,10 @@ var _ = Describe("NodePool Reservations", func() {
 			Expect(cpuOf(usage()).String()).To(Equal("8"))
 		})
 		It("should credit nothing for a replaced NodeClaim that already stopped counting", func() {
-			s.Nodes.NodeClaimStore.Put(limitNodeClaim("a", "1", "8", true))
+			s.NodeClaims.Put(limitNodeClaim("a", "1", "8", true))
 			disrupted := limitNodeClaim("a", "2", "8", true)
 			disrupted.Status.Conditions = []status.Condition{{Type: v1.ConditionTypeDisruptionReason, Status: metav1.ConditionTrue, Reason: "Drifted"}}
-			s.Nodes.NodeClaimStore.Put(disrupted)
+			s.NodeClaims.Put(disrupted)
 			Expect(s.NodePoolState.ReserveResources("np", limits, nodeResources("10"), []string{"a"})).ToNot(BeNil())
 			Expect(s.NodePoolState.ReserveResources("np", limits, nodeResources("1"), []string{"a"})).To(BeNil(), "credited a NodeClaim that no longer counts")
 		})
@@ -155,7 +155,7 @@ var _ = Describe("NodePool Reservations", func() {
 				for _, cpu := range held {
 					holding += cpu
 				}
-				f := s.NodePoolState.Get("np")
+				f := s.NodePoolState.Fields("np")
 				if f.Usage.Cpu().Value() != counted || f.ReservedResources.Cpu().Value() != holding || counted+holding > limits.Cpu().Value() {
 					violations = append(violations, fmt.Sprintf("after %s, fields = %s counted and %s held, want %d and %d within %s",
 						step, f.Usage.Cpu(), f.ReservedResources.Cpu(), counted, holding, limits.Cpu()))
@@ -186,20 +186,20 @@ var _ = Describe("NodePool Reservations", func() {
 							continue
 						}
 						reservation.Bind(name)
-						s.Nodes.NodeClaimStore.Put(limitNodeClaim(name, "1", "", false))
+						s.NodeClaims.Put(limitNodeClaim(name, "1", "", false))
 						check("create " + name)
 						mu.Unlock()
 
 						mu.Lock()
 						cpu := int64(1 + r.IntN(3))
-						s.Nodes.NodeClaimStore.Put(limitNodeClaim(name, "2", fmt.Sprint(cpu), true))
+						s.NodeClaims.Put(limitNodeClaim(name, "2", fmt.Sprint(cpu), true))
 						delete(held, name)
 						launched[name] = cpu
 						check("launch " + name)
 						mu.Unlock()
 
 						mu.Lock()
-						s.Nodes.NodeClaimStore.Remove(name)
+						s.NodeClaims.Remove(name)
 						delete(launched, name)
 						check("delete " + name)
 						mu.Unlock()
@@ -233,9 +233,9 @@ var _ = Describe("NodePool Reservations", func() {
 						if reservation == nil {
 							continue
 						}
-						s.Nodes.NodeClaimStore.Put(limitNodeClaim(name, "1", "2", true))
+						s.NodeClaims.Put(limitNodeClaim(name, "1", "2", true))
 						reservation.Bind(name)
-						s.Nodes.NodeClaimStore.Remove(name)
+						s.NodeClaims.Remove(name)
 					}
 				})
 			}

@@ -17,7 +17,12 @@ limitations under the License.
 // Package state is a stand-in for pkg/state's builders.
 package state
 
-import "context"
+import (
+	"context"
+	"iter"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
 
 type Entry[O, D, I any] struct {
 	Object  O
@@ -31,8 +36,17 @@ type Reader[K comparable, O, D, I any] struct{}
 
 func (Reader[K, O, D, I]) Subscribe(func()) func() { return func() {} }
 func (Reader[K, O, D, I]) Source() any             { return nil }
-func (Reader[K, O, D, I]) Get(K) (Entry[O, D, I], bool) {
+func (Reader[K, O, D, I]) Get(K, ...client.GetOption) (Entry[O, D, I], bool) {
 	return Entry[O, D, I]{}, false
+}
+func (Reader[K, O, D, I]) List(...client.ListOption) iter.Seq2[K, Entry[O, D, I]] {
+	return func(func(K, Entry[O, D, I]) bool) {}
+}
+
+type Index[K comparable, O, D, I any, V comparable] struct{}
+
+func (*Index[K, O, D, I, V]) List(V, ...client.ListOption) iter.Seq2[K, Entry[O, D, I]] {
+	return func(func(K, Entry[O, D, I]) bool) {}
 }
 
 type Store[K comparable, O, D, I any] struct{ Reader[K, O, D, I] }

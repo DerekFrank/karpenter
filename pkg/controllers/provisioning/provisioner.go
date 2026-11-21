@@ -63,6 +63,7 @@ import (
 	karpenterstate "sigs.k8s.io/karpenter/pkg/state"
 	"sigs.k8s.io/karpenter/pkg/utils/daemonset"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
+	"sigs.k8s.io/karpenter/pkg/utils/pdb"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
@@ -89,7 +90,7 @@ type Provisioner struct {
 	kubeClient                 client.Client
 	batcher                    *Batcher[types.UID]
 	volumeTopology             *scheduler.VolumeTopology
-	cluster                    *karpentercluster.NodeState
+	stores                     Stores
 	nodePools                  *karpentercluster.NodePoolState
 	capacityQuotas             *karpentercluster.CapacityQuotaState
 	recorder                   events.Recorder
@@ -105,8 +106,24 @@ type Provisioner struct {
 	podScheduling *karpentercluster.PodScheduling
 }
 
+// Stores are the cluster state stores the provisioner reads: the managed nodes, the unmanaged Nodes, the pods, the
+// cluster-wide counts, and the pods by Node and by DaemonSet.
+type Stores struct {
+	NodeClaims      *karpentercluster.NodeClaims
+	Nodes           *karpentercluster.Nodes
+	Pods            *karpentercluster.Pods
+	Cluster         *karpentercluster.Clusters
+	PodsByNode      *karpentercluster.PodIndex[string]
+	PodsByDaemonSet *karpentercluster.PodIndex[types.NamespacedName]
+}
+
+// StoresOf returns the stores of cluster state the provisioner reads.
+func StoresOf(s karpentercluster.State) Stores {
+	return Stores{NodeClaims: s.NodeClaims, Nodes: s.Nodes, Pods: s.Pods, Cluster: s.Cluster, PodsByNode: s.PodsByNode, PodsByDaemonSet: s.PodsByDaemonSet}
+}
+
 func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
-	cloudProvider cloudprovider.CloudProvider, cluster *karpentercluster.NodeState, nodePools *karpentercluster.NodePoolState,
+	cloudProvider cloudprovider.CloudProvider, stores Stores, nodePools *karpentercluster.NodePoolState,
 	capacityQuotas *karpentercluster.CapacityQuotaState, clock clock.Clock, deviceAllocationController *deviceallocation.Controller,
 	virtualPodCache *virtualpods.Cache, predictionStore *prediction.Store, nomination *karpentercluster.Nomination,
 	bufferPods *karpentercluster.BufferPods, podScheduling *karpentercluster.PodScheduling,
@@ -116,7 +133,7 @@ func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 		cloudProvider:              cloudProvider,
 		kubeClient:                 kubeClient,
 		volumeTopology:             scheduler.NewVolumeTopology(kubeClient),
-		cluster:                    cluster,
+		stores:                     stores,
 		nodePools:                  nodePools,
 		capacityQuotas:             capacityQuotas,
 		recorder:                   recorder,
@@ -154,7 +171,7 @@ func (p *Provisioner) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(p.Name()).
 		WatchesRawSource(singleton.Source()).
-		WatchesRawSource(karpenterstate.Requires(p.cluster, p.nodePools)).
+		WatchesRawSource(karpenterstate.Requires(p.stores.NodeClaims, p.stores.Nodes, p.stores.Pods, p.stores.Cluster, p.nodePools)).
 		Complete(singleton.AsReconciler(p))
 }
 
@@ -167,7 +184,7 @@ func (p *Provisioner) Reconcile(ctx context.Context) (result reconciler.Result, 
 	}
 	// A NodeClaim that's launching isn't a node in cluster state yet, so scheduling now would schedule pods off a smaller
 	// subset of nodes than actually exist, and provision for them again.
-	if !p.cluster.NodeClaimsLaunched() {
+	if !p.stores.Cluster.NodeClaimsLaunched() {
 		return reconciler.Result{RequeueAfter: singleton.RequeueImmediately}, nil //storelint:deadline the batcher's loop runs again at once
 	}
 	if options.FromContext(ctx).FeatureGates.PredictionEnabled && !p.predictionStore.Hydrated(ctx) {
@@ -273,7 +290,7 @@ func (p *Provisioner) GetPendingPods(ctx context.Context) ([]*corev1.Pod, error)
 // copy, never the store's object.
 func (p *Provisioner) provisionablePods() []*corev1.Pod {
 	var pods []*corev1.Pod
-	for _, e := range p.cluster.PodStore.List() {
+	for _, e := range p.stores.Pods.List(client.UnsafeDisableDeepCopy) {
 		if e.Object.Spec.NodeName == "" && podutils.IsProvisionable(e.Object) {
 			pods = append(pods, e.Object.DeepCopy())
 		}
@@ -322,7 +339,7 @@ var ErrNodePoolsNotFound = errors.New("no nodepools found")
 func (p *Provisioner) NewScheduler(
 	ctx context.Context,
 	pods []*corev1.Pod,
-	stateNodes []*karpentercluster.StateNode,
+	stateNodes []karpentercluster.NodeView,
 	deletingPodUIDs sets.Set[types.UID],
 	opts ...scheduler.Options,
 ) (*scheduler.Scheduler, error) {
@@ -387,7 +404,7 @@ func (p *Provisioner) NewScheduler(
 	scheduler.NewDefaultTopologySpreadInjector(p.kubeClient).Inject(ctx, pods)
 
 	// Calculate cluster topology, if a context error occurs, it is wrapped and returned
-	topology, err := scheduler.NewTopology(ctx, p.kubeClient, p.cluster, stateNodes, nodePools, instanceTypes, pods, opts...)
+	topology, err := scheduler.NewTopology(ctx, p.kubeClient, p.stores.Nodes, stateNodes, nodePools, instanceTypes, pods, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("tracking topology counts, %w", err)
 	}
@@ -414,7 +431,57 @@ func (p *Provisioner) NewScheduler(
 
 	predictionStore := lo.Ternary(options.FromContext(ctx).FeatureGates.PredictionEnabled, p.predictionStore, nil)
 	// Pass volumeReqs to scheduler - added to nodeRequirements for NodeClaim zone selection
-	return scheduler.NewScheduler(ctx, p.kubeClient, nodePools, p.cluster, p.nodePools, p.capacityQuotas, stateNodes, topology, instanceTypes, daemonSetPods, p.recorder, p.clock, volumeReqs, allocator, deletingPodUIDs, predictionStore, opts...), nil
+	_, deleting := p.ExistingNodes()
+	deletingNodeNames := sets.New[string]()
+	for _, n := range deleting {
+		if name := n.NodeName(); name != "" {
+			deletingNodeNames.Insert(name)
+		}
+	}
+	return scheduler.NewScheduler(ctx, p.kubeClient, nodePools, deletingNodeNames, p.nodePools, p.capacityQuotas, stateNodes, topology, instanceTypes, daemonSetPods, p.recorder, p.clock, volumeReqs, allocator, deletingPodUIDs, predictionStore, opts...), nil
+}
+
+// ExistingNodes returns the nodes the scheduler schedules onto, active, and the nodes going away, whose pods
+// reschedule, deleting: each launched NodeClaim's node, and each unmanaged Node, by whether it's deleting. A NodeClaim
+// still launching has no capacity yet, so it's neither: a decision waits for it (NodeClaimsLaunched). A registering
+// Node is represented by its NodeClaim, so it counts once. The views share cluster state's objects and usage; the
+// scheduler copies what it adds simulated pods to.
+func (p *Provisioner) ExistingNodes() (active, deleting []karpentercluster.NodeView) {
+	for _, nc := range p.stores.NodeClaims.List(client.UnsafeDisableDeepCopy) {
+		if !karpentercluster.Launched(nc) {
+			continue
+		}
+		if karpentercluster.Deleting(nc) {
+			deleting = append(deleting, karpentercluster.ViewOfNodeClaim(nc))
+			continue
+		}
+		active = append(active, karpentercluster.ViewOfNodeClaim(nc))
+	}
+	for _, n := range p.stores.Nodes.Unmanaged(client.UnsafeDisableDeepCopy) {
+		if !n.Object.DeletionTimestamp.IsZero() {
+			deleting = append(deleting, karpentercluster.ViewOfNode(n))
+			continue
+		}
+		active = append(active, karpentercluster.ViewOfNode(n))
+	}
+	return active, deleting
+}
+
+// CurrentlyReschedulablePods returns copies of the pods bound to the nodes, read from the pod store, that can
+// reschedule now: those the PodDisruptionBudgets let go.
+func (p *Provisioner) CurrentlyReschedulablePods(ctx context.Context, nodes ...karpentercluster.NodeView) ([]*corev1.Pod, error) {
+	var pods []*corev1.Pod
+	for _, n := range nodes {
+		pods = append(pods, karpentercluster.PodsOn(p.stores.PodsByNode, n.NodeName())...)
+	}
+	if len(pods) == 0 {
+		return nil, nil
+	}
+	pdbs, err := pdb.NewLimits(ctx, p.kubeClient)
+	if err != nil {
+		return nil, fmt.Errorf("tracking PodDisruptionBudgets, %w", err)
+	}
+	return lo.Filter(pods, func(pod *corev1.Pod, _ int) bool { return pdbs.IsCurrentlyReschedulable(pod, p.clock, p.recorder) }), nil
 }
 
 func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
@@ -430,7 +497,7 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	// We don't consider the nodes that are MarkedForDeletion since this capacity shouldn't be considered
 	// as persistent capacity for the cluster (since it will soon be removed). Additionally, we are scheduling for
 	// the pods that are on these nodes so the MarkedForDeletion node capacity can't be considered.
-	nodes := p.cluster.DeepCopyNodes()
+	active, deleting := p.ExistingNodes()
 
 	// Get pods, exit if nothing to do
 	pendingPods, err := p.GetPendingPods(ctx)
@@ -442,7 +509,7 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	// We do this after getting the pending pods so that we undershoot if pods are
 	// actively migrating from a node that is being deleted
 	// NOTE: The assumption is that these nodes are cordoned and no additional pods will schedule to them
-	deletingNodePods, err := nodes.Deleting().CurrentlyReschedulablePods(ctx, p.kubeClient, p.clock, p.recorder)
+	deletingNodePods, err := p.CurrentlyReschedulablePods(ctx, deleting...)
 	if err != nil {
 		return scheduler.Results{}, err
 	}
@@ -466,7 +533,7 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	s, err := p.NewScheduler(
 		ctx,
 		pods,
-		nodes.Active(),
+		active,
 		deletingPodUIDs,
 		opts...,
 	)
@@ -614,7 +681,7 @@ func (p *Provisioner) getDaemonSetPods(ctx context.Context) ([]*corev1.Pod, erro
 	}
 
 	return lo.Map(daemonSetList.Items, func(d appsv1.DaemonSet, _ int) *corev1.Pod {
-		pod := p.cluster.GetDaemonSetPod(&d)
+		pod := karpentercluster.DaemonSetPod(p.stores.PodsByDaemonSet, &d)
 		if pod == nil {
 			pod = daemonset.PodForDaemonSet(&d)
 		}

@@ -18,8 +18,8 @@ package cluster
 
 import (
 	"github.com/samber/lo"
-	corev1 "k8s.io/api/core/v1"
 
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/state"
 )
 
@@ -30,10 +30,10 @@ type Cluster struct{ name string }
 // TheCluster is the key of the cluster's entry.
 var TheCluster = Cluster{name: "cluster"}
 
-// ClusterDerived are the cluster-wide counts, derived from the NodeClaim and Node stores.
+// ClusterDerived are the cluster-wide counts, derived from the NodeClaim store.
 type ClusterDerived struct {
 	// UnlaunchedNodeClaims counts the NodeClaims without a providerID, deleting or not, which a decision that counts
-	// the cluster's nodes waits on (HasUnlaunchedNodeClaims). It isn't a NodePool's NodeClaims, which split by deletion
+	// the cluster's nodes waits on (NodeClaimsLaunched). It isn't a NodePool's NodeClaims, which split by deletion
 	// rather than launch, nor NodePoolState.UnlaunchedNodeClaims, which leaves out the deleting ones.
 	UnlaunchedNodeClaims int
 }
@@ -45,19 +45,11 @@ type ClusterEntry = state.Entry[Cluster, ClusterDerived, struct{}]
 type Clusters struct {
 	state.Reader[Cluster, Cluster, ClusterDerived, struct{}]
 	store *state.Store[Cluster, Cluster, ClusterDerived, struct{}]
-	// unmanagedIndex is the target of unmanaged, keyed by TheCluster.
-	unmanagedIndex *state.Store[Cluster, Cluster, struct{}, struct{}]
-	// unmanaged is the Derive from the Node store whose Sources are the unmanaged Nodes.
-	unmanaged *state.Derivation[string, Cluster, struct{}, member]
 }
 
 func newClusters() *Clusters {
 	store := state.NewSyntheticStore[Cluster, Cluster, ClusterDerived, struct{}](func(c Cluster) Cluster { return c })
-	return &Clusters{
-		Reader:         store.Reader,
-		store:          store,
-		unmanagedIndex: state.NewSyntheticStore[Cluster, Cluster, struct{}, struct{}](func(c Cluster) Cluster { return c }),
-	}
+	return &Clusters{Reader: store.Reader, store: store}
 }
 
 // Counts returns the cluster's counts.
@@ -79,15 +71,16 @@ func (n unlaunchedNodeClaim) Delete(d ClusterDerived) ClusterDerived {
 	return d
 }
 
-// derive keeps the cluster's counts, and the index of unmanaged Nodes, from the NodeClaim and Node stores.
-func (c *Clusters) derive(nodeClaims *NodeClaims, nodes *Nodes) {
-	state.Derive(nodeClaims.Reader, c.store,
-		func(_ string, e NodeClaimEntry) Cluster { return lo.Ternary(!Launched(e), TheCluster, Cluster{}) },
-		func(string, NodeClaimEntry) unlaunchedNodeClaim { return 1 })
-	c.unmanaged = state.DeriveObject(nodes.Reader, c.unmanagedIndex,
-		func(_ string, node *corev1.Node) Cluster { return lo.Ternary(Unmanaged(node), TheCluster, Cluster{}) },
-		func(string, *corev1.Node) member { return member{} })
+// derive keeps the cluster's counts from the NodeClaim store.
+func (c *Clusters) derive(nodeClaims *NodeClaims) {
+	state.DeriveObject(nodeClaims.Reader, c.store,
+		func(_ string, nodeClaim *v1.NodeClaim) Cluster {
+			return lo.Ternary(nodeClaim.Status.ProviderID == "", TheCluster, Cluster{})
+		},
+		func(string, *v1.NodeClaim) unlaunchedNodeClaim { return 1 })
 }
 
-// UnmanagedNodes returns the names of the unmanaged Nodes.
-func (c *Clusters) UnmanagedNodes() []string { return c.unmanaged.Sources(TheCluster) }
+// NodeClaimsLaunched returns whether every NodeClaim has launched, for a decision that counts the cluster's nodes,
+// which waits until none is launching since an unlaunched NodeClaim has no capacity yet. A controller calling it
+// declares the NodeClaim store with state.Requires and wakes on NodeClaims.UnlaunchedSource.
+func (c *Clusters) NodeClaimsLaunched() bool { return c.Counts().UnlaunchedNodeClaims == 0 }

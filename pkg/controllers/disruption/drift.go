@@ -30,7 +30,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -40,16 +39,14 @@ import (
 // Drift is a subreconciler that deletes drifted candidates.
 type Drift struct {
 	kubeClient  client.Client
-	cluster     *karpentercluster.NodeState
 	provisioner *provisioning.Provisioner
 	recorder    events.Recorder
 	clock       clock.Clock
 }
 
-func NewDrift(kubeClient client.Client, cluster *karpentercluster.NodeState, provisioner *provisioning.Provisioner, recorder events.Recorder, clk clock.Clock) *Drift {
+func NewDrift(kubeClient client.Client, provisioner *provisioning.Provisioner, recorder events.Recorder, clk clock.Clock) *Drift {
 	return &Drift{
 		kubeClient:  kubeClient,
-		cluster:     cluster,
 		provisioner: provisioner,
 		recorder:    recorder,
 		clock:       clk,
@@ -85,7 +82,7 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 		// Simulate rescheduling the candidate's pods. When they can't be replaced-first and the candidate holds a full
 		// reservation, this reports terminate-first (RFC #3203): delete the candidate and let reactive provisioning
 		// refill the freed slot. See SimulateSchedulingWithReservedFallback.
-		results, terminateFirst, err := SimulateSchedulingWithReservedFallback(ctx, d.kubeClient, d.cluster, d.provisioner, d.clock, d.recorder, candidate, options.FromContext(ctx).FeatureGates.TerminateFirstDrift, SimulationOptions{})
+		results, terminateFirst, err := SimulateSchedulingWithReservedFallback(ctx, d.kubeClient, d.provisioner, d.clock, d.recorder, candidate, options.FromContext(ctx).FeatureGates.TerminateFirstDrift, SimulationOptions{})
 		if err != nil {
 			// if a candidate is now deleting, just retry
 			if errors.Is(err, errCandidateDeleting) {

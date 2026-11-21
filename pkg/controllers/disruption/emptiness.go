@@ -52,7 +52,7 @@ func (e *Emptiness) ShouldDisrupt(_ context.Context, c *Candidate) bool {
 	// A node hosting virtual buffer pods is not empty — the provisioner placed
 	// buffer capacity here intentionally. Deleting it would trigger immediate
 	// re-provisioning (pointless churn).
-	if e.cluster.HasBufferPods(c.NodeClaim.Name) {
+	if e.cluster.hasBufferPods(c.NodeClaim.Name) {
 		e.recorder.Publish(disruptionevents.Unconsolidatable(c.Node, c.NodeClaim, fmt.Sprintf("Node %q has buffer pods", c.Node.Name))...)
 		return false
 	}

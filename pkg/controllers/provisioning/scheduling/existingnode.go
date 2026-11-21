@@ -31,9 +31,13 @@ import (
 )
 
 type ExistingNode struct {
-	*karpentercluster.StateNode
-	cachedAvailable v1.ResourceList // Cache so we don't have to re-subtract resources on the StateNode every time
+	karpentercluster.NodeView
+	cachedAvailable v1.ResourceList // Cache so we don't have to re-subtract resources on the node every time
 	cachedTaints    []v1.Taint      // Cache so we don't hae to re-construct the taints each time we attempt to schedule a pod
+	// hostPorts and volumes are the node's own copies of its host port and volume usage, which scheduling adds the
+	// simulated pods to.
+	hostPorts *scheduling.HostPortUsage
+	volumes   *scheduling.VolumeUsage
 
 	Pods                    []*v1.Pod
 	topology                *Topology
@@ -45,11 +49,13 @@ type ExistingNode struct {
 	instanceType *cloudprovider.InstanceType
 }
 
-func NewExistingNode(n *karpentercluster.StateNode, topology *Topology, taints []v1.Taint, daemonResources v1.ResourceList, instanceType *cloudprovider.InstanceType, isUnderConsolidateAfter bool) *ExistingNode {
-	// The state node passed in here must be a deep copy from cluster state as we modify it
+func NewExistingNode(n karpentercluster.NodeView, topology *Topology, taints []v1.Taint, daemonResources v1.ResourceList, instanceType *cloudprovider.InstanceType, isUnderConsolidateAfter bool) *ExistingNode {
+	// The node's host port and volume usage are its own copies, which scheduling adds pods to; the rest of the view is
+	// cluster state's, read-only.
+	volumes := n.VolumeUsage()
 	if instanceType != nil {
 		for driver, limit := range instanceType.VolumeAttachmentLimits {
-			n.VolumeUsage().AddFallbackLimit(driver, limit)
+			volumes.AddFallbackLimit(driver, limit)
 		}
 	}
 	// the remaining daemonResources to schedule are the total daemonResources minus what has already scheduled
@@ -65,7 +71,9 @@ func NewExistingNode(n *karpentercluster.StateNode, topology *Topology, taints [
 	}
 	available := n.Available()
 	node := &ExistingNode{
-		StateNode:               n,
+		NodeView:                n,
+		hostPorts:               n.HostPortUsage(),
+		volumes:                 volumes,
 		cachedAvailable:         available,
 		cachedTaints:            taints,
 		topology:                topology,
@@ -78,6 +86,12 @@ func NewExistingNode(n *karpentercluster.StateNode, topology *Topology, taints [
 	topology.Register(v1.LabelHostname, n.HostName())
 	return node
 }
+
+// HostPortUsage is the host ports the node's pods and the pods scheduled to it use.
+func (n *ExistingNode) HostPortUsage() *scheduling.HostPortUsage { return n.hostPorts }
+
+// VolumeUsage is the volumes the node's pods and the pods scheduled to it mount.
+func (n *ExistingNode) VolumeUsage() *scheduling.VolumeUsage { return n.volumes }
 
 // CanAdd returns whether the pod can be added to the ExistingNode
 // based on the taints/tolerations, volume requirements, host port compatibility,

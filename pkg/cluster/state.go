@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package cluster holds the cluster's state: an accessor for each kind Karpenter reads, returning the objects with the
-// fields Karpenter derives about them, built from the primitives in pkg/state. One file per kind. See
+// Package cluster holds the cluster's state: a store for each kind Karpenter reads, whose Reader returns the objects
+// with the fields Karpenter derives about them, built from the primitives in pkg/state. One file per kind. See
 // pkg/state/AGENTS.md.
 package cluster
 
@@ -23,9 +23,13 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/awslabs/operatorpkg/object"
 	"github.com/awslabs/operatorpkg/option"
+	"github.com/awslabs/operatorpkg/status"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,20 +44,44 @@ import (
 	"sigs.k8s.io/karpenter/pkg/state/overlay"
 )
 
-// State holds every accessor, the stores behind them and the intent handles. Build it once, with New, where the
-// operator is wired, start its stores with Register, and give each controller the accessors it reads and the intent
+// State holds every store's Reader, the indexes on them and the intent handles. Build it once, with New, where the
+// operator is wired, start its stores with Register, and give each controller the Readers it reads and the intent
 // handles it writes, never State itself, so that each constructor says what it reads and writes.
 type State struct {
-	// NodePools is the NodePool accessor, which reads each NodePool with NodePoolState's fields.
-	NodePools *NodePools
 	// NodePoolState keeps the fields of each NodePool, by name, and the reservations against its node limit.
 	NodePoolState *NodePoolState
 	// CapacityQuotaState keeps what counts against each CapacityQuota, by name, and the reservations against them.
 	CapacityQuotaState *CapacityQuotaState
-	// Nodes holds the stores behind the nodes Karpenter schedules onto and disrupts.
-	Nodes *NodeState
+	// NodeClaims are the managed nodes, by NodeClaim name: each NodeClaim with its Node, that Node's usage and the
+	// intent kept about the node.
+	NodeClaims *NodeClaims
+	// Nodes are the Nodes, by name, with the usage of the pods bound to each. Unmanaged reads the unmanaged ones.
+	Nodes *Nodes
+	// Pods are the pods, by namespaced name, with what the provisioner decided about each.
+	Pods *Pods
+	// CSINodes are the CSINodes, by name, whose drivers count on their Nodes' usage.
+	CSINodes *CSINodes
+	// PVCs are the PVCs' resolved CSI drivers, which the PVC driver controller feeds.
+	PVCs *PVCs
+	// Cluster is the cluster-wide counts.
+	Cluster *Clusters
 	// Cost keeps the cost of each NodePool's NodeClaims, priced by the pricing controller.
 	Cost *ClusterCost
+	// RepairPolicyMatcher is the matcher the Node store matches each Node's conditions with, or nil when node repair is
+	// disabled.
+	RepairPolicyMatcher *repair.RepairPolicyMatcher
+
+	// NodeClaimsByProviderID indexes the NodeClaims by providerID, for code that starts from a cloud instance.
+	NodeClaimsByProviderID *NodeClaimIndex[string]
+	// NodeClaimsByNodePool indexes the NodeClaims by their NodePool label.
+	NodeClaimsByNodePool *NodeClaimIndex[string]
+	// PodsByNode indexes the pods by spec.nodeName.
+	PodsByNode *PodIndex[string]
+	// PodsByDaemonSet indexes the pods by the DaemonSet that controls them, whose newest pod DaemonSetPod samples.
+	PodsByDaemonSet *PodIndex[types.NamespacedName]
+	// PodsBySimulatedNodeClaim indexes the pods by the NodeClaim the provisioner's most recent scheduling simulation of
+	// each placed it on.
+	PodsBySimulatedNodeClaim *PodIndex[string]
 
 	// Deletion is the handle of the deletion marks on NodeClaims, for the disruption queue, their one writer.
 	Deletion *Deletion
@@ -76,8 +104,8 @@ type Options struct {
 	sources             Sources
 }
 
-// WithRepairPolicyMatcher makes the node state match each Node against the repair policies as it changes. Node repair
-// reads the same matcher back through NodeState.RepairPolicyMatcher.
+// WithRepairPolicyMatcher makes the Node store match each Node against the repair policies as it changes. Node repair
+// reads the same matcher back through State.RepairPolicyMatcher.
 func WithRepairPolicyMatcher(matcher *repair.RepairPolicyMatcher) option.Function[Options] {
 	return func(o *Options) { o.repairPolicyMatcher = matcher }
 }
@@ -103,10 +131,10 @@ func Kinds(ctx context.Context) []client.Object {
 	return kinds
 }
 
-// New builds every store and accessor, in dependency order. Each object store follows its kind's newest versions
-// through kubeClient, an overlay.Client that overlays Kinds, and the NodePools accessor reads NodePools through it.
-// ctx carries the options derived fields read, and cloudProvider's node classes decide which NodeClaims the node state
-// holds.
+// New builds every store, in dependency order. Each object store follows its kind's newest versions through
+// kubeClient, an overlay.Client that overlays Kinds. ctx carries the options derived fields read, such as the feature
+// gates that decide a pod's disruption cost, and cloudProvider's node classes decide which NodeClaims the NodeClaim
+// store holds.
 func New(ctx context.Context, clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, opts ...option.Function[Options]) State {
 	o := option.Resolve(opts...)
 	sources := o.sources
@@ -135,26 +163,55 @@ func New(ctx context.Context, clk clock.Clock, kubeClient client.Client, cloudPr
 		}
 		return src
 	}
-	nodes := NewNodeState(ctx, clk, sources, cloudProvider, o.repairPolicyMatcher)
-	nodePools := NewNodePoolState(clk, sources(&v1.NodePool{}), nodes)
+	managed := lo.Map(cloudProvider.GetSupportedNodeClasses(), func(nodeClass status.Object, _ int) schema.GroupKind {
+		return object.GVK(nodeClass).GroupKind()
+	})
+	pods := newPods(sources(&corev1.Pod{}))
+	nodeClaims := newNodeClaims(sources(&v1.NodeClaim{}), managed)
+	nodes := newNodes(sources(&corev1.Node{}))
+	csiNodes := newCSINodes(sources(&storagev1.CSINode{}))
+	pvcs := newPVCs()
+	clusters := newClusters()
+	if o.repairPolicyMatcher != nil {
+		nodes.deriveRepairMatches(o.repairPolicyMatcher)
+	}
+	csiNodes.deriveDrivers(nodes)
+	pvcs.dependOn(pods)
+	// The pods' usage on the Node they're bound to, then each tracked Node's entry on its NodeClaim's.
+	state.Derive(pods.Reader, nodes.store, podNodeKey, podContributionOf(ctx, pvcs))
+	nodeClaims.deriveNodes(nodes)
+	clusters.derive(nodeClaims)
+	nodePools := NewNodePoolState(clk, sources(&v1.NodePool{}), nodeClaims, nodes, o.repairPolicyMatcher)
 	return State{
-		NodePools:          NewNodePools(kubeClient, nodePools),
-		NodePoolState:      nodePools,
-		CapacityQuotaState: NewCapacityQuotaState(ctx, clk, quotas, nodes),
-		Nodes:              nodes,
-		Cost:               newClusterCost(ctx, cloudProvider, nodes.NodeClaimStore),
-		Deletion:           newDeletion(nodes.NodeClaimStore),
-		Nomination:         newNomination(clk, nodes.NodeClaimStore),
-		BufferPods:         newBufferPods(nodes.NodeClaimStore),
-		PodScheduling:      newPodScheduling(clk, nodes.PodStore),
-		Registrations:      newRegistrations(nodePools),
+		NodePoolState:            nodePools,
+		CapacityQuotaState:       NewCapacityQuotaState(ctx, clk, quotas, nodeClaims, nodes),
+		NodeClaims:               nodeClaims,
+		Nodes:                    nodes,
+		Pods:                     pods,
+		CSINodes:                 csiNodes,
+		PVCs:                     pvcs,
+		Cluster:                  clusters,
+		Cost:                     newClusterCost(ctx, cloudProvider, nodeClaims),
+		RepairPolicyMatcher:      o.repairPolicyMatcher,
+		NodeClaimsByProviderID:   nodeClaims.byProviderID,
+		NodeClaimsByNodePool:     nodeClaims.byNodePool,
+		PodsByNode:               pods.byNode,
+		PodsByDaemonSet:          pods.byDaemonSet,
+		PodsBySimulatedNodeClaim: pods.bySimulatedNodeClaim,
+		Deletion:                 newDeletion(nodeClaims),
+		Nomination:               newNomination(clk, nodeClaims),
+		BufferPods:               newBufferPods(nodeClaims),
+		PodScheduling:            newPodScheduling(clk, pods),
+		Registrations:            newRegistrations(nodePools),
 	}
 }
 
 // Reset clears every store between specs, each of which then holds what its source holds, and the intent on their
 // entries. It's for tests; storelint reports a Reset outside a test.
 func (s State) Reset() {
-	s.Nodes.Clear()
+	for _, store := range []interface{ Clear() }{s.NodeClaims.store, s.Nodes.store, s.Pods.store, s.CSINodes.store, s.PVCs.store, s.Cluster.store} {
+		store.Clear()
+	}
 	s.NodePoolState.Clear()
 	s.CapacityQuotaState.Clear()
 	s.Cost.Clear()
@@ -174,8 +231,7 @@ func (none) Holds(types.NamespacedName, types.UID) bool     { return false }
 // once the manager's caches sync. A controller reading them declares it with state.Requires, which holds
 // its workers until they're synced. A controller adds only the stores it builds itself.
 func (s State) Register(m manager.Manager) error {
-	stores := []manager.Runnable{s.Nodes.NodeClaimStore.store, s.Nodes.NodeStore.store, s.Nodes.PodStore.store, s.Nodes.CSINodeStore.store,
-		s.NodePoolState.store}
+	stores := []manager.Runnable{s.NodeClaims.store, s.Nodes.store, s.Pods.store, s.CSINodes.store, s.NodePoolState.store}
 	// The CapacityQuota store follows the informer only with the CapacityQuota feature gate.
 	if s.CapacityQuotaState.follows() {
 		stores = append(stores, s.CapacityQuotaState.quotas)

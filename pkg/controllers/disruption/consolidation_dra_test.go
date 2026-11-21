@@ -66,12 +66,12 @@ var _ = Describe("Consolidation/DRA", func() {
 		nodePoolMap, nodePoolToInstanceTypesMap, err := disruption.BuildNodePoolMap(ctx, env.Client, cloudProvider)
 		Expect(err).To(Succeed())
 		candidates := lo.Map(nodes, func(node *corev1.Node, _ int) *disruption.Candidate {
-			stateNode := ExpectStateNodeExists(cluster, node)
-			candidate, err := disruption.NewCandidate(ctx, env.Client, recorder, env.Clock, stateNode, pdbs, nodePoolMap, nodePoolToInstanceTypesMap, queue, disruption.GracefulDisruptionClass)
+			stateNode := stateNodeOf(node)
+			candidate, err := disruption.NewCandidate(ctx, cluster.PodsByNode, recorder, env.Clock, stateNode, pdbs, nodePoolMap, nodePoolToInstanceTypesMap, queue, disruption.GracefulDisruptionClass)
 			Expect(err).To(Succeed())
 			return candidate
 		})
-		results, err := disruption.SimulateScheduling(ctx, env.Client, cluster, prov, env.Clock, recorder, []pscheduling.Options{pscheduling.IsConsolidationSimulation}, disruption.SimulationOptions{}, candidates...)
+		results, err := disruption.SimulateScheduling(ctx, env.Client, prov, env.Clock, recorder, []pscheduling.Options{pscheduling.IsConsolidationSimulation}, disruption.SimulationOptions{}, candidates...)
 		Expect(err).To(Succeed())
 		return results
 	}

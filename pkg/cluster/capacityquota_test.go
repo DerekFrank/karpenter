@@ -70,7 +70,7 @@ var _ = Describe("CapacityQuota", func() {
 	It("should count launched NodeClaims against the quotas that select them", func() {
 		quotas().Put(capacityQuota("a", team("a"), "8"))
 		quotas().Put(capacityQuota("b", team("b"), "8"))
-		s.Nodes.NodeClaimStore.Put(quotaNodeClaim("nc", "a", "1", "4"))
+		s.NodeClaims.Put(quotaNodeClaim("nc", "a", "1", "4"))
 		Expect(cpuOf(used("a")).String()).To(Equal("4"))
 		Expect(used("b")).To(BeEmpty())
 	})
@@ -78,34 +78,34 @@ var _ = Describe("CapacityQuota", func() {
 		quotas().Put(capacityQuota("zone-1", &metav1.LabelSelector{MatchLabels: map[string]string{corev1.LabelTopologyZone: "test-zone-1"}}, "8"))
 		quotas().Put(capacityQuota("b", team("b"), "8"))
 		// The zone is open, so it may launch in test-zone-1; it has no team label, so it won't be team b's.
-		s.Nodes.NodeClaimStore.Put(quotaNodeClaim("nc", "", "1", ""))
+		s.NodeClaims.Put(quotaNodeClaim("nc", "", "1", ""))
 		Expect(used("zone-1")).To(HaveLen(1))
 		Expect(used("zone-1")[resources.Node]).To(BeComparableTo(resource.MustParse("1")))
 		Expect(used("b")).To(BeEmpty())
 	})
 	It("should stop counting a NodeClaim once it's disrupted", func() {
 		quotas().Put(capacityQuota("a", team("a"), "8"))
-		s.Nodes.NodeClaimStore.Put(quotaNodeClaim("nc", "a", "1", "4"))
+		s.NodeClaims.Put(quotaNodeClaim("nc", "a", "1", "4"))
 		disrupted := quotaNodeClaim("nc", "a", "2", "4")
 		disrupted.Status.Conditions = []status.Condition{{Type: v1.ConditionTypeDisruptionReason, Status: metav1.ConditionTrue, Reason: "Drifted"}}
-		s.Nodes.NodeClaimStore.Put(disrupted)
+		s.NodeClaims.Put(disrupted)
 		Expect(used("a")).To(BeEmpty())
 	})
 	It("should count Nodes Karpenter doesn't manage", func() {
 		quotas().Put(capacityQuota("a", team("a"), "8"))
 		node := test.Node(test.NodeOptions{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"team": "a"}}, Capacity: cpu("6")})
-		s.Nodes.NodeStore.Put(node)
+		s.Nodes.Put(node)
 		Expect(cpuOf(used("a")).String()).To(Equal("6"))
 		managed := test.Node(test.NodeOptions{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"team": "a", v1.NodePoolLabelKey: "np"}}, Capacity: cpu("6")})
-		s.Nodes.NodeStore.Put(managed)
+		s.Nodes.Put(managed)
 		Expect(cpuOf(used("a")).String()).To(Equal("6"), "counted a Node Karpenter manages")
 
-		s.Nodes.NodeStore.Remove(node.Name)
+		s.Nodes.Remove(node.Name)
 		Expect(used("a")).To(BeEmpty())
 	})
 	It("should count what exists against a quota added after it, and recount once its selector changes", func() {
-		s.Nodes.NodeClaimStore.Put(quotaNodeClaim("nc-a", "a", "1", "4"))
-		s.Nodes.NodeClaimStore.Put(quotaNodeClaim("nc-b", "b", "1", "2"))
+		s.NodeClaims.Put(quotaNodeClaim("nc-a", "a", "1", "4"))
+		s.NodeClaims.Put(quotaNodeClaim("nc-b", "b", "1", "2"))
 		quotas().Put(capacityQuota("q", team("a"), "8"))
 		Expect(cpuOf(used("q")).String()).To(Equal("4"))
 		Expect(quotas().Synced()).To(BeTrue())
@@ -120,7 +120,7 @@ var _ = Describe("CapacityQuota", func() {
 		Expect(used("q")).To(BeEmpty())
 	})
 	It("should enforce a quota from its controller, not on the CapacityQuota store's notification, and be synced once it has", func() {
-		s.Nodes.NodeClaimStore.Put(quotaNodeClaim("nc", "a", "1", "4"))
+		s.NodeClaims.Put(quotaNodeClaim("nc", "a", "1", "4"))
 		// The informer feeds the CapacityQuota store; nothing rebuilds on the goroutine that changes it.
 		sources(quotas()).Put(capacityQuota("q", team("a"), "8"))
 		Expect(quotas().Quotas()).To(BeEmpty(), "enforced on the store's notification")
@@ -154,7 +154,7 @@ var _ = Describe("CapacityQuota", func() {
 	It("should reserve against every quota a NodeClaim may match, in name order, and hold none when one refuses", func() {
 		quotas().Put(capacityQuota("a", team("a"), "8"))
 		quotas().Put(capacityQuota("all", nil, "10"))
-		s.Nodes.NodeClaimStore.Put(quotaNodeClaim("nc", "b", "1", "6"))
+		s.NodeClaims.Put(quotaNodeClaim("nc", "b", "1", "6"))
 
 		// Fits team a's quota, but not the cluster-wide one, so it holds against neither.
 		reservations, refused := quotas().Reserve(teamA, nodeResources("6"), nil)
@@ -176,10 +176,10 @@ var _ = Describe("CapacityQuota", func() {
 		reservations, _ := quotas().Reserve(teamA, nodeResources("8"), nil)
 		Expect(reservations).To(HaveLen(1))
 		reservations[0].Bind("nc")
-		s.Nodes.NodeClaimStore.Put(quotaNodeClaim("nc", "a", "1", ""))
+		s.NodeClaims.Put(quotaNodeClaim("nc", "a", "1", ""))
 		Expect(cpuOf(reserved("a")).String()).To(Equal("8"))
 
-		s.Nodes.NodeClaimStore.Put(quotaNodeClaim("nc", "a", "2", "2"))
+		s.NodeClaims.Put(quotaNodeClaim("nc", "a", "2", "2"))
 		Expect(cpuOf(used("a")).String()).To(Equal("2"))
 		Expect(reserved("a")).To(BeEmpty())
 	})
@@ -188,16 +188,16 @@ var _ = Describe("CapacityQuota", func() {
 		reservations, _ := quotas().Reserve([]scheduling.Requirements{scheduling.NewRequirements()}, nodeResources("8"), nil)
 		Expect(reservations).To(HaveLen(1))
 		reservations[0].Bind("nc")
-		s.Nodes.NodeClaimStore.Put(quotaNodeClaim("nc", "", "1", ""))
+		s.NodeClaims.Put(quotaNodeClaim("nc", "", "1", ""))
 		launched := quotaNodeClaim("nc", "", "2", "2")
 		launched.Labels[corev1.LabelTopologyZone] = "test-zone-2"
-		s.Nodes.NodeClaimStore.Put(launched)
+		s.NodeClaims.Put(launched)
 		Expect(used("zone-1")).To(BeEmpty())
 		Expect(reserved("zone-1")).To(BeEmpty())
 	})
 	It("should credit the NodeClaims a replacement replaces", func() {
 		quotas().Put(capacityQuota("a", team("a"), "8"))
-		s.Nodes.NodeClaimStore.Put(quotaNodeClaim("candidate", "a", "1", "8"))
+		s.NodeClaims.Put(quotaNodeClaim("candidate", "a", "1", "8"))
 		_, refused := quotas().Reserve(teamA, nodeResources("8"), nil)
 		Expect(refused).To(Equal("a"))
 		reservations, refused := quotas().Reserve(teamA, nodeResources("8"), []string{"candidate"})
@@ -278,20 +278,20 @@ var _ = Describe("CapacityQuota", func() {
 					for _, reservation := range reservations {
 						reservation.Bind(name)
 					}
-					s.Nodes.NodeClaimStore.Put(quotaNodeClaim(name, t, "1", ""))
+					s.NodeClaims.Put(quotaNodeClaim(name, t, "1", ""))
 					check("create " + name)
 					mu.Unlock()
 
 					mu.Lock()
 					c := int64(1 + r.IntN(3))
-					s.Nodes.NodeClaimStore.Put(quotaNodeClaim(name, t, "2", fmt.Sprint(c)))
+					s.NodeClaims.Put(quotaNodeClaim(name, t, "2", fmt.Sprint(c)))
 					delete(held, name)
 					launched[name] = live{team: t, cpu: c}
 					check("launch " + name)
 					mu.Unlock()
 
 					mu.Lock()
-					s.Nodes.NodeClaimStore.Remove(name)
+					s.NodeClaims.Remove(name)
 					delete(launched, name)
 					check("delete " + name)
 					mu.Unlock()
@@ -327,11 +327,11 @@ var _ = Describe("CapacityQuota", func() {
 					if reservations == nil {
 						continue
 					}
-					s.Nodes.NodeClaimStore.Put(quotaNodeClaim(name, t, "1", "2"))
+					s.NodeClaims.Put(quotaNodeClaim(name, t, "1", "2"))
 					for _, reservation := range reservations {
 						reservation.Bind(name)
 					}
-					s.Nodes.NodeClaimStore.Remove(name)
+					s.NodeClaims.Remove(name)
 				}
 			})
 		}

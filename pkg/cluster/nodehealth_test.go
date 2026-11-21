@@ -80,17 +80,17 @@ var _ = Describe("NodeHealth", func() {
 	})
 
 	It("should count Nodes per NodePool", func() {
-		c, nodePools := s.Nodes, s.NodePoolState
+		c, nodePools := s, s.NodePoolState
 		for _, node := range []*corev1.Node{
 			healthNode("a-1", "a", true), healthNode("a-2", "a", false), healthNode("a-3", "a", false),
 			healthNode("b-1", "b", true),
 			// An unmanaged Node counts toward no NodePool.
 			healthNode("unmanaged", "", true),
 		} {
-			c.NodeStore.Put(node)
+			c.Nodes.Put(node)
 		}
 		// A NodeClaim without a Node isn't a node yet.
-		c.NodeClaimStore.Put(&v1.NodeClaim{
+		c.NodeClaims.Put(&v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{Name: "launching", UID: "launching", Labels: map[string]string{v1.NodePoolLabelKey: "a"}},
 			Spec:       v1.NodeClaimSpec{NodeClassRef: test.NodeClaim().Spec.NodeClassRef},
 			Status:     v1.NodeClaimStatus{ProviderID: "fake://launching"},
@@ -101,26 +101,26 @@ var _ = Describe("NodeHealth", func() {
 		Expect(nodePools.NodeHealth("missing")).To(Equal(NodeCounts{}))
 
 		// A Node that recovers stops counting as unhealthy.
-		c.NodeStore.Put(withResourceVersion(healthNode("a-1", "a", false), "2"))
+		c.Nodes.Put(withResourceVersion(healthNode("a-1", "a", false), "2"))
 		Expect(nodePools.NodeHealth("a")).To(Equal(NodeCounts{Nodes: 3, Unhealthy: 0}))
 		// A Node that moves between NodePools moves its count.
-		c.NodeStore.Put(withResourceVersion(healthNode("b-1", "a", true), "2"))
+		c.Nodes.Put(withResourceVersion(healthNode("b-1", "a", true), "2"))
 		Expect(nodePools.NodeHealth("a")).To(Equal(NodeCounts{Nodes: 4, Unhealthy: 1}))
 		Expect(nodePools.NodeHealth("b")).To(Equal(NodeCounts{}))
 
 		// A Node that's gone stops counting, and a NodePool without Nodes leaves nothing behind.
-		c.NodeStore.Remove("b-1")
+		c.Nodes.Remove("b-1")
 		e, _ := nodePools.store.Get("b")
 		Expect(e.Derived).To(BeZero(), "NodePool b has fields after its last Node went")
 		Expect(nodePools.NodeHealth("a")).To(Equal(NodeCounts{Nodes: 3, Unhealthy: 0}))
 	})
 	It("should enqueue the unhealthy Nodes counted where the counts change, with Source", func() {
-		c := s.Nodes
-		h := c.DeriveNodeHealth(func(node *corev1.Node) bool { return len(node.Status.Conditions) != 0 })
-		c.NodeStore.Put(healthNode("a-1", "a", true))
-		c.NodeStore.Put(healthNode("a-2", "a", true))
-		c.NodeStore.Put(healthNode("a-3", "a", false))
-		c.NodeStore.Put(healthNode("b-1", "b", true))
+		c := s
+		h := c.Nodes.DeriveNodeHealth(func(node *corev1.Node) bool { return len(node.Status.Conditions) != 0 })
+		c.Nodes.Put(healthNode("a-1", "a", true))
+		c.Nodes.Put(healthNode("a-2", "a", true))
+		c.Nodes.Put(healthNode("a-3", "a", false))
+		c.Nodes.Put(healthNode("b-1", "b", true))
 		queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
 		DeferCleanup(queue.ShutDown)
 		ctx, cancel := context.WithCancel(context.Background())
@@ -138,29 +138,29 @@ var _ = Describe("NodeHealth", func() {
 		Expect(drain()).To(BeEmpty(), "want nothing until the counts change")
 
 		// a-1 recovering changes NodePool a's counts and the cluster's: the unhealthy Nodes of each are enqueued.
-		c.NodeStore.Put(withResourceVersion(healthNode("a-1", "a", false), "2"))
+		c.Nodes.Put(withResourceVersion(healthNode("a-1", "a", false), "2"))
 		Expect(drain()).To(ConsistOf("a-2", "b-1"))
 
 		// A Node's change that leaves the counts as they were enqueues nothing.
 		updated := withResourceVersion(healthNode("a-3", "a", false), "2")
 		updated.Annotations = map[string]string{"changed": "true"}
-		c.NodeStore.Put(updated)
+		c.Nodes.Put(updated)
 		Expect(drain()).To(BeEmpty())
 	})
 	It("should derive node health that counts with its own predicate and the Nodes already held", func() {
-		c := s.Nodes
-		c.NodeStore.Put(healthNode("a-1", "a", true))
-		c.NodeStore.Put(healthNode("a-2", "a", false))
+		c := s
+		c.Nodes.Put(healthNode("a-1", "a", true))
+		c.Nodes.Put(healthNode("a-2", "a", false))
 		// Unhealthy here is a Node without the BadNode condition, the opposite of the matcher's.
-		h := c.DeriveNodeHealth(func(node *corev1.Node) bool { return len(node.Status.Conditions) == 0 })
+		h := c.Nodes.DeriveNodeHealth(func(node *corev1.Node) bool { return len(node.Status.Conditions) == 0 })
 		Expect(h.NodePool("a")).To(Equal(NodeCounts{Nodes: 2, Unhealthy: 1}))
-		c.NodeStore.Put(healthNode("a-3", "a", false))
+		c.Nodes.Put(healthNode("a-3", "a", false))
 		Expect(h.NodePool("a")).To(Equal(NodeCounts{Nodes: 3, Unhealthy: 2}))
 		Expect(s.NodePoolState.NodeHealth("a")).To(Equal(NodeCounts{Nodes: 3, Unhealthy: 1}))
 		Expect(h.Cluster()).To(Equal(NodeCounts{Nodes: 3, Unhealthy: 2}))
 	})
 	It("should converge after concurrent changes", func() {
-		c := s.Nodes
+		c := s
 		pools := []string{"", "a", "b", "c"}
 		var wg sync.WaitGroup
 		for w := range 8 {
@@ -169,18 +169,18 @@ var _ = Describe("NodeHealth", func() {
 				for i := range 500 {
 					name := fmt.Sprintf("node-%d", r.IntN(40))
 					if r.IntN(4) == 0 {
-						c.NodeStore.Remove(name)
+						c.Nodes.Remove(name)
 						continue
 					}
-					c.NodeStore.Put(withResourceVersion(healthNode(name, pools[r.IntN(len(pools))], r.IntN(2) == 0), fmt.Sprint(w*1000+i)))
+					c.Nodes.Put(withResourceVersion(healthNode(name, pools[r.IntN(len(pools))], r.IntN(2) == 0), fmt.Sprint(w*1000+i)))
 				}
 			})
 		}
 		wg.Wait()
 		want := map[string]NodeCounts{}
-		for _, e := range c.NodeStore.List() {
+		for _, e := range c.Nodes.List() {
 			node := e.Object
-			bad := len(c.matcher.Match(node)) > 0
+			bad := len(c.RepairPolicyMatcher.Match(node)) > 0
 			name := node.Labels[v1.NodePoolLabelKey]
 			if name == "" {
 				continue

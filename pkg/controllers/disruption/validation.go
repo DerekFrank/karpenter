@@ -98,7 +98,7 @@ type Validator interface {
 // skip the validation TTL for all but the first command.
 type validation struct {
 	clock         clock.Clock
-	cluster       *karpentercluster.NodeState
+	cluster       Stores
 	nodePools     *karpentercluster.NodePoolState
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
@@ -240,7 +240,7 @@ func (e *EmptinessValidator) validateCandidates(ctx context.Context, candidates 
 	}
 
 	if valid := lo.Filter(validatedCandidates, func(cn *Candidate, _ int) bool {
-		if e.cluster.IsNodeNominated(cn.NodeClaim.Name) {
+		if e.cluster.nominated(cn.NodeClaim.Name, e.clock.Now()) {
 			FailedValidationsTotal.Inc(map[string]string{ConsolidationTypeLabel: e.validationType})
 			return false
 		}
@@ -284,7 +284,7 @@ func (c *ConsolidationValidator) validateCandidates(ctx context.Context, candida
 	//  a. A pod was nominated to the candidate
 	//  b. Disrupting the candidate would violate node disruption budgets
 	for _, vc := range validatedCandidates {
-		if c.cluster.IsNodeNominated(vc.NodeClaim.Name) {
+		if c.cluster.nominated(vc.NodeClaim.Name, c.clock.Now()) {
 			FailedValidationsTotal.Add(float64(len(candidates)), map[string]string{ConsolidationTypeLabel: c.validationType})
 			return nil, NewBudgetValidationError(fmt.Errorf("a candidate was nominated during validation"))
 		}
@@ -303,7 +303,7 @@ func (v *validation) validateCommand(ctx context.Context, cmd Command, candidate
 	if len(candidates) == 0 {
 		return NewValidationError(fmt.Errorf("no candidates"))
 	}
-	results, err := SimulateScheduling(ctx, v.kubeClient, v.cluster, v.provisioner, v.clock, v.recorder, []scheduling.Options{scheduling.IsConsolidationSimulation}, SimulationOptions{}, candidates...)
+	results, err := SimulateScheduling(ctx, v.kubeClient, v.provisioner, v.clock, v.recorder, []scheduling.Options{scheduling.IsConsolidationSimulation}, SimulationOptions{}, candidates...)
 	if err != nil {
 		return fmt.Errorf("simluating scheduling, %w", err)
 	}

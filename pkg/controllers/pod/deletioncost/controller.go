@@ -64,7 +64,8 @@ type Controller struct {
 	clock         clock.Clock
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
-	nodes         *karpentercluster.NodeState
+	nodeClaims    *karpentercluster.NodeClaims
+	podsByNode    *karpentercluster.PodIndex[string]
 	nodePools     *karpentercluster.NodePoolState
 	queue         *Queue
 
@@ -80,7 +81,8 @@ func NewController(
 	clk clock.Clock,
 	kubeClient client.Client,
 	cloudProvider cloudprovider.CloudProvider,
-	nodes *karpentercluster.NodeState,
+	nodeClaims *karpentercluster.NodeClaims,
+	podsByNode *karpentercluster.PodIndex[string],
 	nodePools *karpentercluster.NodePoolState,
 	queue *Queue,
 ) *Controller {
@@ -88,21 +90,22 @@ func NewController(
 		clock:         clk,
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
-		nodes:         nodes,
+		nodeClaims:    nodeClaims,
+		podsByNode:    podsByNode,
 		nodePools:     nodePools,
 		queue:         queue,
 	}
 }
 
 // Register wakes the controller on what disruption wakes on, which decides how disruption would rank the nodes: the
-// NodeClaim and Node stores narrowed to disruption's inputs, and a managed NodePool's spec changing, through its
+// NodeClaim store narrowed to disruption's inputs, and a managed NodePool's spec changing, through its
 // generation. Each change counts, so that the controller skips its work until one comes, or for revalidationPeriod.
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		WatchesRawSource(singleton.Source()).
-		WatchesRawSource(karpenterstate.Requires(c.nodes, c.nodePools)).
-		WatchesRawSource(karpenterstate.WakeCounting(c.countChange, c.nodes.DisruptionSources()...)).
+		WatchesRawSource(karpenterstate.Requires(c.nodeClaims, c.nodePools)).
+		WatchesRawSource(karpenterstate.WakeCounting(c.countChange, c.nodeClaims.DisruptionSource())).
 		Watches(&v1.NodePool{}, handler.EnqueueRequestsFromMapFunc(func(context.Context, client.Object) []reconcile.Request {
 			c.countChange()
 			return []reconcile.Request{{}}
@@ -131,7 +134,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 
 	// RankNodes reads the nodes from cluster state; skip the NodePool lookups when there are none. A node appearing
 	// wakes the controller.
-	if _, ok := first(c.nodes.Nodes()); !ok {
+	if _, ok := first(c.nodeClaims.List(client.UnsafeDisableDeepCopy)); !ok {
 		return reconciler.Result{}, nil
 	}
 
@@ -141,7 +144,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return reconciler.Result{}, fmt.Errorf("building node pool map, %w", err)
 	}
 
-	groupA, groupBC, groupD, err := RankNodes(ctx, c.kubeClient, c.clock, c.nodes, c.nodePools, nodePoolMap, nodePoolToInstanceTypesMap)
+	groupA, groupBC, groupD, err := RankNodes(ctx, c.kubeClient, c.clock, c.nodeClaims, c.podsByNode, c.nodePools, nodePoolMap, nodePoolToInstanceTypesMap)
 	if err != nil {
 		return reconciler.Result{}, fmt.Errorf("ranking nodes, %w", err)
 	}
@@ -165,7 +168,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 
 // Group A bypasses the per-cycle cap so nodes already being torn down always
 // annotate promptly. Returns per-nodepool counts of nodes annotated.
-func (c *Controller) enqueueAnnotationWrites(ctx context.Context, groupA, groupBC, groupD []*karpentercluster.StateNode) map[string]int {
+func (c *Controller) enqueueAnnotationWrites(ctx context.Context, groupA, groupBC, groupD []karpentercluster.NodeClaimEntry) map[string]int {
 	perNodePool := map[string]int{}
 	for _, node := range groupA {
 		c.tryEnqueueNode(ctx, node, math.MinInt32, false, perNodePool)
@@ -180,8 +183,8 @@ func (c *Controller) enqueueAnnotationWrites(ctx context.Context, groupA, groupB
 	return perNodePool
 }
 
-func (c *Controller) tryEnqueueNode(ctx context.Context, node *karpentercluster.StateNode, rank int, cleanup bool, perNodePool map[string]int) bool {
-	pods, _ := node.Pods(ctx, c.kubeClient)
+func (c *Controller) tryEnqueueNode(_ context.Context, node karpentercluster.NodeClaimEntry, rank int, cleanup bool, perNodePool map[string]int) bool {
+	pods := karpentercluster.PodsOn(c.podsByNode, karpentercluster.ViewOfNodeClaim(node).NodeName())
 	// kube-controller-manager's ReplicaSet controller is the only in-tree consumer
 	// of corev1.PodDeletionCost, so writing it on a pod controlled by any other
 	// kind has no effect. Filter before the no-op guard so the guard, the enqueue
@@ -193,11 +196,11 @@ func (c *Controller) tryEnqueueNode(ctx context.Context, node *karpentercluster.
 	for _, pod := range pods {
 		c.queue.Add(pod, rank, cleanup)
 	}
-	perNodePool[node.Labels()[v1.NodePoolLabelKey]]++
+	perNodePool[labelsOf(node)[v1.NodePoolLabelKey]]++
 	return true
 }
 
-func (c *Controller) enqueueCapped(ctx context.Context, nodes []*karpentercluster.StateNode, budget int, perNodePool map[string]int, rankAt func(i int) (int, bool)) int {
+func (c *Controller) enqueueCapped(ctx context.Context, nodes []karpentercluster.NodeClaimEntry, budget int, perNodePool map[string]int, rankAt func(i int) (int, bool)) int {
 	if budget <= 0 {
 		return 0
 	}
@@ -234,8 +237,8 @@ func podHasDesiredAnnotation(pod *corev1.Pod, rank int, cleanup bool) bool {
 }
 
 // first returns the first value of seq, and whether it has one.
-func first[V any](seq iter.Seq[V]) (V, bool) {
-	for v := range seq {
+func first[K, V any](seq iter.Seq2[K, V]) (V, bool) {
+	for _, v := range seq {
 		return v, true
 	}
 	var zero V

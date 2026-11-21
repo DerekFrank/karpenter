@@ -100,7 +100,7 @@ func (f *timingOutNodePoolClient) Get(ctx context.Context, key client.ObjectKey,
 var (
 	cs            karpentercluster.State
 	ctx           context.Context
-	cluster       *karpentercluster.NodeState
+	cluster       karpentercluster.State
 	cloudProvider *fake.CloudProvider
 	controller    *static.Controller
 	env           *test.Environment
@@ -119,9 +119,9 @@ var _ = BeforeSuite(func() {
 	cloudProvider = fake.NewCloudProvider()
 	virtualPodCache := virtualpods.NewVirtualPodCache(env.Overlay)
 	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = cs.Nodes
-	prov = provisioning.NewProvisioner(env.Overlay, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, cs.NodePoolState, cs.CapacityQuotaState, env.Clock, deviceallocation.NewController(env.Overlay), virtualPodCache, nil, cs.Nomination, cs.BufferPods, cs.PodScheduling)
-	controller = static.NewController(env.Overlay, cluster, cs.NodePoolState, cs.CapacityQuotaState, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, prov, env.Clock, deviceallocation.NewController(env.Overlay), virtualPodCache)
+	cluster = cs
+	prov = provisioning.NewProvisioner(env.Overlay, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, provisioning.StoresOf(cs), cs.NodePoolState, cs.CapacityQuotaState, env.Clock, deviceallocation.NewController(env.Overlay), virtualPodCache, nil, cs.Nomination, cs.BufferPods, cs.PodScheduling)
+	controller = static.NewController(env.Overlay, provisioning.StoresOf(cluster), cluster.NodePoolState, cs.CapacityQuotaState, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, prov, env.Clock, deviceallocation.NewController(env.Overlay), virtualPodCache)
 })
 
 var _ = BeforeEach(func() {
@@ -154,7 +154,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 			ExpectApplied(ctx, env.Client, nodePool)
 
 			// Create controller with failing client
-			failingController := static.NewController(&failingClient{Client: env.Overlay}, cluster, cs.NodePoolState, cs.CapacityQuotaState, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, prov, env.Clock, deviceallocation.NewController(env.Overlay), virtualpods.NewVirtualPodCache(env.Overlay))
+			failingController := static.NewController(&failingClient{Client: env.Overlay}, provisioning.StoresOf(cluster), cluster.NodePoolState, cs.CapacityQuotaState, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, prov, env.Clock, deviceallocation.NewController(env.Overlay), virtualpods.NewVirtualPodCache(env.Overlay))
 
 			result, err := failingController.Reconcile(ctx, nodePool)
 			Expect(err).To(HaveOccurred())
@@ -173,7 +173,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 				nodePool := test.StaticNodePool()
 				nodePool.Spec.Replicas = new(int64(2))
 				ExpectApplied(ctx, env.Client, nodePool)
-				reconciler := static.NewController(newClient(env.Overlay), cluster, cs.NodePoolState, cs.CapacityQuotaState, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, prov, env.Clock, deviceallocation.NewController(env.Overlay), virtualpods.NewVirtualPodCache(env.Overlay))
+				reconciler := static.NewController(newClient(env.Overlay), provisioning.StoresOf(cluster), cluster.NodePoolState, cs.CapacityQuotaState, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, prov, env.Clock, deviceallocation.NewController(env.Overlay), virtualpods.NewVirtualPodCache(env.Overlay))
 				reconcileCtx := ctx
 				if canceled {
 					var cancel context.CancelFunc
@@ -344,7 +344,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 
 			// Update cluster state to track the nodes
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node1, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2})
-			Expect(cluster.Nodes()).To(HaveLen(2))
+			Expect(StateNodes(cluster)).To(HaveLen(2))
 			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 2, 0, 0)
 
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
@@ -398,7 +398,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 
 			// 	// Update cluster state to track the nodes
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
-			Expect(cluster.Nodes()).To(HaveLen(1))
+			Expect(StateNodes(cluster)).To(HaveLen(1))
 			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 1, 0, 0)
 
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
@@ -487,7 +487,7 @@ var _ = Describe("Static Provisioning Controller", func() {
 
 			// 	// Update cluster state to track the nodes
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
-			Expect(cluster.Nodes()).To(HaveLen(1))
+			Expect(StateNodes(cluster)).To(HaveLen(1))
 			ExpectStateNodePoolCount(cs.NodePoolState, nodePool.Name, 1, 0, 0)
 
 			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
@@ -761,7 +761,7 @@ var _ = Describe("Static Provisioning Wakes", func() {
 	var nodeClaim *v1.NodeClaim
 	var queue workqueue.TypedRateLimitingInterface[reconcile.Request]
 	BeforeEach(func() {
-		c := static.NewController(env.Overlay, cluster, cs.NodePoolState, cs.CapacityQuotaState, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, prov, env.Clock, deviceallocation.NewController(env.Overlay), virtualpods.NewVirtualPodCache(env.Overlay))
+		c := static.NewController(env.Overlay, provisioning.StoresOf(cluster), cluster.NodePoolState, cs.CapacityQuotaState, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, prov, env.Clock, deviceallocation.NewController(env.Overlay), virtualpods.NewVirtualPodCache(env.Overlay))
 		register(c)
 		nodePool = test.StaticNodePool()
 		nodePool.Spec.Replicas = new(int64(2))
@@ -804,14 +804,14 @@ var _ = Describe("Static Provisioning Wakes", func() {
 
 		nodeClaim.Status.Capacity = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}
 		ExpectApplied(ctx, env.Client, nodeClaim)
-		Expect(new(cs.NodePoolState.Get(nodePool.Name).Usage[corev1.ResourceCPU]).Value()).To(Equal(int64(2)))
+		Expect(new(cs.NodePoolState.Fields(nodePool.Name).Usage[corev1.ResourceCPU]).Value()).To(Equal(int64(2)))
 
 		node := test.Node(test.NodeOptions{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
 			v1.NodePoolLabelKey:            nodePool.Name,
 			corev1.LabelInstanceTypeStable: "instance-type",
 		}}, ProviderID: nodeClaim.Status.ProviderID})
 		ExpectApplied(ctx, env.Client, node)
-		Expect(cs.NodePoolState.Get(nodePool.Name).NodeHealth.Nodes).To(Equal(1))
+		Expect(cs.NodePoolState.Fields(nodePool.Name).NodeHealth.Nodes).To(Equal(1))
 		Expect(drain(queue)).To(BeEmpty(), "want nothing for the NodePool's usage and node health")
 	})
 	It("should wake once reservations that make up the shortfall expire, without a requeue, and provision in their place", func() {

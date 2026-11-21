@@ -72,14 +72,21 @@ func (x *Index[K, O, D, I, V]) Lookup(v V) []K {
 // List returns the entries that exist and that return v, such as the pods that mount a PVC: matching a field is the
 // index's List, where the client's would take client.MatchingFields. It's Lookup then Get, so it skips a key whose entry
 // has since gone, and each entry is from one moment, as Reader.List's are; an entry that changed since Lookup may no
-// longer return v. It takes the options listOptionsOf parses.
+// longer return v. It takes the options listOptionsOf parses, and copies each object as Reader.List does.
 func (x *Index[K, O, D, I, V]) List(v V, opts ...client.ListOption) iter.Seq2[K, Entry[O, D, I]] {
 	o := listOptionsOf[O](opts)
 	keys := x.lookup(v)
 	r := Reader[K, O, D, I]{x.s}
 	return func(yield func(K, Entry[O, D, I]) bool) {
 		for _, k := range keys {
-			if e, ok := r.Get(k); ok && o.matches(e.Object) && !yield(k, e) {
+			e, ok := r.get(k)
+			if !ok || !o.matches(e.Object) {
+				continue
+			}
+			if !o.unsafeDisableDeepCopy {
+				e.Object = deepCopy(e.Object)
+			}
+			if !yield(k, e) {
 				return
 			}
 		}
@@ -90,20 +97,21 @@ func (x *Index[K, O, D, I, V]) List(v V, opts ...client.ListOption) iter.Seq2[K,
 type listOptions struct {
 	// selector filters by the object's labels, nil for every object.
 	selector labels.Selector
-	// unsafeDisableDeepCopy is client.UnsafeDisableDeepCopy. A store's reads don't copy its objects yet, so it changes
-	// nothing.
+	// unsafeDisableDeepCopy is client.UnsafeDisableDeepCopy: the read returns the store's own objects.
 	unsafeDisableDeepCopy bool
 }
 
-// listOptionsOf parses the options a List of a store of O takes: client.UnsafeDisableDeepCopy, and a label selector,
-// client.MatchingLabels or client.MatchingLabelsSelector, which needs O to be a metav1.Object. Any other option panics,
-// such as client.MatchingFields, which an Index's List serves.
+// listOptionsOf parses the options a Reader's List and an Index's List take: client.UnsafeDisableDeepCopy, and a label
+// selector, client.MatchingLabels or client.MatchingLabelsSelector, which needs O to be a metav1.Object. Any other
+// option panics, naming it, such as client.MatchingFields, which an Index's List serves, and client.InNamespace.
 func listOptionsOf[O any](opts []client.ListOption) listOptions {
 	var parsed client.ListOptions
 	for _, opt := range opts {
 		switch opt.(type) {
 		case client.MatchingLabels, client.MatchingLabelsSelector, client.UnsafeDisableDeepCopyOption:
 			opt.ApplyToList(&parsed)
+		case client.MatchingFields, client.MatchingFieldsSelector:
+			panic(fmt.Sprintf("a store's List doesn't take a %T: match a field with an Index's List", opt))
 		default:
 			panic(fmt.Sprintf("a store's List doesn't take a %T", opt))
 		}
@@ -113,6 +121,19 @@ func listOptionsOf[O any](opts []client.ListOption) listOptions {
 		panic(fmt.Sprintf("a label selector on a store of %s, which isn't a metav1.Object", reflect.TypeFor[O]()))
 	}
 	return o
+}
+
+// getOptionsOf parses the options a Reader's Get takes, client.UnsafeDisableDeepCopy, and returns whether it's set. Any
+// other option panics, naming it.
+func getOptionsOf(opts []client.GetOption) (unsafeDisableDeepCopy bool) {
+	var parsed client.GetOptions
+	for _, opt := range opts {
+		if _, ok := opt.(client.UnsafeDisableDeepCopyOption); !ok {
+			panic(fmt.Sprintf("a store's Get doesn't take a %T", opt))
+		}
+		opt.ApplyToGet(&parsed)
+	}
+	return parsed.UnsafeDisableDeepCopy != nil && *parsed.UnsafeDisableDeepCopy
 }
 
 // matches returns whether obj is one the options select.

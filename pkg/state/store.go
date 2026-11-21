@@ -25,6 +25,7 @@ import (
 	"sync"
 
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // Entry describes one object: the object itself, the fields Derives and Claims compute about it from other stores,
@@ -95,7 +96,7 @@ type core[K comparable, O, D, I any] struct {
 type Reader[K comparable, O, D, I any] struct{ s *core[K, O, D, I] }
 
 // Store is a store and its writes: a fed store's Feed and FeedAll. A Derive's target, a Claims', an intent handle's and
-// an Index's take a Store, and TouchOn and DependsOn re-notify one.
+// an Index's take a Store, and DependsOn re-notifies one.
 type Store[K comparable, O, D, I any] struct{ Reader[K, O, D, I] }
 
 func newCore[K comparable, O, D, I any](k kind, build func(K) O) *core[K, O, D, I] {
@@ -115,8 +116,19 @@ func NewFedStore[K comparable, O, D, I any]() *Store[K, O, D, I] {
 }
 
 // Get returns key's entry, and whether it exists. An entry that doesn't exist can hold Derived contributions waiting
-// for its object, which Get returns.
-func (r Reader[K, O, D, I]) Get(key K) (Entry[O, D, I], bool) {
+// for its object, which Get returns. The object is a deep copy, which the caller may change and write, unless opts has
+// client.UnsafeDisableDeepCopy, which returns the store's own object, for a read that only reads. Derived and Intent are
+// never copied: they're shared and never change. Get takes no other option, and panics naming one.
+func (r Reader[K, O, D, I]) Get(key K, opts ...client.GetOption) (Entry[O, D, I], bool) {
+	e, ok := r.get(key)
+	if !getOptionsOf(opts) {
+		e.Object = deepCopy(e.Object)
+	}
+	return e, ok
+}
+
+// get returns key's entry as Get does, without copying its object.
+func (r Reader[K, O, D, I]) get(key K) (Entry[O, D, I], bool) {
 	v, ok := r.s.slots.Load(key)
 	if !ok {
 		return Entry[O, D, I]{}, false
@@ -125,9 +137,29 @@ func (r Reader[K, O, D, I]) Get(key K) (Entry[O, D, I], bool) {
 	return sl.entry, sl.exists
 }
 
-// List returns every entry that exists. Each entry is from one moment, but different entries may be from different
-// moments.
-func (r Reader[K, O, D, I]) List() iter.Seq2[K, Entry[O, D, I]] {
+// List returns every entry that exists and that opts select. Each entry is from one moment, but different entries may
+// be from different moments. Each object is a deep copy unless opts has client.UnsafeDisableDeepCopy, as Get's is. It
+// takes the options listOptionsOf parses: a label selector, a scan, and client.UnsafeDisableDeepCopy. Matching a field
+// is an Index's List.
+func (r Reader[K, O, D, I]) List(opts ...client.ListOption) iter.Seq2[K, Entry[O, D, I]] {
+	o := listOptionsOf[O](opts)
+	return func(yield func(K, Entry[O, D, I]) bool) {
+		for k, e := range r.list() {
+			if !o.matches(e.Object) {
+				continue
+			}
+			if !o.unsafeDisableDeepCopy {
+				e.Object = deepCopy(e.Object)
+			}
+			if !yield(k, e) {
+				return
+			}
+		}
+	}
+}
+
+// list returns every entry that exists, as List does, without copying its object.
+func (r Reader[K, O, D, I]) list() iter.Seq2[K, Entry[O, D, I]] {
 	return func(yield func(K, Entry[O, D, I]) bool) {
 		r.s.slots.Range(func(k, v any) bool {
 			sl := v.(*slot[O, D, I])
@@ -136,9 +168,19 @@ func (r Reader[K, O, D, I]) List() iter.Seq2[K, Entry[O, D, I]] {
 	}
 }
 
+// deepCopy returns a copy of obj that a reader may change: obj.DeepCopy() for an O with that method, as every API
+// object has, and obj itself otherwise. An O without DeepCopy is a synthetic object: a value, which assignment copies,
+// or one whose readers never change what it references, such as a cloud provider's instance type.
+func deepCopy[O any](obj O) O {
+	if c, ok := any(obj).(interface{ DeepCopy() O }); ok {
+		return c.DeepCopy()
+	}
+	return obj
+}
+
 // Subscribe calls fn with each change of an entry that exists before or after it, and returns a func that stops it. fn
 // runs on the goroutine that made the change, after the store's lock is released, so it must be cheap and never block:
-// it updates a counter, enqueues or Touches.
+// it updates a counter or enqueues.
 func (r Reader[K, O, D, I]) Subscribe(fn func(Change[K, O, D, I])) func() {
 	s := r.s
 	s.mu.Lock()
@@ -176,10 +218,10 @@ func (r Reader[K, O, D, I]) Synced() bool {
 }
 
 // touch stores key's entry again in a new slot and notifies its subscribers, so that the Derives from the store
-// recompute key's contribution, for a contribution that reads another store's entry that changed, such as a
-// NodeClaim's, which reads its Node's. The new slot refuses the commit of a recompute that read the other store before
-// it changed, as a changed entry would. The entry is unchanged, so its index values are too. TouchOn and DependsOn are
-// its callers.
+// recompute key's contribution, for a contribution that reads another store's entry that changed, such as a pod's,
+// which reads the drivers of the PVCs it mounts. The new slot refuses the commit of a recompute that read the other
+// store before it changed, as a changed entry would. The entry is unchanged, so its index values are too. DependsOn is
+// its caller.
 func (s *Store[K, O, D, I]) touch(key K) {
 	c := s.s
 	c.mu.Lock()
@@ -192,19 +234,6 @@ func (s *Store[K, O, D, I]) touch(key K) {
 	c.slots.Store(key, &next)
 	c.pending = append(c.pending, Change[K, O, D, I]{Key: key, Old: cur.entry, New: next.entry, Existed: true, Exists: true})
 	c.unlock()
-}
-
-// TouchOn re-notifies the keys of to that dependents returns for each change of from, so that the Derives from to
-// whose contributions read from's entries recompute, such as a NodeClaim's contribution to its NodePool, which reads
-// its Node's entry. It's the subscriber half of a dependency kept with an index; dependents reads the index, such as a
-// Derivation's Sources, and is cheap and non-blocking. It returns a func that stops it.
-func TouchOn[K1 comparable, O1, D1, I1 any, K2 comparable, O2, D2, I2 any](from Reader[K1, O1, D1, I1], to *Store[K2, O2, D2, I2],
-	dependents func(Change[K1, O1, D1, I1]) []K2) func() {
-	return from.Subscribe(func(c Change[K1, O1, D1, I1]) {
-		for _, key := range dependents(c) {
-			to.touch(key)
-		}
-	})
 }
 
 // Clear empties the store in place, notifying the removal of each entry, so that subscribers stay subscribed, and each

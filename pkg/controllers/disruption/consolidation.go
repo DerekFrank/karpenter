@@ -53,7 +53,7 @@ type consolidation struct {
 	// Consolidation needs to be aware of the queue for validation
 	queue         *Queue
 	clock         clock.Clock
-	cluster       *karpentercluster.NodeState
+	cluster       Stores
 	nodePools     *karpentercluster.NodePoolState
 	kubeClient    client.Client
 	provisioner   *provisioning.Provisioner
@@ -80,7 +80,7 @@ func (c *consolidation) SetNodePoolTotals(totals map[string]NodePoolTotals) {
 	c.evaluator = NewBalancedEvaluator(totals, c.recorder)
 }
 
-func MakeConsolidation(clock clock.Clock, cluster *karpentercluster.NodeState, nodePools *karpentercluster.NodePoolState, kubeClient client.Client, provisioner *provisioning.Provisioner,
+func MakeConsolidation(clock clock.Clock, cluster Stores, nodePools *karpentercluster.NodePoolState, kubeClient client.Client, provisioner *provisioning.Provisioner,
 	cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue) consolidation {
 	return consolidation{
 		queue:         queue,
@@ -178,7 +178,7 @@ func (c *consolidation) sortCandidates(_ context.Context, candidates []*Candidat
 func (c *consolidation) computeConsolidation(ctx context.Context, candidates ...*Candidate) (Command, error) {
 	var err error
 	// Run scheduling simulation to compute consolidation option
-	results, err := SimulateScheduling(ctx, c.kubeClient, c.cluster, c.provisioner, c.clock, c.recorder, []pscheduling.Options{pscheduling.IsConsolidationSimulation}, SimulationOptions{}, candidates...)
+	results, err := SimulateScheduling(ctx, c.kubeClient, c.provisioner, c.clock, c.recorder, []pscheduling.Options{pscheduling.IsConsolidationSimulation}, SimulationOptions{}, candidates...)
 	if err != nil {
 		// if a candidate node is now deleting, just retry
 		if errors.Is(err, errCandidateDeleting) {

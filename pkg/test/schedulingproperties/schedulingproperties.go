@@ -654,7 +654,7 @@ func solve(ctx context.Context, t *caseT, cfg Config, s scenario) (scheduling.Re
 	srcs := statetest.NewSources()
 	cs := karpcluster.New(ctx, clock.RealClock{}, nil, cp, karpcluster.WithSources(func(obj client.Object) karpstate.Newest { return srcs.For(obj) }))
 	srcs.Put(lo.Map(s.pods, func(pod *corev1.Pod, _ int) client.Object { return pod.DeepCopy() })...)
-	prov := provisioning.NewProvisioner(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cp, cs.Nodes, cs.NodePoolState, cs.CapacityQuotaState, clock.RealClock{}, nil, nil, nil, cs.Nomination, cs.BufferPods, cs.PodScheduling)
+	prov := provisioning.NewProvisioner(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cp, provisioning.StoresOf(cs), cs.NodePoolState, cs.CapacityQuotaState, clock.RealClock{}, nil, nil, nil, cs.Nomination, cs.BufferPods, cs.PodScheduling)
 	opts := *options.FromContext(ctx)
 	opts.MinValuesPolicy = s.minValuesPolicy
 	// Scheduling logs bury the failure report.

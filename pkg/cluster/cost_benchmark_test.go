@@ -79,7 +79,7 @@ func newCostBenchmark(nodePools, nodeClaimsPerNodePool, instanceTypesPerNodePool
 	for _, nodeClaim := range bm.nodeClaims {
 		srcs.Put(nodeClaim)
 	}
-	bm.store = s.Nodes.NodeClaimStore
+	bm.store = s.NodeClaims
 	return bm
 }
 

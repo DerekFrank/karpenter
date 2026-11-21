@@ -49,7 +49,7 @@ const (
 type Launch struct {
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
-	pods          *karpentercluster.Pods
+	simulated     *karpentercluster.PodIndex[string]
 	cache         *cache.Cache // exists due to eventual consistency on the cache
 	recorder      events.Recorder
 	clock         clock.Clock
@@ -145,7 +145,7 @@ func (l *Launch) launchNodeClaim(ctx context.Context, nodeClaim *v1.NodeClaim) (
 // against the NodeClaim, so that users can discover that insufficient capacity is preventing their pods from
 // scheduling without requiring access to the Karpenter logs.
 func (l *Launch) publishPodInsufficientCapacityEvents(ctx context.Context, nodeClaim *v1.NodeClaim, launchErr error) {
-	for _, podKey := range l.pods.SimulatedOn(nodeClaim.Name) {
+	for _, podKey := range l.simulated.Lookup(nodeClaim.Name) {
 		pod := &corev1.Pod{}
 		// This also skips CapacityBuffer virtual pods since they never exist in the API server
 		if err := l.kubeClient.Get(ctx, podKey, pod); err != nil {

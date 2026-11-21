@@ -50,7 +50,7 @@ var (
 	garbageCollectionController *nodeclaimgarbagecollection.Controller
 	env                         *test.Environment
 	cloudProvider               *fake.CloudProvider
-	cluster                     *karpentercluster.NodeState
+	cluster                     karpentercluster.State
 	cs                          karpentercluster.State
 )
 
@@ -65,9 +65,9 @@ var _ = BeforeSuite(func() {
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
 	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = cs.Nodes
+	cluster = cs
 	garbageCollectionController = nodeclaimgarbagecollection.NewController(env.Clock, env.Overlay, cloudProvider)
-	nodeClaimController = nodeclaimlifcycle.NewController(env.Clock, env.Overlay, cloudProvider, events.NewRecorder(&record.FakeRecorder{}), cluster.PodStore, cs.Registrations, nil)
+	nodeClaimController = nodeclaimlifcycle.NewController(env.Clock, env.Overlay, cloudProvider, events.NewRecorder(&record.FakeRecorder{}), cluster.PodsBySimulatedNodeClaim, cs.Registrations, nil)
 })
 
 var _ = AfterSuite(func() {

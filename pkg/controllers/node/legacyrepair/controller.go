@@ -65,7 +65,7 @@ type Controller struct {
 	recorder      events.Recorder
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
-	cluster       *karpentercluster.NodeState
+	nodes         *karpentercluster.Nodes
 	policies      []replacePolicy
 	// health counts the Nodes, and those a replace policy matches, per NodePool and across the cluster. Register
 	// derives it.
@@ -80,7 +80,7 @@ type replacePolicy struct {
 }
 
 // NewController constructs a controller instance
-func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, cluster *karpentercluster.NodeState, clock clock.Clock, recorder events.Recorder) *Controller {
+func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, nodes *karpentercluster.Nodes, clock clock.Clock, recorder events.Recorder) *Controller {
 	var policies []replacePolicy
 	for _, policy := range cloudProvider.RepairPolicies() {
 		if policy.Action != cloudprovider.ReplaceNode {
@@ -96,7 +96,7 @@ func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudPr
 		recorder:      recorder,
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
-		cluster:       cluster,
+		nodes:         nodes,
 		policies:      policies,
 	}
 }
@@ -104,7 +104,7 @@ func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudPr
 // deriveHealth derives the controller's own node health counts from cluster state's Node store, by the replace
 // policies, which aren't the repair policy matcher's.
 func (c *Controller) deriveHealth() {
-	c.health = c.cluster.DeriveNodeHealth(func(node *corev1.Node) bool { return unhealthy(c.policies, node) })
+	c.health = c.nodes.DeriveNodeHealth(func(node *corev1.Node) bool { return unhealthy(c.policies, node) })
 }
 
 // unhealthy reports whether one of the policies matches the Node's condition of the policy's type.
@@ -161,7 +161,7 @@ func (c *Controller) Register(ctx context.Context, m manager.Manager) error {
 			MaxConcurrentReconciles: utilscontroller.LinearScaleReconciles(utilscontroller.CPUCount(ctx), 10, 1000),
 		}).
 		// The node counts that guard repair are only whole once cluster state has synced.
-		WatchesRawSource(karpenterstate.Requires(c.cluster)).
+		WatchesRawSource(karpenterstate.Requires(c.nodes)).
 		// A change of the counts that guard repair reconciles the unhealthy Nodes they may have held back.
 		WatchesRawSource(c.health.Source()).
 		Complete(reconcile.AsReconciler(m.GetClient(), c))

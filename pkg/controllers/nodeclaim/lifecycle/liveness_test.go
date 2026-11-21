@@ -28,7 +28,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
@@ -459,8 +458,8 @@ var _ = Describe("Liveness", func() {
 		env.Clock.Step(time.Minute * 20)
 		_ = ExpectObjectReconcileFailed(ctx, env.Client, nodeClaimController, nodeClaim)
 		// The failure is the deleted NodePool's, so the recreated one records none.
-		recorded, err := karpentercluster.NewNodePools(env.Client, npState).Get(ctx, client.ObjectKeyFromObject(nodePool))
-		Expect(err).ToNot(HaveOccurred())
+		recorded, ok := npState.Get(nodePool.Name)
+		Expect(ok).To(BeTrue())
 		Expect(recorded.Intent.Registration.Value).To(BeZero(), "recorded a launch outcome for the recreated NodePool")
 		expectNodeRegistrationHealthy(nodePool, metav1.ConditionUnknown)
 		ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)

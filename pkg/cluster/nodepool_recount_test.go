@@ -45,14 +45,14 @@ var _ = Describe("NodePoolState Recount", func() {
 		r := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // deterministic seed for reproducible test inputs
 		clk := clock.NewFakeClock(time.Now())
 		cs := newState(options.ToContext(context.Background(), test.Options()), clk, fakecp.NewCloudProvider())
-		c := cs.Nodes
+		c := cs
 		latest := map[string]*v1.NodeClaim{}
 		var rv, uid uint64
 		for i := range 20000 {
 			name := fmt.Sprintf("nc-%d", r.IntN(50))
 			switch op := r.IntN(10); {
 			case op == 0:
-				c.NodeClaimStore.Remove(name)
+				c.NodeClaims.Remove(name)
 				delete(latest, name)
 			case op == 1 && latest[name] != nil:
 				// A stale version arriving after a newer one doesn't count.
@@ -61,7 +61,7 @@ var _ = Describe("NodePoolState Recount", func() {
 					stale := latest[name].DeepCopy()
 					stale.ResourceVersion = strconv.FormatUint(1+r.Uint64N(current-1), 10)
 					stale.Labels[v1.NodePoolLabelKey] = "stale"
-					c.NodeClaimStore.Put(stale)
+					c.NodeClaims.Put(stale)
 				}
 			default:
 				rv++
@@ -82,7 +82,7 @@ var _ = Describe("NodePoolState Recount", func() {
 				if r.IntN(3) == 0 {
 					nc.Status.Conditions = []status.Condition{{Type: v1.ConditionTypeDisruptionReason, Status: metav1.ConditionTrue}}
 				}
-				c.NodeClaimStore.Put(nc)
+				c.NodeClaims.Put(nc)
 				latest[name] = nc
 			}
 			want := map[string]NodeClaimCounts{}

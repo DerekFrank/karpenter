@@ -61,15 +61,15 @@ type Topology struct {
 	// excludedPods are the pod UIDs of pods that are excluded from counting.  This is used so we can simulate
 	// moving pods to prevent them from being double counted.
 	excludedPods sets.Set[string]
-	cluster      *karpentercluster.NodeState
-	stateNodes   []*karpentercluster.StateNode
+	nodes        *karpentercluster.Nodes
+	stateNodes   []karpentercluster.NodeView
 }
 
 func NewTopology(
 	ctx context.Context,
 	kubeClient client.Client,
-	cluster *karpentercluster.NodeState,
-	stateNodes []*karpentercluster.StateNode,
+	nodes *karpentercluster.Nodes,
+	stateNodes []karpentercluster.NodeView,
 	nodePools []*v1.NodePool,
 	instanceTypes map[string][]*cloudprovider.InstanceType,
 	pods []*corev1.Pod,
@@ -78,7 +78,7 @@ func NewTopology(
 	t := &Topology{
 		kubeClient:            kubeClient,
 		preferencePolicy:      option.Resolve(opts...).preferencePolicy,
-		cluster:               cluster,
+		nodes:                 nodes,
 		stateNodes:            stateNodes,
 		domainGroups:          buildDomainGroups(nodePools, instanceTypes),
 		topologyGroups:        map[uint64]*TopologyGroup{},
@@ -312,7 +312,7 @@ func (t *Topology) Unregister(topologyKey string, domain string) {
 // have to look at every pod in the cluster as there is no way to query for a pod with anti-affinity terms.
 func (t *Topology) updateInverseAffinities(ctx context.Context) error {
 	var errs error
-	t.cluster.ForPodsWithAntiAffinity(func(pod *corev1.Pod, node *corev1.Node) bool {
+	t.nodes.ForPodsWithAntiAffinity(func(pod *corev1.Pod, node *corev1.Node) bool {
 		// don't count the pod we are excluding
 		if t.excludedPods.Has(string(pod.UID)) {
 			return true
@@ -377,11 +377,12 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 	// to handle affinity in addition to taints / tolerations.
 	for _, n := range t.stateNodes {
 		// ignore state nodes which are tracking in-flight NodeClaims
-		if n.Node == nil {
+		node := n.Node()
+		if node == nil {
 			continue
 		}
 		// ignore the node if it doesn't match the topology group
-		if !tg.nodeFilter.Matches(n.Node.Spec.Taints, scheduling.NewLabelRequirements(n.Node.Labels)) {
+		if !tg.nodeFilter.Matches(node.Spec.Taints, scheduling.NewLabelRequirements(node.Labels)) {
 			continue
 		}
 		domain, exists := n.Labels()[tg.Key]

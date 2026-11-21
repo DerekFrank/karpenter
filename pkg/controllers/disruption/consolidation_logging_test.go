@@ -28,7 +28,6 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
-	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 
@@ -481,15 +480,11 @@ func TestCommand_String(t *testing.T) {
 }
 
 func mockCandidate(name string) *Candidate {
-	return &Candidate{
-		StateNode: &karpentercluster.StateNode{
-			Node: &corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: name,
-				},
-			},
+	return testCandidate(nil, &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
 		},
-	}
+	})
 }
 
 func TestLogValues_PodCount(t *testing.T) {
@@ -534,22 +529,17 @@ func TestConsolidationCandidateEvent(t *testing.T) {
 	recorder := test.NewEventRecorder()
 
 	// Create a mock candidate with Node and NodeClaim
-	candidate := &Candidate{
-		StateNode: &karpentercluster.StateNode{
-			Node: &corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-node",
-					UID:  "test-node-uid",
-				},
-			},
-			NodeClaim: &v1.NodeClaim{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-nodeclaim",
-					UID:  "test-nodeclaim-uid",
-				},
-			},
+	candidate := testCandidate(&v1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-nodeclaim",
+			UID:  "test-nodeclaim-uid",
 		},
-	}
+	}, &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-node",
+			UID:  "test-node-uid",
+		},
+	})
 
 	// Create a command with candidates but no replacements (delete consolidation)
 	cmd := Command{

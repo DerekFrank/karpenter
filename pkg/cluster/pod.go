@@ -20,7 +20,9 @@ import (
 	"time"
 
 	"github.com/samber/lo"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -50,29 +52,68 @@ type PodSchedulingFields struct {
 	NodeClaim string
 }
 
+// PodIndex is an Index of the pods by values of type V, such as PodsByNode.
+type PodIndex[V comparable] = state.Index[types.NamespacedName, *corev1.Pod, struct{}, PodIntent, V]
+
 // Pods are the pods, by namespaced name: an object store, with the intent the provisioner keeps about each.
 type Pods struct {
 	state.Reader[types.NamespacedName, *corev1.Pod, struct{}, PodIntent]
 	store *state.Store[types.NamespacedName, *corev1.Pod, struct{}, PodIntent]
-	// simulated is the Derive keyed by the NodeClaim each pod was last simulated against, whose Sources are the pods.
-	simulated *state.Derivation[types.NamespacedName, string, struct{}, member]
+	// byNode, byDaemonSet and bySimulatedNodeClaim are PodsByNode, PodsByDaemonSet and PodsBySimulatedNodeClaim.
+	byNode               *PodIndex[string]
+	byDaemonSet          *PodIndex[types.NamespacedName]
+	bySimulatedNodeClaim *PodIndex[string]
 }
 
 func newPods(from state.Newest) *Pods {
 	store := state.NewObjectStore[types.NamespacedName, *corev1.Pod, struct{}, PodIntent](from)
-	nodeClaims := state.NewSyntheticStore[string, string, struct{}, struct{}](func(name string) string { return name })
 	return &Pods{
 		Reader: store.Reader,
 		store:  store,
-		simulated: state.Derive(store.Reader, nodeClaims,
-			func(_ types.NamespacedName, e PodEntry) string { return e.Intent.Scheduling.Value.NodeClaim },
-			func(types.NamespacedName, PodEntry) member { return member{} }),
+		byNode: state.NewIndex(store, func(_ types.NamespacedName, e PodEntry) []string {
+			return lo.Ternary(e.Object.Spec.NodeName != "", []string{e.Object.Spec.NodeName}, nil)
+		}),
+		byDaemonSet: state.NewIndex(store, func(_ types.NamespacedName, e PodEntry) []types.NamespacedName {
+			if owner := metav1.GetControllerOf(e.Object); owner != nil && owner.Kind == "DaemonSet" {
+				return []types.NamespacedName{{Namespace: e.Object.Namespace, Name: owner.Name}}
+			}
+			return nil
+		}),
+		bySimulatedNodeClaim: state.NewIndex(store, func(_ types.NamespacedName, e PodEntry) []string {
+			nodeClaim := e.Intent.Scheduling.Value.NodeClaim
+			return lo.Ternary(nodeClaim != "", []string{nodeClaim}, nil)
+		}),
 	}
 }
 
-// SimulatedOn returns the pods the most recent scheduling simulation of each placed on the NodeClaim.
-func (p *Pods) SimulatedOn(nodeClaimName string) []types.NamespacedName {
-	return p.simulated.Sources(nodeClaimName)
+// DaemonSetPod returns a copy of the DaemonSet's newest pod, a sample of its current template, or nil if cluster
+// state holds none, read from PodsByDaemonSet. A pod samples its DaemonSet until it's gone, or until the garbage
+// collector orphans it from a DaemonSet deleted without its pods.
+func DaemonSetPod(podsByDaemonSet *PodIndex[types.NamespacedName], daemonSet *appsv1.DaemonSet) *corev1.Pod {
+	var newest *corev1.Pod
+	for _, e := range podsByDaemonSet.List(client.ObjectKeyFromObject(daemonSet), client.UnsafeDisableDeepCopy) {
+		if newest == nil || e.Object.CreationTimestamp.After(newest.CreationTimestamp.Time) ||
+			(e.Object.CreationTimestamp.Equal(&newest.CreationTimestamp) && e.Object.Name > newest.Name) {
+			newest = e.Object
+		}
+	}
+	if newest == nil {
+		return nil
+	}
+	return newest.DeepCopy()
+}
+
+// PodsOn returns copies of the pods bound to the Node named nodeName, read from PodsByNode, or none for "", a node in
+// flight.
+func PodsOn(podsByNode *PodIndex[string], nodeName string) []*corev1.Pod {
+	if nodeName == "" {
+		return nil
+	}
+	var pods []*corev1.Pod
+	for _, e := range podsByNode.List(nodeName) {
+		pods = append(pods, e.Object)
+	}
+	return pods
 }
 
 // PodScheduling is the handle of what the provisioner decides about each pod as it schedules it, the Scheduling
@@ -161,11 +202,3 @@ func (p *PodScheduling) MapToNodeClaims(ncPods map[string][]*corev1.Pod) {
 		}
 	}
 }
-
-// member is a source's contribution to an index: nothing but its place among the Derive's Sources, which the index
-// reads.
-type member struct{}
-
-func (member) Update(struct{}, member) struct{} { return struct{}{} }
-
-func (member) Delete(struct{}) struct{} { return struct{}{} }

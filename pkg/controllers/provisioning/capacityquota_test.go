@@ -107,13 +107,13 @@ var _ = Describe("CapacityQuota", func() {
 
 		_, err := prov.CreateNodeClaims(ctx, first.NewNodeClaims)
 		Expect(err).ToNot(HaveOccurred())
-		heldByFirst := cs.NodePoolState.Get("a").ReservedResources.DeepCopy()
+		heldByFirst := cs.NodePoolState.Fields("a").ReservedResources.DeepCopy()
 
 		// The second fits the NodePool's limits but not the quota, so its NodePool reservation is released.
 		_, err = prov.CreateNodeClaims(ctx, second.NewNodeClaims)
 		Expect(err).To(MatchError(ContainSubstring("capacityquota")))
 		Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
-		Expect(cs.NodePoolState.Get("a").ReservedResources[corev1.ResourceCPU]).To(BeComparableTo(heldByFirst[corev1.ResourceCPU]))
+		Expect(cs.NodePoolState.Fields("a").ReservedResources[corev1.ResourceCPU]).To(BeComparableTo(heldByFirst[corev1.ResourceCPU]))
 	})
 	It("should hold a quota on a zone against a NodeClaim that may launch in it", func() {
 		nodePool("a")

@@ -40,7 +40,7 @@ var _ = Describe("NodePool Members", func() {
 	// NodePools and go away.
 	It("should index each NodePool's Nodes and unlaunched NodeClaims as its members", func() {
 		cs := newState(options.ToContext(context.Background(), test.Options()), clock.RealClock{}, fake.NewCloudProvider())
-		s, nodePools := cs.Nodes, cs.NodePoolState
+		s, nodePools := cs, cs.NodePoolState
 		nodeClaim := func(name, nodePool, providerID, rv string) *v1.NodeClaim {
 			return &v1.NodeClaim{
 				ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(name), ResourceVersion: rv, Labels: map[string]string{v1.NodePoolLabelKey: nodePool}},
@@ -54,18 +54,18 @@ var _ = Describe("NodePool Members", func() {
 				expectNodePoolMembers(cs, np)
 			}
 		}
-		s.NodeClaimStore.Put(nodeClaim("1", "a", "", "1"))
-		s.NodeClaimStore.Put(nodeClaim("2", "a", "", "1"))
-		s.NodeClaimStore.Put(nodeClaim("3", "b", "p3", "1"))
+		s.NodeClaims.Put(nodeClaim("1", "a", "", "1"))
+		s.NodeClaims.Put(nodeClaim("2", "a", "", "1"))
+		s.NodeClaims.Put(nodeClaim("3", "b", "p3", "1"))
 		expect()
-		s.NodeClaimStore.Put(nodeClaim("1", "a", "p1", "2"))
+		s.NodeClaims.Put(nodeClaim("1", "a", "p1", "2"))
 		expect()
-		s.NodeClaimStore.Put(nodeClaim("3", "a", "p3", "2"))
+		s.NodeClaims.Put(nodeClaim("3", "a", "p3", "2"))
 		expect()
 		deleting := nodeClaim("2", "a", "", "2")
 		deleting.DeletionTimestamp = &metav1.Time{Time: time.Unix(1, 0)}
 		deleting.Finalizers = []string{"test"}
-		s.NodeClaimStore.Put(deleting)
+		s.NodeClaims.Put(deleting)
 		expect()
 		// A NodeClaim's NodePool is the NodeClaim's label, whatever its Node's says.
 		node := &corev1.Node{
@@ -74,17 +74,17 @@ var _ = Describe("NodePool Members", func() {
 			}, OwnerReferences: []metav1.OwnerReference{{APIVersion: apis.Group + "/v1", Kind: "NodeClaim", Name: "1", UID: "1"}}},
 			Spec: corev1.NodeSpec{ProviderID: "p1"},
 		}
-		s.NodeStore.Put(node)
+		s.Nodes.Put(node)
 		expect()
 		// LaunchedNodes(a) is the launched NodeClaims, the first linked to n1 by its owner reference.
 		launched := nodePools.LaunchedNodes("a")
 		Expect(launched).To(HaveLen(2))
-		Expect(launched[0].Node).ToNot(BeNil())
-		Expect(launched[0].Node.Name).To(Equal("n1"))
-		s.NodeStore.Remove(node.Name)
+		Expect(launched[0].Derived.Node).ToNot(BeNil())
+		Expect(launched[0].Derived.Node.Name).To(Equal("n1"))
+		s.Nodes.Remove(node.Name)
 		expect()
-		s.NodeClaimStore.Remove("1")
-		s.NodeClaimStore.Remove("3")
+		s.NodeClaims.Remove("1")
+		s.NodeClaims.Remove("3")
 		expect()
 	})
 })
@@ -95,19 +95,19 @@ var _ = Describe("NodePool Members", func() {
 func expectNodePoolMembers(s State, np string) {
 	GinkgoHelper()
 	var want, got []string
-	for n := range s.Nodes.Nodes() {
-		if n.NodeClaim != nil && n.NodeClaim.Labels[v1.NodePoolLabelKey] == np {
-			want = append(want, n.ProviderID())
+	for _, e := range s.NodeClaims.List() {
+		if Launched(e) && e.Object.Labels[v1.NodePoolLabelKey] == np {
+			want = append(want, ViewOfNodeClaim(e).ProviderID())
 		}
 	}
 	for _, n := range s.NodePoolState.LaunchedNodes(np) {
-		got = append(got, n.ProviderID())
+		got = append(got, ViewOfNodeClaim(n).ProviderID())
 	}
 	// Both reads return their members sorted.
 	slices.Sort(want)
 	Expect(slices.Equal(got, want)).To(BeTrue(), "LaunchedNodes(%q) = %v, want %v", np, got, want)
 	want, got = nil, nil
-	for _, f := range s.Nodes.NodeClaimStore.List() {
+	for _, f := range s.NodeClaims.List() {
 		if nc := f.Object; nc.Labels[v1.NodePoolLabelKey] == np && nc.Status.ProviderID == "" && nc.DeletionTimestamp.IsZero() {
 			want = append(want, nc.Name)
 		}

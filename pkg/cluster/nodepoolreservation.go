@@ -45,7 +45,7 @@ func (r Reservations) Release() {
 // GetNodeCount returns the NodePool's active and deleting NodeClaims, and the nodes reserved for NodeClaims the counts
 // don't include yet.
 func (n *NodePoolState) GetNodeCount(nodePoolName string) (active, deleting, reserved int) {
-	f := n.Get(nodePoolName)
+	f := n.Fields(nodePoolName)
 	return f.NodeClaims.Active, f.NodeClaims.Deleting, int(f.Reserved)
 }
 
@@ -104,7 +104,7 @@ func (n *NodePoolState) ReserveResources(nodePoolName string, limits, value core
 // ReservedResources returns what is held against the NodePool's resource limits for NodeClaims whose launched capacity
 // Usage doesn't count yet (NodePoolFields.ReservedResources). It's shared; copy it to change it.
 func (n *NodePoolState) ReservedResources(nodePoolName string) corev1.ResourceList {
-	return n.Get(nodePoolName).ReservedResources
+	return n.Fields(nodePoolName).ReservedResources
 }
 
 // withinLimits returns whether counted and held together are within every limit.

@@ -45,20 +45,15 @@ var sourcesOf sync.Map
 func newState(ctx context.Context, clk clock.Clock, cloudProvider cloudprovider.CloudProvider, opts ...option.Function[Options]) State {
 	srcs := statetest.NewSources()
 	s := New(ctx, clk, nil, cloudProvider, append(opts, WithSources(func(obj client.Object) state.Newest { return srcs.For(obj) }))...)
-	for _, accessor := range []any{s.Nodes, s.Nodes.NodeClaimStore, s.Nodes.NodeStore, s.Nodes.PodStore, s.Nodes.CSINodeStore, s.NodePoolState, s.CapacityQuotaState} {
-		sourcesOf.Store(accessor, srcs)
-	}
+	registerSources(s, srcs)
 	return s
 }
 
-// newNodeState builds node state over statetest.Sources, as NewNodeState does over the overlay client.
-func newNodeState(ctx context.Context, clk clock.Clock, cloudProvider cloudprovider.CloudProvider) (*NodeState, *statetest.Sources) {
-	srcs := statetest.NewSources()
-	s := NewNodeState(ctx, clk, func(obj client.Object) state.Newest { return srcs.For(obj) }, cloudProvider, nil)
-	for _, accessor := range []any{s, s.NodeClaimStore, s.NodeStore, s.PodStore, s.CSINodeStore} {
+// registerSources records srcs as what each of s's stores follows, for Put and Remove.
+func registerSources(s State, srcs *statetest.Sources) {
+	for _, accessor := range []any{s.NodeClaims, s.Nodes, s.Pods, s.CSINodes, s.NodePoolState, s.CapacityQuotaState} {
 		sourcesOf.Store(accessor, srcs)
 	}
-	return s, srcs
 }
 
 func sources(accessor any) *statetest.Sources {

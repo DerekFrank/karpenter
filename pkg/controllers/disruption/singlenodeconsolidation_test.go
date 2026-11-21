@@ -89,7 +89,7 @@ var _ = Describe("SingleNodeConsolidation", func() {
 		}
 
 		// Create a single node consolidation controller
-		c := disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)
+		c := disruption.MakeConsolidation(env.Clock, stores, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue)
 		consolidation = disruption.NewSingleNodeConsolidation(c)
 	})
 
@@ -258,10 +258,10 @@ func createCandidates(disruptionCost float64, nodesPerNodePool ...int) ([]*disru
 	}
 
 	return lo.Map(nodeClaims, func(nodeClaim *v1.NodeClaim, _ int) *disruption.Candidate {
-		stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim)
+		stateNode := stateNodeOfNodeClaim(nodeClaim)
 		candidate, err := disruption.NewCandidate(
 			ctx,
-			env.Client,
+			cluster.PodsByNode,
 			recorder,
 			env.Clock,
 			stateNode,

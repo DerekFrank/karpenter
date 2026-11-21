@@ -61,7 +61,7 @@ var _ = BeforeSuite(func() {
 	cp = fake.NewCloudProvider()
 	cs := karpentercluster.New(ctx, env.Clock, env.Overlay, cp)
 	cc = cs.Cost
-	pricingController = pricing.NewController(env.Clock, cs.NodePools, cs.NodePoolState, cc)
+	pricingController = pricing.NewController(env.Clock, cs.NodePoolState, cc)
 	nodePoolController = nodepool.NewController(env.Overlay, cp, cc)
 })
 

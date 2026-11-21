@@ -152,7 +152,7 @@ func (h *Intent[K, O, D, I, V]) Clear(key K) {
 
 // Get returns key's value, the zero value if it's unset, and false if the entry doesn't exist or the value lapsed.
 func (h *Intent[K, O, D, I, V]) Get(key K) (V, bool) {
-	e, ok := h.store.Get(key)
+	e, ok := h.store.get(key)
 	if !ok {
 		var zero V
 		return zero, false

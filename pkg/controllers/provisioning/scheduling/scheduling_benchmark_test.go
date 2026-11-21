@@ -231,8 +231,8 @@ func setupScheduler(ctx context.Context, pods []*corev1.Pod, opts ...scheduling.
 	client := fakecr.NewFakeClient()
 	clock := &clock.RealClock{}
 	cs := emptyState(ctx, clock, cloudProvider)
-	cluster = cs.Nodes
-	topology, err := scheduling.NewTopology(ctx, client, cluster, nil, []*v1.NodePool{nodePool}, map[string][]*cloudprovider.InstanceType{
+	cluster = cs
+	topology, err := scheduling.NewTopology(ctx, client, cluster.Nodes, nil, []*v1.NodePool{nodePool}, map[string][]*cloudprovider.InstanceType{
 		nodePool.Name: instanceTypes,
 	}, pods, opts...)
 	if err != nil {
@@ -243,7 +243,7 @@ func setupScheduler(ctx context.Context, pods []*corev1.Pod, opts ...scheduling.
 		ctx,
 		client,
 		[]*v1.NodePool{nodePool},
-		cluster,
+		nil, // deletingNodeNames
 		cs.NodePoolState,
 		cs.CapacityQuotaState,
 		nil,

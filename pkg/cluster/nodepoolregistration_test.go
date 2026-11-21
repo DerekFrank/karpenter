@@ -207,7 +207,7 @@ var _ = Describe("NodePool Registration", func() {
 		// A NodePool that replaces another under its name starts with none, though it keeps what the NodeClaims count.
 		s.Put(np)
 		recordOutcome(rec, np, true)
-		s.nodes.NodeClaimStore.Put(&v1.NodeClaim{
+		s.nodeClaims.Put(&v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{Name: "nc", UID: "nc", ResourceVersion: "1", Labels: map[string]string{v1.NodePoolLabelKey: np.Name}},
 			Spec:       v1.NodeClaimSpec{NodeClassRef: test.NodeClaim().Spec.NodeClassRef},
 		})
@@ -215,7 +215,7 @@ var _ = Describe("NodePool Registration", func() {
 		replacement.ResourceVersion = "3"
 		s.Put(replacement)
 		Expect(registration(s, np.Name).Outcomes).To(BeNil(), "outcomes once another NodePool took the name, want none")
-		f := s.Get(np.Name)
+		f := s.Fields(np.Name)
 		Expect(f.NodeClaims.Active).To(Equal(1), "fields = %+v once another NodePool took the name, want the counts kept", f)
 	})
 })

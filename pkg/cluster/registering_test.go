@@ -18,6 +18,7 @@ package cluster_test
 
 import (
 	"fmt"
+	"slices"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -28,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	karpentercluster "sigs.k8s.io/karpenter/pkg/cluster"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
@@ -77,10 +79,10 @@ var _ = Describe("Registering window", func() {
 	}
 	countsNow := func() counts {
 		GinkgoHelper()
-		nodes := cluster.DeepCopyNodes()
+		nodes := slices.Collect(stateNodes())
 		c := counts{Scheduler: len(nodes)}
 		for _, n := range nodes {
-			if n.NodeClaim != nil {
+			if n.Managed() {
 				c.SchedulerNodeClaims++
 			}
 		}
@@ -93,15 +95,15 @@ var _ = Describe("Registering window", func() {
 		apply(nodeClaim, node)
 		window := countsNow()
 		Expect(window).To(Equal(counts{Scheduler: 1, SchedulerNodeClaims: 1, Active: 1, Launches: 1}), "counts in the window")
-		n := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim)
-		Expect(n.Node).To(BeNil(), "the NodeClaim's node links its Node before the owner reference lands")
+		n := karpentercluster.ViewOfNodeClaim(ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim))
+		Expect(n.Node()).To(BeNil(), "the NodeClaim's node links its Node before the owner reference lands")
 		Expect(n.Managed()).To(BeTrue())
 
 		linkOwner()
 		Expect(countsNow()).To(Equal(window), "counts once the owner reference landed")
-		n = ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim)
-		Expect(n.Node).ToNot(BeNil())
-		Expect(n.Node.Name).To(Equal(node.Name))
+		n = karpentercluster.ViewOfNodeClaim(ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim))
+		Expect(n.Node()).ToNot(BeNil())
+		Expect(n.Node().Name).To(Equal(node.Name))
 	})
 	It("should read a Node that registers without its NodePool label as unmanaged until the owner reference lands, then converge", func() {
 		delete(node.Labels, v1.NodePoolLabelKey)
@@ -114,9 +116,9 @@ var _ = Describe("Registering window", func() {
 
 		linkOwner()
 		Expect(countsNow()).To(Equal(counts{Scheduler: 1, SchedulerNodeClaims: 1, Active: 1, Launches: 1}), "counts once the owner reference landed")
-		n := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim)
-		Expect(n.Node).ToNot(BeNil())
-		Expect(n.Node.Name).To(Equal(node.Name))
+		n := karpentercluster.ViewOfNodeClaim(ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim))
+		Expect(n.Node()).ToNot(BeNil())
+		Expect(n.Node().Name).To(Equal(node.Name))
 	})
 	It("should count DaemonSet pods bound in the window on the Node, and on the NodeClaim's node once the owner reference lands", func() {
 		daemonSet := test.DaemonSet()
@@ -147,8 +149,8 @@ var _ = Describe("Registering window", func() {
 		}
 		see := func() seen {
 			GinkgoHelper()
-			n := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim)
-			e, _ := cluster.NodeStore.Get(node.Name)
+			n := karpentercluster.ViewOfNodeClaim(ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim))
+			e, _ := cluster.Nodes.Get(node.Name)
 			requests, daemonSets, available := n.PodRequests(), n.DaemonSetRequests(), n.Available()
 			return seen{
 				Pods:          requests.Pods().Value(),
@@ -157,7 +159,7 @@ var _ = Describe("Registering window", func() {
 				AvailableCPU:  available.Cpu().String(),
 				NodeEntryPods: e.Derived.Usage.Pods,
 				NodeEntryCPU:  e.Derived.Usage.Requests.Cpu().String(),
-				LinksNode:     n.Node != nil,
+				LinksNode:     n.Node() != nil,
 			}
 		}
 		window := see()

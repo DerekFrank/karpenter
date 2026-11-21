@@ -17,11 +17,14 @@ limitations under the License.
 package cluster
 
 import (
+	"iter"
 	"slices"
 	"strings"
 
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -29,16 +32,16 @@ import (
 	"sigs.k8s.io/karpenter/pkg/state"
 )
 
-// NodeDerived are the fields derived about a Node from other stores, and from its own conditions.
+// NodeDerived are the fields derived about a Node from other stores, and from its own conditions. It has no NodeClaim:
+// from a Node to its NodeClaim, follow the Node's owner reference (OwnerNodeClaim) and Get the NodeClaim.
 type NodeDerived struct {
-	// Usage is what the pods bound to the Node use of it, contributed by the pod store keyed by spec.nodeName. Pods
-	// bound before cluster state sees the Node wait on its key, so they count once it does.
+	// Usage is what the pods bound to the Node use of it, contributed by the pod store keyed by spec.nodeName, and its
+	// CSINode's drivers, contributed by the CSINode store. Pods bound before cluster state sees the Node wait on its
+	// key, so they count once it does.
 	Usage NodeUsage
 	// RepairPolicyMatches are the repair policies the Node's conditions match, regardless of toleration, while cluster
 	// state tracks it, contributed by the Node store itself when node repair is enabled.
 	RepairPolicyMatches []repair.RepairPolicyMatch // bounded: repair policies
-	// CSIDrivers are the drivers of the Node's CSINode, contributed by the CSINode store.
-	CSIDrivers []storagev1.CSINodeDriver // bounded: CSI drivers per node
 }
 
 // NodeEntry is a Node's entry: the Node, and what its pods, its CSINode and its conditions contribute.
@@ -46,17 +49,41 @@ type NodeEntry = state.Entry[*corev1.Node, NodeDerived, struct{}]
 
 type nodeStore = state.Store[string, *corev1.Node, NodeDerived, struct{}]
 
-// Nodes are the Nodes, by name: an object store. A managed Node is read through its NodeClaim's entry, which names
-// it; an unmanaged Node has no owning NodeClaim and no karpenter.sh/nodepool label, and is read from this store.
+// Nodes are the Nodes, by name: an object store of every Node. It's the source of each NodeClaim entry's Derived, and
+// only the scheduler, the metrics and the controllers keyed by Node read it. A managed Node is read through its
+// NodeClaim's entry, which carries it; an unmanaged Node has no owning NodeClaim and no karpenter.sh/nodepool label, and
+// is read from this store, through Unmanaged.
 type Nodes struct {
 	state.Reader[string, *corev1.Node, NodeDerived, struct{}]
 	store *nodeStore
+	// unmanaged indexes the unmanaged Nodes under true.
+	unmanaged *state.Index[string, *corev1.Node, NodeDerived, struct{}, bool]
 }
 
 // newNodes returns the Node store. A Node is cluster-scoped, so its name is its key.
 func newNodes(from state.Newest) *Nodes {
 	store := state.NewObjectStore[string, *corev1.Node, NodeDerived, struct{}](from, state.WithKey(state.ByName))
-	return &Nodes{Reader: store.Reader, store: store}
+	return &Nodes{
+		Reader: store.Reader,
+		store:  store,
+		unmanaged: state.NewIndex(store, func(_ string, e NodeEntry) []bool {
+			return lo.Ternary(Unmanaged(e.Object), []bool{true}, nil)
+		}),
+	}
+}
+
+// Unmanaged returns the entries of the unmanaged Nodes, those with neither a NodeClaim owner reference nor the
+// karpenter.sh/nodepool label, that opts select, as List does. A registering Node, labeled and without its owner
+// reference yet, isn't one: its NodeClaim's entry, in flight, already counts it, so the node counts once.
+func (n *Nodes) Unmanaged(opts ...client.ListOption) iter.Seq2[string, NodeEntry] {
+	return func(yield func(string, NodeEntry) bool) {
+		for name, e := range n.unmanaged.List(true, opts...) {
+			// An entry that changed since the index's Lookup may have become managed.
+			if Unmanaged(e.Object) && !yield(name, e) {
+				return
+			}
+		}
+	}
 }
 
 // Tracked returns whether cluster state reads a Node: an unmanaged Node always, and a managed one (with the NodePool
@@ -69,9 +96,10 @@ func Tracked(node *corev1.Node) bool {
 	return node.Spec.ProviderID != "" && (node.Labels[corev1.LabelInstanceTypeStable] != "" || node.Labels[v1.NodeInitializedLabelKey] != "")
 }
 
-// ownerNodeClaim returns the name of the NodeClaim in the Node's owner references, which registration sets
-// (nodeclaimutils.UpdateNodeOwnerReferences), or "" for none.
-func ownerNodeClaim(node *corev1.Node) string {
+// OwnerNodeClaim returns the name of the NodeClaim in the Node's owner references, which registration sets
+// (nodeclaimutils.UpdateNodeOwnerReferences), or "" for none. It's the one way from a Node to its NodeClaim: Get the
+// Node, then the NodeClaim this names.
+func OwnerNodeClaim(node *corev1.Node) string {
 	for _, o := range node.OwnerReferences {
 		if o.Kind == "NodeClaim" && strings.HasPrefix(o.APIVersion, apis.Group+"/") {
 			return o.Name
@@ -83,7 +111,7 @@ func ownerNodeClaim(node *corev1.Node) string {
 // Unmanaged returns whether a Node is unmanaged: it has neither a NodeClaim owner reference nor the NodePool label. A
 // Node with the label and no owner reference is registering: its NodeClaim's entry already represents it.
 func Unmanaged(node *corev1.Node) bool {
-	return ownerNodeClaim(node) == "" && node.Labels[v1.NodePoolLabelKey] == ""
+	return OwnerNodeClaim(node) == "" && node.Labels[v1.NodePoolLabelKey] == ""
 }
 
 // repairMatches are a tracked Node's contribution to its own entry: the repair policies its conditions match.
@@ -120,12 +148,12 @@ func (n *Nodes) deriveRepairMatches(matcher *repair.RepairPolicyMatcher) {
 type csiDrivers []storagev1.CSINodeDriver
 
 func (d csiDrivers) Update(f NodeDerived, _ csiDrivers) NodeDerived {
-	f.CSIDrivers = d
+	f.Usage.CSIDrivers = d
 	return f
 }
 
 func (d csiDrivers) Delete(f NodeDerived) NodeDerived {
-	f.CSIDrivers = nil
+	f.Usage.CSIDrivers = nil
 	return f
 }
 
@@ -146,4 +174,20 @@ func (c *CSINodes) deriveDrivers(nodes *Nodes) {
 	state.DeriveObject(c.Reader, nodes.store,
 		func(name string, _ *storagev1.CSINode) string { return name },
 		func(_ string, csiNode *storagev1.CSINode) csiDrivers { return csiDrivers(csiNode.Spec.Drivers) })
+}
+
+// ForPodsWithAntiAffinity calls fn with each pod with required anti-affinity terms bound to a tracked Node, and the
+// Node, until fn returns false. A pod may not be up to date with respect to its status, but its anti-affinity terms
+// can't change. The pods and Nodes are the stores': fn reads them.
+func (n *Nodes) ForPodsWithAntiAffinity(fn func(p *corev1.Pod, n *corev1.Node) bool) {
+	for _, e := range n.List(client.UnsafeDisableDeepCopy) {
+		if len(e.Derived.Usage.AntiAffinityPods) == 0 || !Tracked(e.Object) {
+			continue
+		}
+		for _, pod := range e.Derived.Usage.AntiAffinityPods {
+			if !fn(pod, e.Object) {
+				return
+			}
+		}
+	}
 }

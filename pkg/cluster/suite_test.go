@@ -43,7 +43,7 @@ import (
 var ctx context.Context
 var env *test.Environment
 var cs karpentercluster.State
-var cluster *karpentercluster.NodeState
+var cluster karpentercluster.State
 var clusterCost *karpentercluster.ClusterCost
 var pvcDriverController *driver.Controller
 var pricingController *pricing.Controller
@@ -69,10 +69,10 @@ var _ = BeforeSuite(func() {
 	ctx = options.ToContext(ctx, test.Options())
 	cloudProvider = fake.NewCloudProvider()
 	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = cs.Nodes
+	cluster = cs
 	clusterCost = cs.Cost
-	pvcDriverController = driver.NewController(env.Overlay, cluster.PVCStore)
-	pricingController = pricing.NewController(env.Clock, cs.NodePools, cs.NodePoolState, clusterCost)
+	pvcDriverController = driver.NewController(env.Overlay, cluster.PVCs)
+	pricingController = pricing.NewController(env.Clock, cs.NodePoolState, clusterCost)
 	nodeOverlayStore = nodeoverlay.NewInstanceTypeStore()
 	nodeOverlayController = nodeoverlay.NewController(env.Clock, env.Overlay, cloudProvider, nodeOverlayStore)
 })

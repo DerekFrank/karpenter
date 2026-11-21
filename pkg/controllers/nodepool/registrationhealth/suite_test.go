@@ -53,7 +53,7 @@ var (
 	nodeClass     *v1alpha1.TestNodeClass
 	npState       *cluster.NodePoolState
 	registrations *cluster.Registrations
-	nodePools     *cluster.NodePools
+	nodePools     *cluster.NodePoolState
 )
 
 func TestAPIs(t *testing.T) {
@@ -67,7 +67,7 @@ var _ = BeforeSuite(func() {
 	env = test.NewEnvironment(test.WithCRDs(apis.CRDs...), test.WithCRDs(v1alpha1.CRDs...))
 	cs := cluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
 	npState, registrations = cs.NodePoolState, cs.Registrations
-	nodePools = cluster.NewNodePools(env.Overlay, npState)
+	nodePools = npState
 	controller = registrationhealth.NewController(env.Clock, env.Overlay, cloudProvider, npState)
 })
 var _ = AfterEach(func() {
@@ -90,8 +90,8 @@ func record(registered bool) {
 // expectRecordUntouched expects nothing recorded for the NodePool, so the controller wrote no outcome.
 func expectRecordUntouched() {
 	GinkgoHelper()
-	np, err := nodePools.Get(ctx, client.ObjectKeyFromObject(nodePool))
-	Expect(err).ToNot(HaveOccurred())
+	np, ok := nodePools.Get(nodePool.Name)
+	Expect(ok).To(BeTrue())
 	Expect(np.Intent.Registration.Value).To(BeZero(), "the controller recorded launch outcomes")
 }
 

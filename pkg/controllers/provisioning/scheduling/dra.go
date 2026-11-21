@@ -92,8 +92,8 @@ func (d *draExistingNode) ID() dynamicresources.NodeClaimID {
 
 func (d *draExistingNode) NodeName() string {
 	// Published ResourceSlices pinned via spec.nodeName are accessible only from the node with this name.
-	if d.en.Node != nil {
-		return d.en.Node.Name
+	if node := d.en.Node(); node != nil {
+		return node.Name
 	}
 	return ""
 }
@@ -128,7 +128,7 @@ func templateSlicesForInstanceType(it *cloudprovider.InstanceType) []dynamicreso
 
 // instanceTypeForNode resolves the cloud provider instance type backing a node from the scheduler's per-NodePool
 // instance type set. Returns nil when the node is unmanaged or its instance type is not in the current set.
-func (s *Scheduler) instanceTypeForNode(n *karpentercluster.StateNode) *cloudprovider.InstanceType {
+func (s *Scheduler) instanceTypeForNode(n karpentercluster.NodeView) *cloudprovider.InstanceType {
 	itName := n.Labels()[corev1.LabelInstanceTypeStable]
 	nodePoolName := n.Labels()[v1.NodePoolLabelKey]
 	if itName == "" || nodePoolName == "" {

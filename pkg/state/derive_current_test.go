@@ -65,9 +65,8 @@ var _ = ginkgo.Describe("Derive commit-if-current", func() {
 			u.CPU *= f.Object
 			return u
 		})
-		TouchOn(scale.Reader, nodeClaims, func(Change[string, int64, struct{}, struct{}]) []types.NamespacedName {
-			return []types.NamespacedName{{Name: "a"}}
-		})
+		readsScale := NewIndex(nodeClaims, func(types.NamespacedName, nodeClaimEntry) []string { return []string{"scale"} })
+		DependsOn(nodeClaims, scale.Reader, readsScale)
 		observe(nodeClaims, nodeClaim("a", "x", 1, "2"))
 		commit := staleRead(d, types.NamespacedName{Name: "a"})
 		scale.Feed("scale", 3)

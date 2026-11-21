@@ -145,10 +145,10 @@ func NewScheduler(
 	ctx context.Context,
 	kubeClient client.Client,
 	nodePools []*v1.NodePool,
-	cluster *karpentercluster.NodeState,
+	deletingNodeNames sets.Set[string],
 	nodePoolState *karpentercluster.NodePoolState,
 	capacityQuotas *karpentercluster.CapacityQuotaState,
-	stateNodes []*karpentercluster.StateNode,
+	stateNodes []karpentercluster.NodeView,
 	topology *Topology,
 	instanceTypes map[string][]*cloudprovider.InstanceType,
 	daemonSetPods []*corev1.Pod,
@@ -232,17 +232,11 @@ func NewScheduler(
 		return np.Name, np
 	})
 
-	nodeToNodePool := lo.SliceToMap(stateNodes, func(n *karpentercluster.StateNode) (string, *v1.NodePool) {
-		return n.Name(), npByName[n.Labels()[v1.NodePoolLabelKey]]
+	nodeToNodePool := lo.SliceToMap(stateNodes, func(n karpentercluster.NodeView) (karpentercluster.NodeKey, *v1.NodePool) {
+		return n.Key(), npByName[n.Labels()[v1.NodePoolLabelKey]]
 	})
-	// Build a set of node names that are marked for deletion so we can exempt their pods
-	// from the consolidateAfter destination check
-	deletingNodeNames := sets.New[string]()
-	for n := range cluster.Nodes() {
-		if n.MarkedForDeletion() {
-			deletingNodeNames.Insert(n.Name())
-		}
-	}
+	// The names of the Nodes that are marked for deletion, whose pods are exempt from the consolidateAfter destination
+	// check.
 	s.deletingNodeNames = deletingNodeNames
 	if karpopts.FromContext(ctx).FeatureGates.CapacityQuota {
 		s.quotaLimits, s.quotaMatches = newQuotaLimits(capacityQuotas, s.nodeClaimTemplates)
@@ -339,8 +333,8 @@ type Results struct {
 // nominate nominates the existing node for a pending pod. Nomination is intent kept with the NodeClaim, so an unmanaged
 // node has none to nominate.
 func nominate(ctx context.Context, nomination *karpentercluster.Nomination, existing *ExistingNode) {
-	if existing.NodeClaim != nil {
-		nomination.Nominate(ctx, existing.NodeClaim.Name)
+	if existing.Managed() {
+		nomination.Nominate(ctx, existing.Key().NodeClaim)
 	}
 }
 
@@ -372,7 +366,7 @@ func (r Results) Record(ctx context.Context, recorder events.Recorder, nominatio
 			nominate(ctx, nomination, existing)
 		}
 		for _, p := range realPods {
-			recorder.Publish(NominatePodEvent(p, existing.Node, existing.NodeClaim))
+			recorder.Publish(NominatePodEvent(p, existing.Node(), existing.NodeClaim()))
 		}
 	}
 	// Report new nodes, or exit to avoid log spam
@@ -434,7 +428,7 @@ func (r Results) ExistingNodeToPodMapping() map[string][]*corev1.Pod {
 		// Filter out nodes that are not managed
 		return n.Managed()
 	}), func(n *ExistingNode) (string, []*corev1.Pod) {
-		return n.NodeClaim.Name, n.Pods
+		return n.Key().NodeClaim, n.Pods
 	})
 }
 
@@ -857,12 +851,12 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod, volu
 	return multierr.Combine(errs...)
 }
 
-func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes []*karpentercluster.StateNode, daemonSetPods []*corev1.Pod, nodePoolMap map[string]*v1.NodePool, enforceConsolidateAfter bool) {
+func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes []karpentercluster.NodeView, daemonSetPods []*corev1.Pod, nodePoolMap map[karpentercluster.NodeKey]*v1.NodePool, enforceConsolidateAfter bool) {
 	// create our existing nodes
 	for _, node := range stateNodes {
 		taints := node.Taints()
 		daemons := s.getCompatibleDaemonPods(ctx, node, taints, daemonSetPods)
-		isUnderConsolidateAfter := enforceConsolidateAfter && disruption.IsUnderConsolidateAfter(nodePoolMap[node.Name()], node.NodeClaim, s.clock)
+		isUnderConsolidateAfter := enforceConsolidateAfter && disruption.IsUnderConsolidateAfter(nodePoolMap[node.Key()], node.NodeClaim(), s.clock)
 		s.existingNodes = append(s.existingNodes, NewExistingNode(node, s.topology, taints, resources.RequestsForPods(daemons...), s.instanceTypeForNode(node), isUnderConsolidateAfter))
 		s.updateRemainingResources(node)
 		s.spendQuotasForNode(node)
@@ -871,7 +865,7 @@ func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes 
 }
 
 // getCompatibleDaemonPods filters daemon pods that can schedule to the given node
-func (s *Scheduler) getCompatibleDaemonPods(ctx context.Context, node *karpentercluster.StateNode, taints []corev1.Taint, daemonSetPods []*corev1.Pod) []*corev1.Pod {
+func (s *Scheduler) getCompatibleDaemonPods(ctx context.Context, node karpentercluster.NodeView, taints []corev1.Taint, daemonSetPods []*corev1.Pod) []*corev1.Pod {
 	var daemons []*corev1.Pod
 	for _, p := range daemonSetPods {
 		if s.shouldSkipDaemonPod(ctx, p) {
@@ -901,7 +895,7 @@ func (s *Scheduler) isDaemonPodCompatibleWithNode(p *corev1.Pod, taints []corev1
 }
 
 // updateRemainingResources updates the remaining resources for the node's nodepool
-func (s *Scheduler) updateRemainingResources(node *karpentercluster.StateNode) {
+func (s *Scheduler) updateRemainingResources(node karpentercluster.NodeView) {
 	// We don't use the status field and instead recompute the remaining resources to ensure we have a consistent view
 	// of the cluster during scheduling.  Depending on how node creation falls out, this will also work for cases where
 	// we don't create NodeClaim resources.

@@ -44,14 +44,14 @@ import (
 type Controller struct {
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
-	nodes         *karpentercluster.NodeState
+	nodeClaims    *karpentercluster.NodeClaims
 }
 
 // NewController returns the node hydration controller, which reconciles a NodeClaim when the Node it registered links
 // to it, or its NodeClass changes, as the NodeClaim store records them in the node state.
-func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, nodes *karpentercluster.NodeState) *Controller {
+func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, nodeClaims *karpentercluster.NodeClaims) *Controller {
 	return &Controller{
-		nodes:         nodes,
+		nodeClaims:    nodeClaims,
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
 	}
@@ -61,14 +61,15 @@ func NewController(kubeClient client.Client, cloudProvider cloudprovider.CloudPr
 // holds only the cloud provider's NodeClaims.
 func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
-	e, ok := c.nodes.NodeClaimStore.Get(req.Name)
-	if !ok || e.Derived.Node == "" || e.Object.Spec.NodeClassRef == nil {
+	e, ok := c.nodeClaims.Get(req.Name, client.UnsafeDisableDeepCopy)
+	nodeName := karpentercluster.ViewOfNodeClaim(e).NodeName()
+	if !ok || nodeName == "" || e.Object.Spec.NodeClassRef == nil {
 		return reconcile.Result{}, nil
 	}
 	nc := e.Object
 	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("NodeClaim", klog.KObj(nc)))
 	n := &corev1.Node{}
-	if err := c.kubeClient.Get(ctx, client.ObjectKey{Name: e.Derived.Node}, n); err != nil {
+	if err := c.kubeClient.Get(ctx, client.ObjectKey{Name: nodeName}, n); err != nil {
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 	stored := n.DeepCopy()
@@ -91,8 +92,8 @@ func (c *Controller) Name() string {
 // entry names and its NodeClass. It reconciles a NodeClaim once its Node links to it, such as after both at startup,
 // and not on the NodeClaim's every status update.
 func (c *Controller) nodeClasses() source.SyncingSource {
-	return c.nodes.NodeClaimStore.SourceOn(func(_ string, e karpentercluster.NodeClaimEntry) any {
-		return nodeClassOf{Node: e.Derived.Node, NodeClass: e.Object.Spec.NodeClassRef}
+	return c.nodeClaims.SourceOn(func(_ string, e karpentercluster.NodeClaimEntry) any {
+		return nodeClassOf{Node: karpentercluster.ViewOfNodeClaim(e).NodeName(), NodeClass: e.Object.Spec.NodeClassRef}
 	})
 }
 

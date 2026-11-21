@@ -74,7 +74,23 @@ func (s State) Start(m manager.Manager) error {
 	return m.Add(s.NodePoolUsage.store) // want `s.NodePoolUsage.store is a shared store: only cluster.State.Register adds it to the manager`
 }
 
-type NodeClaim struct{ Conditions []string }
+type NodeClaim struct {
+	Conditions []string
+	Labels     map[string]string
+	Spec       NodeClaimSpec
+	Status     NodeClaimStatus
+}
+
+type NodeClaimSpec struct {
+	Taints       []string
+	NodeClassRef string
+}
+
+type NodeClaimStatus struct {
+	Capacity    map[string]int
+	Allocatable map[string]int
+	ProviderID  string
+}
 
 func (n *NodeClaim) DeepCopy() *NodeClaim {
 	return &NodeClaim{Conditions: append([]string(nil), n.Conditions...)}
@@ -83,3 +99,30 @@ func (n *NodeClaim) DeepCopy() *NodeClaim {
 func (n *NodeClaim) StatusConditions(observedOnly ...bool) []string { return n.Conditions }
 
 type StateNode struct{ NodeClaim *NodeClaim }
+
+type Node struct{ Name string }
+
+func (n *Node) DeepCopy() *Node { return &Node{Name: n.Name} }
+
+// NodeClaimDerived carries the Node a store holds.
+type NodeClaimDerived struct{ Node *Node }
+
+type NodeClaimEntry = state.Entry[*NodeClaim, NodeClaimDerived, struct{}]
+
+// NodeClaims are the NodeClaim store's Reader.
+type NodeClaims struct {
+	state.Reader[string, *NodeClaim, NodeClaimDerived, struct{}]
+}
+
+// NodeView shares the objects of the entry it views.
+type NodeView struct{ nodeClaim *NodeClaim }
+
+func ViewOfNodeClaim(e NodeClaimEntry) NodeView { return NodeView{nodeClaim: e.Object} }
+
+func (v NodeView) NodeClaim() *NodeClaim { return v.nodeClaim }
+
+// LaunchedNodes returns entries a store holds, uncopied.
+func LaunchedNodes() []NodeClaimEntry { return nil }
+
+// Unlaunched returns objects a store holds, uncopied.
+func Unlaunched() []*NodeClaim { return nil }

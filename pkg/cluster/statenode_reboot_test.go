@@ -29,10 +29,10 @@ import (
 	"sigs.k8s.io/karpenter/pkg/test"
 )
 
-var _ = Describe("StateNode Reboot", func() {
-	// stateNode builds an initialized, registered, managed StateNode. rebootStatus, when non-empty, sets
+var _ = Describe("NodeView Reboot", func() {
+	// stateNode builds the view of an initialized, registered, managed node. rebootStatus, when non-empty, sets
 	// the Rebooting condition to that status; taints are placed on the Node.
-	stateNode := func(rebootStatus metav1.ConditionStatus, taints ...corev1.Taint) *karpentercluster.StateNode {
+	stateNode := func(rebootStatus metav1.ConditionStatus, taints ...corev1.Taint) karpentercluster.NodeView {
 		nc := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: "default"}}})
 		n := test.Node(test.NodeOptions{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
 			v1.NodePoolLabelKey:        "default",
@@ -46,7 +46,7 @@ var _ = Describe("StateNode Reboot", func() {
 		case metav1.ConditionFalse:
 			nc.StatusConditions().SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "done")
 		}
-		return &karpentercluster.StateNode{Node: n, NodeClaim: nc}
+		return karpentercluster.ViewOfNodeClaim(karpentercluster.NodeClaimEntry{Object: nc, Derived: karpentercluster.NodeClaimDerived{Node: n}})
 	}
 
 	Context("RebootInProgress", func() {
@@ -59,8 +59,8 @@ var _ = Describe("StateNode Reboot", func() {
 		It("is false when there is no Rebooting condition", func() {
 			Expect(stateNode("").RebootInProgress()).To(BeFalse())
 		})
-		It("is false when the StateNode has no NodeClaim", func() {
-			Expect((&karpentercluster.StateNode{Node: test.Node()}).RebootInProgress()).To(BeFalse())
+		It("is false when the node has no NodeClaim", func() {
+			Expect(karpentercluster.ViewOfNode(karpentercluster.NodeEntry{Object: test.Node()}).RebootInProgress()).To(BeFalse())
 		})
 	})
 

@@ -76,14 +76,14 @@ type Controller struct {
 	liveness       *Liveness
 }
 
-func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, pods *karpentercluster.Pods, registrations *karpentercluster.Registrations, registrationHooks []cloudprovider.NodeLifecycleHook) *Controller {
+func NewController(clk clock.Clock, kubeClient client.Client, cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, podsBySimulatedNodeClaim *karpentercluster.PodIndex[string], registrations *karpentercluster.Registrations, registrationHooks []cloudprovider.NodeLifecycleHook) *Controller {
 	return &Controller{
 		clock:         clk,
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
 		recorder:      recorder,
 
-		launch:         &Launch{kubeClient: kubeClient, cloudProvider: cloudProvider, pods: pods, cache: cache.New(time.Hour, time.Minute), recorder: recorder, clock: clk},
+		launch:         &Launch{kubeClient: kubeClient, cloudProvider: cloudProvider, simulated: podsBySimulatedNodeClaim, cache: cache.New(time.Hour, time.Minute), recorder: recorder, clock: clk},
 		registration:   &Registration{kubeClient: kubeClient, cloudProvider: cloudProvider, recorder: recorder, registrations: registrations, registrationHooks: registrationHooks, clock: clk},
 		initialization: &Initialization{kubeClient: kubeClient, clock: clk},
 		liveness:       &Liveness{clock: clk, kubeClient: kubeClient, cloudProvider: cloudProvider, registrations: registrations},

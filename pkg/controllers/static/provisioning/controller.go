@@ -56,7 +56,7 @@ type Controller struct {
 	kubeClient    client.Client
 	cloudProvider cloudprovider.CloudProvider
 	provisioner   *provisioning.Provisioner
-	nodes         *karpentercluster.NodeState
+	nodeClaims    *karpentercluster.NodeClaims
 	nodePools     *karpentercluster.NodePoolState
 	// counts wakes the controller on each NodePool's nodeCounts, built in Register.
 	counts source.SyncingSource
@@ -74,16 +74,16 @@ func nodeCountsOf(_ string, e karpentercluster.NodePoolEntry) any {
 	return nodeCounts{NodeClaims: e.Derived.NodeClaims, Reserved: e.Derived.Reserved}
 }
 
-func NewController(kubeClient client.Client, nodes *karpentercluster.NodeState, nodePools *karpentercluster.NodePoolState,
+func NewController(kubeClient client.Client, stores provisioning.Stores, nodePools *karpentercluster.NodePoolState,
 	capacityQuotas *karpentercluster.CapacityQuotaState, recorder events.Recorder, cloudProvider cloudprovider.CloudProvider, provisioner *provisioning.Provisioner, clock clock.Clock, deviceAllocationController *deviceallocation.Controller, virtualPodCache *virtualpods.Cache) *Controller {
 	return &Controller{
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
-		nodes:         nodes,
+		nodeClaims:    stores.NodeClaims,
 		nodePools:     nodePools,
 		// The controller creates NodeClaims and schedules no pods, so its provisioner writes neither nominations, buffer
 		// pod counts nor pod scheduling decisions.
-		provisioner: provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, nodes, nodePools, capacityQuotas, clock, deviceAllocationController, virtualPodCache, nil, nil, nil, nil),
+		provisioner: provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, stores, nodePools, capacityQuotas, clock, deviceAllocationController, virtualPodCache, nil, nil, nil, nil),
 	}
 }
 
@@ -173,7 +173,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 		WatchesRawSource(c.counts).
 		// Cluster state's NodePoolState counts the NodePool's NodeClaims only once it has synced; before, it would count
 		// fewer than exist and provision too many.
-		WatchesRawSource(karpenterstate.Requires(c.nodes, c.nodePools)).
+		WatchesRawSource(karpenterstate.Requires(c.nodeClaims, c.nodePools)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 10}).
 		Complete(reconcile.AsReconciler(m.GetClient(), c))
 }

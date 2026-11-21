@@ -30,7 +30,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 
@@ -78,10 +77,17 @@ type Method interface {
 
 type CandidateFilter func(context.Context, *Candidate) bool
 
-// Candidate is a karpentercluster.StateNode that we are considering for disruption along with extra information to be used in
-// making that determination
+// Candidate is a managed node that we are considering for disruption, read from its NodeClaim's entry, along with extra
+// information to be used in making that determination. Its NodeView reads the node's facts.
 type Candidate struct {
-	*karpentercluster.StateNode
+	karpentercluster.NodeView
+	// Entry is the node's NodeClaim entry as the candidate was built from it. Its objects are the store's: read-only.
+	Entry karpentercluster.NodeClaimEntry
+	// NodeClaim and Node are the view's objects, the store's, which a caller must copy before changing or writing. The
+	// queue replaces NodeClaim with a fresher read before it deletes it.
+	NodeClaim *v1.NodeClaim
+	Node      *corev1.Node
+
 	instanceType      *cloudprovider.InstanceType
 	NodePool          *v1.NodePool
 	zone              string
@@ -149,11 +155,12 @@ func (c *Candidate) IsEmpty() bool {
 }
 
 //nolint:gocyclo // Candidate validation is clearer as one linear workflow.
-func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events.Recorder, clk clock.Clock, node *karpentercluster.StateNode, pdbs pdb.Limits,
+func NewCandidate(ctx context.Context, podsByNode *karpentercluster.PodIndex[string], recorder events.Recorder, clk clock.Clock, entry karpentercluster.NodeClaimEntry, pdbs pdb.Limits,
 	nodePoolMap map[string]*v1.NodePool, nodePoolToInstanceTypesMap map[string]map[string]*cloudprovider.InstanceType, queue *Queue, disruptionClass string,
 ) (*Candidate, error) {
+	node := newCandidateNode(entry)
 	// If the orchestration queue is already considering a candidate we want to disrupt, don't consider it a candidate.
-	if queue.HasNode(node) {
+	if queue.HasNode(entry) {
 		return nil, fmt.Errorf("candidate is already being disrupted")
 	}
 	if disruptionClass == RepairDisruptionClass && node.NodeClaim != nil && node.Labels()[v1.NodePoolLabelKey] == "" {
@@ -162,7 +169,7 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 		return nil, serrors.Wrap(fmt.Errorf("repair requires a nodepool"), "NodeClaim", klog.KObj(node.NodeClaim))
 	}
 
-	err := ValidateNodeDisruptable(node, clk)
+	err := ValidateNodeDisruptable(entry, clk)
 	if err != nil {
 		// Repair is voluntary but is NOT discretionary: do-not-disrupt was never intended to strand a broken node.
 		// Nor is a node that never initializes left stranded, since nothing else replaces it.
@@ -175,7 +182,7 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 				recorder.Publish(disruptionevents.Blocked(node.Node, node.NodeClaim, pretty.Sentence(err.Error()))...)
 			}
 			err = fmt.Errorf("validating node for disruption, %w", err)
-			if node.Node == nil || !node.Registered() {
+			if node.Node == nil || !karpentercluster.Registered(entry) {
 				return nil, serrors.Wrap(err, "NodeClaim", klog.KObj(node.NodeClaim))
 			}
 			return nil, serrors.Wrap(err, "Node", klog.KObj(node.Node))
@@ -193,7 +200,7 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 	}
 	// We only care if instanceType in non-empty consolidation to do price-comparison.
 	instanceType := instanceTypeMap[node.Labels()[corev1.LabelInstanceTypeStable]]
-	pods, err := ValidatePodsDisruptable(ctx, kubeClient, node, pdbs, clk, recorder)
+	pods, err := ValidatePodsDisruptable(podsByNode, entry, pdbs, clk, recorder)
 	hasPodBlockers := false
 	if err != nil {
 		// Repair resolves its policy deadline after candidate construction, so retain whether pod blockers were ignored
@@ -214,7 +221,10 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 	reschedulable := lo.Filter(pods, func(p *corev1.Pod, _ int) bool { return pod.IsReschedulable(p) })
 	price, _ := cloudprovider.PriceNodeClaim(ctx, node.NodeClaim, instanceType)
 	return &Candidate{
-		StateNode:         node,
+		NodeView:          node.NodeView,
+		Entry:             node.Entry,
+		NodeClaim:         node.NodeClaim,
+		Node:              node.Node,
 		instanceType:      instanceType,
 		NodePool:          nodePool,
 		capacityType:      node.Labels()[v1.CapacityTypeLabelKey],
@@ -226,6 +236,12 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 		Price:                    price,
 		RescheduleDisruptionCost: disruptionutils.ComputeRescheduleDisruptionCost(ctx, reschedulable),
 	}, nil
+}
+
+// newCandidateNode returns the candidate of a NodeClaim entry, with only its node: its view, entry and objects.
+func newCandidateNode(entry karpentercluster.NodeClaimEntry) *Candidate {
+	view := karpentercluster.ViewOfNodeClaim(entry)
+	return &Candidate{NodeView: view, Entry: entry, NodeClaim: view.NodeClaim(), Node: view.Node()}
 }
 
 type Replacement struct {

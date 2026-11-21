@@ -51,7 +51,7 @@ var env *test.Environment
 var cloudProvider *fake.CloudProvider
 var recorder *test.EventRecorder
 var queue *terminator.Queue
-var cluster *karpentercluster.NodeState
+var cluster karpentercluster.State
 var cs karpentercluster.State
 
 // expectApplied applies the objects; env.Client waits for cluster state's Node and NodeClaim stores to see each write.
@@ -85,7 +85,7 @@ var _ = BeforeSuite(func() {
 	recorder = test.NewEventRecorder()
 	queue = terminator.NewQueue(env.Clock, env.Overlay, recorder)
 	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = cs.Nodes
+	cluster = cs
 })
 
 var _ = AfterSuite(func() {
@@ -100,7 +100,7 @@ var _ = Describe("Node Health", func() {
 	BeforeEach(func() {
 		env.Clock.SetTime(time.Now())
 		cloudProvider.Reset()
-		healthController = legacyrepair.NewController(env.Overlay, cloudProvider, cluster, env.Clock, recorder)
+		healthController = legacyrepair.NewController(env.Overlay, cloudProvider, cluster.Nodes, env.Clock, recorder)
 		healthController.DeriveHealth()
 
 		nodePool = test.NodePool()
@@ -265,7 +265,7 @@ var _ = Describe("Node Health", func() {
 					Action:             cloudprovider.ReplaceNode,
 				},
 			}
-			healthController = legacyrepair.NewController(env.Overlay, cloudProvider, cluster, env.Clock, recorder)
+			healthController = legacyrepair.NewController(env.Overlay, cloudProvider, cluster.Nodes, env.Clock, recorder)
 			healthController.DeriveHealth()
 			node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
 				Type:   "ValidUnhealthyCondition",
@@ -309,7 +309,7 @@ var _ = Describe("Node Health", func() {
 				TolerationDuration: 30 * time.Minute,
 				Action:             cloudprovider.RebootNode,
 			}}
-			healthController = legacyrepair.NewController(env.Overlay, cloudProvider, cluster, env.Clock, recorder)
+			healthController = legacyrepair.NewController(env.Overlay, cloudProvider, cluster.Nodes, env.Clock, recorder)
 			healthController.DeriveHealth()
 			node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
 				Type:               "BadNode",
@@ -339,7 +339,7 @@ var _ = Describe("Node Health", func() {
 					Action:             cloudprovider.ReplaceNode,
 				},
 			}
-			healthController = legacyrepair.NewController(env.Overlay, cloudProvider, cluster, env.Clock, recorder)
+			healthController = legacyrepair.NewController(env.Overlay, cloudProvider, cluster.Nodes, env.Clock, recorder)
 			healthController.DeriveHealth()
 			node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
 				Type:               "BadNode",
@@ -367,7 +367,7 @@ var _ = Describe("Node Health", func() {
 				TolerationDuration: 30 * time.Minute,
 				Action:             cloudprovider.ReplaceNode,
 			}}
-			healthController = legacyrepair.NewController(env.Overlay, cloudProvider, cluster, env.Clock, recorder)
+			healthController = legacyrepair.NewController(env.Overlay, cloudProvider, cluster.Nodes, env.Clock, recorder)
 			healthController.DeriveHealth()
 			node.Status.Conditions = append(node.Status.Conditions, corev1.NodeCondition{
 				Type:               "BadNode",

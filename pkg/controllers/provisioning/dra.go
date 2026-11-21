@@ -41,7 +41,7 @@ import (
 //
 // Ownership is determined via metadata.ownerReferences (Kind == "Node"), not spec.nodeName, which only indicates
 // accessibility. Slices with no Node owner reference (e.g. cluster-wide slices) are always included.
-func (p *Provisioner) gatherResourceSlices(ctx context.Context, stateNodes []*karpentercluster.StateNode) ([]dynamicresources.ResourceSlice, error) {
+func (p *Provisioner) gatherResourceSlices(ctx context.Context, stateNodes []karpentercluster.NodeView) ([]dynamicresources.ResourceSlice, error) {
 	sliceList := &resourcev1.ResourceSliceList{}
 	if err := p.kubeClient.List(ctx, sliceList); err != nil {
 		return nil, fmt.Errorf("listing resourceslices, %w", err)
@@ -49,11 +49,8 @@ func (p *Provisioner) gatherResourceSlices(ctx context.Context, stateNodes []*ka
 
 	includedNodeNames := sets.New[string]()
 	for _, n := range stateNodes {
-		if n.Node == nil {
-			continue
-		}
-		if n.Initialized() {
-			includedNodeNames.Insert(n.Name())
+		if n.NodeName() != "" && n.Initialized() {
+			includedNodeNames.Insert(n.NodeName())
 		}
 	}
 

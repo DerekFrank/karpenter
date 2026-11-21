@@ -18,26 +18,38 @@ package cluster
 
 import (
 	"context"
+	"reflect"
 	"slices"
 	"time"
 
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/utils/clock"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cluster/repair"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/state"
 )
 
-// NodeClaimDerived are the fields derived about a NodeClaim from other stores.
+// NodeClaimDerived are the fields derived about a NodeClaim from other stores: its node's Node and what that Node's
+// entry carries, contributed by the Node store keyed by each tracked Node's owner reference. A pod event writes the
+// Node's entry, then this one. A managed node reads only its NodeClaim's entry.
 type NodeClaimDerived struct {
-	// Node is the name of the tracked Node whose owner reference names the NodeClaim, contributed by the Node store.
-	// It's empty before registration sets the owner reference, and once the Node is gone.
-	Node string
+	// Node is the tracked Node whose owner reference names the NodeClaim. It's nil while the NodeClaim is in flight,
+	// before registration sets the owner reference, and once the Node is gone. It's the Node store's object, read-only.
+	Node *corev1.Node
+	// Usage is the usage on Node's entry: the pods bound to it (requests, limits, host ports, volumes, DaemonSet usage,
+	// pod counts) and its CSINode's drivers. It's empty while Node is nil.
+	Usage NodeUsage
+	// RepairPolicyMatches are the repair policies Node's conditions match, from Node's entry, carried here until repair
+	// derives its own, so that disruption's repair reads one store.
+	RepairPolicyMatches []repair.RepairPolicyMatch // bounded: repair policies
 }
 
 // NodeClaimIntent is what Karpenter decided about a NodeClaim's node. It drops with the NodeClaim.
@@ -52,20 +64,29 @@ type NodeClaimIntent struct {
 	BufferPods state.Intended[int]
 }
 
-// NodeClaimEntry is a NodeClaim's entry: the NodeClaim, its linked Node's name and the intent kept about its node.
+// NodeClaimEntry is a NodeClaim's entry, a managed node's: the NodeClaim, the Node it links with that Node's usage, and
+// the intent kept about the node. ViewOfNodeClaim reads its facts; Registered, InFlight, Deleting, Nominated and
+// HasBufferPods read what only a managed node has.
 type NodeClaimEntry = state.Entry[*v1.NodeClaim, NodeClaimDerived, NodeClaimIntent]
 
 type nodeClaimStore = state.Store[string, *v1.NodeClaim, NodeClaimDerived, NodeClaimIntent]
 
+// NodeClaimIndex is an Index of the NodeClaims by values of type V, such as NodeClaimsByProviderID.
+type NodeClaimIndex[V comparable] = state.Index[string, *v1.NodeClaim, NodeClaimDerived, NodeClaimIntent, V]
+
 // NodeClaims are the NodeClaims of the cloud provider's node classes, by name: an object store over the newest version
-// of each NodeClaim. The NodeClaim is the source of truth for Karpenter's view of the nodes it manages, so the intent
-// about a node lives on its NodeClaim's entry and drops with it.
+// of each NodeClaim, and the store of managed nodes, launched or in flight. The NodeClaim is the source of truth for
+// Karpenter's view of the nodes it manages, so the intent about a node lives on its NodeClaim's entry and drops with
+// it. Disruption, static provisioning, limits and nominations read only this store.
 //
 // It's the one object store with a filter: a NodeClaim of another provider's node class is no node of Karpenter's, and
 // every reader, a Derive's key, a List, a Get and a controller's source, would otherwise have to leave it out.
 type NodeClaims struct {
 	state.Reader[string, *v1.NodeClaim, NodeClaimDerived, NodeClaimIntent]
 	store *nodeClaimStore
+	// byProviderID and byNodePool are NodeClaimsByProviderID and NodeClaimsByNodePool.
+	byProviderID *NodeClaimIndex[string]
+	byNodePool   *NodeClaimIndex[string]
 }
 
 func newNodeClaims(from state.Newest, managed []schema.GroupKind) *NodeClaims {
@@ -73,13 +94,28 @@ func newNodeClaims(from state.Newest, managed []schema.GroupKind) *NodeClaims {
 		state.WithFilter(func(nodeClaim *v1.NodeClaim) bool {
 			return nodeClaim.Spec.NodeClassRef != nil && slices.Contains(managed, nodeClaim.Spec.NodeClassRef.GroupKind())
 		}))
-	return &NodeClaims{Reader: store.Reader, store: store}
+	return &NodeClaims{
+		Reader: store.Reader,
+		store:  store,
+		byProviderID: state.NewIndex(store, func(_ string, e NodeClaimEntry) []string {
+			return lo.Ternary(e.Object.Status.ProviderID != "", []string{e.Object.Status.ProviderID}, nil)
+		}),
+		byNodePool: state.NewIndex(store, func(_ string, e NodeClaimEntry) []string {
+			return lo.Ternary(e.Object.Labels[v1.NodePoolLabelKey] != "", []string{e.Object.Labels[v1.NodePoolLabelKey]}, nil)
+		}),
+	}
 }
 
 // Exists returns whether cluster state holds the NodeClaim.
 func (n *NodeClaims) Exists(name string) bool {
-	_, ok := n.Get(name)
+	_, ok := n.Get(name, client.UnsafeDisableDeepCopy)
 	return ok
+}
+
+// deriveNodes carries each tracked Node, its usage and its repair policy matches to the entry of the NodeClaim its
+// owner reference names. It reads the Node's whole entry, so a pod bound to the Node changes the NodeClaim's entry too.
+func (n *NodeClaims) deriveNodes(nodes *Nodes) {
+	state.Derive(nodes.Reader, n.store, linkedNodeKey, linkedNodeOf)
 }
 
 // UnlaunchedSource is the NodeClaims as a source that wakes on a NodeClaim appearing, going, or launching, for a
@@ -88,32 +124,76 @@ func (n *NodeClaims) UnlaunchedSource() source.SyncingSource {
 	return n.SourceOn(func(_ string, e NodeClaimEntry) any { return Launched(e) })
 }
 
-// Launched returns whether the NodeClaim has a providerID: its instance exists, and it's a node in Nodes.
+// Launched returns whether the NodeClaim has a providerID: its instance exists.
 func Launched(e NodeClaimEntry) bool { return e.Object != nil && e.Object.Status.ProviderID != "" }
 
-// linkedNode is a tracked Node's contribution to the NodeClaim its owner reference names: its name. A NodeClaim has
-// one such Node; were two to name it, the last to change would be its Node until either left.
-type linkedNode string
+// Registered returns whether the managed node's Node is linked and carries the registered label.
+func Registered(e NodeClaimEntry) bool { return registered(e.Object, e.Derived.Node) }
+
+// InFlight returns whether the managed node has no Node yet: it's launching, or its Node is registering.
+func InFlight(e NodeClaimEntry) bool { return e.Derived.Node == nil }
+
+// Deleting returns whether the managed node is going away: the disruption queue marked it for deletion, or its
+// NodeClaim is being deleted or its instance is terminating. Its pods are reschedulable.
+func Deleting(e NodeClaimEntry) bool { return e.Intent.Deletion.Value || deleted(e.Object) }
+
+// Nominated returns whether the managed node was the target of a pending pod in a recent scheduling pass, at now.
+func Nominated(e NodeClaimEntry, now time.Time) bool {
+	nominated, holds := e.Intent.Nomination.At(now)
+	return nominated && holds
+}
+
+// HasBufferPods returns whether the provisioner's last scheduling pass placed a virtual buffer pod on the managed node.
+func HasBufferPods(e NodeClaimEntry) bool { return e.Intent.BufferPods.Value > 0 }
+
+// linkedNode is a tracked Node's contribution to the NodeClaim its owner reference names: the Node, its usage and its
+// repair policy matches. A NodeClaim has one such Node; were two to name it, the last to change would be its Node
+// until either left.
+type linkedNode struct {
+	node    *corev1.Node
+	usage   NodeUsage
+	matches []repair.RepairPolicyMatch
+}
 
 func (n linkedNode) Update(f NodeClaimDerived, _ linkedNode) NodeClaimDerived {
-	f.Node = string(n)
+	f.Node, f.Usage, f.RepairPolicyMatches = n.node, n.usage, n.matches
 	return f
 }
 
 func (n linkedNode) Delete(f NodeClaimDerived) NodeClaimDerived {
-	f.Node = ""
+	f.Node, f.Usage, f.RepairPolicyMatches = nil, NodeUsage{}, nil
 	return f
 }
 
-// linkedNodeKey is the NodeClaim a tracked Node links to: the one its owner reference names.
-func linkedNodeKey(_ string, node *corev1.Node) string {
-	if !Tracked(node) {
-		return ""
-	}
-	return ownerNodeClaim(node)
+// Equal reports whether both carry the same Node entry's fields. A Node entry's fields never change once stored, so the
+// same Node and the same usage maps are the same fields; equal fields in new maps compare unequal, which costs a write.
+func (n linkedNode) Equal(o linkedNode) bool {
+	return n.node == o.node && sameUsage(n.usage, o.usage) && slices.EqualFunc(n.matches, o.matches, repair.RepairPolicyMatch.Equal)
 }
 
-func linkedNodeOf(name string, _ *corev1.Node) linkedNode { return linkedNode(name) }
+// sameUsage returns whether a and b are the same usage: equal counts, and the same maps and slices.
+func sameUsage(a, b NodeUsage) bool {
+	return a.Pods == b.Pods && a.Terminating == b.Terminating && a.DoNotDisrupt == b.DoNotDisrupt &&
+		a.DisruptionCost == b.DisruptionCost && a.HostPorts == b.HostPorts &&
+		same(a.Requests, b.Requests) && same(a.Limits, b.Limits) && same(a.DaemonSetRequests, b.DaemonSetRequests) &&
+		same(a.DaemonSetLimits, b.DaemonSetLimits) && same(a.Volumes, b.Volumes) && same(a.AntiAffinityPods, b.AntiAffinityPods) &&
+		len(a.CSIDrivers) == len(b.CSIDrivers) && same(a.CSIDrivers, b.CSIDrivers)
+}
+
+// same returns whether two maps or two slices are the same one, by reference.
+func same(a, b any) bool { return reflect.ValueOf(a).Pointer() == reflect.ValueOf(b).Pointer() }
+
+// linkedNodeKey is the NodeClaim a tracked Node links to: the one its owner reference names.
+func linkedNodeKey(_ string, e NodeEntry) string {
+	if !Tracked(e.Object) {
+		return ""
+	}
+	return OwnerNodeClaim(e.Object)
+}
+
+func linkedNodeOf(_ string, e NodeEntry) linkedNode {
+	return linkedNode{node: e.Object, usage: e.Derived.Usage, matches: e.Derived.RepairPolicyMatches}
+}
 
 // deleted returns whether the NodeClaim is being deleted or its instance is terminating.
 func deleted(nodeClaim *v1.NodeClaim) bool {
@@ -204,7 +284,7 @@ func newBufferPods(n *NodeClaims) *BufferPods {
 // Replace replaces the buffer pod counts with counts, by NodeClaim name. The provisioner calls it after each
 // scheduling pass with the virtual buffer pods it placed on each node; a node missing from counts no longer hosts any.
 func (b *BufferPods) Replace(counts map[string]int) {
-	for name, e := range b.nodeClaims.List() {
+	for name, e := range b.nodeClaims.List(client.UnsafeDisableDeepCopy) {
 		if _, ok := counts[name]; !ok && e.Intent.BufferPods.Value != 0 {
 			b.intent.Clear(name)
 		}
@@ -212,13 +292,4 @@ func (b *BufferPods) Replace(counts map[string]int) {
 	for name, count := range counts {
 		b.intent.Set(name, count)
 	}
-}
-
-// nodeOwner returns the NodeClaim whose entry a Node's change Touches: the one its owner reference names, while
-// cluster state tracks it, so that the Derives from the NodeClaim store that read its Node recompute.
-func nodeOwner(node *corev1.Node) string {
-	if node == nil || !Tracked(node) {
-		return ""
-	}
-	return ownerNodeClaim(node)
 }

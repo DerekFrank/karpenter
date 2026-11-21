@@ -156,8 +156,8 @@ var _ = Describe("Repair", func() {
 	// newRepairController builds an isolated repair-only disruption controller around the suite's repair policy matcher,
 	// which useRepairPolicies recompiles in place, so a spec that changes policies needn't build the controller again.
 	newRepairController := func() {
-		repair = disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue))
-		repairController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost,
+		repair = disruption.NewRepair(disruption.MakeConsolidation(env.Clock, stores, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue))
+		repairController = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, stores, cs.NodePoolState, queue, clusterCost,
 			disruption.WithMethods(repair))
 	}
 
@@ -706,7 +706,7 @@ var _ = Describe("Repair", func() {
 		// Wait past the 30 minute toleration, so repair can act on both.
 		env.Clock.Step(31 * time.Minute)
 
-		candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, repair.ShouldDisrupt, disruption.RepairDisruptionClass, queue)
+		candidates, err := disruption.GetCandidates(ctx, stores, env.Client, recorder, env.Clock, cloudProvider, repair.ShouldDisrupt, disruption.RepairDisruptionClass, queue)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(candidates).To(HaveLen(2))
 		// candidates[0] has the name that sorts first, so it should win the tie.
@@ -747,7 +747,7 @@ var _ = Describe("Repair", func() {
 		// Use a clock that moves forward every time it's read, like a real clock does.
 		clk := tickingClock{FakeClock: clocktesting.NewFakeClock(env.Clock.Now())}
 
-		candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, clk, cloudProvider, repair.ShouldDisrupt, disruption.RepairDisruptionClass, queue)
+		candidates, err := disruption.GetCandidates(ctx, stores, env.Client, recorder, clk, cloudProvider, repair.ShouldDisrupt, disruption.RepairDisruptionClass, queue)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(candidates).To(HaveLen(2))
 		// Both nodes must get the same cost, even though the clock moved on between them.
@@ -923,9 +923,9 @@ var _ = Describe("Repair", func() {
 		})
 		injectedErr := errors.New("injected termination timestamp patch failure")
 		failingClient := &terminationTimestampPatchErrorClient{Client: env.Overlay, err: injectedErr, failNext: true}
-		failingQueue := disruption.NewQueue(failingClient, recorder, cluster, env.Clock, prov, cs.Deletion)
-		failingRepair := disruption.NewRepair(disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, failingClient, prov, cloudProvider, recorder, failingQueue))
-		failingController := disruption.NewController(ctx, env.Clock, failingClient, prov, cloudProvider, recorder, cluster, cs.NodePoolState, failingQueue, clusterCost,
+		failingQueue := disruption.NewQueue(failingClient, recorder, cluster.NodeClaims, env.Clock, prov, cs.Deletion)
+		failingRepair := disruption.NewRepair(disruption.MakeConsolidation(env.Clock, stores, cs.NodePoolState, failingClient, prov, cloudProvider, recorder, failingQueue))
+		failingController := disruption.NewController(ctx, env.Clock, failingClient, prov, cloudProvider, recorder, stores, cs.NodePoolState, failingQueue, clusterCost,
 			disruption.WithMethods(failingRepair))
 
 		nodeClaim.Finalizers = append(nodeClaim.Finalizers, "karpenter.sh/test-finalizer")
@@ -1128,7 +1128,7 @@ var _ = Describe("Repair", func() {
 		}
 		markUnhealthy(nodes[0], "BadNode")
 		env.Clock.Step(31 * time.Minute)
-		candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, repair.ShouldDisrupt, disruption.RepairDisruptionClass, queue)
+		candidates, err := disruption.GetCandidates(ctx, stores, env.Client, recorder, env.Clock, cloudProvider, repair.ShouldDisrupt, disruption.RepairDisruptionClass, queue)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(candidates).To(HaveLen(1))
 		commands, err := repair.ComputeCommands(ctx, map[string]int{nodePool.Name: 1}, candidates...)
@@ -1152,7 +1152,7 @@ var _ = Describe("Repair", func() {
 		initNode(nodeClaim, node)
 		markUnhealthy(node, "BadNode")
 		env.Clock.Step(31 * time.Minute)
-		candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, repair.ShouldDisrupt, disruption.RepairDisruptionClass, queue)
+		candidates, err := disruption.GetCandidates(ctx, stores, env.Client, recorder, env.Clock, cloudProvider, repair.ShouldDisrupt, disruption.RepairDisruptionClass, queue)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(candidates).To(HaveLen(1))
 
@@ -1162,7 +1162,7 @@ var _ = Describe("Repair", func() {
 			failingClient,
 			recorder,
 			cloudProvider,
-			cluster,
+			provisioning.StoresOf(cluster),
 			cs.NodePoolState,
 			cs.CapacityQuotaState,
 			env.Clock,
@@ -1175,7 +1175,7 @@ var _ = Describe("Repair", func() {
 		)
 		failingRepair := disruption.NewRepair(disruption.MakeConsolidation(
 			env.Clock,
-			cluster,
+			stores,
 			cs.NodePoolState,
 			failingClient,
 			failingProvisioner,

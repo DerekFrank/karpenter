@@ -71,8 +71,8 @@ var _ = Describe("Wakes", func() {
 		Expect(cmds).To(BeEmpty())
 	}
 	BeforeEach(func() {
-		emptiness = disruption.NewEmptiness(disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue), disruption.WithValidator(NopValidator{}))
-		controller = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, cluster, cs.NodePoolState, queue, clusterCost, disruption.WithMethods(emptiness))
+		emptiness = disruption.NewEmptiness(disruption.MakeConsolidation(env.Clock, stores, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue), disruption.WithValidator(NopValidator{}))
+		controller = disruption.NewController(ctx, env.Clock, env.Overlay, prov, cloudProvider, recorder, stores, cs.NodePoolState, queue, clusterCost, disruption.WithMethods(emptiness))
 		register(controller)
 		wakes = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[reconcile.Request]())
 		DeferCleanup(wakes.ShutDown)
@@ -116,7 +116,7 @@ var _ = Describe("Wakes", func() {
 		Expect(emptiness.IsConsolidated()).To(BeFalse(), "want consolidation revalidated after the period")
 	})
 	It("should not skip consolidation on a method the controller didn't register", func() {
-		unregistered := disruption.NewEmptiness(disruption.MakeConsolidation(env.Clock, cluster, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue), disruption.WithValidator(NopValidator{}))
+		unregistered := disruption.NewEmptiness(disruption.MakeConsolidation(env.Clock, stores, cs.NodePoolState, env.Overlay, prov, cloudProvider, recorder, queue), disruption.WithValidator(NopValidator{}))
 		_, err := unregistered.ComputeCommands(ctx, map[string]int{})
 		Expect(err).ToNot(HaveOccurred())
 		Expect(unregistered.IsConsolidated()).To(BeFalse())

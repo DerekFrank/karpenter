@@ -70,7 +70,7 @@ var prov *provisioning.Provisioner
 var predictionStore *prediction.Store
 var env *test.Environment
 var clusterCost *karpentercluster.ClusterCost
-var cluster *karpentercluster.NodeState
+var cluster karpentercluster.State
 var cloudProvider *fake.CloudProvider
 var podController *provisioning.PodController
 
@@ -96,9 +96,9 @@ var _ = BeforeSuite(func() {
 	cloudProvider.InstanceTypes = instanceTypes
 	clusterCost = cs.Cost
 	cs = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider)
-	cluster = cs.Nodes
+	cluster = cs
 	predictionStore = prediction.NewStore(env.Overlay)
-	prov = provisioning.NewProvisioner(env.Overlay, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, cs.NodePoolState, cs.CapacityQuotaState, env.Clock, deviceallocation.NewController(env.Overlay), virtualpods.NewVirtualPodCache(env.Overlay), predictionStore, cs.Nomination, cs.BufferPods, cs.PodScheduling)
+	prov = provisioning.NewProvisioner(env.Overlay, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, provisioning.StoresOf(cs), cs.NodePoolState, cs.CapacityQuotaState, env.Clock, deviceallocation.NewController(env.Overlay), virtualpods.NewVirtualPodCache(env.Overlay), predictionStore, cs.Nomination, cs.BufferPods, cs.PodScheduling)
 	podController = provisioning.NewPodController(env.Overlay, prov, cs.PodScheduling)
 })
 
@@ -432,8 +432,8 @@ var _ = Context("Scheduling", func() {
 					cs.PodScheduling.Ack(pod)
 					ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
 					ExpectNotScheduled(ctx, env.Client, pod)
-					Expect(PodSchedulingOf(cluster.PodStore, nn).SchedulableAt.IsZero()).To(BeTrue())
-					Expect(PodSchedulingOf(cluster.PodStore, nn).DecidedAt.IsZero()).To(BeFalse())
+					Expect(PodSchedulingOf(cluster.Pods, nn).SchedulableAt.IsZero()).To(BeTrue())
+					Expect(PodSchedulingOf(cluster.Pods, nn).DecidedAt.IsZero()).To(BeFalse())
 					ExpectMetricHistogramSampleCountValue("karpenter_pods_scheduling_decision_duration_seconds", 1, nil)
 				}
 			})
@@ -2214,7 +2214,7 @@ var _ = Context("Scheduling", func() {
 				ExpectDeleted(ctx, env.Client, initialPod)
 
 				ExpectApplied(ctx, env.Client, nodePool, dsPod)
-				for n := range cluster.Nodes() {
+				for n := range StateNodes(cluster) {
 					dsRequests := n.DaemonSetRequests()
 					available := n.Available()
 					Expect(dsRequests.Cpu().AsApproximateFloat64()).To(BeNumerically("~", 0))
@@ -2223,7 +2223,7 @@ var _ = Context("Scheduling", func() {
 				}
 				ExpectManualBinding(ctx, env.Client, dsPod, node1)
 
-				for f := range cluster.Nodes() {
+				for f := range StateNodes(cluster) {
 					dsRequests := f.DaemonSetRequests()
 					available := f.Available()
 					Expect(dsRequests.Cpu().AsApproximateFloat64()).To(BeNumerically("~", 1))
@@ -2298,7 +2298,7 @@ var _ = Context("Scheduling", func() {
 				ExpectDeleted(ctx, env.Client, initialPod)
 
 				ExpectApplied(ctx, env.Client, nodePool, dsPod)
-				for n := range cluster.Nodes() {
+				for n := range StateNodes(cluster) {
 					dsRequests := n.DaemonSetRequests()
 					available := n.Available()
 					Expect(dsRequests.Cpu().AsApproximateFloat64()).To(BeNumerically("~", 0))
@@ -2307,7 +2307,7 @@ var _ = Context("Scheduling", func() {
 				}
 				ExpectManualBinding(ctx, env.Client, dsPod, node1)
 
-				for n := range cluster.Nodes() {
+				for n := range StateNodes(cluster) {
 					dsRequests := n.DaemonSetRequests()
 					available := n.Available()
 					Expect(dsRequests.Cpu().AsApproximateFloat64()).To(BeNumerically("~", 1))
@@ -2430,7 +2430,7 @@ var _ = Context("Scheduling", func() {
 				// delete the pod so that the node is empty
 				ExpectDeleted(ctx, env.Client, initialPod)
 
-				for n := range cluster.Nodes() {
+				for n := range StateNodes(cluster) {
 					dsRequests := n.DaemonSetRequests()
 					available := n.Available()
 					Expect(dsRequests.Cpu().AsApproximateFloat64()).To(BeNumerically("~", 0))
@@ -2445,7 +2445,7 @@ var _ = Context("Scheduling", func() {
 
 				ExpectManualBinding(ctx, env.Client, ds2Pod, node1)
 
-				for n := range cluster.Nodes() {
+				for n := range StateNodes(cluster) {
 					dsRequests := n.DaemonSetRequests()
 					available := n.Available()
 					Expect(dsRequests.Cpu().AsApproximateFloat64()).To(BeNumerically("~", 2))
@@ -2485,7 +2485,7 @@ var _ = Context("Scheduling", func() {
 			// due to the in-flight node support, we should pack existing nodes before launching new node. The end result
 			// is that we should only have some spare capacity on our final node
 			nodesWithCPUFree := 0
-			for n := range cluster.Nodes() {
+			for n := range StateNodes(cluster) {
 				available := n.Available()
 				if available.Cpu().AsApproximateFloat64() >= 1 {
 					nodesWithCPUFree++
@@ -4250,7 +4250,7 @@ var _ = Context("Scheduling", func() {
 			Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("small-instance-type"))
 
 			// Mark for deletion so that we consider all pods on this node for reschedulability
-			cs.Deletion.Mark(ExpectStateNodeExists(cluster, node).NodeClaim.Name)
+			cs.Deletion.Mark(ExpectStateNodeExists(cluster, node).NodeClaim().Name)
 
 			// Trigger a provisioning loop and expect another node to get created
 			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov)
@@ -4276,7 +4276,7 @@ var _ = Context("Scheduling", func() {
 			Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("small-instance-type"))
 
 			// Mark for deletion so that we consider all pods on this node for reschedulability
-			cs.Deletion.Mark(ExpectStateNodeExists(cluster, node).NodeClaim.Name)
+			cs.Deletion.Mark(ExpectStateNodeExists(cluster, node).NodeClaim().Name)
 
 			// Trigger an eviction to set the deletion timestamp but not delete the pod
 			ExpectEvicted(ctx, env.Client, pod)
@@ -4377,7 +4377,7 @@ var _ = Context("Scheduling", func() {
 			Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("small-instance-type"))
 
 			// Mark for deletion so that we consider all pods on this node for reschedulability
-			cs.Deletion.Mark(ExpectStateNodeExists(cluster, node).NodeClaim.Name)
+			cs.Deletion.Mark(ExpectStateNodeExists(cluster, node).NodeClaim().Name)
 
 			// Trigger an eviction to set the deletion timestamp but not delete the pod
 			ExpectEvicted(ctx, env.Client, pod)
@@ -4421,7 +4421,7 @@ var _ = Context("Scheduling", func() {
 			Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("small-instance-type"))
 
 			// Mark for deletion so that we consider all pods on this node for reschedulability
-			cs.Deletion.Mark(ExpectStateNodeExists(cluster, node).NodeClaim.Name)
+			cs.Deletion.Mark(ExpectStateNodeExists(cluster, node).NodeClaim().Name)
 
 			// Trigger an eviction to set the deletion timestamp but not delete the pod
 			ExpectEvicted(ctx, env.Client, pod)
@@ -4457,7 +4457,7 @@ var _ = Context("Scheduling", func() {
 				Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("small-instance-type"))
 
 				// Mark for deletion so that we consider all pods on this node for reschedulability
-				cs.Deletion.Mark(ExpectStateNodeExists(cluster, node).NodeClaim.Name)
+				cs.Deletion.Mark(ExpectStateNodeExists(cluster, node).NodeClaim().Name)
 
 				// Trigger a provisioning loop and expect that we don't create more nodes
 				ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov)
@@ -5668,10 +5668,10 @@ var _ = Context("Scheduling", func() {
 
 			// When IgnoreDRARequests = true (default): only appPod counts (1 CPU total)
 			ctx1 := options.ToContext(ctx, test.Options(test.OptionsFields{IgnoreDRARequests: new(true)}))
-			topology1, err := scheduling.NewTopology(ctx1, env.Client, cluster, nil, []*v1.NodePool{nodePool},
+			topology1, err := scheduling.NewTopology(ctx1, env.Client, cluster.Nodes, nil, []*v1.NodePool{nodePool},
 				map[string][]*cloudprovider.InstanceType{nodePool.Name: cloudProvider.InstanceTypes}, []*corev1.Pod{appPod})
 			Expect(err).ToNot(HaveOccurred())
-			scheduler1 := scheduling.NewScheduler(ctx1, env.Client, []*v1.NodePool{nodePool}, cluster, cs.NodePoolState, cs.CapacityQuotaState, nil, topology1,
+			scheduler1 := scheduling.NewScheduler(ctx1, env.Client, []*v1.NodePool{nodePool}, nil, cs.NodePoolState, cs.CapacityQuotaState, nil, topology1,
 				map[string][]*cloudprovider.InstanceType{nodePool.Name: cloudProvider.InstanceTypes},
 				[]*corev1.Pod{draDaemonPod}, events.NewRecorder(&record.FakeRecorder{}), env.Clock, nil, nil, nil, nil)
 			results1, err := scheduler1.Solve(ctx1, []*corev1.Pod{appPod})
@@ -5681,10 +5681,10 @@ var _ = Context("Scheduling", func() {
 
 			// When IgnoreDRARequests = false: both draDaemonPod + appPod count (3+1=4 CPU total)
 			ctx2 := options.ToContext(ctx, test.Options(test.OptionsFields{IgnoreDRARequests: new(false)}))
-			topology2, err := scheduling.NewTopology(ctx2, env.Client, cluster, nil, []*v1.NodePool{nodePool},
+			topology2, err := scheduling.NewTopology(ctx2, env.Client, cluster.Nodes, nil, []*v1.NodePool{nodePool},
 				map[string][]*cloudprovider.InstanceType{nodePool.Name: cloudProvider.InstanceTypes}, []*corev1.Pod{appPod})
 			Expect(err).ToNot(HaveOccurred())
-			scheduler2 := scheduling.NewScheduler(ctx2, env.Client, []*v1.NodePool{nodePool}, cluster, cs.NodePoolState, cs.CapacityQuotaState, nil, topology2,
+			scheduler2 := scheduling.NewScheduler(ctx2, env.Client, []*v1.NodePool{nodePool}, nil, cs.NodePoolState, cs.CapacityQuotaState, nil, topology2,
 				map[string][]*cloudprovider.InstanceType{nodePool.Name: cloudProvider.InstanceTypes},
 				[]*corev1.Pod{draDaemonPod}, events.NewRecorder(&record.FakeRecorder{}), env.Clock, nil, nil, nil, nil)
 			results2, err := scheduler2.Solve(ctx2, []*corev1.Pod{appPod})

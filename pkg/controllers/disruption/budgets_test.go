@@ -51,25 +51,31 @@ import (
 // owner reference names it is missing or isn't Ready.
 //
 //nolint:gocyclo
-func recountNodePoolStats(nodes []*karpentercluster.StateNode, nodeObjects map[string]*corev1.Node, reason v1.DisruptionReason) (numNodes, disrupting map[string]int) {
+func recountNodePoolStats(nodeClaims *karpentercluster.NodeClaims, nodeObjects map[string]*corev1.Node, reason v1.DisruptionReason) (numNodes, disrupting map[string]int) {
 	numNodes = map[string]int{}
 	disrupting = map[string]int{}
-	for _, node := range nodes {
-		if !node.Managed() || (!node.NodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue() && !node.RebootInProgress()) {
+	// The NodeClaims are copies, since StatusConditions sets the missing conditions.
+	for _, e := range nodeClaims.List() {
+		if !karpentercluster.Launched(e) {
 			continue
 		}
-		if node.NodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() {
+		node := karpentercluster.ViewOfNodeClaim(e)
+		nodeClaim := e.Object
+		if !nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized).IsTrue() && !node.RebootInProgress() {
 			continue
 		}
-		nodePool := node.NodeClaim.Labels[v1.NodePoolLabelKey]
+		if nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() {
+			continue
+		}
+		nodePool := nodeClaim.Labels[v1.NodePoolLabelKey]
 		numNodes[nodePool]++
-		if node.MarkedForDeletion() || node.RebootInProgress() {
+		if karpentercluster.Deleting(e) || node.RebootInProgress() {
 			disrupting[nodePool]++
 			continue
 		}
 		owned, ok := lo.Find(lo.Values(nodeObjects), func(n *corev1.Node) bool {
 			return karpentercluster.Tracked(n) && lo.ContainsBy(n.OwnerReferences, func(o metav1.OwnerReference) bool {
-				return o.Kind == "NodeClaim" && o.Name == node.NodeClaim.Name
+				return o.Kind == "NodeClaim" && o.Name == nodeClaim.Name
 			})
 		})
 		if reason != v1.DisruptionReasonUnhealthy && (!ok || nodeutils.GetCondition(owned, corev1.NodeReady).Status != corev1.ConditionTrue) {
@@ -94,7 +100,7 @@ var _ = Describe("NodePoolStats", func() {
 		srcs := statetest.NewSources()
 		cs := karpentercluster.New(statsCtx, clk, nil, fakecp.NewCloudProvider(),
 			karpentercluster.WithSources(func(obj client.Object) karpenterstate.Newest { return srcs.For(obj) }))
-		c := cs.Nodes
+		c := cs.NodeClaims
 		nodePools := []string{"a", "b", ""}
 		var rv uint64
 		nextRV := func() string { rv++; return strconv.FormatUint(rv, 10) }
@@ -177,7 +183,7 @@ var _ = Describe("NodePoolStats", func() {
 				nodeObjects[name] = node
 			}
 			for _, reason := range []v1.DisruptionReason{v1.DisruptionReasonUnderutilized, v1.DisruptionReasonDrifted, v1.DisruptionReasonEmpty, v1.DisruptionReasonUnhealthy} {
-				wantNodes, wantDisrupting := recountNodePoolStats(c.DeepCopyNodes(), nodeObjects, reason)
+				wantNodes, wantDisrupting := recountNodePoolStats(c, nodeObjects, reason)
 				// NodePool names are never empty, so nodes without the label count toward none.
 				for _, np := range []string{"a", "b"} {
 					numNodes, disrupting := disruption.NodePoolStats(cs.NodePoolState, np, reason)
@@ -190,7 +196,7 @@ var _ = Describe("NodePoolStats", func() {
 })
 
 var _ = Describe("ValidateNodeDisruptable", func() {
-	stateNode := func(rebootStatus metav1.ConditionStatus) *karpentercluster.StateNode {
+	stateNode := func(rebootStatus metav1.ConditionStatus) karpentercluster.NodeClaimEntry {
 		nc := test.NodeClaim(v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: "default"}}})
 		n := test.Node(test.NodeOptions{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
 			v1.NodePoolLabelKey:        "default",
@@ -202,7 +208,7 @@ var _ = Describe("ValidateNodeDisruptable", func() {
 		} else {
 			nc.StatusConditions().SetFalse(v1.ConditionTypeRebooting, v1.RebootReasonSucceeded, "done")
 		}
-		return &karpentercluster.StateNode{Node: n, NodeClaim: nc}
+		return karpentercluster.NodeClaimEntry{Object: nc, Derived: karpentercluster.NodeClaimDerived{Node: n}}
 	}
 	It("should reject a rebooting node", func() {
 		err := disruption.ValidateNodeDisruptable(stateNode(metav1.ConditionTrue), clock.RealClock{})

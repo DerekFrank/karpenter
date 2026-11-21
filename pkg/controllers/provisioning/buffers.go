@@ -211,14 +211,14 @@ func bufferPodCountsFromResults(results scheduler.Results) map[string]int {
 	counts := map[string]int{}
 	for _, existing := range results.ExistingNodes {
 		// Buffer pod counts are intent kept with the NodeClaim; an unmanaged node has none.
-		if existing.NodeClaim == nil {
+		if !existing.Managed() {
 			continue
 		}
 		for _, pod := range existing.Pods {
 			if !IsVirtualPod(pod) {
 				continue
 			}
-			counts[existing.NodeClaim.Name]++
+			counts[existing.Key().NodeClaim]++
 		}
 	}
 	return counts

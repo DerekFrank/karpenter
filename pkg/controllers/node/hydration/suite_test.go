@@ -46,7 +46,7 @@ import (
 
 var ctx context.Context
 var hydrationController *hydration.Controller
-var nodeState *karpentercluster.NodeState
+var nodeState *karpentercluster.NodeClaims
 var env *test.Environment
 var cloudProvider *fake.CloudProvider
 
@@ -61,7 +61,7 @@ var _ = BeforeSuite(func() {
 	ctx = options.ToContext(ctx, test.Options())
 
 	cloudProvider = fake.NewCloudProvider()
-	nodeState = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider).Nodes
+	nodeState = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider).NodeClaims
 	hydrationController = hydration.NewController(env.Overlay, cloudProvider, nodeState)
 })
 
@@ -112,12 +112,12 @@ var _ = Describe("Hydration", func() {
 })
 
 var _ = Describe("Hydration Wakes", func() {
-	var nodes *karpentercluster.NodeState
+	var nodes *karpentercluster.NodeClaims
 	var queue workqueue.TypedRateLimitingInterface[reconcile.Request]
 	BeforeEach(func() {
-		// A fresh NodeState per spec wired to the shared overlay sources, so env.Client's wait waits for this
-		// NodeState too and the wake queue sees only this spec's events.
-		nodes = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider).Nodes
+		// A fresh cluster state per spec wired to the shared overlay sources, so env.Client's wait waits for its
+		// stores too and the wake queue sees only this spec's events.
+		nodes = karpentercluster.New(ctx, env.Clock, env.Overlay, cloudProvider).NodeClaims
 		c := hydration.NewController(env.Overlay, cloudProvider, nodes)
 		m, err := controllerruntime.NewManager(env.Config, controllerruntime.Options{
 			Scheme:     scheme.Scheme,
