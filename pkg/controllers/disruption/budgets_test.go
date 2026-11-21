@@ -107,8 +107,8 @@ var _ = Describe("NodePoolStats", func() {
 			}
 			return nodes
 		}
-		for i := range 300 {
-			id := r.IntN(10)
+		for i := range 2000 {
+			id := r.IntN(30)
 			name, providerID := fmt.Sprintf("node-%d", id), fmt.Sprintf("fake:///node-%d", id)
 			nodePool := nodePools[r.IntN(len(nodePools))]
 			switch op := r.IntN(12); {

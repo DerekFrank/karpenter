@@ -646,10 +646,16 @@ Tests are Ginkgo specs, one `RunSpecs` suite per package.
 - **`env.APIServer`** reads back a controller's write to a kind the overlay
   doesn't record.
 - **`pkg/state`'s primitive specs and benchmarks drive stores through
-  `statetest.Objects`**, filled with `Put` and `Remove`, and so does the
-  scheduling properties harness, which runs thousands of generated cases per
-  run: `cluster.WithSources` for cluster state. `pkg/cluster` and controller
-  specs write through `env.Client`.
+  `statetest.Objects`**, filled with `Put` and `Remove`: `cluster.WithSources`
+  for cluster state. `pkg/cluster` and controller specs write through
+  `env.Client`, except where envtest can't produce the state or makes the run
+  count impractical:
+  - the scheduling properties harness, which runs thousands of generated cases
+    per run;
+  - "should report how long cluster state has been unsynced while its stores
+    are" in metrics/node, and "Node stores should be at least as strongly
+    synced as the List check once its stores sync with no unlaunched
+    NodeClaims" in `pkg/cluster`, which need sources that never sync.
 - Drive an object store through its source, then assert on the target's `Get`,
   as `store_test.go` does.
 - Cover moving between keys ("Derive should move contributions between keys"),
