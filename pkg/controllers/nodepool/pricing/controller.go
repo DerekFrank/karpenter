@@ -96,14 +96,14 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 	if refreshedAt, ok := c.refreshedAt[req.Name]; ok && c.cost.Priced(req.Name) && c.clock.Since(refreshedAt) < refreshPeriod {
-		return reconcile.Result{RequeueAfter: refreshPeriod - c.clock.Since(refreshedAt)}, nil //storelint:deadline the price refresh period
+		return reconcile.Result{RequeueAfter: refreshPeriod - c.clock.Since(refreshedAt)}, nil //storelint:poll the cloud provider's prices
 	}
 	if err := c.cost.RefreshPrices(ctx, nodePool.Object); err != nil {
 		CostTrackingErrorsTotal.Inc(map[string]string{metrics.NodePoolLabel: req.Name})
 		return reconcile.Result{}, err
 	}
 	c.refreshedAt[req.Name] = c.clock.Now()
-	return reconcile.Result{RequeueAfter: refreshPeriod}, nil //storelint:deadline the price refresh period
+	return reconcile.Result{RequeueAfter: refreshPeriod}, nil //storelint:poll the cloud provider's prices
 }
 
 // Register wakes the controller on a NodePool appearing or going, and on a change of the set of offerings a NodePool's

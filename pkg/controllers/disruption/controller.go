@@ -147,7 +147,7 @@ func (c *Controller) Name() string {
 //   - the NodeClaim store's UnlaunchedSource: a NodeClaim launching, which can end the wait on NodeClaimsLaunched. It
 //     doesn't count as a change for consolidation, since a launch also changes the NodeClaim's inputs.
 //
-// The controller still runs every revalidationPeriod for what shows only with time.
+// The controller runs every revalidationPeriod, polling the inputs it names.
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	for _, method := range c.methods {
 		if t, ok := method.(changeTracker); ok {
@@ -226,7 +226,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	}
 
 	// All methods did nothing, so wait for a change, or for the revalidation period
-	return reconciler.Result{RequeueAfter: revalidationPeriod}, nil //storelint:deadline revalidation period, for what shows only with time
+	return reconciler.Result{RequeueAfter: revalidationPeriod}, nil //storelint:poll PodDisruptionBudgets, NodeOverlays, VPA predictions, prices and availability, which no store holds, and budget schedules, tolerations and durations
 }
 
 func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, error) {

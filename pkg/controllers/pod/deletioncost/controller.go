@@ -126,7 +126,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	changes := c.changes.Load()
 	if c.ranked && changes == c.rankedChanges && c.clock.Since(c.rankedAt) < revalidationPeriod {
 		log.FromContext(ctx).V(1).Info("no changes detected, skipping pod deletion cost update")
-		return reconciler.Result{RequeueAfter: revalidationPeriod - c.clock.Since(c.rankedAt)}, nil //storelint:deadline revalidation period, for what shows only with time
+		return reconciler.Result{RequeueAfter: revalidationPeriod - c.clock.Since(c.rankedAt)}, nil //storelint:poll PodDisruptionBudgets, NodeOverlays, VPA predictions and prices, which no store holds, and budget schedules
 	}
 
 	// RankNodes reads the nodes from cluster state; skip the NodePool lookups when there are none. A node appearing
@@ -160,7 +160,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	if total > 0 {
 		log.FromContext(ctx).V(1).WithValues("nodeCount", total).Info("enqueued pod deletion cost annotation writes")
 	}
-	return reconciler.Result{RequeueAfter: revalidationPeriod}, nil //storelint:deadline revalidation period, for what shows only with time
+	return reconciler.Result{RequeueAfter: revalidationPeriod}, nil //storelint:poll PodDisruptionBudgets, NodeOverlays, VPA predictions and prices, which no store holds, and budget schedules
 }
 
 // Group A bypasses the per-cycle cap so nodes already being torn down always
