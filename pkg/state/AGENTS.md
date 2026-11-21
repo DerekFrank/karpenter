@@ -655,7 +655,9 @@ Tests are Ginkgo specs, one `RunSpecs` suite per package.
   - "should report how long cluster state has been unsynced while its stores
     are" in metrics/node, and "Node stores should be at least as strongly
     synced as the List check once its stores sync with no unlaunched
-    NodeClaims" in `pkg/cluster`, which need sources that never sync.
+    NodeClaims" in `pkg/cluster`, and "doesn't back off when the
+    CapacityQuotas haven't synced" in disruption's queue, which need sources
+    that never sync.
 - Drive an object store through its source, then assert on the target's `Get`,
   as `store_test.go` does.
 - Cover moving between keys ("Derive should move contributions between keys"),
